@@ -1,7 +1,8 @@
 import QRCode from 'qrcode';
 import crypto from 'crypto';
+import config from '../config/env.js';
 
-const APP_BASE_URL = process.env.APP_BASE_URL || 'http://localhost:5173';
+const APP_BASE_URL = config.appBaseUrl;
 
 export const generateQRCode = async (data) => {
   try {
