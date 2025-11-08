@@ -188,7 +188,18 @@ router.post(
         createdBy: req.user._id,
       });
 
-      const { qrCode, qrImage } = await generateSessionQRCode(session._id, examId, manualToken);
+      const requestOrigin =
+        req.body.appBaseUrl ||
+        req.get('origin') ||
+        req.headers['x-forwarded-origin'] ||
+        undefined;
+
+      const { qrCode, qrImage } = await generateSessionQRCode(
+        session._id,
+        examId,
+        manualToken,
+        requestOrigin
+      );
       session.qrCode = qrCode;
       session.qrImage = qrImage;
 

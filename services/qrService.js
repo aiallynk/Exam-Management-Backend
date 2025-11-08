@@ -4,6 +4,11 @@ import config from '../config/env.js';
 
 const APP_BASE_URL = config.appBaseUrl;
 
+const sanitizeBaseUrl = (baseUrl) => {
+  if (!baseUrl) return null;
+  return baseUrl.endsWith('/') ? baseUrl.slice(0, -1) : baseUrl;
+};
+
 export const generateQRCode = async (data) => {
   try {
     const qrDataURL = await QRCode.toDataURL(data, {
@@ -22,13 +27,23 @@ export const generateUniqueQRString = () => {
   return crypto.randomBytes(32).toString('hex');
 };
 
-export const generateSessionQRCode = async (sessionId, examId, manualToken) => {
+export const generateSessionQRCode = async (
+  sessionId,
+  examId,
+  manualToken,
+  baseUrl
+) => {
+  const resolvedBaseUrl = sanitizeBaseUrl(baseUrl) || sanitizeBaseUrl(APP_BASE_URL);
+
   const qrPayload = {
     type: 'exam-session',
     sessionId,
     examId,
     manualToken,
-    url: sessionId ? `${APP_BASE_URL}/exam/take/${sessionId}` : undefined,
+    url:
+      sessionId && resolvedBaseUrl
+        ? `${resolvedBaseUrl}/exam/take/${sessionId}`
+        : undefined,
     timestamp: Date.now(),
   };
   const qrData = JSON.stringify(qrPayload);
