@@ -31,6 +31,10 @@ const QuestionSchema = new mongoose.Schema(
     correctAnswer: {
       type: String,
     },
+    imageUrl: {
+      type: String,
+      trim: true,
+    },
     points: {
       type: Number,
       default: 1,

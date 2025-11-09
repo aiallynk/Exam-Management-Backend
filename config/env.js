@@ -17,6 +17,7 @@ export default {
     process.env.APP_BASE_URL ||
     process.env.RENDER_EXTERNAL_URL ||
     'https://exam-management-frontend-psi.vercel.app',
+  assetBaseUrl: process.env.ASSET_BASE_URL || '',
   nodeEnv: process.env.NODE_ENV || 'development',
 };
 

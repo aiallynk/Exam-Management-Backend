@@ -27,7 +27,7 @@ const storage = multer.diskStorage({
   },
 });
 
-const upload = multer({
+const docUpload = multer({
   storage,
   limits: {
     fileSize: 10 * 1024 * 1024, // 10MB
@@ -52,7 +52,7 @@ router.post(
   '/content',
   requireAuth,
   requireRole('DESIGNER', 'ADMIN'),
-  upload.single('file'),
+  docUpload.single('file'),
   async (req, res, next) => {
     try {
       if (!req.file) {
@@ -94,6 +94,70 @@ router.post(
         }
         throw error;
       }
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+const imageUpload = multer({
+  storage,
+  limits: {
+    fileSize: 5 * 1024 * 1024, // 5MB
+  },
+  fileFilter: (req, file, cb) => {
+    if (file.mimetype && file.mimetype.startsWith('image/')) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only image files are allowed.'));
+    }
+  },
+});
+
+const buildPublicUrl = (req, filename) => {
+  const configured = (config.assetBaseUrl || '').trim();
+  const sanitizeBase = (base) => base.replace(/\/$/, '');
+
+  let base = configured ? sanitizeBase(configured) : '';
+
+  if (!base) {
+    const forwardedProto = (req.headers['x-forwarded-proto'] || '').split(',')[0];
+    const protocol = forwardedProto || req.protocol || 'http';
+    const host = req.get('host');
+    if (host) {
+      base = sanitizeBase(`${protocol}://${host}`);
+    }
+  }
+
+  if (!base) {
+    return `/uploads/${filename}`;
+  }
+
+  return `${base}/uploads/${filename}`;
+};
+
+router.post(
+  '/image',
+  requireAuth,
+  requireRole('DESIGNER', 'ADMIN'),
+  imageUpload.single('image'),
+  async (req, res, next) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: 'No image uploaded' });
+      }
+
+      const fileName = req.file.filename;
+      const fileUrl = buildPublicUrl(req, fileName);
+
+      res.json({
+        success: true,
+        url: fileUrl,
+        fileName: req.file.originalname,
+        storedFileName: fileName,
+        mimeType: req.file.mimetype,
+        size: req.file.size,
+      });
     } catch (error) {
       next(error);
     }

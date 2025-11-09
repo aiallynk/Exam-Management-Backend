@@ -58,6 +58,7 @@ router.post(
       .withMessage('Invalid question type'),
     body('questionPaperId').notEmpty().withMessage('Question paper ID is required'),
     body('order').isInt({ min: 0 }).withMessage('Order must be a non-negative integer'),
+    body('imageUrl').optional({ nullable: true }).isString().withMessage('Image URL must be a string'),
   ],
   async (req, res, next) => {
     try {
@@ -66,7 +67,7 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { questionText, questionType, options, correctAnswer, points, order, questionPaperId } =
+      const { questionText, questionType, options, correctAnswer, points, order, questionPaperId, imageUrl } =
         req.body;
 
       // Verify question paper belongs to exam
@@ -85,6 +86,7 @@ router.post(
         questionType,
         options,
         correctAnswer,
+        imageUrl: typeof imageUrl === 'string' && imageUrl.trim().length ? imageUrl.trim() : undefined,
         points: points || 1,
         order: order || 0,
       });
@@ -132,6 +134,7 @@ router.put(
   [
     body('questionText').optional().trim().notEmpty(),
     body('questionType').optional().isIn(['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE', 'SHORT_ANSWER', 'PARAGRAPH', 'NUMBER']),
+    body('imageUrl').optional({ nullable: true }).isString().withMessage('Image URL must be a string'),
   ],
   async (req, res, next) => {
     try {
@@ -151,7 +154,7 @@ router.put(
         return res.status(404).json({ error: 'Question not found for this exam' });
       }
 
-      const { questionText, questionType, options, correctAnswer, points, order } =
+      const { questionText, questionType, options, correctAnswer, points, order, imageUrl } =
         req.body;
 
       if (questionText) question.questionText = questionText;
@@ -160,6 +163,10 @@ router.put(
       if (correctAnswer !== undefined) question.correctAnswer = correctAnswer;
       if (points !== undefined) question.points = points;
       if (order !== undefined) question.order = order;
+      if (imageUrl !== undefined) {
+        const normalized = typeof imageUrl === 'string' ? imageUrl.trim() : '';
+        question.imageUrl = normalized.length ? normalized : null;
+      }
 
       await question.save();
       await question.populate('questionPaperId', 'setName');

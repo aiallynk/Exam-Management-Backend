@@ -1,6 +1,8 @@
 import express from 'express';
 import cors from 'cors';
 import helmet from 'helmet';
+import path from 'path';
+import { fileURLToPath } from 'url';
 import config from './config/env.js';
 import { connect } from './utils/db.js';
 import { requestLogger } from './utils/logger.js';
@@ -19,7 +21,11 @@ import adminRoutes from './routes/admin.js';
 import uploadRoutes from './routes/upload.js';
 import aiRoutes from './routes/ai.js';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = path.dirname(__filename);
+
 const app = express();
+app.set('trust proxy', 1);
 
 // Middleware
 app.use(helmet());
@@ -32,6 +38,11 @@ app.use(
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }));
 app.use(requestLogger);
+
+const uploadsPath = path.isAbsolute(config.uploadDir)
+  ? config.uploadDir
+  : path.join(__dirname, config.uploadDir);
+app.use('/uploads', express.static(uploadsPath));
 
 // Health check
 app.get('/health', (req, res) => {
