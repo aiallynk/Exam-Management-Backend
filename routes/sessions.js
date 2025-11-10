@@ -299,20 +299,25 @@ router.get('/validate/:qrCode', requireAuth, async (req, res, next) => {
       return res.json({ valid: false, message: validation.message });
     }
 
-    const assignment = await assignQuestionPaperToStudent({
-      session,
-      userId: req.user._id,
-    });
+    let assignment = null;
+    if (req.user.role === 'STUDENT') {
+      assignment = await assignQuestionPaperToStudent({
+        session,
+        userId: req.user._id,
+      });
+    }
 
     res.json({
       valid: true,
       sessionId: session._id,
       session,
       manualToken: session.manualToken,
-      assignment: {
-        questionPaperId: assignment.questionPaperId?._id || assignment.questionPaperId,
-        setName: assignment.questionPaperId?.setName,
-      },
+      assignment: assignment
+        ? {
+            questionPaperId: assignment.questionPaperId?._id || assignment.questionPaperId,
+            setName: assignment.questionPaperId?.setName,
+          }
+        : null,
       message: 'QR code is valid',
     });
   } catch (error) {
@@ -334,19 +339,24 @@ router.get('/manual-token/:token', requireAuth, async (req, res, next) => {
       return res.json({ valid: false, message: validation.message });
     }
 
-    const assignment = await assignQuestionPaperToStudent({
-      session,
-      userId: req.user._id,
-    });
+    let assignment = null;
+    if (req.user.role === 'STUDENT') {
+      assignment = await assignQuestionPaperToStudent({
+        session,
+        userId: req.user._id,
+      });
+    }
 
     res.json({
       valid: true,
       sessionId: session._id,
       session,
-      assignment: {
-        questionPaperId: assignment.questionPaperId?._id || assignment.questionPaperId,
-        setName: assignment.questionPaperId?.setName,
-      },
+      assignment: assignment
+        ? {
+            questionPaperId: assignment.questionPaperId?._id || assignment.questionPaperId,
+            setName: assignment.questionPaperId?.setName,
+          }
+        : null,
       message: 'Manual token is valid',
     });
   } catch (error) {
