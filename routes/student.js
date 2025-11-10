@@ -1,11 +1,11 @@
 import express from 'express';
 import User from '../models/User.js';
 import ExamAttempt from '../models/ExamAttempt.js';
-import Answer from '../models/Answer.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { body, validationResult } from 'express-validator';
 import bcrypt from 'bcryptjs';
+import { ensureScoreSummary } from '../utils/attemptScores.js';
 
 const router = express.Router();
 
@@ -124,19 +124,10 @@ router.get('/results', requireAuth, requireRole('STUDENT'), async (req, res, nex
 
     const results = await Promise.all(
       attempts.map(async (attempt) => {
-        const answers = await Answer.find({ attemptId: attempt._id })
-          .populate('questionId', 'points');
-        const totalScore = answers.reduce((sum, a) => sum + (a.pointsEarned || 0), 0);
-        const maxScore = answers.reduce((sum, a) => sum + (a.questionId?.points || 0), 0);
-        const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
-
+        const { summary } = await ensureScoreSummary(attempt);
         return {
           attempt,
-          score: {
-            totalScore,
-            maxScore,
-            percentage,
-          },
+          score: summary,
         };
       })
     );

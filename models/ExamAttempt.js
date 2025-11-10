@@ -57,6 +57,27 @@ const ExamAttemptSchema = new mongoose.Schema(
       type: Date,
       default: Date.now,
     },
+    scoreSummary: {
+      totalScore: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      maxScore: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      percentage: {
+        type: Number,
+        default: 0,
+        min: 0,
+        max: 100,
+      },
+      computedAt: {
+        type: Date,
+      },
+    },
   },
   {
     timestamps: true,

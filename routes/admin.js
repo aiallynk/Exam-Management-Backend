@@ -7,6 +7,13 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { body, validationResult } from 'express-validator';
 import crypto from 'crypto';
+import {
+  loadCertificateTemplate,
+  persistCertificateTemplate,
+  extractTemplatePlaceholders,
+  DEFAULT_CERTIFICATE_TEMPLATE,
+  MIN_CERTIFICATION_PERCENTAGE,
+} from '../utils/certificateTemplate.js';
 
 const router = express.Router();
 
@@ -248,6 +255,54 @@ router.post(
       res.status(201).json({
         user: user.toJSON(),
         password: password ? undefined : userPassword, // Only return if auto-generated
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Certificate template configuration
+router.get(
+  '/certificate-template',
+  requireAuth,
+  requireRole('ADMIN'),
+  async (req, res, next) => {
+    try {
+      const template = await loadCertificateTemplate();
+      res.json({
+        template,
+        placeholders: extractTemplatePlaceholders(),
+        defaults: DEFAULT_CERTIFICATE_TEMPLATE,
+        minPercentage: MIN_CERTIFICATION_PERCENTAGE,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+router.put(
+  '/certificate-template',
+  requireAuth,
+  requireRole('ADMIN'),
+  [body('template').isObject().withMessage('Template configuration is required')],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const { template } = req.body;
+      const mergedTemplate = await persistCertificateTemplate(template, req.user._id);
+
+      res.json({
+        success: true,
+        template: mergedTemplate,
+        placeholders: extractTemplatePlaceholders(),
+        minPercentage: MIN_CERTIFICATION_PERCENTAGE,
+        message: 'Certificate template updated successfully.',
       });
     } catch (error) {
       next(error);

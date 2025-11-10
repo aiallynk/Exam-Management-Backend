@@ -10,6 +10,12 @@ import { requireRole } from '../middleware/roles.js';
 import { body, validationResult } from 'express-validator';
 import { evaluateAnswer } from '../services/aiService.js';
 import { assignQuestionPaperToStudent } from '../services/sessionAssignment.js';
+import {
+  MIN_CERTIFICATION_PERCENTAGE,
+  loadCertificateTemplate,
+  applyCertificateTemplate,
+} from '../utils/certificateTemplate.js';
+import { ensureScoreSummary } from '../utils/attemptScores.js';
 
 const parseArrayAnswer = (value) => {
   if (Array.isArray(value)) {
@@ -367,15 +373,22 @@ router.post(
       // Save all answers
       await Answer.insertMany(answerDocs);
 
+      const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
+      const submitTime = new Date();
+
       // Update attempt
       attempt.isCompleted = true;
-      attempt.submitTime = new Date();
+      attempt.submitTime = submitTime;
       attempt.isDisqualified = isDisqualified || false;
       attempt.disqualifyReason = disqualifyReason || '';
+      attempt.scoreSummary = {
+        totalScore,
+        maxScore,
+        percentage,
+        computedAt: new Date(),
+      };
 
       await attempt.save();
-
-      const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
 
       await attempt.populate('examId', 'title duration showResultsImmediately resultsReleasedAt');
       await attempt.populate('questionPaperId', 'setName');
@@ -423,28 +436,15 @@ router.get('/:attemptId/results', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: 'Results are not yet available for this exam.' });
     }
 
-    const answers = await Answer.find({ attemptId: attempt._id })
-      .populate('questionId')
-      .sort({ 'questionId.order': 1 });
-
-    let totalScore = 0;
-    let maxScore = 0;
-
-    answers.forEach((answer) => {
-      totalScore += answer.pointsEarned;
-      maxScore += answer.questionId.points;
+    const { summary, answers } = await ensureScoreSummary(attempt, {
+      includeAnswers: true,
+      includeQuestionDetails: true,
     });
-
-    const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
 
     res.json({
       attempt,
       answers,
-      score: {
-        totalScore,
-        maxScore,
-        percentage,
-      },
+      score: summary,
     });
   } catch (error) {
     next(error);
@@ -497,6 +497,45 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
+    if (!attempt.isCompleted) {
+      return res.status(400).json({ error: 'Certificate is available only after the attempt is submitted.' });
+    }
+
+    if (attempt.isDisqualified) {
+      return res.status(403).json({ error: 'Disqualified attempts are not eligible for certificates.' });
+    }
+
+    const { summary } = await ensureScoreSummary(attempt);
+
+    if ((summary?.percentage ?? 0) < MIN_CERTIFICATION_PERCENTAGE) {
+      return res.status(403).json({
+        error: `Certificate is issued only for scores ${MIN_CERTIFICATION_PERCENTAGE}% or above.`,
+        minPercentage: MIN_CERTIFICATION_PERCENTAGE,
+        achievedPercentage: summary?.percentage ?? 0,
+      });
+    }
+
+    const template = await loadCertificateTemplate();
+    const examTitle =
+      attempt.examId?.title || attempt.examSnapshot?.title || 'Exam';
+    const attemptDate = attempt.submitTime
+      ? new Date(attempt.submitTime)
+      : null;
+    const issuedTimestamp = attemptDate ? attemptDate : new Date();
+    const context = {
+      studentName: attempt.userId?.name || req.user.name || 'Student',
+      examTitle,
+      attemptDate: attemptDate ? attemptDate.toLocaleString() : '',
+      issuedOn: issuedTimestamp.toLocaleString(),
+      percentage: summary?.percentage ?? 0,
+      score: summary?.totalScore ?? 0,
+      maxScore: summary?.maxScore ?? 0,
+      attemptId: attempt._id.toString(),
+      setName: attempt.questionPaperId?.setName || '',
+    };
+
+    const renderedTemplate = applyCertificateTemplate(template, context);
+
     res.json({
       attempt: {
         _id: attempt._id,
@@ -521,6 +560,14 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
       user: {
         name: attempt.userId?.name || req.user.name,
       },
+      score: summary,
+      eligibility: {
+        eligible: true,
+        minPercentage: MIN_CERTIFICATION_PERCENTAGE,
+      },
+      template,
+      rendered: renderedTemplate,
+      placeholders: context,
     });
   } catch (error) {
     next(error);
