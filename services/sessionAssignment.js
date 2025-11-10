@@ -1,16 +1,30 @@
+import mongoose from 'mongoose';
 import SessionAssignment from '../models/SessionAssignment.js';
 import QuestionPaper from '../models/QuestionPaper.js';
 
+const normalizeIdValue = (value) => {
+  if (!value) return null;
+  if (typeof value === 'string') return value;
+  if (value instanceof mongoose.Types.ObjectId) return value.toString();
+  if (typeof value === 'object' && value._id) {
+    const inner = value._id;
+    if (typeof inner === 'string') return inner;
+    if (inner instanceof mongoose.Types.ObjectId) return inner.toString();
+    return String(inner);
+  }
+  return String(value);
+};
+
 const ensureArrayOfIds = (ids) => {
   if (!ids) return [];
-  if (Array.isArray(ids)) return ids.map((id) => id.toString());
-  return [ids.toString()];
+  if (!Array.isArray(ids)) return [normalizeIdValue(ids)].filter(Boolean);
+  return ids.map(normalizeIdValue).filter(Boolean);
 };
 
 const getQuestionPaperPool = async (session) => {
   const candidateIds = ensureArrayOfIds(session.questionPaperIds);
   if (!candidateIds.length && session.questionPaperId) {
-    candidateIds.push(session.questionPaperId.toString());
+    candidateIds.push(normalizeIdValue(session.questionPaperId));
   }
 
   if (!candidateIds.length) {
