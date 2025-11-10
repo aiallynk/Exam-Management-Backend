@@ -6,6 +6,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { body, validationResult } from 'express-validator';
 import { generateSessionQRCode } from '../services/qrService.js';
+import { assignQuestionPaperToStudent } from '../services/sessionAssignment.js';
 
 const router = express.Router();
 
@@ -84,6 +85,7 @@ router.get('/', requireAuth, async (req, res, next) => {
     const sessions = await ExamSession.find(filter)
       .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
       .populate('questionPaperId', 'setName')
+      .populate('questionPaperIds', 'setName')
       .populate('createdBy', 'name email')
       .sort({ createdAt: -1 })
       .skip(skip)
@@ -114,6 +116,7 @@ router.get('/:sessionId', requireAuth, async (req, res, next) => {
         'title description duration gracePeriod maxAttempts showResultsImmediately resultsReleasedAt'
       )
       .populate('questionPaperId', 'setName')
+      .populate('questionPaperIds', 'setName')
       .populate('createdBy', 'name email');
 
     if (!session) {
@@ -128,7 +131,20 @@ router.get('/:sessionId', requireAuth, async (req, res, next) => {
       }
     }
 
-    res.json({ session });
+    let assignment = null;
+    if (req.user.role === 'STUDENT') {
+      await session.populate('questionPaperIds', 'setName');
+      const result = await assignQuestionPaperToStudent({
+        session,
+        userId: req.user._id,
+      });
+      assignment = {
+        questionPaperId: result.questionPaperId?._id || result.questionPaperId,
+        setName: result.questionPaperId?.setName,
+      };
+    }
+
+    res.json({ session, assignment });
   } catch (error) {
     next(error);
   }
@@ -141,7 +157,12 @@ router.post(
   requireRole('DESIGNER', 'ADMIN'),
   [
     body('examId').notEmpty().withMessage('Exam ID is required'),
-    body('questionPaperId').notEmpty().withMessage('Question paper ID is required'),
+    body('questionPaperId').optional().isMongoId(),
+    body('questionPaperIds').optional().isArray({ min: 1 }),
+    body('questionPaperIds.*').optional().isMongoId(),
+    body('distributionMode')
+      .optional()
+      .isIn(['single', 'random', 'sequential', 'roll', 'manual']),
     body('startTime').isISO8601().withMessage('Valid start time is required'),
     body('endTime').isISO8601().withMessage('Valid end time is required'),
   ],
@@ -152,7 +173,16 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { examId, questionPaperId, startTime, endTime } = req.body;
+      const {
+        examId,
+        questionPaperId,
+        questionPaperIds = [],
+        startTime,
+        endTime,
+        distributionMode = 'single',
+      } = req.body;
+
+      const normalizedMode = distributionMode || 'single';
 
       // Verify exam exists
       const exam = await Exam.findById(examId);
@@ -160,14 +190,40 @@ router.post(
         return res.status(404).json({ error: 'Exam not found' });
       }
 
-      // Verify question paper belongs to exam
-      const questionPaper = await QuestionPaper.findOne({
-        _id: questionPaperId,
+      let selectedPaperIds = Array.isArray(questionPaperIds)
+        ? questionPaperIds.map((id) => id.toString())
+        : [];
+
+      if (questionPaperId) {
+        selectedPaperIds.push(questionPaperId.toString());
+      }
+
+      selectedPaperIds = [...new Set(selectedPaperIds)];
+
+      if (normalizedMode === 'single') {
+        if (!selectedPaperIds.length) {
+          return res
+            .status(400)
+            .json({ error: 'Please select a question paper for the session.' });
+        }
+        selectedPaperIds = [selectedPaperIds[0]];
+      } else {
+        if (selectedPaperIds.length < 2) {
+          return res.status(400).json({
+            error: 'Select at least two question papers for distributed sessions.',
+          });
+        }
+      }
+
+      const questionPapers = await QuestionPaper.find({
+        _id: { $in: selectedPaperIds },
         examId,
       });
 
-      if (!questionPaper) {
-        return res.status(404).json({ error: 'Question paper not found' });
+      if (questionPapers.length !== selectedPaperIds.length) {
+        return res
+          .status(404)
+          .json({ error: 'One or more selected question papers were not found.' });
       }
 
       // Verify times
@@ -181,7 +237,10 @@ router.post(
 
       const session = new ExamSession({
         examId,
-        questionPaperId,
+        questionPaperId: selectedPaperIds[0],
+        questionPaperIds: selectedPaperIds,
+        distributionMode: normalizedMode,
+        distributionState: { lastAssignedIndex: -1 },
         qrCode: 'placeholder',
         qrImage: '',
         manualToken,
@@ -212,6 +271,7 @@ router.post(
         'title duration showResultsImmediately resultsReleasedAt'
       );
       await session.populate('questionPaperId', 'setName');
+      await session.populate('questionPaperIds', 'setName');
 
       res.status(201).json({
         session,
@@ -231,18 +291,28 @@ router.get('/validate/:qrCode', requireAuth, async (req, res, next) => {
 
     const session = await ExamSession.findOne({ qrCode })
       .populate('examId', 'title duration maxAttempts showResultsImmediately resultsReleasedAt')
-      .populate('questionPaperId', 'setName');
+      .populate('questionPaperId', 'setName')
+      .populate('questionPaperIds', 'setName');
 
     const validation = await validateSessionAvailability(session, req.user);
     if (!validation.valid) {
       return res.json({ valid: false, message: validation.message });
     }
 
+    const assignment = await assignQuestionPaperToStudent({
+      session,
+      userId: req.user._id,
+    });
+
     res.json({
       valid: true,
       sessionId: session._id,
       session,
       manualToken: session.manualToken,
+      assignment: {
+        questionPaperId: assignment.questionPaperId?._id || assignment.questionPaperId,
+        setName: assignment.questionPaperId?.setName,
+      },
       message: 'QR code is valid',
     });
   } catch (error) {
@@ -256,17 +326,27 @@ router.get('/manual-token/:token', requireAuth, async (req, res, next) => {
 
     const session = await ExamSession.findOne({ manualToken: token })
       .populate('examId', 'title duration maxAttempts showResultsImmediately resultsReleasedAt')
-      .populate('questionPaperId', 'setName');
+      .populate('questionPaperId', 'setName')
+      .populate('questionPaperIds', 'setName');
 
     const validation = await validateSessionAvailability(session, req.user);
     if (!validation.valid) {
       return res.json({ valid: false, message: validation.message });
     }
 
+    const assignment = await assignQuestionPaperToStudent({
+      session,
+      userId: req.user._id,
+    });
+
     res.json({
       valid: true,
       sessionId: session._id,
       session,
+      assignment: {
+        questionPaperId: assignment.questionPaperId?._id || assignment.questionPaperId,
+        setName: assignment.questionPaperId?.setName,
+      },
       message: 'Manual token is valid',
     });
   } catch (error) {

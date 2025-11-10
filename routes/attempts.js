@@ -9,6 +9,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { body, validationResult } from 'express-validator';
 import { evaluateAnswer } from '../services/aiService.js';
+import { assignQuestionPaperToStudent } from '../services/sessionAssignment.js';
 
 const parseArrayAnswer = (value) => {
   if (Array.isArray(value)) {
@@ -184,17 +185,35 @@ router.post(
         userId: req.user._id,
         sessionId,
         isCompleted: false,
-      });
+      }).populate('questionPaperId', 'setName');
 
       if (activeAttempt) {
-        return res.json({ attempt: activeAttempt });
+        await activeAttempt.populate('examId', 'title duration');
+        await activeAttempt.populate('sessionId', 'startTime endTime');
+        return res.json({
+          attempt: activeAttempt,
+          assignment: {
+            questionPaperId:
+              activeAttempt.questionPaperId?._id || activeAttempt.questionPaperId,
+            setName: activeAttempt.questionPaperId?.setName,
+          },
+        });
       }
+
+      await session.populate('questionPaperIds', 'setName');
+      const assignment = await assignQuestionPaperToStudent({
+        session,
+        userId: req.user._id,
+      });
+      const assignedQuestionPaperId =
+        assignment.questionPaperId?._id || assignment.questionPaperId;
 
       // Create new attempt
       const attempt = new ExamAttempt({
         examId,
         sessionId,
         userId: req.user._id,
+        questionPaperId: assignedQuestionPaperId,
         startTime: now,
         isCompleted: false,
         examSnapshot: {
@@ -206,8 +225,15 @@ router.post(
       await attempt.save();
       await attempt.populate('examId', 'title duration');
       await attempt.populate('sessionId', 'startTime endTime');
+      await attempt.populate('questionPaperId', 'setName');
 
-      res.status(201).json({ attempt });
+      res.status(201).json({
+        attempt,
+        assignment: {
+          questionPaperId: assignedQuestionPaperId,
+          setName: assignment.questionPaperId?.setName,
+        },
+      });
     } catch (error) {
       next(error);
     }
@@ -247,9 +273,18 @@ router.post(
 
       const { answers, isDisqualified, disqualifyReason } = req.body;
 
+      const assignedQuestionPaperId =
+        attempt.questionPaperId?._id ||
+        attempt.questionPaperId ||
+        attempt.sessionId?.questionPaperId;
+
+      if (!assignedQuestionPaperId) {
+        return res.status(400).json({ error: 'No question paper assigned for this attempt.' });
+      }
+
       // Get all questions for this session's question paper
       const questions = await Question.find({
-        questionPaperId: attempt.sessionId.questionPaperId,
+        questionPaperId: assignedQuestionPaperId,
       }).sort({ order: 1 });
 
       const answerDocs = [];
@@ -343,6 +378,7 @@ router.post(
       const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
 
       await attempt.populate('examId', 'title duration showResultsImmediately resultsReleasedAt');
+      await attempt.populate('questionPaperId', 'setName');
 
       res.json({
         success: true,
@@ -366,6 +402,7 @@ router.get('/:attemptId/results', requireAuth, async (req, res, next) => {
     const attempt = await ExamAttempt.findById(req.params.attemptId)
       .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
       .populate('sessionId', 'startTime endTime')
+      .populate('questionPaperId', 'setName')
       .populate('userId', 'name email');
 
     if (!attempt) {
@@ -448,7 +485,8 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
   try {
     const attempt = await ExamAttempt.findById(req.params.attemptId)
       .populate('examId', 'title resultsReleasedAt showResultsImmediately')
-      .populate('userId', 'name');
+      .populate('userId', 'name')
+      .populate('questionPaperId', 'setName');
 
     if (!attempt) {
       return res.status(404).json({ error: 'Attempt not found' });
@@ -465,6 +503,12 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
         submitTime: attempt.submitTime,
         examSnapshot: attempt.examSnapshot,
         isCompleted: attempt.isCompleted,
+        questionPaper: attempt.questionPaperId
+          ? {
+              _id: attempt.questionPaperId._id,
+              setName: attempt.questionPaperId.setName,
+            }
+          : null,
         examId: attempt.examId
           ? {
               _id: attempt.examId._id,

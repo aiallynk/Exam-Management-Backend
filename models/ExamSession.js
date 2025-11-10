@@ -11,7 +11,15 @@ const ExamSessionSchema = new mongoose.Schema(
     questionPaperId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'QuestionPaper',
-      required: true,
+    },
+    questionPaperIds: {
+      type: [
+        {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: 'QuestionPaper',
+        },
+      ],
+      default: [],
     },
     qrCode: {
       type: String,
@@ -50,6 +58,21 @@ const ExamSessionSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: true,
+    },
+    distributionMode: {
+      type: String,
+      enum: ['single', 'random', 'sequential', 'roll', 'manual'],
+      default: 'single',
+    },
+    distributionState: {
+      lastAssignedIndex: {
+        type: Number,
+        default: -1,
+      },
+      lastAssignedPaper: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'QuestionPaper',
+      },
     },
   },
   {

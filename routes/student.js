@@ -116,6 +116,7 @@ router.get('/results', requireAuth, requireRole('STUDENT'), async (req, res, nex
       isCompleted: true,
     })
       .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
+      .populate('questionPaperId', 'setName')
       .populate('sessionId', 'startTime endTime')
       .sort({ createdAt: -1 })
       .skip(skip)

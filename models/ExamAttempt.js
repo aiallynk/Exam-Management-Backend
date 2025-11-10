@@ -14,6 +14,10 @@ const ExamAttemptSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    questionPaperId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'QuestionPaper',
+    },
     userId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
