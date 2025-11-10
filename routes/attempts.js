@@ -231,7 +231,7 @@ router.post(
       await attempt.save();
       await attempt.populate('examId', 'title duration');
       await attempt.populate('sessionId', 'startTime endTime');
-      await attempt.populate('questionPaperId', 'setName');
+      await attempt.populate('questionPaperId', '_id');
 
       res.status(201).json({
         attempt,
@@ -415,7 +415,7 @@ router.get('/:attemptId/results', requireAuth, async (req, res, next) => {
     const attempt = await ExamAttempt.findById(req.params.attemptId)
       .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
       .populate('sessionId', 'startTime endTime')
-      .populate('questionPaperId', 'setName')
+      .populate('questionPaperId', '_id')
       .populate('userId', 'name email');
 
     if (!attempt) {
@@ -486,7 +486,7 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
     const attempt = await ExamAttempt.findById(req.params.attemptId)
       .populate('examId', 'title resultsReleasedAt showResultsImmediately')
       .populate('userId', 'name')
-      .populate('questionPaperId', 'setName');
+      .populate('questionPaperId', '_id');
 
     if (!attempt) {
       return res.status(404).json({ error: 'Attempt not found' });
@@ -536,7 +536,7 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
 
     const renderedTemplate = applyCertificateTemplate(template, context);
 
-    res.json({
+    const responsePayload = {
       attempt: {
         _id: attempt._id,
         submitTime: attempt.submitTime,
@@ -545,7 +545,6 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
         questionPaper: attempt.questionPaperId
           ? {
               _id: attempt.questionPaperId._id,
-              setName: attempt.questionPaperId.setName,
             }
           : null,
         examId: attempt.examId
@@ -567,8 +566,18 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
       },
       template,
       rendered: renderedTemplate,
-      placeholders: context,
-    });
+      placeholders: { ...context, setName: undefined },
+    };
+
+    // Hide set details for students (already removed), but keep for non-students if needed
+    if (req.user.role !== 'STUDENT' && attempt.questionPaperId) {
+      responsePayload.attempt.questionPaper = {
+        _id: attempt.questionPaperId._id,
+        setName: attempt.questionPaperId.setName,
+      };
+    }
+
+    res.json(responsePayload);
   } catch (error) {
     next(error);
   }
