@@ -535,13 +535,12 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
     const context = {
       studentName: attempt.userId?.name || req.user.name || 'Student',
       examTitle,
-      attemptDate: attemptDate ? attemptDate.toLocaleString() : '',
-      issuedOn: issuedTimestamp.toLocaleString(),
+      attemptDate: attemptDate ? attemptDate.toLocaleDateString() : '',
+      issuedOn: issuedTimestamp.toLocaleDateString(),
       percentage: summary?.percentage ?? 0,
       score: summary?.totalScore ?? 0,
       maxScore: summary?.maxScore ?? 0,
       attemptId: attempt._id.toString(),
-      setName: attempt.questionPaperId?.setName || '',
     };
 
     const renderedTemplate = applyCertificateTemplate(template, context);
@@ -576,7 +575,7 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
       },
       template,
       rendered: renderedTemplate,
-      placeholders: { ...context, setName: undefined },
+      placeholders: { ...context },
     };
 
     // Hide set details for students (already removed), but keep for non-students if needed

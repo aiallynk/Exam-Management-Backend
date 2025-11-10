@@ -153,7 +153,6 @@ export const extractTemplatePlaceholders = () => [
   '{{score}}',
   '{{maxScore}}',
   '{{attemptId}}',
-  '{{setName}}',
 ];
 
 
