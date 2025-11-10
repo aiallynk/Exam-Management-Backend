@@ -26,6 +26,13 @@ const ExamSchema = new mongoose.Schema(
       default: 1,
       min: 1,
     },
+    showResultsImmediately: {
+      type: Boolean,
+      default: false,
+    },
+    resultsReleasedAt: {
+      type: Date,
+    },
     isActive: {
       type: Boolean,
       default: true,

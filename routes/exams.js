@@ -81,6 +81,7 @@ router.post(
     body('duration').isInt({ min: 1 }).withMessage('Duration must be a positive number'),
     body('gracePeriod').optional().isInt({ min: 0 }),
     body('maxAttempts').optional().isInt({ min: 1 }),
+    body('showResultsImmediately').optional().isBoolean(),
   ],
   async (req, res, next) => {
     try {
@@ -89,7 +90,15 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { title, description, duration, gracePeriod, maxAttempts, isActive } =
+      const {
+        title,
+        description,
+        duration,
+        gracePeriod,
+        maxAttempts,
+        isActive,
+        showResultsImmediately,
+      } =
         req.body;
 
       const exam = new Exam({
@@ -99,6 +108,7 @@ router.post(
         gracePeriod: gracePeriod || 0,
         maxAttempts: maxAttempts || 1,
         isActive: isActive !== undefined ? isActive : true,
+        showResultsImmediately: Boolean(showResultsImmediately),
         createdBy: req.user._id,
       });
 
@@ -122,6 +132,7 @@ router.put(
     body('duration').optional().isInt({ min: 1 }),
     body('gracePeriod').optional().isInt({ min: 0 }),
     body('maxAttempts').optional().isInt({ min: 1 }),
+    body('showResultsImmediately').optional().isBoolean(),
   ],
   async (req, res, next) => {
     try {
@@ -135,7 +146,16 @@ router.put(
         return res.status(404).json({ error: 'Exam not found' });
       }
 
-      const { title, description, duration, gracePeriod, maxAttempts, isActive } =
+      const {
+        title,
+        description,
+        duration,
+        gracePeriod,
+        maxAttempts,
+        isActive,
+        showResultsImmediately,
+        resultsReleasedAt,
+      } =
         req.body;
 
       if (title) exam.title = title;
@@ -144,6 +164,15 @@ router.put(
       if (gracePeriod !== undefined) exam.gracePeriod = gracePeriod;
       if (maxAttempts !== undefined) exam.maxAttempts = maxAttempts;
       if (isActive !== undefined) exam.isActive = isActive;
+      if (showResultsImmediately !== undefined) {
+        exam.showResultsImmediately = showResultsImmediately;
+        if (showResultsImmediately) {
+          exam.resultsReleasedAt = null;
+        }
+      }
+      if (resultsReleasedAt !== undefined) {
+        exam.resultsReleasedAt = resultsReleasedAt ? new Date(resultsReleasedAt) : null;
+      }
 
       await exam.save();
       await exam.populate('createdBy', 'name email');
@@ -169,6 +198,29 @@ router.delete(
 
       await Exam.findByIdAndDelete(req.params.examId);
       res.json({ message: 'Exam deleted successfully' });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Release results
+router.post(
+  '/:examId/release-results',
+  requireAuth,
+  requireOwnershipOrAdmin,
+  async (req, res, next) => {
+    try {
+      const exam = await Exam.findById(req.params.examId);
+      if (!exam) {
+        return res.status(404).json({ error: 'Exam not found' });
+      }
+
+      exam.resultsReleasedAt = new Date();
+      await exam.save();
+      await exam.populate('createdBy', 'name email');
+
+      res.json({ exam });
     } catch (error) {
       next(error);
     }

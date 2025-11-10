@@ -197,6 +197,10 @@ router.post(
         userId: req.user._id,
         startTime: now,
         isCompleted: false,
+        examSnapshot: {
+          title: exam?.title || '',
+          description: exam?.description || '',
+        },
       });
 
       await attempt.save();
@@ -225,7 +229,7 @@ router.post(
       }
 
       const attempt = await ExamAttempt.findById(req.params.attemptId)
-        .populate('examId')
+        .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
         .populate('sessionId');
 
       if (!attempt) {
@@ -338,6 +342,8 @@ router.post(
 
       const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
 
+      await attempt.populate('examId', 'title duration showResultsImmediately resultsReleasedAt');
+
       res.json({
         success: true,
         attempt,
@@ -358,7 +364,7 @@ router.post(
 router.get('/:attemptId/results', requireAuth, async (req, res, next) => {
   try {
     const attempt = await ExamAttempt.findById(req.params.attemptId)
-      .populate('examId', 'title duration')
+      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
       .populate('sessionId', 'startTime endTime')
       .populate('userId', 'name email');
 
@@ -369,6 +375,15 @@ router.get('/:attemptId/results', requireAuth, async (req, res, next) => {
     // Verify ownership (students can only see their own)
     if (req.user.role === 'STUDENT' && attempt.userId._id.toString() !== req.user._id.toString()) {
       return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    if (
+      req.user.role === 'STUDENT' &&
+      attempt.examId &&
+      !attempt.examId.showResultsImmediately &&
+      !attempt.examId.resultsReleasedAt
+    ) {
+      return res.status(403).json({ error: 'Results are not yet available for this exam.' });
     }
 
     const answers = await Answer.find({ attemptId: attempt._id })
@@ -423,6 +438,46 @@ router.patch('/:attemptId', requireAuth, async (req, res, next) => {
     await attempt.save();
 
     res.json({ attempt });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Certificate info
+router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
+  try {
+    const attempt = await ExamAttempt.findById(req.params.attemptId)
+      .populate('examId', 'title resultsReleasedAt showResultsImmediately')
+      .populate('userId', 'name');
+
+    if (!attempt) {
+      return res.status(404).json({ error: 'Attempt not found' });
+    }
+
+    // Students can only see their own certificates
+    if (req.user.role === 'STUDENT' && attempt.userId._id.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+
+    res.json({
+      attempt: {
+        _id: attempt._id,
+        submitTime: attempt.submitTime,
+        examSnapshot: attempt.examSnapshot,
+        isCompleted: attempt.isCompleted,
+        examId: attempt.examId
+          ? {
+              _id: attempt.examId._id,
+              title: attempt.examId.title,
+              showResultsImmediately: attempt.examId.showResultsImmediately,
+              resultsReleasedAt: attempt.examId.resultsReleasedAt,
+            }
+          : null,
+      },
+      user: {
+        name: attempt.userId?.name || req.user.name,
+      },
+    });
   } catch (error) {
     next(error);
   }

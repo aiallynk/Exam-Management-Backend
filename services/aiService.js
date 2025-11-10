@@ -100,6 +100,16 @@ const normalizeQuestionObject = (question, index = 0) => {
 
   const points = Number.isFinite(Number(question.points)) ? Number(question.points) : 1;
 
+  const passage = sanitizeString(
+    question.passage ||
+      question.context ||
+      question.sourceText ||
+      question.reference ||
+      question.passageText ||
+      question.reading ||
+      ''
+  );
+
   return {
     questionText,
     questionType,
@@ -107,6 +117,7 @@ const normalizeQuestionObject = (question, index = 0) => {
     correctAnswer,
     points,
     order: Number.isFinite(Number(question.order)) ? Number(question.order) : index,
+    passage,
   };
 };
 
@@ -173,6 +184,7 @@ For each question, provide:
 - questionType: One of ${validTypes.join(', ')}
 - options: Array of options (for MULTIPLE_CHOICE, MULTIPLE_OPTIONS, TRUE_FALSE)
 - correctAnswer: The correct answer (string)
+- passage: For PARAGRAPH questions, include the supporting passage students must read. Use an empty string for other question types.
 - points: Points for this question (default 1)
 - order: Sequential order starting from 1
 
@@ -225,6 +237,12 @@ Return ONLY a valid JSON array, no markdown, no code blocks.`;
       correctAnswer: q.correctAnswer || q.answer || '',
       points: q.points || 1,
       order: q.order || index + 1,
+      passage:
+        sanitizeString(
+          q.passage ||
+            q.context ||
+            (q.questionType === 'PARAGRAPH' ? q.reference || q.sourceText || '' : '')
+        ) || '',
     }));
 
     return normalizedQuestions;
@@ -540,6 +558,10 @@ const normalizeStructuredRow = (row, index) => {
   const pointsRaw = get('points') || get('score') || get('marks');
   const points = Number.isFinite(Number(pointsRaw)) ? Number(pointsRaw) : 1;
 
+  const rawPassage =
+    get('passage') || get('context') || get('reference') || get('reading') || row?.passage;
+  const passage = sanitizeString(rawPassage);
+
   return {
     questionText,
     questionType,
@@ -547,6 +569,7 @@ const normalizeStructuredRow = (row, index) => {
     correctAnswer,
     points,
     order: index,
+    passage: questionType === 'PARAGRAPH' ? passage : '',
   };
 };
 
@@ -576,6 +599,7 @@ const extractQuestionsFallback = ({ content, structuredRows }) => {
     points: 1,
     correctAnswer: '',
     order: idx,
+    passage: text.length > 220 ? text : '',
   }));
 };
 
@@ -594,6 +618,7 @@ const generateFallbackQuestions = (params) => {
       correctAnswer: 'Sample correct answer',
       points: 1,
       order: i + 1,
+      passage: type === 'PARAGRAPH' ? `Sample reading passage about ${topic} for comprehension.` : '',
     });
   }
 

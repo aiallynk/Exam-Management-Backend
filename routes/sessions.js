@@ -82,7 +82,7 @@ router.get('/', requireAuth, async (req, res, next) => {
     }
 
     const sessions = await ExamSession.find(filter)
-      .populate('examId', 'title duration')
+      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
       .populate('questionPaperId', 'setName')
       .populate('createdBy', 'name email')
       .sort({ createdAt: -1 })
@@ -109,7 +109,10 @@ router.get('/', requireAuth, async (req, res, next) => {
 router.get('/:sessionId', requireAuth, async (req, res, next) => {
   try {
     const session = await ExamSession.findById(req.params.sessionId)
-      .populate('examId', 'title description duration gracePeriod maxAttempts')
+      .populate(
+        'examId',
+        'title description duration gracePeriod maxAttempts showResultsImmediately resultsReleasedAt'
+      )
       .populate('questionPaperId', 'setName')
       .populate('createdBy', 'name email');
 
@@ -204,7 +207,10 @@ router.post(
       session.qrImage = qrImage;
 
       await session.save();
-      await session.populate('examId', 'title duration');
+      await session.populate(
+        'examId',
+        'title duration showResultsImmediately resultsReleasedAt'
+      );
       await session.populate('questionPaperId', 'setName');
 
       res.status(201).json({
@@ -224,7 +230,7 @@ router.get('/validate/:qrCode', requireAuth, async (req, res, next) => {
     const { qrCode } = req.params;
 
     const session = await ExamSession.findOne({ qrCode })
-      .populate('examId', 'title duration maxAttempts')
+      .populate('examId', 'title duration maxAttempts showResultsImmediately resultsReleasedAt')
       .populate('questionPaperId', 'setName');
 
     const validation = await validateSessionAvailability(session, req.user);
@@ -249,7 +255,7 @@ router.get('/manual-token/:token', requireAuth, async (req, res, next) => {
     const { token } = req.params;
 
     const session = await ExamSession.findOne({ manualToken: token })
-      .populate('examId', 'title duration maxAttempts')
+      .populate('examId', 'title duration maxAttempts showResultsImmediately resultsReleasedAt')
       .populate('questionPaperId', 'setName');
 
     const validation = await validateSessionAvailability(session, req.user);

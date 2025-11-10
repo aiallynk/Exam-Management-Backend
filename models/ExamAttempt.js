@@ -40,6 +40,10 @@ const ExamAttemptSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+    examSnapshot: {
+      title: { type: String, trim: true },
+      description: { type: String, trim: true },
+    },
     tabSwitchCount: {
       type: Number,
       default: 0,

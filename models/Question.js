@@ -35,6 +35,10 @@ const QuestionSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+    passage: {
+      type: String,
+      trim: true,
+    },
     points: {
       type: Number,
       default: 1,
