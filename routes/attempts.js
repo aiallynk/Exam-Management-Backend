@@ -497,6 +497,16 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
+    // Block certificate until results are released (for students)
+    if (
+      req.user.role === 'STUDENT' &&
+      attempt.examId &&
+      !attempt.examId.showResultsImmediately &&
+      !attempt.examId.resultsReleasedAt
+    ) {
+      return res.status(403).json({ error: 'Results are not yet available for this exam.' });
+    }
+
     if (!attempt.isCompleted) {
       return res.status(400).json({ error: 'Certificate is available only after the attempt is submitted.' });
     }
