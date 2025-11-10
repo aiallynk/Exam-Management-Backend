@@ -33,9 +33,26 @@ app.use(
     crossOriginResourcePolicy: { policy: 'cross-origin' },
   })
 );
+// CORS: allow multiple origins (comma-separated), localhost, and Vercel previews
+const buildCorsOrigin = () => {
+  const defaults = ['http://localhost:5173', 'http://127.0.0.1:5173'];
+  const configured = (config.corsOrigin || '').split(',').map((s) => s.trim()).filter(Boolean);
+  const allowed = Array.from(new Set([...configured, ...defaults]));
+  return (origin, callback) => {
+    if (!origin) return callback(null, true); // allow non-browser requests
+    // Allow exact matches
+    if (allowed.includes(origin)) return callback(null, true);
+    // Allow any Vercel preview/production subdomain if a *.vercel.app is configured
+    const allowVercelWildcard = allowed.some((o) => o.endsWith('.vercel.app'));
+    if (allowVercelWildcard && /\.vercel\.app$/.test(new URL(origin).hostname)) {
+      return callback(null, true);
+    }
+    return callback(new Error('Not allowed by CORS'));
+  };
+};
 app.use(
   cors({
-    origin: config.corsOrigin,
+    origin: buildCorsOrigin(),
     credentials: true,
   })
 );
