@@ -34,22 +34,24 @@ export const generateSessionQRCode = async (
   baseUrl
 ) => {
   const resolvedBaseUrl = sanitizeBaseUrl(baseUrl) || sanitizeBaseUrl(APP_BASE_URL);
+  const qrString = generateUniqueQRString();
 
   const qrPayload = {
     type: 'exam-session',
     sessionId,
     examId,
     manualToken,
+    qrCode: qrString,
     url:
       sessionId && resolvedBaseUrl
         ? `${resolvedBaseUrl}/exam/take/${sessionId}`
         : undefined,
     timestamp: Date.now(),
   };
+
   const qrData = JSON.stringify(qrPayload);
-  const qrString = generateUniqueQRString();
   const qrImage = await generateQRCode(qrData);
-  
+
   return {
     qrCode: qrString,
     qrImage,
