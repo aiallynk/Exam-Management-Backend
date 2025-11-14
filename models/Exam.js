@@ -33,6 +33,9 @@ const ExamSchema = new mongoose.Schema(
     resultsReleasedAt: {
       type: Date,
     },
+    certificatesSentAt: {
+      type: Date,
+    },
     isActive: {
       type: Boolean,
       default: true,

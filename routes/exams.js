@@ -1,8 +1,16 @@
 import express from 'express';
 import Exam from '../models/Exam.js';
+import ExamAttempt from '../models/ExamAttempt.js';
+import Answer from '../models/Answer.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole, requireOwnershipOrAdmin } from '../middleware/roles.js';
 import { body, validationResult } from 'express-validator';
+import {
+  loadCertificateTemplate,
+  applyCertificateTemplate,
+  MIN_CERTIFICATION_PERCENTAGE,
+} from '../utils/certificateTemplate.js';
+import { ensureScoreSummary } from '../utils/attemptScores.js';
 
 const router = express.Router();
 
@@ -221,6 +229,94 @@ router.post(
       await exam.populate('createdBy', 'name email');
 
       res.json({ exam });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Send certificates separately (for students who passed >= 60%)
+router.post(
+  '/:examId/send-certificates',
+  requireAuth,
+  requireOwnershipOrAdmin,
+  async (req, res, next) => {
+    try {
+      const exam = await Exam.findById(req.params.examId);
+      if (!exam) {
+        return res.status(404).json({ error: 'Exam not found' });
+      }
+
+      // Find all completed attempts for this exam
+      const attempts = await ExamAttempt.find({
+        examId: exam._id,
+        isCompleted: true,
+        isDisqualified: false,
+      })
+        .populate('userId', 'name email')
+        .populate('examId', 'title')
+        .populate('questionPaperId', '_id');
+
+      const certificateResults = [];
+      const template = await loadCertificateTemplate();
+
+      // Process each attempt to check if they qualify for certificate
+      for (const attempt of attempts) {
+        const { summary } = await ensureScoreSummary(attempt);
+        const percentage = summary?.percentage ?? 0;
+
+        // Only send certificates to students who scored >= 60%
+        if (percentage >= MIN_CERTIFICATION_PERCENTAGE) {
+          const examTitle = attempt.examId?.title || attempt.examSnapshot?.title || 'Exam';
+          const attemptDate = attempt.submitTime ? new Date(attempt.submitTime) : null;
+          const issuedTimestamp = attemptDate ? attemptDate : new Date();
+
+          const context = {
+            studentName: attempt.userId?.name || 'Student',
+            examTitle,
+            attemptDate: attemptDate ? attemptDate.toLocaleDateString() : '',
+            issuedOn: issuedTimestamp.toLocaleDateString(),
+            percentage,
+            score: summary?.totalScore ?? 0,
+            maxScore: summary?.maxScore ?? 0,
+            attemptId: attempt._id.toString(),
+          };
+
+          const renderedTemplate = applyCertificateTemplate(template, context);
+
+          // TODO: Implement actual email sending service here
+          // For now, we'll just mark that certificates were sent
+          // In production, you would:
+          // 1. Generate PDF certificate
+          // 2. Send email with certificate attachment
+          // 3. Use a service like nodemailer, SendGrid, etc.
+
+          certificateResults.push({
+            attemptId: attempt._id,
+            studentName: attempt.userId?.name,
+            studentEmail: attempt.userId?.email,
+            percentage,
+            certificateGenerated: true,
+            // certificateSent: true, // Set when email is actually sent
+          });
+        }
+      }
+
+      // Mark exam with certificate sent timestamp
+      exam.certificatesSentAt = new Date();
+      await exam.save();
+
+      res.json({
+        success: true,
+        message: `Certificates processed for ${certificateResults.length} student(s)`,
+        count: certificateResults.length,
+        certificates: certificateResults,
+        exam: {
+          _id: exam._id,
+          title: exam.title,
+          certificatesSentAt: exam.certificatesSentAt,
+        },
+      });
     } catch (error) {
       next(error);
     }
