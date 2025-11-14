@@ -413,7 +413,7 @@ router.post(
 router.get('/:attemptId/results', requireAuth, async (req, res, next) => {
   try {
     const attempt = await ExamAttempt.findById(req.params.attemptId)
-      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
+      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt certificatesSentAt')
       .populate('sessionId', 'startTime endTime')
       .populate('questionPaperId', '_id')
       .populate('userId', 'name email');
@@ -484,7 +484,7 @@ router.patch('/:attemptId', requireAuth, async (req, res, next) => {
 router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
   try {
     const attempt = await ExamAttempt.findById(req.params.attemptId)
-      .populate('examId', 'title resultsReleasedAt showResultsImmediately')
+      .populate('examId', 'title resultsReleasedAt showResultsImmediately certificatesSentAt')
       .populate('userId', 'name')
       .populate('questionPaperId', '_id');
 
@@ -497,12 +497,17 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
       return res.status(403).json({ error: 'Forbidden' });
     }
 
-    // Block certificate until results are released (for students)
+    // Block certificate until results are released OR certificates are sent (for students)
+    // Allow viewing if:
+    // 1. Results are shown immediately, OR
+    // 2. Results have been released, OR
+    // 3. Certificates have been sent separately
     if (
       req.user.role === 'STUDENT' &&
       attempt.examId &&
       !attempt.examId.showResultsImmediately &&
-      !attempt.examId.resultsReleasedAt
+      !attempt.examId.resultsReleasedAt &&
+      !attempt.examId.certificatesSentAt
     ) {
       return res.status(403).json({ error: 'Results are not yet available for this exam.' });
     }
@@ -562,6 +567,7 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
               title: attempt.examId.title,
               showResultsImmediately: attempt.examId.showResultsImmediately,
               resultsReleasedAt: attempt.examId.resultsReleasedAt,
+              certificatesSentAt: attempt.examId.certificatesSentAt,
             }
           : null,
       },
