@@ -148,7 +148,7 @@ router.post(
 router.get(
   '/students/:studentId/results',
   requireAuth,
-  requireRole('ADMIN'),
+  requireRole('ADMIN', 'DESIGNER'),
   async (req, res, next) => {
     try {
       const student = await User.findById(req.params.studentId);
@@ -156,8 +156,10 @@ router.get(
         return res.status(404).json({ error: 'Student not found' });
       }
 
-      const { page = 1, limit = 20 } = req.query;
-      const skip = (parseInt(page) - 1) * parseInt(limit);
+      // Allow fetching all results - use a very high limit if not specified, or use limit from query
+      const { page = 1, limit } = req.query;
+      const parsedLimit = limit ? parseInt(limit) : 10000; // Default to very high number to get all results
+      const skip = (parseInt(page) - 1) * parsedLimit;
 
       const attempts = await ExamAttempt.find({
         userId: student._id,
@@ -167,23 +169,18 @@ router.get(
         .populate('sessionId', 'startTime endTime')
         .sort({ createdAt: -1 })
         .skip(skip)
-        .limit(parseInt(limit));
+        .limit(parsedLimit);
 
+      // Use the ensureScoreSummary utility for consistent score calculation
+      const { ensureScoreSummary } = await import('../utils/attemptScores.js');
+      
       const results = await Promise.all(
         attempts.map(async (attempt) => {
-          const answers = await Answer.find({ attemptId: attempt._id })
-            .populate('questionId', 'points');
-          const totalScore = answers.reduce((sum, a) => sum + (a.pointsEarned || 0), 0);
-          const maxScore = answers.reduce((sum, a) => sum + (a.questionId?.points || 0), 0);
-          const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
-
+          const { summary } = await ensureScoreSummary(attempt);
+          
           return {
             attempt,
-            score: {
-              totalScore,
-              maxScore,
-              percentage,
-            },
+            score: summary,
           };
         })
       );
@@ -198,9 +195,9 @@ router.get(
         results,
         pagination: {
           page: parseInt(page),
-          limit: parseInt(limit),
+          limit: parsedLimit,
           total,
-          pages: Math.ceil(total / parseInt(limit)),
+          pages: Math.ceil(total / parsedLimit),
         },
       });
     } catch (error) {
