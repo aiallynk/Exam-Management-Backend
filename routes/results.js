@@ -31,7 +31,7 @@ router.get('/', requireAuth, requireRole('DESIGNER', 'ADMIN'), async (req, res, 
     const attempts = await ExamAttempt.find(filter)
       .populate('examId', 'title duration')
       .populate('sessionId', 'startTime endTime')
-      .populate('userId', 'name email')
+      .populate('userId', 'name email college')
       .populate('questionPaperId', 'setName')
       .sort({ createdAt: -1 })
       .skip(skip)
