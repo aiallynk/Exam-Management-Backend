@@ -32,6 +32,7 @@ router.get('/', requireAuth, requireRole('DESIGNER', 'ADMIN'), async (req, res, 
       .populate('examId', 'title duration')
       .populate('sessionId', 'startTime endTime')
       .populate('userId', 'name email')
+      .populate('questionPaperId', 'setName')
       .sort({ createdAt: -1 })
       .skip(skip)
       .limit(parseInt(limit));
