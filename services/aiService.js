@@ -184,6 +184,14 @@ These questions should be at the highest difficulty level, suitable for expert-l
 
     const difficultyGuidance = difficultyDescriptions[difficulty] || difficultyDescriptions.medium;
 
+    // Calculate distribution of question types
+    const questionsPerType = Math.floor(count / questionTypes.length);
+    const remainder = count % questionTypes.length;
+    const typeDistribution = questionTypes.map((type, idx) => ({
+      type,
+      count: questionsPerType + (idx < remainder ? 1 : 0)
+    })).filter(item => item.count > 0);
+
     // Build system prompt with enhanced difficulty guidance
     let systemPrompt = `You are an expert exam question generator specializing in creating questions at precise difficulty levels. Generate high-quality exam questions in JSON format.
 
@@ -192,7 +200,14 @@ CRITICAL REQUIREMENTS:
 - Difficulty level: ${difficulty.toUpperCase()}
 - ${difficultyGuidance}
 
-Question types to include: ${questionTypes.join(', ')}
+QUESTION TYPE ENFORCEMENT (MANDATORY):
+- You MUST ONLY use these question types: ${questionTypes.join(', ')}
+- DO NOT generate any question types other than: ${questionTypes.join(', ')}
+- Question type distribution: ${typeDistribution.map(item => `${item.count} ${item.type}`).join(', ')}
+- Each question's questionType field MUST be one of: ${questionTypes.join(', ')}
+- If multiple types are selected, distribute questions across all selected types
+- If only one type is selected, ALL ${count} questions must be of that type
+
 Topic: ${topic}
 ${examTitle ? `Exam title: ${examTitle}` : ''}
 ${examDescription ? `Exam description: ${examDescription}` : ''}
@@ -208,7 +223,7 @@ DIFFICULTY ENFORCEMENT:
 
 For each question, provide:
 - questionText: The question itself (must match the difficulty level)
-- questionType: One of ${validTypes.join(', ')}
+- questionType: MUST be one of ONLY these types: ${questionTypes.join(', ')}. DO NOT use any other types.
 - options: Array of options (for MULTIPLE_CHOICE, MULTIPLE_OPTIONS, TRUE_FALSE). For harder difficulties, make distractors more plausible and challenging.
 - correctAnswer: The correct answer (string)
 - passage: For PARAGRAPH questions, include the supporting passage students must read. Use an empty string for other question types.
@@ -219,7 +234,13 @@ Return ONLY a valid JSON array, no markdown, no code blocks.`;
 
     const userPrompt = `Generate exactly ${count} ${difficulty} difficulty level questions about "${topic}". 
 
-IMPORTANT: 
+CRITICAL REQUIREMENTS:
+- Question Types: You MUST ONLY generate questions of these types: ${questionTypes.join(', ')}
+- Distribution: ${typeDistribution.map(item => `Generate ${item.count} ${item.type} question${item.count > 1 ? 's' : ''}`).join(', ')}
+- DO NOT generate any question types that are NOT in the list: ${questionTypes.join(', ')}
+- Each question's questionType field MUST be exactly one of: ${questionTypes.join(', ')}
+
+Difficulty:
 - Strictly follow the ${difficulty.toUpperCase()} difficulty guidelines provided
 - Each question must genuinely reflect ${difficulty === 'ultra_hard' ? 'expert-level, extreme difficulty requiring deep mastery' : difficulty === 'hard' ? 'advanced difficulty requiring deep understanding' : difficulty === 'medium' ? 'intermediate difficulty requiring solid understanding' : 'basic difficulty requiring fundamental knowledge'}
 - Ensure questions are appropriately challenging for the ${difficulty} level
@@ -271,23 +292,44 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
       throw new Error('Invalid response format from OpenAI');
     }
 
-    // Validate and normalize questions
-    const normalizedQuestions = questions.slice(0, count).map((q, index) => ({
-      questionText: q.questionText || q.question || '',
-      questionType: q.questionType || questionTypes[0],
-      options: q.options || (q.questionType === 'MULTIPLE_CHOICE' ? ['Option A', 'Option B', 'Option C', 'Option D'] : undefined),
-      correctAnswer: q.correctAnswer || q.answer || '',
-      points: q.points || 1,
-      order: q.order || index + 1,
-      passage:
-        sanitizeString(
-          q.passage ||
-            q.context ||
-            (q.questionType === 'PARAGRAPH' ? q.reference || q.sourceText || '' : '')
-        ) || '',
-    }));
+    // Validate and normalize questions, ensuring they match selected question types
+    const normalizedQuestions = questions.slice(0, count).map((q, index) => {
+      let questionType = sanitizeString(q.questionType || q.type || '').toUpperCase();
+      
+      // Validate question type - must be one of the selected types
+      if (!questionTypes.includes(questionType)) {
+        // If AI generated wrong type, assign from selected types in round-robin fashion
+        questionType = questionTypes[index % questionTypes.length];
+        console.warn(`Question ${index + 1} had invalid type "${q.questionType}", corrected to "${questionType}"`);
+      }
+      
+      return {
+        questionText: q.questionText || q.question || '',
+        questionType: questionType,
+        options: q.options || (['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE'].includes(questionType) 
+          ? (questionType === 'TRUE_FALSE' ? ['True', 'False'] : ['Option A', 'Option B', 'Option C', 'Option D'])
+          : undefined),
+        correctAnswer: q.correctAnswer || q.answer || '',
+        points: q.points || 1,
+        order: q.order || index + 1,
+        passage:
+          sanitizeString(
+            q.passage ||
+              q.context ||
+              (questionType === 'PARAGRAPH' ? (q.reference || q.sourceText || '') : '')
+          ) || '',
+      };
+    });
 
-    return normalizedQuestions;
+    // Final validation: Ensure all questions have valid types
+    const validatedQuestions = normalizedQuestions.map((q, idx) => {
+      if (!questionTypes.includes(q.questionType)) {
+        q.questionType = questionTypes[idx % questionTypes.length];
+      }
+      return q;
+    });
+
+    return validatedQuestions;
   } catch (error) {
     console.error('OpenAI question generation error:', error);
     return generateFallbackQuestions(params);
