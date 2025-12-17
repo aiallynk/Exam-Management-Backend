@@ -32,8 +32,8 @@ router.post(
         return res.status(409).json({ error: 'Email already registered' });
       }
 
-      // Validate role
-      const validRoles = ['STUDENT', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN', 'SUPER_ADMIN'];
+      // Validate role (SUPER_ADMIN cannot register - must be created manually)
+      const validRoles = ['STUDENT', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'];
       const selectedRole = role || 'STUDENT';
       
       // Map legacy roles for backward compatibility
@@ -42,6 +42,11 @@ router.post(
         'ADMIN': 'INSTITUTE_ADMIN',
       };
       const mappedRole = roleMapping[selectedRole] || selectedRole;
+      
+      // Prevent SUPER_ADMIN registration
+      if (selectedRole === 'SUPER_ADMIN' || mappedRole === 'SUPER_ADMIN') {
+        return res.status(403).json({ error: 'Super Admin accounts cannot be created through registration' });
+      }
       
       if (!validRoles.includes(mappedRole)) {
         return res.status(400).json({ error: 'Invalid role for registration' });

@@ -12,8 +12,9 @@ const InstituteSchema = new mongoose.Schema(
     uniqueId: {
       type: String,
       unique: true,
-      required: true,
+      required: false, // Will be generated in pre-validate hook
       index: true,
+      sparse: true,
       immutable: true, // Cannot be changed once set
     },
     name: {
@@ -77,13 +78,17 @@ const InstituteSchema = new mongoose.Schema(
   }
 );
 
-// Generate uniqueId before saving
-InstituteSchema.pre('save', async function (next) {
+// Generate uniqueId before validation
+InstituteSchema.pre('validate', async function (next) {
   if (!this.uniqueId) {
-    this.uniqueId = await generateUniqueIdWithCheck(
-      mongoose.model('Institute'),
-      ID_PREFIXES.INSTITUTE
-    );
+    try {
+      this.uniqueId = await generateUniqueIdWithCheck(
+        mongoose.model('Institute'),
+        ID_PREFIXES.INSTITUTE
+      );
+    } catch (error) {
+      return next(error);
+    }
   }
   next();
 });

@@ -6,8 +6,9 @@ const QuestionSchema = new mongoose.Schema(
     uniqueId: {
       type: String,
       unique: true,
-      required: true,
+      required: false, // Will be generated in pre-validate hook
       index: true,
+      sparse: true,
       immutable: true,
     },
     questionPaperId: {
@@ -63,13 +64,17 @@ const QuestionSchema = new mongoose.Schema(
   }
 );
 
-// Generate uniqueId before saving
-QuestionSchema.pre('save', async function (next) {
+// Generate uniqueId before validation
+QuestionSchema.pre('validate', async function (next) {
   if (!this.uniqueId) {
-    this.uniqueId = await generateUniqueIdWithCheck(
-      mongoose.model('Question'),
-      ID_PREFIXES.QUESTION
-    );
+    try {
+      this.uniqueId = await generateUniqueIdWithCheck(
+        mongoose.model('Question'),
+        ID_PREFIXES.QUESTION
+      );
+    } catch (error) {
+      return next(error);
+    }
   }
   next();
 });

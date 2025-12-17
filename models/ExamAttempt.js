@@ -6,8 +6,9 @@ const ExamAttemptSchema = new mongoose.Schema(
     uniqueId: {
       type: String,
       unique: true,
-      required: true,
+      required: false, // Will be generated in pre-validate hook
       index: true,
+      sparse: true,
       immutable: true,
     },
     examId: {
@@ -104,13 +105,17 @@ const ExamAttemptSchema = new mongoose.Schema(
   }
 );
 
-// Generate uniqueId before saving
-ExamAttemptSchema.pre('save', async function (next) {
+// Generate uniqueId before validation
+ExamAttemptSchema.pre('validate', async function (next) {
   if (!this.uniqueId) {
-    this.uniqueId = await generateUniqueIdWithCheck(
-      mongoose.model('ExamAttempt'),
-      ID_PREFIXES.ATTEMPT
-    );
+    try {
+      this.uniqueId = await generateUniqueIdWithCheck(
+        mongoose.model('ExamAttempt'),
+        ID_PREFIXES.ATTEMPT
+      );
+    } catch (error) {
+      return next(error);
+    }
   }
   next();
 });

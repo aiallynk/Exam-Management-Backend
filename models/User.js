@@ -7,8 +7,9 @@ const UserSchema = new mongoose.Schema(
     uniqueId: {
       type: String,
       unique: true,
-      required: true,
+      required: false, // Will be generated in pre-validate hook
       index: true,
+      sparse: true, // Allow null values temporarily
       immutable: true,
     },
     email: {
@@ -108,15 +109,26 @@ UserSchema.index({ organizationId: 1, role: 1 });
 UserSchema.index({ instituteId: 1, role: 1 });
 UserSchema.index({ status: 1 });
 
-// Generate uniqueId before saving
-UserSchema.pre('save', async function (next) {
+// Generate uniqueId before validation (runs before required field checks)
+UserSchema.pre('validate', async function (next) {
   if (!this.uniqueId) {
-    this.uniqueId = await generateUniqueIdWithCheck(
-      mongoose.model('User'),
-      ID_PREFIXES.USER
-    );
+    try {
+      this.uniqueId = await generateUniqueIdWithCheck(
+        mongoose.model('User'),
+        ID_PREFIXES.USER
+      );
+    } catch (error) {
+      return next(error);
+    }
   }
   next();
+});
+
+// Ensure uniqueId is set after generation (validation check)
+UserSchema.post('validate', function () {
+  if (!this.uniqueId) {
+    throw new Error('uniqueId generation failed');
+  }
 });
 
 // Validate: User must belong to EITHER organization OR institute (except SUPER_ADMIN)
