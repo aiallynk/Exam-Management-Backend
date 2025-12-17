@@ -30,10 +30,11 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
       filter.isActive = isActive === 'true';
     }
 
-    // Designers/Teachers see their own exams, Admins see all in their tenant
+    // Designers/Teachers see their own exams, Admins (ORG_ADMIN, INSTITUTE_ADMIN) see all in their tenant
     if (['DESIGNER', 'TEACHER'].includes(req.user.role)) {
       filter.createdBy = req.user._id;
     }
+    // ORG_ADMIN and INSTITUTE_ADMIN see all exams in their tenant (already filtered by tenantFilter)
 
     const exams = await Exam.find(filter)
       .populate('createdBy', 'name email')
@@ -69,6 +70,16 @@ router.get('/:examId', requireAuth, requireTenant, enforceTenantBoundaries, asyn
       return res.status(404).json({ error: 'Exam not found' });
     }
 
+    // Verify tenant access (students and admins can only access exams from their tenant)
+    if (req.user.role !== 'SUPER_ADMIN') {
+      const userTenantId = req.user.organizationId || req.user.instituteId;
+      const examTenantId = exam.organizationId || exam.instituteId;
+      
+      if (!examTenantId || examTenantId.toString() !== userTenantId?.toString()) {
+        return res.status(403).json({ error: 'Exam not found or access denied' });
+      }
+    }
+
     // Students can only see active exams
     if (req.user.role === 'STUDENT' && !exam.isActive) {
       return res.status(403).json({ error: 'Exam not available' });
@@ -85,7 +96,7 @@ router.post(
   '/',
   requireAuth,
   requireTenant, // Ensure user belongs to a tenant (except SUPER_ADMIN)
-  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN'),
+  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
   [
     body('title').trim().notEmpty().withMessage('Title is required'),
     body('duration').isInt({ min: 1 }).withMessage('Duration must be a positive number'),
@@ -154,10 +165,12 @@ router.post(
   }
 );
 
-// Update exam (DESIGNER own/ADMIN)
+// Update exam (DESIGNER own/ADMIN/ORG_ADMIN/INSTITUTE_ADMIN)
 router.put(
   '/:examId',
   requireAuth,
+  requireTenant,
+  enforceTenantBoundaries,
   requireOwnershipOrAdmin,
   [
     body('title').optional().trim().notEmpty(),
@@ -216,10 +229,12 @@ router.put(
   }
 );
 
-// Delete exam (DESIGNER own/ADMIN)
+// Delete exam (DESIGNER own/ADMIN/ORG_ADMIN/INSTITUTE_ADMIN)
 router.delete(
   '/:examId',
   requireAuth,
+  requireTenant,
+  enforceTenantBoundaries,
   requireOwnershipOrAdmin,
   async (req, res, next) => {
     try {
@@ -240,6 +255,8 @@ router.delete(
 router.post(
   '/:examId/release-results',
   requireAuth,
+  requireTenant,
+  enforceTenantBoundaries,
   requireOwnershipOrAdmin,
   async (req, res, next) => {
     try {
@@ -263,6 +280,8 @@ router.post(
 router.post(
   '/:examId/send-certificates',
   requireAuth,
+  requireTenant,
+  enforceTenantBoundaries,
   requireOwnershipOrAdmin,
   async (req, res, next) => {
     try {

@@ -17,13 +17,23 @@ import {
 
 const router = express.Router();
 
-// Get all students
-router.get('/students', requireAuth, requireRole('ADMIN'), async (req, res, next) => {
+// Get all students (filtered by tenant for ORG_ADMIN/INSTITUTE_ADMIN)
+router.get('/students', requireAuth, requireRole('ADMIN', 'INSTITUTE_ADMIN', 'ORG_ADMIN'), async (req, res, next) => {
   try {
     const { page = 1, limit = 20, search } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
     const filter = { role: 'STUDENT' };
+    
+    // Filter by tenant for ORG_ADMIN and INSTITUTE_ADMIN
+    if (req.user.role === 'ORG_ADMIN' && req.user.organizationId) {
+      filter.organizationId = req.user.organizationId;
+      filter.instituteId = null;
+    } else if (req.user.role === 'INSTITUTE_ADMIN' && req.user.instituteId) {
+      filter.instituteId = req.user.instituteId;
+      filter.organizationId = null;
+    }
+    // ADMIN (legacy) can see all students (no tenant filter)
 
     if (search) {
       filter.$or = [
@@ -72,7 +82,7 @@ router.get('/students', requireAuth, requireRole('ADMIN'), async (req, res, next
 router.post(
   '/students/:studentId/block',
   requireAuth,
-  requireRole('ADMIN'),
+  requireRole('ADMIN', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
   [
     body('blocked').isBoolean().withMessage('Blocked status must be a boolean'),
   ],
@@ -86,6 +96,17 @@ router.post(
       const student = await User.findById(req.params.studentId);
       if (!student || student.role !== 'STUDENT') {
         return res.status(404).json({ error: 'Student not found' });
+      }
+
+      // Verify tenant access for ORG_ADMIN and INSTITUTE_ADMIN
+      if (req.user.role === 'ORG_ADMIN') {
+        if (student.organizationId?.toString() !== req.user.organizationId?.toString() || student.instituteId) {
+          return res.status(403).json({ error: 'Access denied - Student does not belong to your organization' });
+        }
+      } else if (req.user.role === 'INSTITUTE_ADMIN') {
+        if (student.instituteId?.toString() !== req.user.instituteId?.toString() || student.organizationId) {
+          return res.status(403).json({ error: 'Access denied - Student does not belong to your institute' });
+        }
       }
 
       const { blocked } = req.body;
@@ -121,12 +142,23 @@ router.post(
 router.post(
   '/students/:studentId/reset-password',
   requireAuth,
-  requireRole('ADMIN'),
+  requireRole('ADMIN', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
   async (req, res, next) => {
     try {
       const student = await User.findById(req.params.studentId);
       if (!student || student.role !== 'STUDENT') {
         return res.status(404).json({ error: 'Student not found' });
+      }
+
+      // Verify tenant access for ORG_ADMIN and INSTITUTE_ADMIN
+      if (req.user.role === 'ORG_ADMIN') {
+        if (student.organizationId?.toString() !== req.user.organizationId?.toString() || student.instituteId) {
+          return res.status(403).json({ error: 'Access denied - Student does not belong to your organization' });
+        }
+      } else if (req.user.role === 'INSTITUTE_ADMIN') {
+        if (student.instituteId?.toString() !== req.user.instituteId?.toString() || student.organizationId) {
+          return res.status(403).json({ error: 'Access denied - Student does not belong to your institute' });
+        }
       }
 
       // Generate random password
@@ -148,12 +180,23 @@ router.post(
 router.get(
   '/students/:studentId/results',
   requireAuth,
-  requireRole('ADMIN', 'DESIGNER'),
+  requireRole('ADMIN', 'DESIGNER', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
   async (req, res, next) => {
     try {
       const student = await User.findById(req.params.studentId);
       if (!student || student.role !== 'STUDENT') {
         return res.status(404).json({ error: 'Student not found' });
+      }
+
+      // Verify tenant access for ORG_ADMIN and INSTITUTE_ADMIN
+      if (req.user.role === 'ORG_ADMIN') {
+        if (student.organizationId?.toString() !== req.user.organizationId?.toString() || student.instituteId) {
+          return res.status(403).json({ error: 'Access denied - Student does not belong to your organization' });
+        }
+      } else if (req.user.role === 'INSTITUTE_ADMIN') {
+        if (student.instituteId?.toString() !== req.user.instituteId?.toString() || student.organizationId) {
+          return res.status(403).json({ error: 'Access denied - Student does not belong to your institute' });
+        }
       }
 
       // Allow fetching all results - use a very high limit if not specified, or use limit from query
@@ -210,7 +253,7 @@ router.get(
 router.post(
   '/create-user',
   requireAuth,
-  requireRole('ADMIN'),
+  requireRole('ADMIN', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
   [
     body('name').trim().notEmpty().withMessage('Name is required'),
     body('email').isEmail().normalizeEmail().withMessage('Valid email is required'),
@@ -236,16 +279,28 @@ router.post(
         return res.status(409).json({ error: 'Email already registered' });
       }
 
-      // Generate random password if not provided
-      const userPassword = password || crypto.randomBytes(8).toString('hex');
-
-      const user = new User({
+      // Set tenant IDs based on admin's tenant
+      const userData = {
         name,
         email,
-        password: userPassword,
+        password: password || crypto.randomBytes(8).toString('hex'),
         role,
         ...otherFields,
-      });
+      };
+
+      // ORG_ADMIN can only create users for their organization
+      if (req.user.role === 'ORG_ADMIN' && req.user.organizationId) {
+        userData.organizationId = req.user.organizationId;
+        userData.instituteId = null;
+      }
+      // INSTITUTE_ADMIN can only create users for their institute
+      else if (req.user.role === 'INSTITUTE_ADMIN' && req.user.instituteId) {
+        userData.instituteId = req.user.instituteId;
+        userData.organizationId = null;
+      }
+      // Legacy ADMIN can create users without tenant (they'll be assigned later)
+
+      const user = new User(userData);
 
       await user.save();
 
@@ -263,7 +318,7 @@ router.post(
 router.get(
   '/certificate-template',
   requireAuth,
-  requireRole('ADMIN'),
+  requireRole('ADMIN', 'DESIGNER', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
   async (req, res, next) => {
     try {
       const template = await loadCertificateTemplate();
@@ -282,7 +337,7 @@ router.get(
 router.put(
   '/certificate-template',
   requireAuth,
-  requireRole('ADMIN'),
+  requireRole('ADMIN', 'DESIGNER', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
   [body('template').isObject().withMessage('Template configuration is required')],
   async (req, res, next) => {
     try {

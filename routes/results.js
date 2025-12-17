@@ -8,7 +8,7 @@ import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenan
 const router = express.Router();
 
 // Get all results (DESIGNER/ADMIN/TEACHER only)
-router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN'), async (req, res, next) => {
+router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'), async (req, res, next) => {
   try {
     const {
       page = 1,

@@ -70,8 +70,9 @@ export const requireOwnershipOrAdmin = async (req, res, next) => {
         return res.status(404).json({ error: 'Exam not found' });
       }
 
-      // Check tenant boundaries
-      if (userRole !== 'SUPER_ADMIN') {
+      // Check tenant boundaries for non-admin roles
+      // ORG_ADMIN and INSTITUTE_ADMIN can access all exams in their tenant (checked by enforceTenantBoundaries)
+      if (!['SUPER_ADMIN', 'ORG_ADMIN', 'INSTITUTE_ADMIN'].includes(userRole)) {
         if (exam.organizationId && req.user.organizationId) {
           if (exam.organizationId.toString() !== req.user.organizationId.toString()) {
             return res.status(403).json({
