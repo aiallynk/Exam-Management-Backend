@@ -166,23 +166,50 @@ export const generateQuestions = async (params) => {
   }
 
   try {
-    // Build system prompt
-    let systemPrompt = `You are an expert exam question generator. Generate high-quality exam questions in JSON format.
-    
-Requirements:
+    // Define difficulty level descriptions for AI guidance
+    const difficultyDescriptions = {
+      easy: `EASY LEVEL: Questions should test basic, fundamental concepts. They should be straightforward and require only basic knowledge of the topic. Use simple language and avoid complex scenarios. Suitable for beginners or introductory courses.`,
+      medium: `MEDIUM LEVEL: Questions should test intermediate understanding. They require students to apply concepts, make connections, or solve moderately complex problems. May involve multi-step reasoning or application of multiple concepts. Suitable for students with solid foundational knowledge.`,
+      hard: `HARD LEVEL: Questions should be challenging and require advanced knowledge. They should test deep understanding, critical thinking, and the ability to solve complex problems. May involve synthesis of multiple concepts, advanced problem-solving techniques, or require expert-level knowledge. Suitable for advanced students or upper-level courses.`,
+      ultra_hard: `ULTRA HARD (EXTREME) LEVEL: Questions must be extremely challenging and test expert-level mastery. They should require:
+- Deep, comprehensive understanding of advanced concepts
+- Complex multi-step problem-solving and critical analysis
+- Synthesis of multiple advanced topics
+- Creative or innovative thinking approaches
+- Expert-level knowledge that goes beyond standard curriculum
+- Questions that challenge even the most advanced students
+- May involve cutting-edge concepts, advanced research-level topics, or require extensive domain expertise
+These questions should be at the highest difficulty level, suitable for expert-level assessments, competitive exams, or advanced graduate-level courses.`,
+    };
+
+    const difficultyGuidance = difficultyDescriptions[difficulty] || difficultyDescriptions.medium;
+
+    // Build system prompt with enhanced difficulty guidance
+    let systemPrompt = `You are an expert exam question generator specializing in creating questions at precise difficulty levels. Generate high-quality exam questions in JSON format.
+
+CRITICAL REQUIREMENTS:
 - Generate exactly ${count} questions
-- Difficulty level: ${difficulty}
-- Question types to include: ${questionTypes.join(', ')}
-- Topic: ${topic}
-${examTitle ? `- Exam title: ${examTitle}` : ''}
-${examDescription ? `- Exam description: ${examDescription}` : ''}
-${duration ? `- Exam duration: ${duration} minutes` : ''}
-${uploadedContent ? `- Use the following content as context:\n${uploadedContent.substring(0, 2000)}` : ''}
+- Difficulty level: ${difficulty.toUpperCase()}
+- ${difficultyGuidance}
+
+Question types to include: ${questionTypes.join(', ')}
+Topic: ${topic}
+${examTitle ? `Exam title: ${examTitle}` : ''}
+${examDescription ? `Exam description: ${examDescription}` : ''}
+${duration ? `Exam duration: ${duration} minutes` : ''}
+${uploadedContent ? `\nIMPORTANT: Use the following detailed content as the PRIMARY source for generating questions:\n${uploadedContent.substring(0, 2000)}` : ''}
+
+DIFFICULTY ENFORCEMENT:
+- You MUST strictly adhere to the ${difficulty} difficulty level specified above
+- Each question must match the difficulty requirements exactly
+- For ${difficulty === 'ultra_hard' ? 'ULTRA HARD' : difficulty.toUpperCase()} level, ensure questions are genuinely challenging and require expert-level knowledge
+- Do NOT create questions that are easier than the specified difficulty level
+- The complexity, depth, and cognitive demand of each question must align with the difficulty level
 
 For each question, provide:
-- questionText: The question itself
+- questionText: The question itself (must match the difficulty level)
 - questionType: One of ${validTypes.join(', ')}
-- options: Array of options (for MULTIPLE_CHOICE, MULTIPLE_OPTIONS, TRUE_FALSE)
+- options: Array of options (for MULTIPLE_CHOICE, MULTIPLE_OPTIONS, TRUE_FALSE). For harder difficulties, make distractors more plausible and challenging.
 - correctAnswer: The correct answer (string)
 - passage: For PARAGRAPH questions, include the supporting passage students must read. Use an empty string for other question types.
 - points: Points for this question (default 1)
@@ -190,7 +217,22 @@ For each question, provide:
 
 Return ONLY a valid JSON array, no markdown, no code blocks.`;
 
-    const userPrompt = `Generate ${count} ${difficulty} questions about ${topic}.`;
+    const userPrompt = `Generate exactly ${count} ${difficulty} difficulty level questions about "${topic}". 
+
+IMPORTANT: 
+- Strictly follow the ${difficulty.toUpperCase()} difficulty guidelines provided
+- Each question must genuinely reflect ${difficulty === 'ultra_hard' ? 'expert-level, extreme difficulty requiring deep mastery' : difficulty === 'hard' ? 'advanced difficulty requiring deep understanding' : difficulty === 'medium' ? 'intermediate difficulty requiring solid understanding' : 'basic difficulty requiring fundamental knowledge'}
+- Ensure questions are appropriately challenging for the ${difficulty} level
+${uploadedContent ? `- Base questions on the provided detailed content while maintaining ${difficulty} difficulty level` : ''}`;
+
+    // Adjust temperature based on difficulty - higher for harder questions to encourage more creative/complex questions
+    const temperatureMap = {
+      easy: 0.5,      // Lower temperature for more straightforward, predictable questions
+      medium: 0.6,    // Moderate temperature for balanced questions
+      hard: 0.75,     // Higher temperature for more complex, varied questions
+      ultra_hard: 0.85, // Highest temperature for extremely challenging, creative questions
+    };
+    const temperature = temperatureMap[difficulty] || 0.7;
 
     const completion = await client.chat.completions.create({
       model: 'gpt-4o-mini',
@@ -198,7 +240,7 @@ Return ONLY a valid JSON array, no markdown, no code blocks.`;
         { role: 'system', content: systemPrompt },
         { role: 'user', content: userPrompt },
       ],
-      temperature: 0.7,
+      temperature: temperature,
       response_format: { type: 'json_object' },
     });
 

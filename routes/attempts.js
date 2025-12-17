@@ -484,7 +484,7 @@ router.patch('/:attemptId', requireAuth, async (req, res, next) => {
 router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
   try {
     const attempt = await ExamAttempt.findById(req.params.attemptId)
-      .populate('examId', 'title resultsReleasedAt showResultsImmediately certificatesSentAt')
+      .populate('examId', 'title resultsReleasedAt showResultsImmediately certificatesSentAt certificateTemplate allowCertification passingPercentage')
       .populate('userId', 'name')
       .populate('questionPaperId', '_id');
 
@@ -522,15 +522,22 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
 
     const { summary } = await ensureScoreSummary(attempt);
 
-    if ((summary?.percentage ?? 0) < MIN_CERTIFICATION_PERCENTAGE) {
+    // Use exam-specific passing percentage if available, otherwise use default
+    const minPercentage = attempt.examId?.passingPercentage !== undefined
+      ? attempt.examId.passingPercentage
+      : MIN_CERTIFICATION_PERCENTAGE;
+
+    if ((summary?.percentage ?? 0) < minPercentage) {
       return res.status(403).json({
-        error: `Certificate is issued only for scores ${MIN_CERTIFICATION_PERCENTAGE}% or above.`,
-        minPercentage: MIN_CERTIFICATION_PERCENTAGE,
+        error: `Certificate is issued only for scores ${minPercentage}% or above.`,
+        minPercentage,
         achievedPercentage: summary?.percentage ?? 0,
       });
     }
 
-    const template = await loadCertificateTemplate();
+    // Use exam-specific template if available, otherwise fall back to global template
+    const examTemplate = attempt.examId?.certificateTemplate || null;
+    const template = await loadCertificateTemplate(examTemplate);
     const examTitle =
       attempt.examId?.title || attempt.examSnapshot?.title || 'Exam';
     const attemptDate = attempt.submitTime

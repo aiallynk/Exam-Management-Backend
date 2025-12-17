@@ -103,7 +103,13 @@ const parseTemplateValue = (value) => {
 export const mergeWithDefaultTemplate = (overrides) =>
   mergeDeep(DEFAULT_CERTIFICATE_TEMPLATE, overrides);
 
-export const loadCertificateTemplate = async () => {
+export const loadCertificateTemplate = async (examTemplate = null) => {
+  // If exam-specific template is provided, use it (merged with defaults)
+  if (examTemplate && typeof examTemplate === 'object' && Object.keys(examTemplate).length > 0) {
+    return mergeWithDefaultTemplate(examTemplate);
+  }
+
+  // Otherwise, load global template
   const config = await SystemConfig.findOne({
     key: CERTIFICATE_TEMPLATE_KEY,
   });

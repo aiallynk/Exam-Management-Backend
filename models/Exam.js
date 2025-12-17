@@ -36,6 +36,20 @@ const ExamSchema = new mongoose.Schema(
     certificatesSentAt: {
       type: Date,
     },
+    certificateTemplate: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+    },
+    allowCertification: {
+      type: Boolean,
+      default: false,
+    },
+    passingPercentage: {
+      type: Number,
+      default: 60,
+      min: 0,
+      max: 100,
+    },
     isActive: {
       type: Boolean,
       default: true,

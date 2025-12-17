@@ -106,6 +106,9 @@ router.post(
         maxAttempts,
         isActive,
         showResultsImmediately,
+        allowCertification,
+        passingPercentage,
+        certificateTemplate,
       } =
         req.body;
 
@@ -117,6 +120,11 @@ router.post(
         maxAttempts: maxAttempts || 1,
         isActive: isActive !== undefined ? isActive : true,
         showResultsImmediately: Boolean(showResultsImmediately),
+        allowCertification: Boolean(allowCertification),
+        passingPercentage: passingPercentage !== undefined 
+          ? Math.max(0, Math.min(100, parseInt(passingPercentage) || 60))
+          : 60,
+        certificateTemplate: allowCertification ? (certificateTemplate || null) : null,
         createdBy: req.user._id,
       });
 
@@ -254,10 +262,12 @@ router.post(
         isDisqualified: false,
       })
         .populate('userId', 'name email')
-        .populate('examId', 'title')
+        .populate('examId', 'title allowCertification passingPercentage certificateTemplate')
         .populate('questionPaperId', '_id');
 
       const certificateResults = [];
+      // Note: For bulk sending, we use global template. 
+      // Individual certificate generation uses exam-specific templates.
       const template = await loadCertificateTemplate();
 
       // Process each attempt to check if they qualify for certificate
@@ -265,8 +275,13 @@ router.post(
         const { summary } = await ensureScoreSummary(attempt);
         const percentage = summary?.percentage ?? 0;
 
-        // Only send certificates to students who scored >= 60%
-        if (percentage >= MIN_CERTIFICATION_PERCENTAGE) {
+        // Use exam-specific passing percentage if available, otherwise use default
+        const minPercentage = attempt.examId?.passingPercentage !== undefined
+          ? attempt.examId.passingPercentage
+          : MIN_CERTIFICATION_PERCENTAGE;
+
+        // Only send certificates to students who scored >= passing percentage
+        if (percentage >= minPercentage) {
           const examTitle = attempt.examId?.title || attempt.examSnapshot?.title || 'Exam';
           const attemptDate = attempt.submitTime ? new Date(attempt.submitTime) : null;
           const issuedTimestamp = attemptDate ? attemptDate : new Date();

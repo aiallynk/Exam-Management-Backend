@@ -143,7 +143,7 @@ router.post(
   [
     body('topic').trim().notEmpty().withMessage('Topic is required'),
     body('count').isInt({ min: 5, max: 50 }).withMessage('Count must be between 5 and 50'),
-    body('difficulty').isIn(['easy', 'medium', 'hard']).withMessage('Invalid difficulty'),
+    body('difficulty').isIn(['easy', 'medium', 'hard', 'ultra_hard']).withMessage('Invalid difficulty'),
     body('questionTypes').isArray().withMessage('Question types must be an array'),
   ],
   async (req, res, next) => {
