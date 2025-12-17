@@ -553,18 +553,21 @@ router.post(
     body('name').trim().notEmpty().withMessage('Name is required'),
     body('email').isEmail().normalizeEmail().withMessage('Valid email is required'),
     body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
-    body('role').isIn(['ORG_ADMIN', 'INSTITUTE_ADMIN', 'TEACHER', 'STUDENT']).withMessage('Invalid role'),
-    body('organizationId').isMongoId().withMessage('Valid organization ID is required'),
+    body('role').isIn(['ORG_ADMIN', 'INSTITUTE_ADMIN', 'TEACHER', 'STUDENT', 'ADMIN', 'DESIGNER']).withMessage('Invalid role'), // Include legacy roles
+    body('organizationId')
+      .optional({ checkFalsy: true })
+      .custom((value) => {
+        if (!value || value === '') return true; // Allow empty string/null
+        return /^[0-9a-fA-F]{24}$/.test(value); // MongoDB ObjectId format
+      })
+      .withMessage('Valid organization ID is required if provided'),
     body('instituteId')
-      .optional()
-      .isMongoId()
-      .custom((value, { req }) => {
-        // Institute ID required for INSTITUTE_ADMIN, TEACHER, STUDENT
-        if (['INSTITUTE_ADMIN', 'TEACHER', 'STUDENT'].includes(req.body.role) && !value) {
-          throw new Error('Institute ID is required for this role');
-        }
-        return true;
-      }),
+      .optional({ checkFalsy: true })
+      .custom((value) => {
+        if (!value || value === '') return true; // Allow empty string/null
+        return /^[0-9a-fA-F]{24}$/.test(value); // MongoDB ObjectId format
+      })
+      .withMessage('Valid institute ID is required if provided'),
   ],
   async (req, res, next) => {
     try {
@@ -581,30 +584,49 @@ router.post(
         return res.status(409).json({ error: 'Email already registered' });
       }
 
-      // Verify organization exists
-      const organization = await Organization.findById(organizationId);
-      if (!organization) {
-        return res.status(404).json({ error: 'Organization not found' });
+      // Map legacy roles to new roles
+      const roleMapping = {
+        'ADMIN': 'INSTITUTE_ADMIN',
+        'DESIGNER': 'TEACHER',
+      };
+      const mappedRole = roleMapping[role] || role;
+
+      // Normalize empty strings to null/undefined
+      const normalizedOrgId = organizationId && organizationId.trim() !== '' ? organizationId : null;
+      const normalizedInstId = instituteId && instituteId.trim() !== '' ? instituteId : null;
+
+      // Validate: User cannot belong to both organization AND institute
+      if (normalizedOrgId && normalizedInstId) {
+        return res.status(400).json({ error: 'User cannot belong to both Organization and Institute. Choose one.' });
       }
 
-      // Verify institute exists and belongs to organization (if provided)
-      if (instituteId) {
-        const institute = await Institute.findById(instituteId);
+      // Verify organization exists (if provided)
+      if (normalizedOrgId) {
+        const organization = await Organization.findById(normalizedOrgId);
+        if (!organization) {
+          return res.status(404).json({ error: 'Organization not found' });
+        }
+      }
+
+      // Verify institute exists (if provided)
+      // Note: Organization and Institute are equal level, so no need to check if institute belongs to organization
+      if (normalizedInstId) {
+        const institute = await Institute.findById(normalizedInstId);
         if (!institute) {
           return res.status(404).json({ error: 'Institute not found' });
         }
-        if (institute.organizationId.toString() !== organizationId) {
-          return res.status(400).json({ error: 'Institute does not belong to the specified organization' });
-        }
       }
+
+      // Allow users to be created without tenant initially (they can be assigned later)
+      // Only validate mutual exclusivity if both are provided
 
       const user = new User({
         name,
         email,
         password,
-        role,
-        organizationId,
-        instituteId: instituteId || null,
+        role: mappedRole,
+        organizationId: normalizedOrgId,
+        instituteId: normalizedInstId,
         mobile,
         college,
         degree,
@@ -632,8 +654,22 @@ router.put(
   [
     body('name').optional().trim().notEmpty(),
     body('email').optional().isEmail().normalizeEmail(),
-    body('role').optional().isIn(['ORG_ADMIN', 'INSTITUTE_ADMIN', 'TEACHER', 'STUDENT']),
+    body('role').optional().isIn(['ORG_ADMIN', 'INSTITUTE_ADMIN', 'TEACHER', 'STUDENT', 'ADMIN', 'DESIGNER']), // Include legacy roles
     body('status').optional().isIn(['ACTIVE', 'INACTIVE', 'SUSPENDED', 'BLOCKED']),
+    body('organizationId')
+      .optional({ checkFalsy: true })
+      .custom((value) => {
+        if (!value || value === '') return true; // Allow empty string/null
+        return /^[0-9a-fA-F]{24}$/.test(value); // MongoDB ObjectId format
+      })
+      .withMessage('Valid organization ID is required if provided'),
+    body('instituteId')
+      .optional({ checkFalsy: true })
+      .custom((value) => {
+        if (!value || value === '') return true; // Allow empty string/null
+        return /^[0-9a-fA-F]{24}$/.test(value); // MongoDB ObjectId format
+      })
+      .withMessage('Valid institute ID is required if provided'),
   ],
   async (req, res, next) => {
     try {
@@ -664,14 +700,29 @@ router.put(
         user.email = email;
       }
       if (password) user.password = password; // Will be hashed by pre-save hook
-      if (role) user.role = role;
-      if (organizationId !== undefined) {
-        if (organizationId) {
-          const org = await Organization.findById(organizationId);
+      if (role) {
+        // Map legacy roles to new roles
+        const roleMapping = {
+          'ADMIN': 'INSTITUTE_ADMIN',
+          'DESIGNER': 'TEACHER',
+        };
+        user.role = roleMapping[role] || role;
+      }
+      // Normalize empty strings to null
+      const normalizedOrgId = organizationId !== undefined 
+        ? (organizationId && organizationId.trim() !== '' ? organizationId : null)
+        : undefined;
+      const normalizedInstId = instituteId !== undefined
+        ? (instituteId && instituteId.trim() !== '' ? instituteId : null)
+        : undefined;
+
+      if (normalizedOrgId !== undefined) {
+        if (normalizedOrgId) {
+          const org = await Organization.findById(normalizedOrgId);
           if (!org) {
             return res.status(404).json({ error: 'Organization not found' });
           }
-          user.organizationId = organizationId;
+          user.organizationId = normalizedOrgId;
           // Clear institute when assigning to organization (mutually exclusive)
           user.instituteId = null;
         } else {
@@ -679,14 +730,14 @@ router.put(
           user.organizationId = null;
         }
       }
-      if (instituteId !== undefined) {
-        if (instituteId) {
-          const inst = await Institute.findById(instituteId);
+      if (normalizedInstId !== undefined) {
+        if (normalizedInstId) {
+          const inst = await Institute.findById(normalizedInstId);
           if (!inst) {
             return res.status(404).json({ error: 'Institute not found' });
           }
           // Note: Organization and Institute are equal level, so no need to check organizationId match
-          user.instituteId = instituteId;
+          user.instituteId = normalizedInstId;
           // Clear organization when assigning to institute (mutually exclusive)
           user.organizationId = null;
         } else {

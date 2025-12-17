@@ -148,6 +148,19 @@ router.post(
         return res.status(401).json({ error: 'Invalid credentials' });
       }
 
+      // Map legacy roles to new roles if needed (for existing users)
+      const roleMapping = {
+        'ADMIN': 'INSTITUTE_ADMIN',
+        'DESIGNER': 'TEACHER',
+      };
+      if (roleMapping[user.role]) {
+        user.role = roleMapping[user.role];
+        if (!user.legacyRole) {
+          user.legacyRole = user.role === 'INSTITUTE_ADMIN' ? 'ADMIN' : 'DESIGNER';
+        }
+        await user.save(); // Save the mapped role
+      }
+
       // Check user status
       if (user.status && user.status !== 'ACTIVE' && user.role !== 'SUPER_ADMIN') {
         return res.status(403).json({ error: 'Account is not active' });
@@ -213,6 +226,19 @@ router.post('/refresh', async (req, res, next) => {
         return res.status(401).json({ error: 'User not found' });
       }
 
+      // Map legacy roles to new roles if needed (for existing users)
+      const roleMapping = {
+        'ADMIN': 'INSTITUTE_ADMIN',
+        'DESIGNER': 'TEACHER',
+      };
+      if (roleMapping[user.role]) {
+        user.role = roleMapping[user.role];
+        if (!user.legacyRole) {
+          user.legacyRole = user.role === 'INSTITUTE_ADMIN' ? 'ADMIN' : 'DESIGNER';
+        }
+        await user.save(); // Save the mapped role
+      }
+
       // Populate organization and institute info
       await user.populate('organizationId', 'name code status');
       await user.populate('instituteId', 'name code status');
@@ -247,10 +273,28 @@ router.post('/logout', requireAuth, (req, res) => {
 // Get current user
 router.get('/me', requireAuth, async (req, res, next) => {
   try {
-    const user = await User.findById(req.user._id).select('-password');
+    const user = await User.findById(req.user._id)
+      .select('-password')
+      .populate('organizationId', 'name code status uniqueId')
+      .populate('instituteId', 'name code status uniqueId');
+    
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
+
+    // Map legacy roles to new roles if needed
+    const roleMapping = {
+      'ADMIN': 'INSTITUTE_ADMIN',
+      'DESIGNER': 'TEACHER',
+    };
+    if (roleMapping[user.role]) {
+      user.role = roleMapping[user.role];
+      if (!user.legacyRole) {
+        user.legacyRole = user.role === 'INSTITUTE_ADMIN' ? 'ADMIN' : 'DESIGNER';
+      }
+      await user.save(); // Save the mapped role
+    }
+
     res.json({ user });
   } catch (error) {
     next(error);

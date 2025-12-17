@@ -38,13 +38,17 @@ export const requireTenant = async (req, res, next) => {
       return res.status(403).json({ error: 'Account is not active' });
     }
 
-    // User must belong to EITHER organization OR institute (not both, not neither)
+    // User must belong to EITHER organization OR institute (not both)
+    // Allow users without tenant initially (they can be assigned later by Super Admin)
     const hasOrg = !!user.organizationId;
     const hasInst = !!user.instituteId;
 
-    if (!hasOrg && !hasInst) {
-      return res.status(403).json({ error: 'User must be assigned to either an Organization or an Institute' });
-    }
+    // Only enforce tenant requirement for routes that actually need it
+    // Users without tenant can still login, but won't be able to access tenant-specific routes
+    // This allows Super Admin to assign them later
+    // if (!hasOrg && !hasInst) {
+    //   return res.status(403).json({ error: 'User must be assigned to either an Organization or an Institute' });
+    // }
 
     if (hasOrg && hasInst) {
       return res.status(403).json({ error: 'User cannot belong to both Organization and Institute. Data integrity error.' });

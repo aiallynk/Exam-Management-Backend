@@ -33,7 +33,7 @@ const UserSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ['SUPER_ADMIN', 'ORG_ADMIN', 'INSTITUTE_ADMIN', 'TEACHER', 'STUDENT'],
+      enum: ['SUPER_ADMIN', 'ORG_ADMIN', 'INSTITUTE_ADMIN', 'TEACHER', 'STUDENT', 'ADMIN', 'DESIGNER'], // Include legacy roles for backward compatibility
       default: 'STUDENT',
       required: true,
       index: true,
@@ -104,6 +104,24 @@ UserSchema.index({ organizationId: 1, role: 1 });
 UserSchema.index({ instituteId: 1, role: 1 });
 UserSchema.index({ status: 1 });
 
+// Map legacy roles to new roles before validation
+UserSchema.pre('validate', function (next) {
+  // Map legacy roles to new roles for backward compatibility
+  const roleMapping = {
+    'ADMIN': 'INSTITUTE_ADMIN',
+    'DESIGNER': 'TEACHER',
+  };
+  
+  if (roleMapping[this.role]) {
+    // Store original role in legacyRole field for reference before mapping
+    if (!this.legacyRole && (this.role === 'ADMIN' || this.role === 'DESIGNER')) {
+      this.legacyRole = this.role;
+    }
+    this.role = roleMapping[this.role];
+  }
+  next();
+});
+
 // Generate uniqueId before validation (only for new documents or existing ones without uniqueId)
 UserSchema.pre('validate', async function (next) {
   // Generate uniqueId for new documents or existing documents that don't have one yet
@@ -121,20 +139,20 @@ UserSchema.pre('validate', async function (next) {
 });
 
 // Validate: User must belong to EITHER organization OR institute (except SUPER_ADMIN)
+// Allow users to be created without tenant initially (they can be assigned later)
 UserSchema.pre('save', function (next) {
   if (this.role === 'SUPER_ADMIN') {
     // SUPER_ADMIN doesn't need organization or institute
     return next();
   }
   
-  // User must belong to EITHER organization OR institute (not both, not neither)
+  // User must belong to EITHER organization OR institute (not both)
+  // Allow neither initially (for users being created without tenant assignment)
   const hasOrg = !!this.organizationId;
   const hasInst = !!this.instituteId;
   
-  if (!hasOrg && !hasInst) {
-    return next(new Error('User must belong to either an Organization or an Institute'));
-  }
-  
+  // Allow users without tenant initially (they'll be assigned later)
+  // Only validate mutual exclusivity if both are set
   if (hasOrg && hasInst) {
     return next(new Error('User cannot belong to both Organization and Institute. Choose one.'));
   }
