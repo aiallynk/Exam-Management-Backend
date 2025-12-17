@@ -665,12 +665,19 @@ router.put(
       }
       if (password) user.password = password; // Will be hashed by pre-save hook
       if (role) user.role = role;
-      if (organizationId) {
-        const org = await Organization.findById(organizationId);
-        if (!org) {
-          return res.status(404).json({ error: 'Organization not found' });
+      if (organizationId !== undefined) {
+        if (organizationId) {
+          const org = await Organization.findById(organizationId);
+          if (!org) {
+            return res.status(404).json({ error: 'Organization not found' });
+          }
+          user.organizationId = organizationId;
+          // Clear institute when assigning to organization (mutually exclusive)
+          user.instituteId = null;
+        } else {
+          // Setting to null explicitly
+          user.organizationId = null;
         }
-        user.organizationId = organizationId;
       }
       if (instituteId !== undefined) {
         if (instituteId) {
@@ -678,11 +685,14 @@ router.put(
           if (!inst) {
             return res.status(404).json({ error: 'Institute not found' });
           }
-          if (user.organizationId && inst.organizationId.toString() !== user.organizationId.toString()) {
-            return res.status(400).json({ error: 'Institute does not belong to user\'s organization' });
-          }
+          // Note: Organization and Institute are equal level, so no need to check organizationId match
+          user.instituteId = instituteId;
+          // Clear organization when assigning to institute (mutually exclusive)
+          user.organizationId = null;
+        } else {
+          // Setting to null explicitly
+          user.instituteId = null;
         }
-        user.instituteId = instituteId;
       }
       if (status) user.status = status;
       if (mobile !== undefined) user.mobile = mobile;
