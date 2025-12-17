@@ -33,7 +33,7 @@ router.post(
       }
 
       // Validate role
-      const validRoles = ['STUDENT', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'];
+      const validRoles = ['STUDENT', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN', 'SUPER_ADMIN'];
       const selectedRole = role || 'STUDENT';
       
       // Map legacy roles for backward compatibility
@@ -47,25 +47,43 @@ router.post(
         return res.status(400).json({ error: 'Invalid role for registration' });
       }
 
-      // Create user (default role: STUDENT)
-      // Note: organizationId and instituteId should be set by admin after registration
-      const user = new User({
+      // Create user
+      // SUPER_ADMIN doesn't need organizationId/instituteId
+      // Other roles will have organizationId/instituteId set to null initially (must be assigned by admin)
+      const userData = {
         name,
         email,
         password,
         role: mappedRole,
+      };
+
+      // Only set organizationId/instituteId for non-SUPER_ADMIN roles (but they'll be null initially)
+      if (mappedRole !== 'SUPER_ADMIN') {
         // organizationId and instituteId will be null initially - must be assigned by admin
-      });
+        // User model validation will enforce tenant assignment later
+      }
+
+      const user = new User(userData);
 
       await user.save();
 
-      // Generate tokens
+      // Populate organization and institute info (if applicable)
+      if (user.organizationId) {
+        await user.populate('organizationId', 'name code status');
+      }
+      if (user.instituteId) {
+        await user.populate('instituteId', 'name code status');
+      }
+
+      // Generate tokens with multi-tenant info
       const accessToken = jwt.sign(
         {
           sub: user._id,
           email: user.email,
           name: user.name,
           role: user.role,
+          organizationId: user.organizationId?._id?.toString() || null,
+          instituteId: user.instituteId?._id?.toString() || null,
         },
         config.jwtSecret,
         { expiresIn: `${config.tokenTtlMinutes}m` }
@@ -85,6 +103,10 @@ router.post(
           name: user.name,
           email: user.email,
           role: user.role,
+          organizationId: user.organizationId?._id || null,
+          instituteId: user.instituteId?._id || null,
+          organization: user.organizationId || null,
+          institute: user.instituteId || null,
         },
       });
     } catch (error) {

@@ -1,7 +1,15 @@
 import mongoose from 'mongoose';
+import { generateUniqueIdWithCheck, ID_PREFIXES } from '../utils/idGenerator.js';
 
 const ExamAttemptSchema = new mongoose.Schema(
   {
+    uniqueId: {
+      type: String,
+      unique: true,
+      required: true,
+      index: true,
+      immutable: true,
+    },
     examId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Exam',
@@ -25,6 +33,7 @@ const ExamAttemptSchema = new mongoose.Schema(
       index: true,
     },
     // Multi-tenant fields (inherited from exam, but stored for performance)
+    // Attempt belongs to EITHER organizationId OR instituteId (same as exam)
     organizationId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Organization',
@@ -95,9 +104,40 @@ const ExamAttemptSchema = new mongoose.Schema(
   }
 );
 
+// Generate uniqueId before saving
+ExamAttemptSchema.pre('save', async function (next) {
+  if (!this.uniqueId) {
+    this.uniqueId = await generateUniqueIdWithCheck(
+      mongoose.model('ExamAttempt'),
+      ID_PREFIXES.ATTEMPT
+    );
+  }
+  next();
+});
+
+// Validate: Attempt must belong to EITHER organization OR institute (same as exam)
+ExamAttemptSchema.pre('save', function (next) {
+  const hasOrg = !!this.organizationId;
+  const hasInst = !!this.instituteId;
+  
+  // Both can be null initially (will be set from exam)
+  if (!hasOrg && !hasInst) {
+    // Allow null initially - will be populated from exam
+    return next();
+  }
+  
+  if (hasOrg && hasInst) {
+    return next(new Error('Attempt cannot belong to both Organization and Institute. Choose one.'));
+  }
+  
+  next();
+});
+
+ExamAttemptSchema.index({ uniqueId: 1 });
 ExamAttemptSchema.index({ userId: 1, createdAt: -1 });
 ExamAttemptSchema.index({ sessionId: 1, userId: 1 });
-ExamAttemptSchema.index({ organizationId: 1, instituteId: 1 });
+ExamAttemptSchema.index({ organizationId: 1 });
+ExamAttemptSchema.index({ instituteId: 1 });
 ExamAttemptSchema.index({ instituteId: 1, userId: 1 });
 
 export default mongoose.model('ExamAttempt', ExamAttemptSchema);

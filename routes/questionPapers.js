@@ -3,12 +3,13 @@ import QuestionPaper from '../models/QuestionPaper.js';
 import Exam from '../models/Exam.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole, requireOwnershipOrAdmin } from '../middleware/roles.js';
+import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { body, validationResult } from 'express-validator';
 
 const router = express.Router();
 
 // Get all question papers for an exam
-router.get('/:examId/question-papers', requireAuth, async (req, res, next) => {
+router.get('/:examId/question-papers', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
     const exam = await Exam.findById(req.params.examId);
     if (!exam) {
@@ -27,11 +28,12 @@ router.get('/:examId/question-papers', requireAuth, async (req, res, next) => {
   }
 });
 
-// Create question paper (DESIGNER/ADMIN)
+// Create question paper (DESIGNER/ADMIN/TEACHER)
 router.post(
   '/:examId/question-papers/create',
   requireAuth,
-  requireRole('DESIGNER', 'ADMIN'),
+  requireTenant,
+  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN'),
   requireOwnershipOrAdmin,
   [
     body('setName').trim().notEmpty().withMessage('Set name is required'),

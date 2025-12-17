@@ -1,7 +1,15 @@
 import mongoose from 'mongoose';
+import { generateUniqueIdWithCheck, ID_PREFIXES } from '../utils/idGenerator.js';
 
 const QuestionSchema = new mongoose.Schema(
   {
+    uniqueId: {
+      type: String,
+      unique: true,
+      required: true,
+      index: true,
+      immutable: true,
+    },
     questionPaperId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'QuestionPaper',
@@ -55,6 +63,18 @@ const QuestionSchema = new mongoose.Schema(
   }
 );
 
+// Generate uniqueId before saving
+QuestionSchema.pre('save', async function (next) {
+  if (!this.uniqueId) {
+    this.uniqueId = await generateUniqueIdWithCheck(
+      mongoose.model('Question'),
+      ID_PREFIXES.QUESTION
+    );
+  }
+  next();
+});
+
+QuestionSchema.index({ uniqueId: 1 });
 QuestionSchema.index({ questionPaperId: 1, order: 1 });
 
 export default mongoose.model('Question', QuestionSchema);

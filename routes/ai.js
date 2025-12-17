@@ -1,6 +1,7 @@
 import express from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
+import { requireTenant } from '../middleware/multiTenant.js';
 import { generateQuestions, extractQuestionsFromContent } from '../services/aiService.js';
 import { body, validationResult } from 'express-validator';
 import multer from 'multer';
@@ -139,7 +140,8 @@ router.post(
 router.post(
   '/generate-questions',
   requireAuth,
-  requireRole('DESIGNER', 'ADMIN'),
+  requireTenant,
+  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN'),
   [
     body('topic').trim().notEmpty().withMessage('Topic is required'),
     body('count').isInt({ min: 5, max: 50 }).withMessage('Count must be between 5 and 50'),
@@ -164,6 +166,15 @@ router.post(
         examDescription,
       } = req.body;
 
+      // Store tenant metadata for AI generation tracking
+      const aiMetadata = {
+        organizationId: req.user.organizationId || null,
+        instituteId: req.user.instituteId || null,
+        inputSource: uploadedContent ? 'DETAILED_CONTENT' : 'TOPIC_ONLY',
+        generatedBy: req.user._id,
+        generatedAt: new Date(),
+      };
+
       const questions = await generateQuestions({
         topic,
         count,
@@ -173,9 +184,13 @@ router.post(
         uploadedContent,
         examTitle,
         examDescription,
+        metadata: aiMetadata, // Pass metadata to AI service for logging
       });
 
-      res.json({ questions });
+      res.json({ 
+        questions,
+        metadata: aiMetadata, // Return metadata for frontend to store with exam
+      });
     } catch (error) {
       next(error);
     }

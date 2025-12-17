@@ -1,12 +1,20 @@
 import mongoose from 'mongoose';
+import { generateUniqueIdWithCheck, ID_PREFIXES } from '../utils/idGenerator.js';
 
 /**
  * Organization Model
- * Represents a top-level organization that can have multiple institutes
+ * Represents an organization (equal level with Institute)
  * Managed by Super Admin
  */
 const OrganizationSchema = new mongoose.Schema(
   {
+    uniqueId: {
+      type: String,
+      unique: true,
+      required: true,
+      index: true,
+      immutable: true, // Cannot be changed once set
+    },
     name: {
       type: String,
       required: true,
@@ -59,7 +67,19 @@ const OrganizationSchema = new mongoose.Schema(
   }
 );
 
+// Generate uniqueId before saving
+OrganizationSchema.pre('save', async function (next) {
+  if (!this.uniqueId) {
+    this.uniqueId = await generateUniqueIdWithCheck(
+      mongoose.model('Organization'),
+      ID_PREFIXES.ORGANIZATION
+    );
+  }
+  next();
+});
+
 // Indexes for efficient queries
+OrganizationSchema.index({ uniqueId: 1 });
 OrganizationSchema.index({ code: 1 });
 OrganizationSchema.index({ status: 1, createdAt: -1 });
 OrganizationSchema.index({ createdBy: 1 });

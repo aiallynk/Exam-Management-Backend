@@ -4,6 +4,7 @@ import ExamAttempt from '../models/ExamAttempt.js';
 import Answer from '../models/Answer.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole, requireOwnershipOrAdmin } from '../middleware/roles.js';
+import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { body, validationResult } from 'express-validator';
 import {
   loadCertificateTemplate,
@@ -14,13 +15,13 @@ import { ensureScoreSummary } from '../utils/attemptScores.js';
 
 const router = express.Router();
 
-// Get all exams (filtered by role)
-router.get('/', requireAuth, async (req, res, next) => {
+// Get all exams (filtered by role and tenant)
+router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
     const { page = 1, limit = 20, isActive } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const filter = {};
+    const filter = { ...req.tenantFilter };
     
     // Students only see active exams
     if (req.user.role === 'STUDENT') {
@@ -29,8 +30,8 @@ router.get('/', requireAuth, async (req, res, next) => {
       filter.isActive = isActive === 'true';
     }
 
-    // Designers see their own exams, Admins see all
-    if (req.user.role === 'DESIGNER') {
+    // Designers/Teachers see their own exams, Admins see all in their tenant
+    if (['DESIGNER', 'TEACHER'].includes(req.user.role)) {
       filter.createdBy = req.user._id;
     }
 
@@ -57,7 +58,7 @@ router.get('/', requireAuth, async (req, res, next) => {
 });
 
 // Get single exam
-router.get('/:examId', requireAuth, async (req, res, next) => {
+router.get('/:examId', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
     const exam = await Exam.findById(req.params.examId).populate(
       'createdBy',
@@ -83,7 +84,8 @@ router.get('/:examId', requireAuth, async (req, res, next) => {
 router.post(
   '/',
   requireAuth,
-  requireRole('DESIGNER', 'ADMIN'),
+  requireTenant, // Ensure user belongs to a tenant (except SUPER_ADMIN)
+  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN'),
   [
     body('title').trim().notEmpty().withMessage('Title is required'),
     body('duration').isInt({ min: 1 }).withMessage('Duration must be a positive number'),
@@ -112,7 +114,9 @@ router.post(
       } =
         req.body;
 
-      const exam = new Exam({
+      // Set tenant IDs based on user's tenant (Organization OR Institute)
+      // SUPER_ADMIN can create exams without tenant (for global use)
+      const examData = {
         title,
         description,
         duration,
@@ -126,8 +130,20 @@ router.post(
           : 60,
         certificateTemplate: allowCertification ? (certificateTemplate || null) : null,
         createdBy: req.user._id,
-      });
+      };
 
+      // Set tenant IDs: user belongs to EITHER organization OR institute (not both)
+      if (req.user.role !== 'SUPER_ADMIN') {
+        if (req.user.organizationId) {
+          examData.organizationId = req.user.organizationId;
+          examData.instituteId = null;
+        } else if (req.user.instituteId) {
+          examData.instituteId = req.user.instituteId;
+          examData.organizationId = null;
+        }
+      }
+
+      const exam = new Exam(examData);
       await exam.save();
       await exam.populate('createdBy', 'name email');
 

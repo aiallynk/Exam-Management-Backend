@@ -7,6 +7,7 @@ import Question from '../models/Question.js';
 import SystemConfig from '../models/SystemConfig.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
+import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { body, validationResult } from 'express-validator';
 import { evaluateAnswer } from '../services/aiService.js';
 import { assignQuestionPaperToStudent } from '../services/sessionAssignment.js';
@@ -214,6 +215,9 @@ router.post(
       const assignedQuestionPaperId =
         assignment.questionPaperId?._id || assignment.questionPaperId;
 
+      // Inherit tenant IDs from exam
+      const examForTenant = await Exam.findById(examId).select('organizationId instituteId');
+      
       // Create new attempt
       const attempt = new ExamAttempt({
         examId,
@@ -226,6 +230,9 @@ router.post(
           title: exam?.title || '',
           description: exam?.description || '',
         },
+        // Inherit tenant IDs from exam
+        organizationId: examForTenant?.organizationId || null,
+        instituteId: examForTenant?.instituteId || null,
       });
 
       await attempt.save();

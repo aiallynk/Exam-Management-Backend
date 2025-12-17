@@ -142,16 +142,12 @@ router.get('/organizations/:orgId', async (req, res, next) => {
       return res.status(404).json({ error: 'Organization not found' });
     }
 
-    // Get institutes count
-    const institutesCount = await Institute.countDocuments({ organizationId: organization._id });
-    
-    // Get users count
+    // Get users count (users belonging to this organization)
     const usersCount = await User.countDocuments({ organizationId: organization._id });
 
     res.json({
       organization,
       stats: {
-        institutes: institutesCount,
         users: usersCount,
       },
     });
@@ -316,7 +312,6 @@ router.get('/institutes', async (req, res, next) => {
 
     const [institutes, total] = await Promise.all([
       Institute.find(filter)
-        .populate('organizationId', 'name code')
         .populate('createdBy', 'name email')
         .sort({ createdAt: -1 })
         .skip(skip)
@@ -342,7 +337,6 @@ router.get('/institutes', async (req, res, next) => {
 router.get('/institutes/:instituteId', async (req, res, next) => {
   try {
     const institute = await Institute.findById(req.params.instituteId)
-      .populate('organizationId', 'name code')
       .populate('createdBy', 'name email');
 
     if (!institute) {
@@ -375,7 +369,6 @@ router.post(
   [
     body('name').trim().notEmpty().withMessage('Institute name is required'),
     body('code').trim().notEmpty().withMessage('Institute code is required'),
-    body('organizationId').isMongoId().withMessage('Valid organization ID is required'),
     body('contactEmail').optional().isEmail().normalizeEmail(),
   ],
   async (req, res, next) => {
@@ -385,29 +378,23 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { name, code, organizationId, contactEmail, contactPhone, address, examLimit, aiUsageLimit, metadata } = req.body;
+      const { name, code, contactEmail, contactPhone, address, examLimit, aiUsageLimit, metadata, status } = req.body;
 
-      // Verify organization exists
-      const organization = await Organization.findById(organizationId);
-      if (!organization) {
-        return res.status(404).json({ error: 'Organization not found' });
-      }
-
-      // Check if code already exists in this organization
-      const existing = await Institute.findOne({ organizationId, code });
+      // Check if code already exists (unique across all institutes)
+      const existing = await Institute.findOne({ code });
       if (existing) {
-        return res.status(409).json({ error: 'Institute code already exists in this organization' });
+        return res.status(409).json({ error: 'Institute code already exists' });
       }
 
       const institute = new Institute({
         name,
         code,
-        organizationId,
         contactEmail,
         contactPhone,
         address,
-        examLimit: examLimit || null,
-        aiUsageLimit: aiUsageLimit || null,
+        status: status || 'ACTIVE',
+        examLimit: examLimit ? parseInt(examLimit) : null,
+        aiUsageLimit: aiUsageLimit ? parseInt(aiUsageLimit) : null,
         metadata: metadata || {},
         createdBy: req.user._id,
       });
@@ -451,14 +438,13 @@ router.put(
 
       if (name) institute.name = name;
       if (code) {
-        // Check if new code conflicts in same organization
+        // Check if new code conflicts (unique across all institutes)
         const existing = await Institute.findOne({
-          organizationId: institute.organizationId,
           code,
           _id: { $ne: institute._id },
         });
         if (existing) {
-          return res.status(409).json({ error: 'Institute code already exists in this organization' });
+          return res.status(409).json({ error: 'Institute code already exists' });
         }
         institute.code = code;
       }

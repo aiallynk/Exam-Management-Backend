@@ -3,11 +3,12 @@ import ExamAttempt from '../models/ExamAttempt.js';
 import Answer from '../models/Answer.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
+import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 
 const router = express.Router();
 
-// Get all results (DESIGNER/ADMIN only)
-router.get('/', requireAuth, requireRole('DESIGNER', 'ADMIN'), async (req, res, next) => {
+// Get all results (DESIGNER/ADMIN/TEACHER only)
+router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN'), async (req, res, next) => {
   try {
     const {
       page = 1,
@@ -20,7 +21,7 @@ router.get('/', requireAuth, requireRole('DESIGNER', 'ADMIN'), async (req, res, 
     } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const filter = {};
+    const filter = { ...req.tenantFilter };
 
     if (examId) filter.examId = examId;
     if (sessionId) filter.sessionId = sessionId;

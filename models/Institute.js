@@ -1,12 +1,21 @@
 import mongoose from 'mongoose';
+import { generateUniqueIdWithCheck, ID_PREFIXES } from '../utils/idGenerator.js';
 
 /**
  * Institute Model
- * Represents an institute that belongs to ONE organization
- * Managed by Organization Admin or Super Admin
+ * Represents an institute (equal level with Organization)
+ * Managed by Super Admin
+ * NOTE: Organization and Institute are at EQUAL LEVEL - not hierarchical
  */
 const InstituteSchema = new mongoose.Schema(
   {
+    uniqueId: {
+      type: String,
+      unique: true,
+      required: true,
+      index: true,
+      immutable: true, // Cannot be changed once set
+    },
     name: {
       type: String,
       required: true,
@@ -16,13 +25,8 @@ const InstituteSchema = new mongoose.Schema(
     code: {
       type: String,
       required: true,
+      unique: true, // Unique across all institutes (not per organization)
       trim: true,
-      index: true,
-    },
-    organizationId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Organization',
-      required: true,
       index: true,
     },
     contactEmail: {
@@ -73,9 +77,21 @@ const InstituteSchema = new mongoose.Schema(
   }
 );
 
-// Compound index: organizationId + code must be unique
-InstituteSchema.index({ organizationId: 1, code: 1 }, { unique: true });
-InstituteSchema.index({ organizationId: 1, status: 1 });
+// Generate uniqueId before saving
+InstituteSchema.pre('save', async function (next) {
+  if (!this.uniqueId) {
+    this.uniqueId = await generateUniqueIdWithCheck(
+      mongoose.model('Institute'),
+      ID_PREFIXES.INSTITUTE
+    );
+  }
+  next();
+});
+
+// Indexes for efficient queries
+InstituteSchema.index({ uniqueId: 1 });
+InstituteSchema.index({ code: 1 });
+InstituteSchema.index({ status: 1, createdAt: -1 });
 InstituteSchema.index({ createdBy: 1 });
 
 export default mongoose.model('Institute', InstituteSchema);

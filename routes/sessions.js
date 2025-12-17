@@ -4,6 +4,7 @@ import Exam from '../models/Exam.js';
 import QuestionPaper from '../models/QuestionPaper.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
+import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { body, validationResult } from 'express-validator';
 import { generateSessionQRCode } from '../services/qrService.js';
 import { assignQuestionPaperToStudent } from '../services/sessionAssignment.js';
@@ -54,13 +55,13 @@ const validateSessionAvailability = async (session, user) => {
   return { valid: true };
 };
 
-// Get all sessions (role filtered)
-router.get('/', requireAuth, async (req, res, next) => {
+// Get all sessions (role filtered and tenant filtered)
+router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
     const { page = 1, limit = 20, examId, isActive } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const filter = {};
+    const filter = { ...req.tenantFilter };
 
     if (examId) {
       filter.examId = examId;
@@ -108,7 +109,7 @@ router.get('/', requireAuth, async (req, res, next) => {
 });
 
 // Get single session
-router.get('/:sessionId', requireAuth, async (req, res, next) => {
+router.get('/:sessionId', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
     const session = await ExamSession.findById(req.params.sessionId)
       .populate(
@@ -150,11 +151,12 @@ router.get('/:sessionId', requireAuth, async (req, res, next) => {
   }
 });
 
-// Create session (DESIGNER/ADMIN)
+// Create session (DESIGNER/ADMIN/TEACHER)
 router.post(
   '/',
   requireAuth,
-  requireRole('DESIGNER', 'ADMIN'),
+  requireTenant,
+  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN'),
   [
     body('examId').notEmpty().withMessage('Exam ID is required'),
     body('questionPaperId').optional().isMongoId(),
@@ -189,6 +191,12 @@ router.post(
       if (!exam) {
         return res.status(404).json({ error: 'Exam not found' });
       }
+
+      // Inherit tenant IDs from exam (Organization OR Institute, not both)
+      const tenantData = {
+        organizationId: exam.organizationId || null,
+        instituteId: exam.instituteId || null,
+      };
 
       let selectedPaperIds = Array.isArray(questionPaperIds)
         ? questionPaperIds.map((id) => id.toString())
@@ -248,6 +256,9 @@ router.post(
         startTime: start,
         endTime: end,
         createdBy: req.user._id,
+        // Inherit tenant IDs from exam
+        organizationId: tenantData.organizationId,
+        instituteId: tenantData.instituteId,
       });
 
       const requestOrigin =

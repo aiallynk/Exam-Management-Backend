@@ -1,6 +1,8 @@
 /**
  * Multi-Tenant Middleware
  * Ensures data isolation between organizations and institutes
+ * NOTE: Organization and Institute are EQUAL LEVEL personas (not hierarchical)
+ * Users belong to EITHER Organization OR Institute (not both)
  */
 
 import User from '../models/User.js';
@@ -8,10 +10,10 @@ import Organization from '../models/Organization.js';
 import Institute from '../models/Institute.js';
 
 /**
- * Middleware to ensure user has organizationId (except SUPER_ADMIN)
+ * Middleware to ensure user has organizationId OR instituteId (except SUPER_ADMIN)
  * Populates req.user with full user document including organization/institute info
  */
-export const requireOrganization = async (req, res, next) => {
+export const requireTenant = async (req, res, next) => {
   try {
     if (!req.user) {
       return res.status(401).json({ error: 'Authentication required' });
@@ -24,8 +26,8 @@ export const requireOrganization = async (req, res, next) => {
 
     // Load full user document to get organizationId/instituteId
     const user = await User.findById(req.user._id)
-      .populate('organizationId', 'name code status')
-      .populate('instituteId', 'name code status organizationId');
+      .populate('organizationId', 'name code status uniqueId')
+      .populate('instituteId', 'name code status uniqueId');
 
     if (!user) {
       return res.status(401).json({ error: 'User not found' });
@@ -36,23 +38,35 @@ export const requireOrganization = async (req, res, next) => {
       return res.status(403).json({ error: 'Account is not active' });
     }
 
-    // Non-SUPER_ADMIN users must have organizationId
-    if (!user.organizationId) {
-      return res.status(403).json({ error: 'User must be assigned to an organization' });
+    // User must belong to EITHER organization OR institute (not both, not neither)
+    const hasOrg = !!user.organizationId;
+    const hasInst = !!user.instituteId;
+
+    if (!hasOrg && !hasInst) {
+      return res.status(403).json({ error: 'User must be assigned to either an Organization or an Institute' });
     }
 
-    // Check organization status
-    if (user.organizationId.status !== 'ACTIVE') {
+    if (hasOrg && hasInst) {
+      return res.status(403).json({ error: 'User cannot belong to both Organization and Institute. Data integrity error.' });
+    }
+
+    // Check tenant status
+    if (hasOrg && user.organizationId.status !== 'ACTIVE') {
       return res.status(403).json({ error: 'Organization is not active' });
+    }
+
+    if (hasInst && user.instituteId.status !== 'ACTIVE') {
+      return res.status(403).json({ error: 'Institute is not active' });
     }
 
     // Update req.user with full user data
     req.user = {
       ...req.user,
-      organizationId: user.organizationId._id,
-      organization: user.organizationId,
-      instituteId: user.instituteId?._id || null,
-      institute: user.instituteId || null,
+      organizationId: hasOrg ? user.organizationId._id : null,
+      organization: hasOrg ? user.organizationId : null,
+      instituteId: hasInst ? user.instituteId._id : null,
+      institute: hasInst ? user.instituteId : null,
+      tenantType: hasOrg ? 'ORGANIZATION' : 'INSTITUTE',
     };
 
     next();
@@ -62,7 +76,14 @@ export const requireOrganization = async (req, res, next) => {
 };
 
 /**
- * Middleware to ensure user has instituteId (for INSTITUTE_ADMIN, TEACHER, STUDENT)
+ * Legacy alias for backward compatibility
+ * @deprecated Use requireTenant instead
+ */
+export const requireOrganization = requireTenant;
+
+/**
+ * Middleware to ensure user belongs to an Institute (for INSTITUTE_ADMIN, TEACHER, STUDENT)
+ * NOTE: Since Organization and Institute are equal level, this checks if user belongs to Institute persona
  */
 export const requireInstitute = async (req, res, next) => {
   try {
@@ -70,23 +91,23 @@ export const requireInstitute = async (req, res, next) => {
       return res.status(401).json({ error: 'Authentication required' });
     }
 
-    // SUPER_ADMIN and ORG_ADMIN can access without instituteId
-    if (['SUPER_ADMIN', 'ORG_ADMIN'].includes(req.user.role)) {
+    // SUPER_ADMIN can access everything
+    if (req.user.role === 'SUPER_ADMIN') {
       return next();
     }
 
     // Load full user document
     const user = await User.findById(req.user._id)
-      .populate('organizationId', 'name code status')
-      .populate('instituteId', 'name code status organizationId');
+      .populate('organizationId', 'name code status uniqueId')
+      .populate('instituteId', 'name code status uniqueId');
 
     if (!user) {
       return res.status(401).json({ error: 'User not found' });
     }
 
-    // INSTITUTE_ADMIN, TEACHER, STUDENT must have instituteId
+    // INSTITUTE_ADMIN, TEACHER, STUDENT must belong to an Institute
     if (!user.instituteId) {
-      return res.status(403).json({ error: 'User must be assigned to an institute' });
+      return res.status(403).json({ error: 'User must be assigned to an Institute' });
     }
 
     // Check institute status
@@ -94,18 +115,14 @@ export const requireInstitute = async (req, res, next) => {
       return res.status(403).json({ error: 'Institute is not active' });
     }
 
-    // Ensure institute belongs to user's organization
-    if (user.organizationId && user.instituteId.organizationId.toString() !== user.organizationId._id.toString()) {
-      return res.status(403).json({ error: 'Institute does not belong to your organization' });
-    }
-
     // Update req.user
     req.user = {
       ...req.user,
-      organizationId: user.organizationId._id,
-      organization: user.organizationId,
+      organizationId: null,
+      organization: null,
       instituteId: user.instituteId._id,
       institute: user.instituteId,
+      tenantType: 'INSTITUTE',
     };
 
     next();
@@ -117,6 +134,7 @@ export const requireInstitute = async (req, res, next) => {
 /**
  * Middleware to filter queries by organization/institute boundaries
  * Automatically adds organizationId/instituteId filters to queries
+ * NOTE: Organization and Institute are EQUAL LEVEL - user belongs to EITHER one (not both)
  */
 export const enforceTenantBoundaries = async (req, res, next) => {
   try {
@@ -130,19 +148,26 @@ export const enforceTenantBoundaries = async (req, res, next) => {
       return next();
     }
 
-    // ORG_ADMIN can see everything in their organization
-    if (req.user.role === 'ORG_ADMIN') {
-      req.tenantFilter = {
-        organizationId: req.user.organizationId || req.user.organization?._id,
-      };
-      return next();
+    // User belongs to EITHER organization OR institute (not both)
+    const tenantId = req.user.organizationId || req.user.instituteId;
+    const tenantType = req.user.tenantType || (req.user.organizationId ? 'ORGANIZATION' : 'INSTITUTE');
+
+    if (!tenantId) {
+      return res.status(403).json({ error: 'User must belong to either an Organization or an Institute' });
     }
 
-    // INSTITUTE_ADMIN, TEACHER, STUDENT can only see their institute's data
-    req.tenantFilter = {
-      organizationId: req.user.organizationId || req.user.organization?._id,
-      instituteId: req.user.instituteId || req.user.institute?._id,
-    };
+    // Build filter based on tenant type
+    if (tenantType === 'ORGANIZATION') {
+      req.tenantFilter = {
+        organizationId: tenantId,
+        instituteId: null, // Ensure we only get org-level data
+      };
+    } else {
+      req.tenantFilter = {
+        instituteId: tenantId,
+        organizationId: null, // Ensure we only get institute-level data
+      };
+    }
 
     next();
   } catch (error) {
@@ -152,7 +177,8 @@ export const enforceTenantBoundaries = async (req, res, next) => {
 
 /**
  * Helper function to validate organization/institute access
- * Used in route handlers to ensure users can only access their own org/institute data
+ * Used in route handlers to ensure users can only access their own tenant data
+ * NOTE: Organization and Institute are EQUAL LEVEL - user belongs to EITHER one
  */
 export const validateTenantAccess = async (resource, user) => {
   // SUPER_ADMIN can access everything
@@ -160,30 +186,26 @@ export const validateTenantAccess = async (resource, user) => {
     return true;
   }
 
-  // Check organization match
-  if (resource.organizationId) {
-    const resourceOrgId = resource.organizationId.toString();
-    const userOrgId = (user.organizationId || user.organization?._id)?.toString();
+  // User belongs to EITHER organization OR institute (not both)
+  const userTenantId = user.organizationId || user.instituteId;
+  const userTenantType = user.tenantType || (user.organizationId ? 'ORGANIZATION' : 'INSTITUTE');
 
-    if (resourceOrgId !== userOrgId) {
-      return false;
-    }
+  if (!userTenantId) {
+    return false;
   }
 
-  // ORG_ADMIN can access everything in their org
-  if (user.role === 'ORG_ADMIN') {
-    return true;
+  // Resource must belong to the same tenant type and ID
+  if (userTenantType === 'ORGANIZATION') {
+    const resourceOrgId = resource.organizationId?.toString();
+    const userOrgId = userTenantId.toString();
+    
+    // Resource must belong to this organization AND not belong to any institute
+    return resourceOrgId === userOrgId && !resource.instituteId;
+  } else {
+    const resourceInstId = resource.instituteId?.toString();
+    const userInstId = userTenantId.toString();
+    
+    // Resource must belong to this institute AND not belong to any organization
+    return resourceInstId === userInstId && !resource.organizationId;
   }
-
-  // Check institute match for INSTITUTE_ADMIN, TEACHER, STUDENT
-  if (resource.instituteId) {
-    const resourceInstId = resource.instituteId.toString();
-    const userInstId = (user.instituteId || user.institute?._id)?.toString();
-
-    if (resourceInstId !== userInstId) {
-      return false;
-    }
-  }
-
-  return true;
 };
