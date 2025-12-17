@@ -115,7 +115,7 @@ const router = express.Router();
 router.post(
   '/import-questions',
   requireAuth,
-  requireRole('DESIGNER', 'ADMIN'),
+  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
   upload.single('file'),
   async (req, res, next) => {
     try {
@@ -141,7 +141,7 @@ router.post(
   '/generate-questions',
   requireAuth,
   requireTenant,
-  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN'),
+  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
   [
     body('topic').trim().notEmpty().withMessage('Topic is required'),
     body('count').isInt({ min: 5, max: 50 }).withMessage('Count must be between 5 and 50'),
