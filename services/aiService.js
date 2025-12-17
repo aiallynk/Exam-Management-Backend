@@ -230,7 +230,7 @@ For each question, provide:
 - points: Points for this question (default 1)
 - order: Sequential order starting from 1
 
-Return ONLY a valid JSON array, no markdown, no code blocks.`;
+Return a JSON object with a "questions" array containing exactly ${count} questions. Format: { "questions": [...] }`;
 
     const userPrompt = `Generate exactly ${count} ${difficulty} difficulty level questions about "${topic}". 
 
@@ -255,6 +255,7 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
     };
     const temperature = temperatureMap[difficulty] || 0.7;
 
+    // Make API call with better error handling
     const completion = await client.chat.completions.create({
       model: 'gpt-4o-mini',
       messages: [
@@ -332,6 +333,11 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
     return validatedQuestions;
   } catch (error) {
     console.error('OpenAI question generation error:', error);
+    // Check if it's a network/connection error
+    if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.message?.includes('timeout')) {
+      console.warn('Network error during AI generation, using fallback questions');
+    }
+    // Always return fallback questions on error
     return generateFallbackQuestions(params);
   }
 };

@@ -4,13 +4,14 @@ import QuestionPaper from '../models/QuestionPaper.js';
 import Exam from '../models/Exam.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole, requireOwnershipOrAdmin } from '../middleware/roles.js';
+import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { body, validationResult } from 'express-validator';
 import { parseCSV, validateQuestionCSV } from '../utils/csv.js';
 
 const router = express.Router();
 
 // Get all questions for an exam (via question papers)
-router.get('/:examId/questions', requireAuth, async (req, res, next) => {
+router.get('/:examId/questions', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
     const exam = await Exam.findById(req.params.examId);
     if (!exam) {
@@ -33,7 +34,7 @@ router.get('/:examId/questions', requireAuth, async (req, res, next) => {
 });
 
 // Get questions for a specific question paper
-router.get('/:examId/question-papers/:paperId/questions', requireAuth, async (req, res, next) => {
+router.get('/:examId/question-papers/:paperId/questions', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
     const questions = await Question.find({
       questionPaperId: req.params.paperId,
@@ -45,11 +46,13 @@ router.get('/:examId/question-papers/:paperId/questions', requireAuth, async (re
   }
 });
 
-// Create question (DESIGNER/ADMIN)
+// Create question (DESIGNER/ADMIN/TEACHER/ORG_ADMIN/INSTITUTE_ADMIN)
 router.post(
   '/:examId/questions',
   requireAuth,
-  requireRole('DESIGNER', 'ADMIN'),
+  requireTenant,
+  enforceTenantBoundaries,
+  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
   requireOwnershipOrAdmin,
   [
     body('questionText').trim().notEmpty().withMessage('Question text is required'),
@@ -82,6 +85,21 @@ router.post(
         return res.status(404).json({ error: 'Question paper not found' });
       }
 
+      // Verify exam belongs to user's tenant (for non-SUPER_ADMIN)
+      const exam = await Exam.findById(req.params.examId);
+      if (!exam) {
+        return res.status(404).json({ error: 'Exam not found' });
+      }
+
+      if (req.user.role !== 'SUPER_ADMIN') {
+        const userTenantId = req.user.organizationId || req.user.instituteId;
+        const examTenantId = exam.organizationId || exam.instituteId;
+        
+        if (!examTenantId || examTenantId.toString() !== userTenantId?.toString()) {
+          return res.status(403).json({ error: 'Access denied - Exam does not belong to your organization/institute' });
+        }
+      }
+
       const question = new Question({
         questionPaperId,
         questionText,
@@ -105,7 +123,7 @@ router.post(
 );
 
 // Get single question
-router.get('/:examId/questions/:questionId', requireAuth, async (req, res, next) => {
+router.get('/:examId/questions/:questionId', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
     const question = await Question.findById(req.params.questionId).populate(
       'questionPaperId',
@@ -132,7 +150,9 @@ router.get('/:examId/questions/:questionId', requireAuth, async (req, res, next)
 router.put(
   '/:examId/questions/:questionId',
   requireAuth,
-  requireRole('DESIGNER', 'ADMIN'),
+  requireTenant,
+  enforceTenantBoundaries,
+  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
   requireOwnershipOrAdmin,
   [
     body('questionText').optional().trim().notEmpty(),
@@ -190,7 +210,9 @@ router.put(
 router.delete(
   '/:examId/questions/:questionId',
   requireAuth,
-  requireRole('DESIGNER', 'ADMIN'),
+  requireTenant,
+  enforceTenantBoundaries,
+  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
   requireOwnershipOrAdmin,
   async (req, res, next) => {
     try {
@@ -217,7 +239,9 @@ router.delete(
 router.post(
   '/:examId/questions/import',
   requireAuth,
-  requireRole('DESIGNER', 'ADMIN'),
+  requireTenant,
+  enforceTenantBoundaries,
+  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
   requireOwnershipOrAdmin,
   async (req, res, next) => {
     try {

@@ -28,12 +28,13 @@ router.get('/:examId/question-papers', requireAuth, requireTenant, enforceTenant
   }
 });
 
-// Create question paper (DESIGNER/ADMIN/TEACHER)
+// Create question paper (DESIGNER/ADMIN/TEACHER/ORG_ADMIN/INSTITUTE_ADMIN)
 router.post(
   '/:examId/question-papers/create',
   requireAuth,
   requireTenant,
-  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN'),
+  enforceTenantBoundaries,
+  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
   requireOwnershipOrAdmin,
   [
     body('setName').trim().notEmpty().withMessage('Set name is required'),
@@ -50,8 +51,21 @@ router.post(
         return res.status(404).json({ error: 'Exam not found' });
       }
 
+      // Verify tenant access (exam must belong to user's tenant)
+      if (req.user.role !== 'SUPER_ADMIN') {
+        const userTenantId = req.user.organizationId || req.user.instituteId;
+        const examTenantId = exam.organizationId || exam.instituteId;
+        
+        if (!examTenantId || examTenantId.toString() !== userTenantId?.toString()) {
+          return res.status(403).json({ error: 'Access denied - Exam does not belong to your organization/institute' });
+        }
+      }
+
       const { setName } = req.body;
 
+      // Set tenant IDs from exam (question paper belongs to same tenant as exam)
+      // Question papers inherit tenant from exam (examId is the link)
+      // No need to store organizationId/instituteId separately as they're accessed via examId
       const questionPaper = new QuestionPaper({
         examId: req.params.examId,
         setName,
