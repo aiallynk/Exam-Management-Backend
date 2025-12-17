@@ -24,6 +24,17 @@ const ExamAttemptSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    // Multi-tenant fields (inherited from exam, but stored for performance)
+    organizationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Organization',
+      index: true,
+    },
+    instituteId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Institute',
+      index: true,
+    },
     startTime: {
       type: Date,
       required: true,
@@ -86,6 +97,8 @@ const ExamAttemptSchema = new mongoose.Schema(
 
 ExamAttemptSchema.index({ userId: 1, createdAt: -1 });
 ExamAttemptSchema.index({ sessionId: 1, userId: 1 });
+ExamAttemptSchema.index({ organizationId: 1, instituteId: 1 });
+ExamAttemptSchema.index({ instituteId: 1, userId: 1 });
 
 export default mongoose.model('ExamAttempt', ExamAttemptSchema);
 

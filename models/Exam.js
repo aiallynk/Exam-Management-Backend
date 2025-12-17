@@ -54,11 +54,37 @@ const ExamSchema = new mongoose.Schema(
       type: Boolean,
       default: true,
     },
+    // Multi-tenant fields
+    organizationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Organization',
+      required: true,
+      index: true,
+    },
+    instituteId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Institute',
+      required: true,
+      index: true,
+    },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: true,
       index: true,
+    },
+    // AI generation metadata
+    aiGenerated: {
+      type: Boolean,
+      default: false,
+    },
+    aiInputSource: {
+      type: String,
+      enum: ['TOPIC_ONLY', 'DETAILED_CONTENT'],
+    },
+    aiMetadata: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
     },
   },
   {
@@ -66,7 +92,11 @@ const ExamSchema = new mongoose.Schema(
   }
 );
 
+// Multi-tenant indexes
+ExamSchema.index({ organizationId: 1, instituteId: 1, createdAt: -1 });
 ExamSchema.index({ createdBy: 1, createdAt: -1 });
+ExamSchema.index({ organizationId: 1, isActive: 1 });
+ExamSchema.index({ instituteId: 1, isActive: 1 });
 
 export default mongoose.model('Exam', ExamSchema);
 

@@ -20,9 +20,16 @@ export const requireAuth = async (req, res, next) => {
         return res.status(401).json({ error: 'User not found' });
       }
 
+      // Check user status
+      if (user.status && user.status !== 'ACTIVE' && user.role !== 'SUPER_ADMIN') {
+        return res.status(403).json({ error: 'Account is not active' });
+      }
+
       req.user = {
         ...decoded,
         _id: decoded.sub,
+        organizationId: decoded.organizationId || user.organizationId?.toString() || null,
+        instituteId: decoded.instituteId || user.instituteId?.toString() || null,
       };
       next();
     } catch (error) {

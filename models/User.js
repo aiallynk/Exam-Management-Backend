@@ -24,9 +24,29 @@ const UserSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      enum: ['STUDENT', 'DESIGNER', 'ADMIN'],
+      enum: ['SUPER_ADMIN', 'ORG_ADMIN', 'INSTITUTE_ADMIN', 'TEACHER', 'STUDENT'],
       default: 'STUDENT',
       required: true,
+      index: true,
+    },
+    // Multi-tenant fields
+    organizationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Organization',
+      index: true,
+      // Required for all roles except SUPER_ADMIN
+      required: function() {
+        return this.role !== 'SUPER_ADMIN';
+      },
+    },
+    instituteId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Institute',
+      index: true,
+      // Required for INSTITUTE_ADMIN, TEACHER, STUDENT
+      required: function() {
+        return ['INSTITUTE_ADMIN', 'TEACHER', 'STUDENT'].includes(this.role);
+      },
     },
     mobile: {
       type: String,
@@ -52,11 +72,29 @@ const UserSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    // Status management
+    status: {
+      type: String,
+      enum: ['ACTIVE', 'INACTIVE', 'SUSPENDED', 'BLOCKED'],
+      default: 'ACTIVE',
+      index: true,
+    },
+    // Legacy support: Keep DESIGNER and ADMIN for backward compatibility
+    // DESIGNER maps to TEACHER, ADMIN maps to INSTITUTE_ADMIN
+    legacyRole: {
+      type: String,
+      enum: ['DESIGNER', 'ADMIN'],
+    },
   },
   {
     timestamps: true,
   }
 );
+
+// Compound indexes for efficient multi-tenant queries
+UserSchema.index({ organizationId: 1, role: 1 });
+UserSchema.index({ instituteId: 1, role: 1 });
+UserSchema.index({ organizationId: 1, instituteId: 1, status: 1 });
 
 // Hash password before saving
 UserSchema.pre('save', async function (next) {

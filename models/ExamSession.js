@@ -54,6 +54,17 @@ const ExamSessionSchema = new mongoose.Schema(
         message: 'End time must be after start time',
       },
     },
+    // Multi-tenant fields (inherited from exam, but stored for performance)
+    organizationId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Organization',
+      index: true,
+    },
+    instituteId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Institute',
+      index: true,
+    },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
@@ -82,6 +93,8 @@ const ExamSessionSchema = new mongoose.Schema(
 
 ExamSessionSchema.index({ examId: 1, createdAt: -1 });
 ExamSessionSchema.index({ isActive: 1, startTime: 1, endTime: 1 });
+ExamSessionSchema.index({ organizationId: 1, instituteId: 1 });
+ExamSessionSchema.index({ instituteId: 1, isActive: 1 });
 
 const ExamSession = mongoose.model('ExamSession', ExamSessionSchema);
 

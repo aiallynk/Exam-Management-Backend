@@ -20,6 +20,7 @@ import studentRoutes from './routes/student.js';
 import adminRoutes from './routes/admin.js';
 import uploadRoutes from './routes/upload.js';
 import aiRoutes from './routes/ai.js';
+import superAdminRoutes from './routes/superAdmin.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -94,6 +95,7 @@ app.use('/api/exam-attempts', attemptRoutes);
 app.use('/api/results', resultRoutes);
 app.use('/api/student', studentRoutes);
 app.use('/api/admin', adminRoutes);
+app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/upload', uploadRoutes);
 app.use('/api/exams', aiRoutes);
 

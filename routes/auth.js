@@ -32,12 +32,29 @@ router.post(
         return res.status(409).json({ error: 'Email already registered' });
       }
 
+      // Validate role
+      const validRoles = ['STUDENT', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'];
+      const selectedRole = role || 'STUDENT';
+      
+      // Map legacy roles for backward compatibility
+      const roleMapping = {
+        'DESIGNER': 'TEACHER',
+        'ADMIN': 'INSTITUTE_ADMIN',
+      };
+      const mappedRole = roleMapping[selectedRole] || selectedRole;
+      
+      if (!validRoles.includes(mappedRole)) {
+        return res.status(400).json({ error: 'Invalid role for registration' });
+      }
+
       // Create user (default role: STUDENT)
+      // Note: organizationId and instituteId should be set by admin after registration
       const user = new User({
         name,
         email,
         password,
-        role: role || 'STUDENT',
+        role: mappedRole,
+        // organizationId and instituteId will be null initially - must be assigned by admin
       });
 
       await user.save();
@@ -104,13 +121,24 @@ router.post(
         return res.status(401).json({ error: 'Invalid credentials' });
       }
 
-      // Generate tokens
+      // Check user status
+      if (user.status && user.status !== 'ACTIVE' && user.role !== 'SUPER_ADMIN') {
+        return res.status(403).json({ error: 'Account is not active' });
+      }
+
+      // Populate organization and institute info
+      await user.populate('organizationId', 'name code status');
+      await user.populate('instituteId', 'name code status');
+
+      // Generate tokens with multi-tenant info
       const accessToken = jwt.sign(
         {
           sub: user._id,
           email: user.email,
           name: user.name,
           role: user.role,
+          organizationId: user.organizationId?._id?.toString() || null,
+          instituteId: user.instituteId?._id?.toString() || null,
         },
         config.jwtSecret,
         { expiresIn: `${config.tokenTtlMinutes}m` }
@@ -130,6 +158,10 @@ router.post(
           name: user.name,
           email: user.email,
           role: user.role,
+          organizationId: user.organizationId?._id || null,
+          instituteId: user.instituteId?._id || null,
+          organization: user.organizationId || null,
+          institute: user.instituteId || null,
         },
       });
     } catch (error) {
@@ -154,12 +186,18 @@ router.post('/refresh', async (req, res, next) => {
         return res.status(401).json({ error: 'User not found' });
       }
 
+      // Populate organization and institute info
+      await user.populate('organizationId', 'name code status');
+      await user.populate('instituteId', 'name code status');
+
       const accessToken = jwt.sign(
         {
           sub: user._id,
           email: user.email,
           name: user.name,
           role: user.role,
+          organizationId: user.organizationId?._id?.toString() || null,
+          instituteId: user.instituteId?._id?.toString() || null,
         },
         config.jwtSecret,
         { expiresIn: `${config.tokenTtlMinutes}m` }
