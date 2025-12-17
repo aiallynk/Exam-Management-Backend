@@ -12,7 +12,10 @@ const router = express.Router();
 // Get own profile
 router.get('/profile', requireAuth, requireRole('STUDENT'), async (req, res, next) => {
   try {
-    const user = await User.findById(req.user._id).select('-password');
+    const user = await User.findById(req.user._id)
+      .select('-password')
+      .populate('organizationId', 'name code')
+      .populate('instituteId', 'name code');
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }

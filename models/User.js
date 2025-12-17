@@ -40,23 +40,18 @@ const UserSchema = new mongoose.Schema(
     },
     // Multi-tenant fields - Organization and Institute are EQUAL LEVEL
     // User belongs to EITHER organizationId OR instituteId (not both)
+    // Validation is enforced in pre-save hook, not schema-level required
     organizationId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Organization',
       index: true,
-      // Required for ORG_ADMIN role
-      required: function() {
-        return this.role === 'ORG_ADMIN';
-      },
+      // Not schema-level required - validated in pre-save hook
     },
     instituteId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Institute',
       index: true,
-      // Required for INSTITUTE_ADMIN, TEACHER, STUDENT
-      required: function() {
-        return ['INSTITUTE_ADMIN', 'TEACHER', 'STUDENT'].includes(this.role);
-      },
+      // Not schema-level required - validated in pre-save hook
     },
     // Validation: User must belong to either organization OR institute (except SUPER_ADMIN)
     // This is enforced in pre-save hook
