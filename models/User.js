@@ -104,8 +104,9 @@ UserSchema.index({ organizationId: 1, role: 1 });
 UserSchema.index({ instituteId: 1, role: 1 });
 UserSchema.index({ status: 1 });
 
-// Generate uniqueId before validation (runs before required field checks)
+// Generate uniqueId before validation (only for new documents or existing ones without uniqueId)
 UserSchema.pre('validate', async function (next) {
+  // Generate uniqueId for new documents or existing documents that don't have one yet
   if (!this.uniqueId) {
     try {
       this.uniqueId = await generateUniqueIdWithCheck(
@@ -117,13 +118,6 @@ UserSchema.pre('validate', async function (next) {
     }
   }
   next();
-});
-
-// Ensure uniqueId is set after generation (validation check)
-UserSchema.post('validate', function () {
-  if (!this.uniqueId) {
-    throw new Error('uniqueId generation failed');
-  }
 });
 
 // Validate: User must belong to EITHER organization OR institute (except SUPER_ADMIN)
