@@ -4,18 +4,35 @@ import config from '../config/env.js';
 import User from '../models/User.js';
 import { requireAuth } from '../middleware/auth.js';
 import { body, validationResult } from 'express-validator';
+import { addToBlacklist, isBlacklisted } from '../utils/tokenBlacklist.js';
+import { validatePasswordStrength as validatePassword } from '../utils/passwordValidator.js';
+import { auditLogin, auditLogout } from '../middleware/audit.js';
 
 const router = express.Router();
 
-// Register
+/**
+ * Register - Create new user account
+ * 
+ * Simple flow:
+ * - Only EXAM_CREATOR and CANDIDATE roles can register
+ * - SUPER_ADMIN cannot register (must be created manually)
+ * - Users start without tenantId (must be assigned by SUPER_ADMIN)
+ */
 router.post(
   '/register',
   [
     body('name').trim().notEmpty().withMessage('Name is required'),
     body('email').isEmail().normalizeEmail().withMessage('Valid email is required'),
     body('password')
-      .isLength({ min: 6 })
-      .withMessage('Password must be at least 6 characters'),
+      .custom((value) => {
+        try {
+          validatePassword(value);
+          return true;
+        } catch (error) {
+          throw new Error(error.message);
+        }
+      })
+      .withMessage('Password does not meet strength requirements'),
   ],
   async (req, res, next) => {
     try {
@@ -32,63 +49,47 @@ router.post(
         return res.status(409).json({ error: 'Email already registered' });
       }
 
-      // Validate role (SUPER_ADMIN cannot register - must be created manually)
-      const validRoles = ['STUDENT', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'];
-      const selectedRole = role || 'STUDENT';
-      
-      // Map legacy roles for backward compatibility
-      const roleMapping = {
-        'DESIGNER': 'TEACHER',
-        'ADMIN': 'INSTITUTE_ADMIN',
-      };
-      const mappedRole = roleMapping[selectedRole] || selectedRole;
+      // Simple role system: Only EXAM_CREATOR and CANDIDATE can register
+      // SUPER_ADMIN cannot register - must be created manually
+      const validRoles = ['EXAM_CREATOR', 'CANDIDATE'];
+      const selectedRole = role || 'CANDIDATE';
       
       // Prevent SUPER_ADMIN registration
-      if (selectedRole === 'SUPER_ADMIN' || mappedRole === 'SUPER_ADMIN') {
+      if (selectedRole === 'SUPER_ADMIN') {
         return res.status(403).json({ error: 'Super Admin accounts cannot be created through registration' });
       }
       
-      if (!validRoles.includes(mappedRole)) {
-        return res.status(400).json({ error: 'Invalid role for registration' });
+      // Validate role
+      if (!validRoles.includes(selectedRole)) {
+        return res.status(400).json({ error: 'Invalid role for registration. Must be EXAM_CREATOR or CANDIDATE' });
       }
 
       // Create user
-      // SUPER_ADMIN doesn't need organizationId/instituteId
-      // Other roles will have organizationId/instituteId set to null initially (must be assigned by admin)
+      // Users will have tenantId set to null initially (must be assigned by Super Admin)
       const userData = {
         name,
         email,
         password,
-        role: mappedRole,
+        role: selectedRole,
       };
-
-      // Only set organizationId/instituteId for non-SUPER_ADMIN roles (but they'll be null initially)
-      if (mappedRole !== 'SUPER_ADMIN') {
-        // organizationId and instituteId will be null initially - must be assigned by admin
-        // User model validation will enforce tenant assignment later
-      }
 
       const user = new User(userData);
 
       await user.save();
 
-      // Populate organization and institute info (if applicable)
-      if (user.organizationId) {
-        await user.populate('organizationId', 'name code status');
-      }
-      if (user.instituteId) {
-        await user.populate('instituteId', 'name code status');
+      // Populate tenant info (if applicable)
+      if (user.tenantId) {
+        await user.populate('tenantId', 'name code status type');
       }
 
-      // Generate tokens with multi-tenant info
+      // Generate tokens with tenant info
       const accessToken = jwt.sign(
         {
           sub: user._id,
           email: user.email,
           name: user.name,
           role: user.role,
-          organizationId: user.organizationId?._id?.toString() || null,
-          instituteId: user.instituteId?._id?.toString() || null,
+          tenantId: user.tenantId?._id?.toString() || null,
         },
         config.jwtSecret,
         { expiresIn: `${config.tokenTtlMinutes}m` }
@@ -108,10 +109,8 @@ router.post(
           name: user.name,
           email: user.email,
           role: user.role,
-          organizationId: user.organizationId?._id || null,
-          instituteId: user.instituteId?._id || null,
-          organization: user.organizationId || null,
-          institute: user.instituteId || null,
+          tenantId: user.tenantId?._id || null,
+          tenant: user.tenantId || null,
         },
       });
     } catch (error) {
@@ -123,6 +122,7 @@ router.post(
 // Login
 router.post(
   '/login',
+  auditLogin,
   [
     body('email').isEmail().normalizeEmail(),
     body('password').notEmpty(),
@@ -148,37 +148,22 @@ router.post(
         return res.status(401).json({ error: 'Invalid credentials' });
       }
 
-      // Map legacy roles to new roles if needed (for existing users)
-      const roleMapping = {
-        'ADMIN': 'INSTITUTE_ADMIN',
-        'DESIGNER': 'TEACHER',
-      };
-      if (roleMapping[user.role]) {
-        user.role = roleMapping[user.role];
-        if (!user.legacyRole) {
-          user.legacyRole = user.role === 'INSTITUTE_ADMIN' ? 'ADMIN' : 'DESIGNER';
-        }
-        await user.save(); // Save the mapped role
-      }
-
       // Check user status
       if (user.status && user.status !== 'ACTIVE' && user.role !== 'SUPER_ADMIN') {
         return res.status(403).json({ error: 'Account is not active' });
       }
 
-      // Populate organization and institute info
-      await user.populate('organizationId', 'name code status');
-      await user.populate('instituteId', 'name code status');
+      // Populate tenant info
+      await user.populate('tenantId', 'name code status type');
 
-      // Generate tokens with multi-tenant info
+      // Generate tokens with tenant info
       const accessToken = jwt.sign(
         {
           sub: user._id,
           email: user.email,
           name: user.name,
           role: user.role,
-          organizationId: user.organizationId?._id?.toString() || null,
-          instituteId: user.instituteId?._id?.toString() || null,
+          tenantId: user.tenantId?._id?.toString() || null,
         },
         config.jwtSecret,
         { expiresIn: `${config.tokenTtlMinutes}m` }
@@ -198,10 +183,8 @@ router.post(
           name: user.name,
           email: user.email,
           role: user.role,
-          organizationId: user.organizationId?._id || null,
-          instituteId: user.instituteId?._id || null,
-          organization: user.organizationId || null,
-          institute: user.instituteId || null,
+          tenantId: user.tenantId?._id || null,
+          tenant: user.tenantId || null,
         },
       });
     } catch (error) {
@@ -218,6 +201,11 @@ router.post('/refresh', async (req, res, next) => {
       return res.status(400).json({ error: 'Refresh token required' });
     }
 
+    // Check if refresh token is blacklisted
+    if (isBlacklisted(refreshToken)) {
+      return res.status(401).json({ error: 'Refresh token has been invalidated' });
+    }
+
     try {
       const decoded = jwt.verify(refreshToken, config.jwtRefreshSecret);
       const user = await User.findById(decoded.sub).select('-password');
@@ -226,22 +214,8 @@ router.post('/refresh', async (req, res, next) => {
         return res.status(401).json({ error: 'User not found' });
       }
 
-      // Map legacy roles to new roles if needed (for existing users)
-      const roleMapping = {
-        'ADMIN': 'INSTITUTE_ADMIN',
-        'DESIGNER': 'TEACHER',
-      };
-      if (roleMapping[user.role]) {
-        user.role = roleMapping[user.role];
-        if (!user.legacyRole) {
-          user.legacyRole = user.role === 'INSTITUTE_ADMIN' ? 'ADMIN' : 'DESIGNER';
-        }
-        await user.save(); // Save the mapped role
-      }
-
-      // Populate organization and institute info
-      await user.populate('organizationId', 'name code status');
-      await user.populate('instituteId', 'name code status');
+      // Populate tenant info
+      await user.populate('tenantId', 'name code status type');
 
       const accessToken = jwt.sign(
         {
@@ -249,14 +223,23 @@ router.post('/refresh', async (req, res, next) => {
           email: user.email,
           name: user.name,
           role: user.role,
-          organizationId: user.organizationId?._id?.toString() || null,
-          instituteId: user.instituteId?._id?.toString() || null,
+          tenantId: user.tenantId?._id?.toString() || null,
         },
         config.jwtSecret,
         { expiresIn: `${config.tokenTtlMinutes}m` }
       );
 
-      res.json({ accessToken });
+      res.json({
+        accessToken,
+        user: {
+          _id: user._id,
+          name: user.name,
+          email: user.email,
+          role: user.role,
+          tenantId: user.tenantId?._id || null,
+          tenant: user.tenantId || null,
+        },
+      });
     } catch (error) {
       return res.status(401).json({ error: 'Invalid refresh token' });
     }
@@ -265,9 +248,40 @@ router.post('/refresh', async (req, res, next) => {
   }
 });
 
-// Logout (client-side token removal, server can maintain denylist if needed)
-router.post('/logout', requireAuth, (req, res) => {
-  res.json({ message: 'Logged out successfully' });
+// Logout (blacklist tokens to prevent reuse)
+router.post('/logout', requireAuth, auditLogout, async (req, res) => {
+  try {
+    // Get tokens from request
+    const authHeader = req.headers.authorization;
+    const accessToken = authHeader?.replace('Bearer ', '');
+    const refreshToken = req.body.refreshToken; // Client should send refresh token
+    
+    // Blacklist access token (if provided)
+    if (accessToken) {
+      // Access tokens expire in tokenTtlMinutes, convert to seconds
+      const expiresInSeconds = config.tokenTtlMinutes * 60;
+      addToBlacklist(accessToken, expiresInSeconds);
+    }
+    
+    // Blacklist refresh token (if provided)
+    if (refreshToken) {
+      try {
+        // Verify token to get expiry, then blacklist it
+        const decoded = jwt.verify(refreshToken, config.jwtRefreshSecret);
+        // Refresh tokens expire in refreshTtlDays, convert to seconds
+        const expiresInSeconds = config.refreshTtlDays * 24 * 60 * 60;
+        addToBlacklist(refreshToken, expiresInSeconds);
+      } catch (error) {
+        // If refresh token is invalid, ignore (might already be expired)
+        // Still proceed with logout
+      }
+    }
+    
+    res.json({ message: 'Logged out successfully' });
+  } catch (error) {
+    // Even if blacklisting fails, return success (client-side cleanup still works)
+    res.json({ message: 'Logged out successfully' });
+  }
 });
 
 // Get current user
@@ -275,24 +289,10 @@ router.get('/me', requireAuth, async (req, res, next) => {
   try {
     const user = await User.findById(req.user._id)
       .select('-password')
-      .populate('organizationId', 'name code status uniqueId')
-      .populate('instituteId', 'name code status uniqueId');
+      .populate('tenantId', 'name code status uniqueId type');
     
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
-    }
-
-    // Map legacy roles to new roles if needed
-    const roleMapping = {
-      'ADMIN': 'INSTITUTE_ADMIN',
-      'DESIGNER': 'TEACHER',
-    };
-    if (roleMapping[user.role]) {
-      user.role = roleMapping[user.role];
-      if (!user.legacyRole) {
-        user.legacyRole = user.role === 'INSTITUTE_ADMIN' ? 'ADMIN' : 'DESIGNER';
-      }
-      await user.save(); // Save the mapped role
     }
 
     res.json({ user });

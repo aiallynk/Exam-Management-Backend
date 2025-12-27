@@ -63,19 +63,12 @@ const ExamSchema = new mongoose.Schema(
       type: Boolean,
       default: true,
     },
-    // Multi-tenant fields - Exam belongs to EITHER organizationId OR instituteId
-    // Organization and Institute are EQUAL LEVEL personas
-    organizationId: {
+    // Tenant field - Exam belongs to a tenant
+    tenantId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: 'Organization',
+      ref: 'Tenant',
+      required: true,
       index: true,
-      // Required if instituteId is not provided
-    },
-    instituteId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Institute',
-      index: true,
-      // Required if organizationId is not provided
     },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
@@ -102,17 +95,10 @@ const ExamSchema = new mongoose.Schema(
   }
 );
 
-// Validate: Exam must belong to EITHER organization OR institute
+// Validate: Exam must belong to a tenant
 ExamSchema.pre('save', function (next) {
-  const hasOrg = !!this.organizationId;
-  const hasInst = !!this.instituteId;
-  
-  if (!hasOrg && !hasInst) {
-    return next(new Error('Exam must belong to either an Organization or an Institute'));
-  }
-  
-  if (hasOrg && hasInst) {
-    return next(new Error('Exam cannot belong to both Organization and Institute. Choose one.'));
+  if (!this.tenantId) {
+    return next(new Error('Exam must belong to a tenant'));
   }
   
   next();
@@ -133,13 +119,11 @@ ExamSchema.pre('validate', async function (next) {
   next();
 });
 
-// Multi-tenant indexes
+// Indexes
 ExamSchema.index({ uniqueId: 1 });
-ExamSchema.index({ organizationId: 1, createdAt: -1 });
-ExamSchema.index({ instituteId: 1, createdAt: -1 });
+ExamSchema.index({ tenantId: 1, createdAt: -1 });
 ExamSchema.index({ createdBy: 1, createdAt: -1 });
-ExamSchema.index({ organizationId: 1, isActive: 1 });
-ExamSchema.index({ instituteId: 1, isActive: 1 });
+ExamSchema.index({ tenantId: 1, isActive: 1 });
 
 export default mongoose.model('Exam', ExamSchema);
 

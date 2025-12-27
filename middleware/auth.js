@@ -1,15 +1,23 @@
 import jwt from 'jsonwebtoken';
 import config from '../config/env.js';
 import User from '../models/User.js';
+import { isBlacklisted } from '../utils/tokenBlacklist.js';
+import { auditUnauthorized } from './audit.js';
 
 export const requireAuth = async (req, res, next) => {
   try {
     const authHeader = req.headers.authorization;
     if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      auditUnauthorized(req, res);
       return res.status(401).json({ error: 'Unauthorized - No token provided' });
     }
 
     const token = authHeader.replace('Bearer ', '');
+    
+    // Check if token is blacklisted
+    if (isBlacklisted(token)) {
+      return res.status(401).json({ error: 'Token has been invalidated' });
+    }
     
     try {
       const decoded = jwt.verify(token, config.jwtSecret);
@@ -28,11 +36,11 @@ export const requireAuth = async (req, res, next) => {
       req.user = {
         ...decoded,
         _id: decoded.sub,
-        organizationId: decoded.organizationId || user.organizationId?.toString() || null,
-        instituteId: decoded.instituteId || user.instituteId?.toString() || null,
+        tenantId: decoded.tenantId || user.tenantId?.toString() || null,
       };
       next();
     } catch (error) {
+      auditUnauthorized(req, res);
       if (error.name === 'TokenExpiredError') {
         return res.status(401).json({ error: 'Token expired' });
       }

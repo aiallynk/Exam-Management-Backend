@@ -8,7 +8,10 @@ import SystemConfig from '../models/SystemConfig.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
+import { requireExamPermission, hasExamPermission, ensureExamParticipant } from '../middleware/examPermissions.js';
 import { body, validationResult } from 'express-validator';
+import { validateObjectId, sanitizePagination, validateObjectIds } from '../middleware/validation.js';
+import { auditLog, AUDIT_ACTIONS } from '../middleware/audit.js';
 import { evaluateAnswer } from '../services/aiService.js';
 import { assignQuestionPaperToStudent } from '../services/sessionAssignment.js';
 import {
@@ -85,22 +88,39 @@ const normalizeAnswerForStorage = (questionType, value) => {
 
 const router = express.Router();
 
-// Get all attempts (own for students, all for designers/admin)
-router.get('/', requireAuth, async (req, res, next) => {
+// Get all attempts (universal: based on exam permissions)
+router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
     const { page = 1, limit = 20, examId, sessionId, userId } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const filter = {};
+    // Start with tenant filter to ensure data isolation
+    const filter = { ...req.tenantFilter };
 
     if (examId) filter.examId = examId;
     if (sessionId) filter.sessionId = sessionId;
 
-    // Students only see their own attempts
-    if (req.user.role === 'STUDENT') {
-      filter.userId = req.user._id;
-    } else if (userId) {
-      filter.userId = userId;
+    // SUPER_ADMIN and EXAM_CREATOR can see all attempts in their scope
+    if (req.user.role === 'SUPER_ADMIN' || req.user.role === 'EXAM_CREATOR') {
+      if (userId) {
+        filter.userId = userId;
+      }
+    } else {
+      // Regular users: check exam permissions
+      if (examId) {
+        // Check if user has VIEW_RESULTS permission for this exam
+        const canViewResults = await hasExamPermission(req.user._id, examId, 'VIEW_RESULTS');
+        if (!canViewResults) {
+          // User can only see their own attempts for this exam
+          filter.userId = req.user._id;
+        } else if (userId) {
+          // User has VIEW_RESULTS, can filter by userId
+          filter.userId = userId;
+        }
+      } else {
+        // No examId: users can only see their own attempts
+        filter.userId = req.user._id;
+      }
     }
 
     const attempts = await ExamAttempt.find(filter)
@@ -109,17 +129,17 @@ router.get('/', requireAuth, async (req, res, next) => {
       .populate('userId', 'name email')
       .sort({ createdAt: -1 })
       .skip(skip)
-      .limit(parseInt(limit));
+      .limit(limit);
 
     const total = await ExamAttempt.countDocuments(filter);
 
     res.json({
       attempts,
       pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
+        page,
+        limit,
         total,
-        pages: Math.ceil(total / parseInt(limit)),
+        pages: Math.ceil(total / limit),
       },
     });
   } catch (error) {
@@ -127,11 +147,20 @@ router.get('/', requireAuth, async (req, res, next) => {
   }
 });
 
-// Start attempt (STUDENT only)
+/**
+ * Start attempt - Only CANDIDATE can start exam attempts
+ * 
+ * Simple flow:
+ * 1. User must be CANDIDATE role
+ * 2. Session must be active and within time window
+ * 3. User must not have exceeded max attempts
+ * 4. ExamParticipant record is auto-created with CANDIDATE role if not exists
+ * 5. Attempt inherits tenantId from exam
+ */
 router.post(
   '/',
   requireAuth,
-  requireRole('STUDENT'),
+  requireRole('CANDIDATE'), // Only CANDIDATE can attempt exams
   [
     body('sessionId').notEmpty().withMessage('Session ID is required'),
     body('examId').notEmpty().withMessage('Exam ID is required'),
@@ -145,23 +174,57 @@ router.post(
 
       const { sessionId, examId } = req.body;
 
-      // Check if user is blocked
+      // Check exam permission: user must have ATTEMPT_EXAM permission
+      const canAttempt = await hasExamPermission(req.user._id, examId, 'ATTEMPT_EXAM');
+      if (!canAttempt) {
+        return res.status(403).json({ error: 'You do not have permission to attempt this exam' });
+      }
+
+      // Check if user is blocked (universal: changed from blocked_student_ to blocked_user_)
+      // Check both old and new key format for backward compatibility
       const blockedConfig = await SystemConfig.findOne({
-        key: `blocked_student_${req.user._id}`,
+        $or: [
+          { key: `blocked_user_${req.user._id}` }, // New universal format
+          { key: `blocked_student_${req.user._id}` }, // Legacy format
+        ],
       });
 
       if (blockedConfig && blockedConfig.value === 'true') {
         return res.status(403).json({ error: 'Your account has been blocked' });
       }
 
-      // Verify session
+      // Verify session and exam exist
       const session = await ExamSession.findById(sessionId).populate('examId');
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
       }
 
+      const exam = await Exam.findById(examId);
+      if (!exam) {
+        return res.status(404).json({ error: 'Exam not found' });
+      }
+
+      // Verify session belongs to exam
       if (session.examId._id.toString() !== examId) {
         return res.status(400).json({ error: 'Session does not belong to this exam' });
+      }
+
+      // Verify tenant match: session and exam must belong to same tenant
+      const sessionTenantId = session.tenantId;
+      const examTenantId = exam.tenantId;
+      
+      if (sessionTenantId && examTenantId) {
+        if (sessionTenantId.toString() !== examTenantId.toString()) {
+          return res.status(400).json({ error: 'Session and exam belong to different tenants' });
+        }
+      }
+
+      // Verify user has access to this tenant (already checked via exam permission, but double-check)
+      const userTenantId = req.user.tenantId;
+      if (userTenantId && examTenantId && req.user.role !== 'SUPER_ADMIN') {
+        if (userTenantId.toString() !== examTenantId.toString()) {
+          return res.status(403).json({ error: 'You do not have access to this exam' });
+        }
       }
 
       if (!session.isActive) {
@@ -173,8 +236,7 @@ router.post(
         return res.status(403).json({ error: 'Session is not available at this time' });
       }
 
-      // Check max attempts
-      const exam = await Exam.findById(examId);
+      // Check max attempts (exam already loaded above)
       const existingAttempts = await ExamAttempt.countDocuments({
         userId: req.user._id,
         examId,
@@ -207,6 +269,15 @@ router.post(
         });
       }
 
+      // UNIVERSAL: Ensure ExamParticipant exists with CANDIDATE role
+      // This happens when user starts an attempt (if not already created via QR/token scan)
+      await ensureExamParticipant(
+        req.user._id,
+        examId,
+        'CANDIDATE',
+        req.user._id
+      );
+
       await session.populate('questionPaperIds', 'setName');
       const assignment = await assignQuestionPaperToStudent({
         session,
@@ -215,8 +286,8 @@ router.post(
       const assignedQuestionPaperId =
         assignment.questionPaperId?._id || assignment.questionPaperId;
 
-      // Inherit tenant IDs from exam
-      const examForTenant = await Exam.findById(examId).select('organizationId instituteId');
+      // Inherit tenant ID from exam
+      const examForTenant = await Exam.findById(examId).select('tenantId');
       
       // Create new attempt
       const attempt = new ExamAttempt({
@@ -230,15 +301,17 @@ router.post(
           title: exam?.title || '',
           description: exam?.description || '',
         },
-        // Inherit tenant IDs from exam
-        organizationId: examForTenant?.organizationId || null,
-        instituteId: examForTenant?.instituteId || null,
+        // Inherit tenant ID from exam
+        tenantId: examForTenant?.tenantId || null,
       });
 
       await attempt.save();
       await attempt.populate('examId', 'title duration');
       await attempt.populate('sessionId', 'startTime endTime');
       await attempt.populate('questionPaperId', '_id');
+
+      // Store attempt ID for audit log
+      res.locals.attemptId = attempt._id.toString();
 
       res.status(201).json({
         attempt,
@@ -257,6 +330,11 @@ router.post(
 router.post(
   '/:attemptId/submit',
   requireAuth,
+  validateObjectId('attemptId'),
+  auditLog(AUDIT_ACTIONS.ATTEMPT_SUBMITTED, (req) => ({
+    attemptId: req.params.attemptId,
+    isDisqualified: req.body.isDisqualified || false,
+  })),
   [
     body('answers').isObject().withMessage('Answers must be an object'),
   ],
@@ -275,9 +353,10 @@ router.post(
         return res.status(404).json({ error: 'Attempt not found' });
       }
 
-      // Verify ownership (students can only submit their own)
-      if (req.user.role === 'STUDENT' && attempt.userId.toString() !== req.user._id.toString()) {
-        return res.status(403).json({ error: 'Forbidden' });
+      // Verify ownership: users can only submit their own attempts (unless they have REVIEW_ANSWERS permission)
+      const canReview = await hasExamPermission(req.user._id, attempt.examId, 'REVIEW_ANSWERS');
+      if (!canReview && attempt.userId.toString() !== req.user._id.toString()) {
+        return res.status(403).json({ error: 'Forbidden - You can only submit your own attempts' });
       }
 
       if (attempt.isCompleted) {
@@ -417,7 +496,7 @@ router.post(
 );
 
 // Get attempt results
-router.get('/:attemptId/results', requireAuth, async (req, res, next) => {
+router.get('/:attemptId/results', requireAuth, validateObjectId('attemptId'), async (req, res, next) => {
   try {
     const attempt = await ExamAttempt.findById(req.params.attemptId)
       .populate('examId', 'title duration showResultsImmediately resultsReleasedAt certificatesSentAt')
@@ -429,13 +508,18 @@ router.get('/:attemptId/results', requireAuth, async (req, res, next) => {
       return res.status(404).json({ error: 'Attempt not found' });
     }
 
-    // Verify ownership (students can only see their own)
-    if (req.user.role === 'STUDENT' && attempt.userId._id.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ error: 'Forbidden' });
+    // Verify ownership: users can only see their own results unless they have VIEW_RESULTS permission
+    const canViewResults = await hasExamPermission(req.user._id, attempt.examId._id, 'VIEW_RESULTS');
+    const isOwnAttempt = attempt.userId._id.toString() === req.user._id.toString();
+    
+    if (!canViewResults && !isOwnAttempt) {
+      return res.status(403).json({ error: 'Forbidden - You can only view your own results' });
     }
 
+    // For own attempts, check if results are released
     if (
-      req.user.role === 'STUDENT' &&
+      isOwnAttempt &&
+      !canViewResults &&
       attempt.examId &&
       !attempt.examId.showResultsImmediately &&
       !attempt.examId.resultsReleasedAt
@@ -459,7 +543,7 @@ router.get('/:attemptId/results', requireAuth, async (req, res, next) => {
 });
 
 // Update attempt (for proctoring violations)
-router.patch('/:attemptId', requireAuth, async (req, res, next) => {
+router.patch('/:attemptId', requireAuth, validateObjectId('attemptId'), async (req, res, next) => {
   try {
     const attempt = await ExamAttempt.findById(req.params.attemptId);
 
@@ -488,7 +572,7 @@ router.patch('/:attemptId', requireAuth, async (req, res, next) => {
 });
 
 // Certificate info
-router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
+router.get('/:attemptId/certificate', requireAuth, validateObjectId('attemptId'), async (req, res, next) => {
   try {
     const attempt = await ExamAttempt.findById(req.params.attemptId)
       .populate('examId', 'title resultsReleasedAt showResultsImmediately certificatesSentAt certificateTemplate allowCertification passingPercentage')
@@ -499,18 +583,22 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
       return res.status(404).json({ error: 'Attempt not found' });
     }
 
-    // Students can only see their own certificates
-    if (req.user.role === 'STUDENT' && attempt.userId._id.toString() !== req.user._id.toString()) {
-      return res.status(403).json({ error: 'Forbidden' });
+    // Users can only see their own certificates unless they have VIEW_RESULTS permission
+    const canViewResults = await hasExamPermission(req.user._id, attempt.examId._id, 'VIEW_RESULTS');
+    const isOwnAttempt = attempt.userId._id.toString() === req.user._id.toString();
+    
+    if (!canViewResults && !isOwnAttempt) {
+      return res.status(403).json({ error: 'Forbidden - You can only view your own certificates' });
     }
 
-    // Block certificate until results are released OR certificates are sent (for students)
+    // Block certificate until results are released OR certificates are sent (for own attempts)
     // Allow viewing if:
     // 1. Results are shown immediately, OR
     // 2. Results have been released, OR
     // 3. Certificates have been sent separately
     if (
-      req.user.role === 'STUDENT' &&
+      isOwnAttempt &&
+      !canViewResults &&
       attempt.examId &&
       !attempt.examId.showResultsImmediately &&
       !attempt.examId.resultsReleasedAt &&
@@ -552,7 +640,7 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
       : null;
     const issuedTimestamp = attemptDate ? attemptDate : new Date();
     const context = {
-      studentName: attempt.userId?.name || req.user.name || 'Student',
+      studentName: attempt.userId?.name || req.user.name || 'Candidate', // Universal: Changed from 'Student' to 'Candidate'
       examTitle,
       attemptDate: attemptDate ? attemptDate.toLocaleDateString() : '',
       issuedOn: issuedTimestamp.toLocaleDateString(),
@@ -598,8 +686,10 @@ router.get('/:attemptId/certificate', requireAuth, async (req, res, next) => {
       placeholders: { ...context },
     };
 
-    // Hide set details for students (already removed), but keep for non-students if needed
-    if (req.user.role !== 'STUDENT' && attempt.questionPaperId) {
+    // Hide set details for candidates (already removed), but keep for evaluators/creators if needed
+    // Only show if user has REVIEW_ANSWERS permission
+    const canReview = await hasExamPermission(req.user._id, attempt.examId._id, 'REVIEW_ANSWERS');
+    if (canReview && attempt.questionPaperId) {
       responsePayload.attempt.questionPaper = {
         _id: attempt.questionPaperId._id,
         setName: attempt.questionPaperId.setName,

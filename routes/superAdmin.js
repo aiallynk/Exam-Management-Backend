@@ -1,10 +1,9 @@
 import express from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
-import { requireOrganization, enforceTenantBoundaries } from '../middleware/multiTenant.js';
+import { enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { body, validationResult } from 'express-validator';
-import Organization from '../models/Organization.js';
-import Institute from '../models/Institute.js';
+import Tenant from '../models/Tenant.js';
 import User from '../models/User.js';
 import Exam from '../models/Exam.js';
 import ExamAttempt from '../models/ExamAttempt.js';
@@ -23,20 +22,16 @@ router.use(requireRole('SUPER_ADMIN'));
 router.get('/stats', async (req, res, next) => {
   try {
     const [
-      totalOrganizations,
-      activeOrganizations,
-      totalInstitutes,
-      activeInstitutes,
+      totalTenants,
+      activeTenants,
       totalUsers,
       usersByRole,
       totalExams,
       totalExamAttempts,
       totalSessions,
     ] = await Promise.all([
-      Organization.countDocuments(),
-      Organization.countDocuments({ status: 'ACTIVE' }),
-      Institute.countDocuments(),
-      Institute.countDocuments({ status: 'ACTIVE' }),
+      Tenant.countDocuments(),
+      Tenant.countDocuments({ status: 'ACTIVE' }),
       User.countDocuments({ role: { $ne: 'SUPER_ADMIN' } }),
       User.aggregate([
         { $match: { role: { $ne: 'SUPER_ADMIN' } } },
@@ -55,15 +50,10 @@ router.get('/stats', async (req, res, next) => {
     });
 
     res.json({
-      organizations: {
-        total: totalOrganizations,
-        active: activeOrganizations,
-        inactive: totalOrganizations - activeOrganizations,
-      },
-      institutes: {
-        total: totalInstitutes,
-        active: activeInstitutes,
-        inactive: totalInstitutes - activeInstitutes,
+      tenants: {
+        total: totalTenants,
+        active: activeTenants,
+        inactive: totalTenants - activeTenants,
       },
       users: {
         total: totalUsers,
@@ -90,11 +80,11 @@ router.get('/stats', async (req, res, next) => {
 });
 
 /**
- * ORGANIZATION MANAGEMENT
+ * TENANT MANAGEMENT
  */
 
-// List all organizations
-router.get('/organizations', async (req, res, next) => {
+// List all tenants
+router.get('/tenants', async (req, res, next) => {
   try {
     const { page = 1, limit = 20, status, search } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
@@ -109,17 +99,17 @@ router.get('/organizations', async (req, res, next) => {
       ];
     }
 
-    const [organizations, total] = await Promise.all([
-      Organization.find(filter)
+    const [tenants, total] = await Promise.all([
+      Tenant.find(filter)
         .populate('createdBy', 'name email')
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parseInt(limit)),
-      Organization.countDocuments(filter),
+      Tenant.countDocuments(filter),
     ]);
 
     res.json({
-      organizations,
+      tenants,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
@@ -132,40 +122,25 @@ router.get('/organizations', async (req, res, next) => {
   }
 });
 
-// Get single organization
-router.get('/organizations/:orgId', async (req, res, next) => {
-  try {
-    const organization = await Organization.findById(req.params.orgId)
-      .populate('createdBy', 'name email');
-
-    if (!organization) {
-      return res.status(404).json({ error: 'Organization not found' });
-    }
-
-    // Get users count (users belonging to this organization)
-    const usersCount = await User.countDocuments({ organizationId: organization._id });
-
-    res.json({
-      organization,
-      stats: {
-        users: usersCount,
-      },
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// Create organization
+/**
+ * Create tenant - Only SUPER_ADMIN can create tenants
+ * 
+ * Simple flow:
+ * 1. Only SUPER_ADMIN can create tenants (enforced by requireRole middleware)
+ * 2. Tenant requires: name, code, type (SCHOOL|COLLEGE|COMPANY|INSTITUTE|GOVERNMENT|OTHER)
+ * 3. Tenant cannot self-register - must be created by SUPER_ADMIN
+ * 4. After creation, SUPER_ADMIN assigns users to tenants
+ */
 router.post(
-  '/organizations',
+  '/tenants',
   [
-    body('name').trim().notEmpty().withMessage('Organization name is required'),
+    body('name').trim().notEmpty().withMessage('Tenant name is required'),
     body('code')
       .trim()
       .notEmpty()
       .matches(/^[A-Z0-9_-]+$/)
       .withMessage('Code must contain only uppercase letters, numbers, hyphens, and underscores'),
+    body('type').isIn(['SCHOOL', 'COLLEGE', 'COMPANY', 'INSTITUTE', 'GOVERNMENT', 'OTHER']).withMessage('Valid tenant type is required'),
     body('contactEmail').isEmail().normalizeEmail().withMessage('Valid email is required'),
   ],
   async (req, res, next) => {
@@ -175,40 +150,94 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { name, code, contactEmail, contactPhone, address, metadata } = req.body;
+      const { name, code, type, contactEmail, contactPhone, address, examLimit, aiUsageLimit, metadata } = req.body;
 
       // Check if code already exists
-      const existing = await Organization.findOne({ code: code.toUpperCase() });
+      const existing = await Tenant.findOne({ code: code.toUpperCase() });
       if (existing) {
-        return res.status(409).json({ error: 'Organization code already exists' });
+        return res.status(409).json({ error: 'Tenant code already exists' });
       }
 
-      const organization = new Organization({
+      const tenant = new Tenant({
         name,
         code: code.toUpperCase(),
+        type,
         contactEmail,
         contactPhone,
         address,
+        examLimit: examLimit ? parseInt(examLimit) : null,
+        aiUsageLimit: aiUsageLimit ? parseInt(aiUsageLimit) : null,
         metadata: metadata || {},
         createdBy: req.user._id,
       });
 
-      await organization.save();
-      await organization.populate('createdBy', 'name email');
+      await tenant.save();
+      await tenant.populate('createdBy', 'name email');
 
-      res.status(201).json({ organization });
+      res.status(201).json({ tenant });
     } catch (error) {
       if (error.code === 11000) {
-        return res.status(409).json({ error: 'Organization code already exists' });
+        return res.status(409).json({ error: 'Tenant code already exists' });
       }
       next(error);
     }
   }
 );
 
-// Update organization
+// Get single tenant with details
+router.get('/tenants/:tenantId', async (req, res, next) => {
+  try {
+    const tenant = await Tenant.findById(req.params.tenantId)
+      .populate('createdBy', 'name email');
+
+    if (!tenant) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    // Get detailed stats and data
+    const [usersCount, users, examsCount, exams, attemptsCount, sessionsCount, sessions] = await Promise.all([
+      User.countDocuments({ tenantId: tenant._id }),
+      User.find({ tenantId: tenant._id })
+        .select('name email role status createdAt')
+        .sort({ createdAt: -1 })
+        .limit(100), // Limit to 100 users for performance
+      Exam.countDocuments({ tenantId: tenant._id }),
+      Exam.find({ tenantId: tenant._id })
+        .select('title isActive duration maxAttempts createdAt')
+        .populate('createdBy', 'name email')
+        .sort({ createdAt: -1 })
+        .limit(50), // Limit to 50 exams
+      ExamAttempt.countDocuments({ tenantId: tenant._id }),
+      ExamSession.countDocuments({ tenantId: tenant._id }),
+      ExamSession.find({ tenantId: tenant._id })
+        .populate('examId', 'title duration maxAttempts')
+        .populate('questionPaperId', 'setName')
+        .populate('questionPaperIds', 'setName')
+        .populate('createdBy', 'name email')
+        .sort({ createdAt: -1 })
+        .limit(50), // Limit to 50 sessions
+    ]);
+
+    res.json({
+      tenant,
+      stats: {
+        users: usersCount,
+        exams: examsCount,
+        attempts: attemptsCount,
+        sessions: sessionsCount,
+      },
+      users,
+      exams,
+      sessions,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Update tenant
 router.put(
-  '/organizations/:orgId',
+  '/tenants/:tenantId',
   [
     body('name').optional().trim().notEmpty(),
     body('code')
@@ -216,6 +245,7 @@ router.put(
       .trim()
       .matches(/^[A-Z0-9_-]+$/)
       .withMessage('Code must contain only uppercase letters, numbers, hyphens, and underscores'),
+    body('type').optional().isIn(['SCHOOL', 'COLLEGE', 'COMPANY', 'INSTITUTE', 'GOVERNMENT', 'OTHER']),
     body('contactEmail').optional().isEmail().normalizeEmail(),
     body('status').optional().isIn(['ACTIVE', 'INACTIVE', 'SUSPENDED']),
   ],
@@ -226,274 +256,68 @@ router.put(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const organization = await Organization.findById(req.params.orgId);
-      if (!organization) {
-        return res.status(404).json({ error: 'Organization not found' });
+      const tenant = await Tenant.findById(req.params.tenantId);
+      if (!tenant) {
+        return res.status(404).json({ error: 'Tenant not found' });
       }
 
-      const { name, code, contactEmail, contactPhone, address, status, metadata } = req.body;
+      const { name, code, type, contactEmail, contactPhone, address, status, examLimit, aiUsageLimit, metadata } = req.body;
 
-      if (name) organization.name = name;
+      if (name) tenant.name = name;
       if (code) {
         // Check if new code conflicts
-        const existing = await Organization.findOne({ code: code.toUpperCase(), _id: { $ne: organization._id } });
+        const existing = await Tenant.findOne({ code: code.toUpperCase(), _id: { $ne: tenant._id } });
         if (existing) {
-          return res.status(409).json({ error: 'Organization code already exists' });
+          return res.status(409).json({ error: 'Tenant code already exists' });
         }
-        organization.code = code.toUpperCase();
+        tenant.code = code.toUpperCase();
       }
-      if (contactEmail) organization.contactEmail = contactEmail;
-      if (contactPhone !== undefined) organization.contactPhone = contactPhone;
-      if (address !== undefined) organization.address = address;
-      if (status) organization.status = status;
-      if (metadata) organization.metadata = { ...organization.metadata, ...metadata };
+      if (type) tenant.type = type;
+      if (contactEmail) tenant.contactEmail = contactEmail;
+      if (contactPhone !== undefined) tenant.contactPhone = contactPhone;
+      if (address !== undefined) tenant.address = address;
+      if (status) tenant.status = status;
+      if (examLimit !== undefined) tenant.examLimit = examLimit;
+      if (aiUsageLimit !== undefined) tenant.aiUsageLimit = aiUsageLimit;
+      if (metadata) tenant.metadata = { ...tenant.metadata, ...metadata };
 
-      await organization.save();
-      await organization.populate('createdBy', 'name email');
+      await tenant.save();
+      await tenant.populate('createdBy', 'name email');
 
-      res.json({ organization });
+      res.json({ tenant });
     } catch (error) {
       if (error.code === 11000) {
-        return res.status(409).json({ error: 'Organization code already exists' });
+        return res.status(409).json({ error: 'Tenant code already exists' });
       }
       next(error);
     }
   }
 );
 
-// Delete organization (soft delete by setting status to INACTIVE)
-router.delete('/organizations/:orgId', async (req, res, next) => {
+// Delete tenant (soft delete by setting status to INACTIVE)
+router.delete('/tenants/:tenantId', async (req, res, next) => {
   try {
-    const organization = await Organization.findById(req.params.orgId);
-    if (!organization) {
-      return res.status(404).json({ error: 'Organization not found' });
+    const tenant = await Tenant.findById(req.params.tenantId);
+    if (!tenant) {
+      return res.status(404).json({ error: 'Tenant not found' });
     }
 
-    // Check if organization has active institutes
-    const activeInstitutes = await Institute.countDocuments({
-      organizationId: organization._id,
-      status: 'ACTIVE',
-    });
-
-    if (activeInstitutes > 0) {
-      return res.status(400).json({
-        error: 'Cannot delete organization with active institutes. Deactivate institutes first.',
-      });
-    }
-
-    organization.status = 'INACTIVE';
-    await organization.save();
-
-    res.json({ message: 'Organization deactivated successfully', organization });
-  } catch (error) {
-    next(error);
-  }
-});
-
-/**
- * INSTITUTE MANAGEMENT
- */
-
-// List all institutes (with optional organization filter)
-router.get('/institutes', async (req, res, next) => {
-  try {
-    const { page = 1, limit = 20, organizationId, status, search } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
-
-    const filter = {};
-    if (organizationId) filter.organizationId = organizationId;
-    if (status) filter.status = status;
-    if (search) {
-      filter.$or = [
-        { name: { $regex: search, $options: 'i' } },
-        { code: { $regex: search, $options: 'i' } },
-      ];
-    }
-
-    const [institutes, total] = await Promise.all([
-      Institute.find(filter)
-        .populate('createdBy', 'name email')
-        .sort({ createdAt: -1 })
-        .skip(skip)
-        .limit(parseInt(limit)),
-      Institute.countDocuments(filter),
-    ]);
-
-    res.json({
-      institutes,
-      pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
-        total,
-        pages: Math.ceil(total / parseInt(limit)),
-      },
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// Get single institute
-router.get('/institutes/:instituteId', async (req, res, next) => {
-  try {
-    const institute = await Institute.findById(req.params.instituteId)
-      .populate('createdBy', 'name email');
-
-    if (!institute) {
-      return res.status(404).json({ error: 'Institute not found' });
-    }
-
-    // Get stats
-    const [usersCount, examsCount, attemptsCount] = await Promise.all([
-      User.countDocuments({ instituteId: institute._id }),
-      Exam.countDocuments({ instituteId: institute._id }),
-      ExamAttempt.countDocuments({ instituteId: institute._id }),
-    ]);
-
-    res.json({
-      institute,
-      stats: {
-        users: usersCount,
-        exams: examsCount,
-        attempts: attemptsCount,
-      },
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
-// Create institute
-router.post(
-  '/institutes',
-  [
-    body('name').trim().notEmpty().withMessage('Institute name is required'),
-    body('code').trim().notEmpty().withMessage('Institute code is required'),
-    body('contactEmail').optional().isEmail().normalizeEmail(),
-  ],
-  async (req, res, next) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
-
-      const { name, code, contactEmail, contactPhone, address, examLimit, aiUsageLimit, metadata, status } = req.body;
-
-      // Check if code already exists (unique across all institutes)
-      const existing = await Institute.findOne({ code });
-      if (existing) {
-        return res.status(409).json({ error: 'Institute code already exists' });
-      }
-
-      const institute = new Institute({
-        name,
-        code,
-        contactEmail,
-        contactPhone,
-        address,
-        status: status || 'ACTIVE',
-        examLimit: examLimit ? parseInt(examLimit) : null,
-        aiUsageLimit: aiUsageLimit ? parseInt(aiUsageLimit) : null,
-        metadata: metadata || {},
-        createdBy: req.user._id,
-      });
-
-      await institute.save();
-      await institute.populate('organizationId', 'name code');
-      await institute.populate('createdBy', 'name email');
-
-      res.status(201).json({ institute });
-    } catch (error) {
-      if (error.code === 11000) {
-        return res.status(409).json({ error: 'Institute code already exists in this organization' });
-      }
-      next(error);
-    }
-  }
-);
-
-// Update institute
-router.put(
-  '/institutes/:instituteId',
-  [
-    body('name').optional().trim().notEmpty(),
-    body('code').optional().trim().notEmpty(),
-    body('contactEmail').optional().isEmail().normalizeEmail(),
-    body('status').optional().isIn(['ACTIVE', 'INACTIVE', 'SUSPENDED']),
-  ],
-  async (req, res, next) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
-
-      const institute = await Institute.findById(req.params.instituteId);
-      if (!institute) {
-        return res.status(404).json({ error: 'Institute not found' });
-      }
-
-      const { name, code, contactEmail, contactPhone, address, status, examLimit, aiUsageLimit, metadata } = req.body;
-
-      if (name) institute.name = name;
-      if (code) {
-        // Check if new code conflicts (unique across all institutes)
-        const existing = await Institute.findOne({
-          code,
-          _id: { $ne: institute._id },
-        });
-        if (existing) {
-          return res.status(409).json({ error: 'Institute code already exists' });
-        }
-        institute.code = code;
-      }
-      if (contactEmail !== undefined) institute.contactEmail = contactEmail;
-      if (contactPhone !== undefined) institute.contactPhone = contactPhone;
-      if (address !== undefined) institute.address = address;
-      if (status) institute.status = status;
-      if (examLimit !== undefined) institute.examLimit = examLimit;
-      if (aiUsageLimit !== undefined) institute.aiUsageLimit = aiUsageLimit;
-      if (metadata) institute.metadata = { ...institute.metadata, ...metadata };
-
-      await institute.save();
-      await institute.populate('organizationId', 'name code');
-      await institute.populate('createdBy', 'name email');
-
-      res.json({ institute });
-    } catch (error) {
-      if (error.code === 11000) {
-        return res.status(409).json({ error: 'Institute code already exists in this organization' });
-      }
-      next(error);
-    }
-  }
-);
-
-// Delete institute (soft delete)
-router.delete('/institutes/:instituteId', async (req, res, next) => {
-  try {
-    const institute = await Institute.findById(req.params.instituteId);
-    if (!institute) {
-      return res.status(404).json({ error: 'Institute not found' });
-    }
-
-    // Check if institute has active users or exams
+    // Check if tenant has active users or exams
     const [activeUsers, activeExams] = await Promise.all([
-      User.countDocuments({ instituteId: institute._id, status: 'ACTIVE' }),
-      Exam.countDocuments({ instituteId: institute._id, isActive: true }),
+      User.countDocuments({ tenantId: tenant._id, status: 'ACTIVE' }),
+      Exam.countDocuments({ tenantId: tenant._id, isActive: true }),
     ]);
 
     if (activeUsers > 0 || activeExams > 0) {
       return res.status(400).json({
-        error: 'Cannot delete institute with active users or exams. Deactivate them first.',
+        error: 'Cannot delete tenant with active users or exams. Deactivate them first.',
       });
     }
 
-    institute.status = 'INACTIVE';
-    await institute.save();
+    tenant.status = 'INACTIVE';
+    await tenant.save();
 
-    res.json({ message: 'Institute deactivated successfully', institute });
+    res.json({ message: 'Tenant deactivated successfully', tenant });
   } catch (error) {
     next(error);
   }
@@ -506,12 +330,11 @@ router.delete('/institutes/:instituteId', async (req, res, next) => {
 // List all users (with filters)
 router.get('/users', async (req, res, next) => {
   try {
-    const { page = 1, limit = 20, organizationId, instituteId, role, status, search } = req.query;
+    const { page = 1, limit = 20, tenantId, role, status, search } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
     const filter = { role: { $ne: 'SUPER_ADMIN' } }; // Exclude SUPER_ADMIN from listings
-    if (organizationId) filter.organizationId = organizationId;
-    if (instituteId) filter.instituteId = instituteId;
+    if (tenantId) filter.tenantId = tenantId;
     if (role) filter.role = role;
     if (status) filter.status = status;
     if (search) {
@@ -524,8 +347,7 @@ router.get('/users', async (req, res, next) => {
     const [users, total] = await Promise.all([
       User.find(filter)
         .select('-password')
-        .populate('organizationId', 'name code')
-        .populate('instituteId', 'name code')
+        .populate('tenantId', 'name code type')
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parseInt(limit)),
@@ -546,6 +368,28 @@ router.get('/users', async (req, res, next) => {
   }
 });
 
+// Get single user
+router.get('/users/:userId', async (req, res, next) => {
+  try {
+    const user = await User.findById(req.params.userId)
+      .select('-password')
+      .populate('tenantId', 'name code type');
+
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    // Prevent viewing SUPER_ADMIN details
+    if (user.role === 'SUPER_ADMIN') {
+      return res.status(403).json({ error: 'Cannot view SUPER_ADMIN user details' });
+    }
+
+    res.json({ user });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Create user
 router.post(
   '/users',
@@ -553,21 +397,14 @@ router.post(
     body('name').trim().notEmpty().withMessage('Name is required'),
     body('email').isEmail().normalizeEmail().withMessage('Valid email is required'),
     body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
-    body('role').isIn(['ORG_ADMIN', 'INSTITUTE_ADMIN', 'TEACHER', 'STUDENT', 'ADMIN', 'DESIGNER']).withMessage('Invalid role'), // Include legacy roles
-    body('organizationId')
+    body('role').isIn(['TENANT_ADMIN', 'EXAM_CREATOR', 'CANDIDATE']).withMessage('Invalid role. Must be TENANT_ADMIN, EXAM_CREATOR, or CANDIDATE'),
+    body('tenantId')
       .optional({ checkFalsy: true })
       .custom((value) => {
         if (!value || value === '') return true; // Allow empty string/null
         return /^[0-9a-fA-F]{24}$/.test(value); // MongoDB ObjectId format
       })
-      .withMessage('Valid organization ID is required if provided'),
-    body('instituteId')
-      .optional({ checkFalsy: true })
-      .custom((value) => {
-        if (!value || value === '') return true; // Allow empty string/null
-        return /^[0-9a-fA-F]{24}$/.test(value); // MongoDB ObjectId format
-      })
-      .withMessage('Valid institute ID is required if provided'),
+      .withMessage('Valid tenant ID is required if provided'),
   ],
   async (req, res, next) => {
     try {
@@ -576,7 +413,7 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { name, email, password, role, organizationId, instituteId, mobile, college, degree, branch } = req.body;
+      const { name, email, password, role, tenantId, mobile } = req.body;
 
       // Check if user exists
       const existing = await User.findOne({ email });
@@ -584,53 +421,31 @@ router.post(
         return res.status(409).json({ error: 'Email already registered' });
       }
 
-      // Map legacy roles to new roles
-      const roleMapping = {
-        'ADMIN': 'INSTITUTE_ADMIN',
-        'DESIGNER': 'TEACHER',
-      };
-      const mappedRole = roleMapping[role] || role;
-
       // Normalize empty strings to null/undefined
-      const normalizedOrgId = organizationId && organizationId.trim() !== '' ? organizationId : null;
-      const normalizedInstId = instituteId && instituteId.trim() !== '' ? instituteId : null;
+      const normalizedTenantId = tenantId && tenantId.trim() !== '' ? tenantId : null;
 
-      // Validate: User cannot belong to both organization AND institute
-      if (normalizedOrgId && normalizedInstId) {
-        return res.status(400).json({ error: 'User cannot belong to both Organization and Institute. Choose one.' });
+      // TENANT_ADMIN must have a tenantId
+      if (role === 'TENANT_ADMIN' && !normalizedTenantId) {
+        return res.status(400).json({ error: 'TENANT_ADMIN must be assigned to a tenant' });
       }
 
-      // Verify organization exists (if provided)
-      if (normalizedOrgId) {
-        const organization = await Organization.findById(normalizedOrgId);
-        if (!organization) {
-          return res.status(404).json({ error: 'Organization not found' });
-        }
-      }
-
-      // Verify institute exists (if provided)
-      // Note: Organization and Institute are equal level, so no need to check if institute belongs to organization
-      if (normalizedInstId) {
-        const institute = await Institute.findById(normalizedInstId);
-        if (!institute) {
-          return res.status(404).json({ error: 'Institute not found' });
+      // Verify tenant exists (if provided)
+      if (normalizedTenantId) {
+        const tenant = await Tenant.findById(normalizedTenantId);
+        if (!tenant) {
+          return res.status(404).json({ error: 'Tenant not found' });
         }
       }
 
       // Allow users to be created without tenant initially (they can be assigned later)
-      // Only validate mutual exclusivity if both are provided
-
+      // Exception: TENANT_ADMIN must have tenantId (checked above)
       const user = new User({
         name,
         email,
         password,
-        role: mappedRole,
-        organizationId: normalizedOrgId,
-        instituteId: normalizedInstId,
+        role,
+        tenantId: normalizedTenantId,
         mobile,
-        college,
-        degree,
-        branch,
         status: 'ACTIVE',
       });
 
@@ -638,15 +453,33 @@ router.post(
       const userObj = user.toObject();
       delete userObj.password;
 
-      await user.populate('organizationId', 'name code');
-      await user.populate('instituteId', 'name code');
+      await user.populate('tenantId', 'name code type');
 
-      res.status(201).json({ user: { ...userObj, organizationId: user.organizationId, instituteId: user.instituteId } });
+      res.status(201).json({ user: { ...userObj, tenantId: user.tenantId } });
     } catch (error) {
       next(error);
     }
   }
 );
+
+// Role mapping for old roles to new roles
+const roleMapping = {
+  // Admin/creator roles → EXAM_CREATOR
+  'ORG_ADMIN': 'EXAM_CREATOR',
+  'INSTITUTE_ADMIN': 'EXAM_CREATOR',
+  'ADMIN': 'EXAM_CREATOR',
+  'DESIGNER': 'EXAM_CREATOR',
+  'TEACHER': 'EXAM_CREATOR',
+  
+  // User roles → CANDIDATE
+  'USER': 'CANDIDATE',
+  'STUDENT': 'CANDIDATE',
+};
+
+// Helper function to convert old roles to new roles
+function convertRole(oldRole) {
+  return roleMapping[oldRole] || oldRole;
+}
 
 // Update user
 router.put(
@@ -654,22 +487,22 @@ router.put(
   [
     body('name').optional().trim().notEmpty(),
     body('email').optional().isEmail().normalizeEmail(),
-    body('role').optional().isIn(['ORG_ADMIN', 'INSTITUTE_ADMIN', 'TEACHER', 'STUDENT', 'ADMIN', 'DESIGNER']), // Include legacy roles
+    body('role')
+      .optional()
+      .custom((value) => {
+        // Allow new roles and old roles (will be converted in handler)
+        const validRoles = ['EXAM_CREATOR', 'CANDIDATE', 'TENANT_ADMIN', 'ORG_ADMIN', 'INSTITUTE_ADMIN', 'ADMIN', 'DESIGNER', 'TEACHER', 'USER', 'STUDENT'];
+        return validRoles.includes(value);
+      })
+      .withMessage('Invalid role'),
     body('status').optional().isIn(['ACTIVE', 'INACTIVE', 'SUSPENDED', 'BLOCKED']),
-    body('organizationId')
+    body('tenantId')
       .optional({ checkFalsy: true })
       .custom((value) => {
         if (!value || value === '') return true; // Allow empty string/null
         return /^[0-9a-fA-F]{24}$/.test(value); // MongoDB ObjectId format
       })
-      .withMessage('Valid organization ID is required if provided'),
-    body('instituteId')
-      .optional({ checkFalsy: true })
-      .custom((value) => {
-        if (!value || value === '') return true; // Allow empty string/null
-        return /^[0-9a-fA-F]{24}$/.test(value); // MongoDB ObjectId format
-      })
-      .withMessage('Valid institute ID is required if provided'),
+      .withMessage('Valid tenant ID is required if provided'),
   ],
   async (req, res, next) => {
     try {
@@ -688,7 +521,7 @@ router.put(
         return res.status(403).json({ error: 'Cannot modify SUPER_ADMIN user' });
       }
 
-      const { name, email, password, role, organizationId, instituteId, status, mobile, college, degree, branch } = req.body;
+      const { name, email, password, role, tenantId, status, mobile } = req.body;
 
       if (name) user.name = name;
       if (email) {
@@ -700,65 +533,48 @@ router.put(
         user.email = email;
       }
       if (password) user.password = password; // Will be hashed by pre-save hook
-      if (role) {
-        // Map legacy roles to new roles
-        const roleMapping = {
-          'ADMIN': 'INSTITUTE_ADMIN',
-          'DESIGNER': 'TEACHER',
-        };
-        user.role = roleMapping[role] || role;
-      }
-      // Normalize empty strings to null
-      const normalizedOrgId = organizationId !== undefined 
-        ? (organizationId && organizationId.trim() !== '' ? organizationId : null)
-        : undefined;
-      const normalizedInstId = instituteId !== undefined
-        ? (instituteId && instituteId.trim() !== '' ? instituteId : null)
-        : undefined;
-
-      if (normalizedOrgId !== undefined) {
-        if (normalizedOrgId) {
-          const org = await Organization.findById(normalizedOrgId);
-          if (!org) {
-            return res.status(404).json({ error: 'Organization not found' });
-          }
-          user.organizationId = normalizedOrgId;
-          // Clear institute when assigning to organization (mutually exclusive)
-          user.instituteId = null;
-        } else {
-          // Setting to null explicitly
-          user.organizationId = null;
+      
+      // Handle role: convert old roles to new roles
+      if (role !== undefined) {
+        // Convert role if it's an old role, otherwise use the provided role
+        const convertedRole = convertRole(role);
+        user.role = convertedRole;
+      } else {
+        // No role provided in request - check if current role needs conversion
+        const currentRole = user.role;
+        const convertedCurrentRole = convertRole(currentRole);
+        if (convertedCurrentRole !== currentRole) {
+          // User has an old role, convert it automatically
+          user.role = convertedCurrentRole;
         }
       }
-      if (normalizedInstId !== undefined) {
-        if (normalizedInstId) {
-          const inst = await Institute.findById(normalizedInstId);
-          if (!inst) {
-            return res.status(404).json({ error: 'Institute not found' });
+      // Normalize empty strings to null
+      const normalizedTenantId = tenantId !== undefined 
+        ? (tenantId && tenantId.trim() !== '' ? tenantId : null)
+        : undefined;
+
+      if (normalizedTenantId !== undefined) {
+        if (normalizedTenantId) {
+          const tenant = await Tenant.findById(normalizedTenantId);
+          if (!tenant) {
+            return res.status(404).json({ error: 'Tenant not found' });
           }
-          // Note: Organization and Institute are equal level, so no need to check organizationId match
-          user.instituteId = normalizedInstId;
-          // Clear organization when assigning to institute (mutually exclusive)
-          user.organizationId = null;
+          user.tenantId = normalizedTenantId;
         } else {
           // Setting to null explicitly
-          user.instituteId = null;
+          user.tenantId = null;
         }
       }
       if (status) user.status = status;
       if (mobile !== undefined) user.mobile = mobile;
-      if (college !== undefined) user.college = college;
-      if (degree !== undefined) user.degree = degree;
-      if (branch !== undefined) user.branch = branch;
 
       await user.save();
       const userObj = user.toObject();
       delete userObj.password;
 
-      await user.populate('organizationId', 'name code');
-      await user.populate('instituteId', 'name code');
+      await user.populate('tenantId', 'name code type');
 
-      res.json({ user: { ...userObj, organizationId: user.organizationId, instituteId: user.instituteId } });
+      res.json({ user: { ...userObj, tenantId: user.tenantId } });
     } catch (error) {
       next(error);
     }
@@ -802,12 +618,11 @@ router.post(
 // List all exams (with filters)
 router.get('/exams', async (req, res, next) => {
   try {
-    const { page = 1, limit = 20, organizationId, instituteId, createdBy, isActive, search } = req.query;
+    const { page = 1, limit = 20, tenantId, createdBy, isActive, search } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
     const filter = {};
-    if (organizationId) filter.organizationId = organizationId;
-    if (instituteId) filter.instituteId = instituteId;
+    if (tenantId) filter.tenantId = tenantId;
     if (createdBy) filter.createdBy = createdBy;
     if (isActive !== undefined) filter.isActive = isActive === 'true';
     if (search) {
@@ -819,8 +634,7 @@ router.get('/exams', async (req, res, next) => {
 
     const [exams, total] = await Promise.all([
       Exam.find(filter)
-        .populate('organizationId', 'name code')
-        .populate('instituteId', 'name code')
+        .populate('tenantId', 'name code type')
         .populate('createdBy', 'name email role')
         .sort({ createdAt: -1 })
         .skip(skip)
@@ -866,19 +680,25 @@ router.put('/exams/:examId/disable', async (req, res, next) => {
 // List all exam attempts (with filters)
 router.get('/attempts', async (req, res, next) => {
   try {
-    const { page = 1, limit = 20, organizationId, instituteId, examId, userId, isCompleted } = req.query;
+    const { page = 1, limit = 20, tenantId, examId, userId, isCompleted } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
     const filter = {};
-    if (organizationId) filter.organizationId = organizationId;
-    if (instituteId) filter.instituteId = instituteId;
+    if (tenantId) filter.tenantId = tenantId;
     if (examId) filter.examId = examId;
     if (userId) filter.userId = userId;
     if (isCompleted !== undefined) filter.isCompleted = isCompleted === 'true';
 
     const [attempts, total] = await Promise.all([
       ExamAttempt.find(filter)
-        .populate('examId', 'title organizationId instituteId')
+        .populate({
+          path: 'examId',
+          select: 'title tenantId',
+          populate: {
+            path: 'tenantId',
+            select: 'name code type'
+          }
+        })
         .populate('userId', 'name email role')
         .populate('sessionId', 'startTime endTime')
         .sort({ createdAt: -1 })

@@ -63,15 +63,10 @@ const ExamSessionSchema = new mongoose.Schema(
         message: 'End time must be after start time',
       },
     },
-    // Multi-tenant fields (inherited from exam, but stored for performance)
-    organizationId: {
+    // Tenant field (inherited from exam, but stored for performance)
+    tenantId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: 'Organization',
-      index: true,
-    },
-    instituteId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Institute',
+      ref: 'Tenant',
       index: true,
     },
     createdBy: {
@@ -115,30 +110,31 @@ ExamSessionSchema.pre('validate', async function (next) {
   next();
 });
 
-// Validate: Session must belong to EITHER organization OR institute (same as exam)
+// Validate: Session tenantId will be inherited from exam
+// Allow null initially - will be populated from exam
 ExamSessionSchema.pre('save', function (next) {
-  const hasOrg = !!this.organizationId;
-  const hasInst = !!this.instituteId;
-  
-  // Both can be null initially (will be set from exam)
-  if (!hasOrg && !hasInst) {
-    // Allow null initially - will be populated from exam
-    return next();
-  }
-  
-  if (hasOrg && hasInst) {
-    return next(new Error('Session cannot belong to both Organization and Institute. Choose one.'));
-  }
-  
+  // tenantId can be null initially - will be set from exam
   next();
 });
 
+// Single field indexes
 ExamSessionSchema.index({ uniqueId: 1 });
+ExamSessionSchema.index({ tenantId: 1 });
+ExamSessionSchema.index({ qrCode: 1 });
+ExamSessionSchema.index({ manualToken: 1 });
+
+// Compound indexes for common query patterns
+// For exam sessions: { examId, createdAt }
 ExamSessionSchema.index({ examId: 1, createdAt: -1 });
+
+// For active sessions query: { isActive, startTime, endTime }
 ExamSessionSchema.index({ isActive: 1, startTime: 1, endTime: 1 });
-ExamSessionSchema.index({ organizationId: 1 });
-ExamSessionSchema.index({ instituteId: 1 });
-ExamSessionSchema.index({ instituteId: 1, isActive: 1 });
+
+// For tenant-scoped active sessions: { tenantId, isActive }
+ExamSessionSchema.index({ tenantId: 1, isActive: 1 });
+
+// For time-based queries: { startTime, endTime }
+ExamSessionSchema.index({ startTime: 1, endTime: 1 });
 
 const ExamSession = mongoose.model('ExamSession', ExamSessionSchema);
 

@@ -2,10 +2,14 @@ import express from 'express';
 import Exam from '../models/Exam.js';
 import ExamAttempt from '../models/ExamAttempt.js';
 import Answer from '../models/Answer.js';
+import ExamParticipant from '../models/ExamParticipant.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole, requireOwnershipOrAdmin } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
+import { ensureExamParticipant } from '../middleware/examPermissions.js';
 import { body, validationResult } from 'express-validator';
+import { sanitizePagination } from '../middleware/validation.js';
+import { auditLog, AUDIT_ACTIONS } from '../middleware/audit.js';
 import {
   loadCertificateTemplate,
   applyCertificateTemplate,
@@ -15,42 +19,81 @@ import { ensureScoreSummary } from '../utils/attemptScores.js';
 
 const router = express.Router();
 
-// Get all exams (filtered by role and tenant)
-router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
+// Get all exams (filtered by exam permissions and tenant)
+// Universal: Shows exams based on exam context roles, not user system role
+router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, sanitizePagination, async (req, res, next) => {
   try {
-    const { page = 1, limit = 20, isActive } = req.query;
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const { page, limit, isActive, filterBy } = req.query;
+    const skip = (page - 1) * limit;
 
-    const filter = { ...req.tenantFilter };
+    let filter = { ...req.tenantFilter };
     
-    // Students only see active exams
-    if (req.user.role === 'STUDENT') {
-      filter.isActive = true;
-    } else if (isActive !== undefined) {
-      filter.isActive = isActive === 'true';
+    // SUPER_ADMIN, TENANT_ADMIN, and EXAM_CREATOR see all exams in their scope
+    if (req.user.role === 'SUPER_ADMIN' || req.user.role === 'TENANT_ADMIN' || req.user.role === 'EXAM_CREATOR') {
+      if (isActive !== undefined) {
+        filter.isActive = isActive === 'true';
+      }
+    } else {
+      // Regular users see exams based on their exam context roles
+      // Get all ExamParticipant records for this user
+      const participants = await ExamParticipant.find({ userId: req.user._id })
+        .select('examId examRole')
+        .lean();
+      
+      const examIds = participants.map(p => p.examId);
+      
+      if (filterBy === 'created') {
+        // Show only exams user created (CREATOR role)
+        const creatorExamIds = participants
+          .filter(p => p.examRole === 'CREATOR')
+          .map(p => p.examId);
+        filter._id = { $in: creatorExamIds };
+      } else if (filterBy === 'canAttempt') {
+        // Show only exams user can attempt (CANDIDATE role)
+        const candidateExamIds = participants
+          .filter(p => p.examRole === 'CANDIDATE')
+          .map(p => p.examId);
+        filter._id = { $in: candidateExamIds };
+        filter.isActive = true; // Only active exams can be attempted
+      } else if (filterBy === 'canEvaluate') {
+        // Show only exams user can evaluate (EVALUATOR role)
+        const evaluatorExamIds = participants
+          .filter(p => p.examRole === 'EVALUATOR')
+          .map(p => p.examId);
+        filter._id = { $in: evaluatorExamIds };
+      } else {
+        // Default: show all exams user has any role in
+        if (examIds.length > 0) {
+          filter._id = { $in: examIds };
+          // For candidates, only show active exams
+          const candidateExamIds = participants
+            .filter(p => p.examRole === 'CANDIDATE')
+            .map(p => p.examId);
+          if (candidateExamIds.length > 0 && examIds.every(id => candidateExamIds.includes(id))) {
+            filter.isActive = true;
+          }
+        } else {
+          // User has no exam roles, return empty
+          filter._id = { $in: [] };
+        }
+      }
     }
-
-    // Designers/Teachers see their own exams, Admins (ORG_ADMIN, INSTITUTE_ADMIN) see all in their tenant
-    if (['DESIGNER', 'TEACHER'].includes(req.user.role)) {
-      filter.createdBy = req.user._id;
-    }
-    // ORG_ADMIN and INSTITUTE_ADMIN see all exams in their tenant (already filtered by tenantFilter)
 
     const exams = await Exam.find(filter)
       .populate('createdBy', 'name email')
       .sort({ createdAt: -1 })
       .skip(skip)
-      .limit(parseInt(limit));
+      .limit(limit);
 
     const total = await Exam.countDocuments(filter);
 
     res.json({
       exams,
       pagination: {
-        page: parseInt(page),
-        limit: parseInt(limit),
+        page,
+        limit,
         total,
-        pages: Math.ceil(total / parseInt(limit)),
+        pages: Math.ceil(total / limit),
       },
     });
   } catch (error) {
@@ -59,6 +102,7 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
 });
 
 // Get single exam
+// Universal: Access based on exam permissions, not user role
 router.get('/:examId', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
     const exam = await Exam.findById(req.params.examId).populate(
@@ -70,19 +114,34 @@ router.get('/:examId', requireAuth, requireTenant, enforceTenantBoundaries, asyn
       return res.status(404).json({ error: 'Exam not found' });
     }
 
-    // Verify tenant access (students and admins can only access exams from their tenant)
-    if (req.user.role !== 'SUPER_ADMIN') {
-      const userTenantId = req.user.organizationId || req.user.instituteId;
-      const examTenantId = exam.organizationId || exam.instituteId;
+    // SUPER_ADMIN, TENANT_ADMIN, and EXAM_CREATOR can access all exams in their scope
+    if (req.user.role === 'SUPER_ADMIN') {
+      return res.json({ exam });
+    }
+
+    if (req.user.role === 'TENANT_ADMIN' || req.user.role === 'EXAM_CREATOR') {
+      const userTenantId = req.user.tenantId;
+      const examTenantId = exam.tenantId;
       
-      if (!examTenantId || examTenantId.toString() !== userTenantId?.toString()) {
-        return res.status(403).json({ error: 'Exam not found or access denied' });
+      if (userTenantId && examTenantId && userTenantId.toString() === examTenantId.toString()) {
+        return res.json({ exam });
       }
     }
 
-    // Students can only see active exams
-    if (req.user.role === 'STUDENT' && !exam.isActive) {
-      return res.status(403).json({ error: 'Exam not available' });
+    // Regular users: check exam permissions
+    const { hasExamPermission } = await import('../middleware/examPermissions.js');
+    const hasViewResults = await hasExamPermission(req.user._id, exam._id, 'VIEW_RESULTS');
+    const hasAttemptExam = await hasExamPermission(req.user._id, exam._id, 'ATTEMPT_EXAM');
+    const hasCreateSession = await hasExamPermission(req.user._id, exam._id, 'CREATE_SESSION');
+
+    // User must have at least one permission to view exam
+    if (!hasViewResults && !hasAttemptExam && !hasCreateSession) {
+      return res.status(403).json({ error: 'You do not have access to this exam' });
+    }
+
+    // Candidates can only see active exams
+    if (hasAttemptExam && !hasCreateSession && !exam.isActive) {
+      return res.status(403).json({ error: 'Exam is not currently available' });
     }
 
     res.json({ exam });
@@ -91,12 +150,24 @@ router.get('/:examId', requireAuth, requireTenant, enforceTenantBoundaries, asyn
   }
 });
 
-// Create exam (DESIGNER/ADMIN only)
+/**
+ * Create exam - Only EXAM_CREATOR can create exams
+ * 
+ * Simple flow:
+ * 1. User must be EXAM_CREATOR role
+ * 2. User must belong to a tenant (except SUPER_ADMIN)
+ * 3. Exam is created with user's tenantId
+ * 4. ExamParticipant record is auto-created with CREATOR role
+ */
 router.post(
   '/',
   requireAuth,
   requireTenant, // Ensure user belongs to a tenant (except SUPER_ADMIN)
-  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can create exams
+  auditLog(AUDIT_ACTIONS.EXAM_CREATED, (req, res) => ({
+    examTitle: req.body.title,
+    examId: res.locals.examId, // Will be set after creation
+  })),
   [
     body('title').trim().notEmpty().withMessage('Title is required'),
     body('duration').isInt({ min: 1 }).withMessage('Duration must be a positive number'),
@@ -143,20 +214,26 @@ router.post(
         createdBy: req.user._id,
       };
 
-      // Set tenant IDs: user belongs to EITHER organization OR institute (not both)
-      if (req.user.role !== 'SUPER_ADMIN') {
-        if (req.user.organizationId) {
-          examData.organizationId = req.user.organizationId;
-          examData.instituteId = null;
-        } else if (req.user.instituteId) {
-          examData.instituteId = req.user.instituteId;
-          examData.organizationId = null;
-        }
+      // Set tenant ID
+      if (req.user.role !== 'SUPER_ADMIN' && req.user.tenantId) {
+        examData.tenantId = req.user.tenantId;
       }
 
       const exam = new Exam(examData);
       await exam.save();
       await exam.populate('createdBy', 'name email');
+
+      // UNIVERSAL: Auto-create ExamParticipant with CREATOR role
+      // This enables exam-context permissions instead of role-based assumptions
+      await ensureExamParticipant(
+        req.user._id,
+        exam._id,
+        'CREATOR',
+        req.user._id
+      );
+
+      // Store exam ID for audit log
+      res.locals.examId = exam._id.toString();
 
       res.status(201).json({ exam });
     } catch (error) {
@@ -165,13 +242,14 @@ router.post(
   }
 );
 
-// Update exam (DESIGNER own/ADMIN/ORG_ADMIN/INSTITUTE_ADMIN)
+// Update exam - Only EXAM_CREATOR who owns the exam or SUPER_ADMIN can update
+// Simple permission: EXAM_CREATOR can update their own exams within their tenant
 router.put(
   '/:examId',
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireOwnershipOrAdmin,
+  requireOwnershipOrAdmin, // Checks EXAM_CREATOR ownership or SUPER_ADMIN
   [
     body('title').optional().trim().notEmpty(),
     body('duration').optional().isInt({ min: 1 }),
@@ -236,6 +314,9 @@ router.delete(
   requireTenant,
   enforceTenantBoundaries,
   requireOwnershipOrAdmin,
+  auditLog(AUDIT_ACTIONS.EXAM_DELETED, (req) => ({
+    examId: req.params.examId,
+  })),
   async (req, res, next) => {
     try {
       const exam = await Exam.findById(req.params.examId);
@@ -258,6 +339,9 @@ router.post(
   requireTenant,
   enforceTenantBoundaries,
   requireOwnershipOrAdmin,
+  auditLog(AUDIT_ACTIONS.EXAM_RESULTS_RELEASED, (req) => ({
+    examId: req.params.examId,
+  })),
   async (req, res, next) => {
     try {
       const exam = await Exam.findById(req.params.examId);
@@ -322,7 +406,7 @@ router.post(
           const issuedTimestamp = attemptDate ? attemptDate : new Date();
 
           const context = {
-            studentName: attempt.userId?.name || 'Student',
+            studentName: attempt.userId?.name || 'Candidate', // Universal: Changed from 'Student' to 'Candidate'
             examTitle,
             attemptDate: attemptDate ? attemptDate.toLocaleDateString() : '',
             issuedOn: issuedTimestamp.toLocaleDateString(),
@@ -358,7 +442,7 @@ router.post(
 
       res.json({
         success: true,
-        message: `Certificates processed for ${certificateResults.length} student(s)`,
+        message: `Certificates processed for ${certificateResults.length} candidate(s)`, // Universal: Changed from 'student(s)' to 'candidate(s)'
         count: certificateResults.length,
         certificates: certificateResults,
         exam: {
@@ -374,4 +458,5 @@ router.post(
 );
 
 export default router;
+
 

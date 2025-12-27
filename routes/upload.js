@@ -27,36 +27,105 @@ const storage = multer.diskStorage({
   },
 });
 
+// Allowed file extensions and their corresponding MIME types
+const ALLOWED_DOC_EXTENSIONS = ['.pdf', '.txt', '.doc', '.docx'];
+const ALLOWED_DOC_MIMETYPES = [
+  'application/pdf',
+  'text/plain',
+  'application/msword',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+];
+
+// Sanitize filename to prevent path traversal and other attacks
+const sanitizeFilename = (filename) => {
+  if (!filename || typeof filename !== 'string') {
+    return 'file';
+  }
+  
+  // Remove path components
+  const basename = path.basename(filename);
+  
+  // Remove or replace dangerous characters
+  const sanitized = basename
+    .replace(/[^a-zA-Z0-9._-]/g, '_') // Replace non-alphanumeric (except . _ -) with _
+    .replace(/^\.+/, '') // Remove leading dots
+    .replace(/\.{2,}/g, '.') // Replace multiple dots with single dot
+    .substring(0, 255); // Limit length
+  
+  return sanitized || 'file';
+};
+
 const docUpload = multer({
   storage,
   limits: {
     fileSize: 10 * 1024 * 1024, // 10MB
+    files: 1, // Only allow single file
   },
   fileFilter: (req, file, cb) => {
-    const allowedTypes = [
-      'application/pdf',
-      'text/plain',
-      'application/msword',
-      'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    ];
-    if (allowedTypes.includes(file.mimetype)) {
-      cb(null, true);
-    } else {
-      cb(new Error('Invalid file type. Only PDF, TXT, and DOC files are allowed.'));
+    if (!file || !file.originalname) {
+      return cb(new Error('Invalid file'));
     }
+    
+    // Get file extension
+    const ext = path.extname(file.originalname).toLowerCase();
+    
+    // Validate extension
+    if (!ALLOWED_DOC_EXTENSIONS.includes(ext)) {
+      return cb(new Error(`Invalid file extension. Allowed: ${ALLOWED_DOC_EXTENSIONS.join(', ')}`));
+    }
+    
+    // Validate MIME type (but don't rely solely on it)
+    if (!ALLOWED_DOC_MIMETYPES.includes(file.mimetype)) {
+      // Warn but allow if extension is valid (mimetype can be spoofed)
+      console.warn(`MIME type mismatch for file ${file.originalname}: ${file.mimetype}`);
+    }
+    
+    // Sanitize filename
+    file.originalname = sanitizeFilename(file.originalname);
+    
+    cb(null, true);
   },
 });
+
+// Error handler for multer errors
+const handleMulterError = (err, req, res, next) => {
+  if (err && err.code && err.code.startsWith('LIMIT_')) {
+    if (err.code === 'LIMIT_FILE_SIZE') {
+      return res.status(400).json({ error: 'File too large. Maximum size is 10MB for documents, 5MB for images.' });
+    }
+    if (err.code === 'LIMIT_FILE_COUNT') {
+      return res.status(400).json({ error: 'Too many files. Only one file allowed per upload.' });
+    }
+    return res.status(400).json({ error: `Upload error: ${err.message}` });
+  }
+  if (err) {
+    return res.status(400).json({ error: err.message || 'File upload failed' });
+  }
+  next();
+};
 
 // Upload and extract text content
 router.post(
   '/content',
   requireAuth,
-  requireRole('DESIGNER', 'ADMIN'),
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can upload files
   docUpload.single('file'),
+  handleMulterError,
   async (req, res, next) => {
     try {
       if (!req.file) {
         return res.status(400).json({ error: 'No file uploaded' });
+      }
+      
+      // Additional validation: check file actually exists and has content
+      try {
+        const stats = await fs.stat(req.file.path);
+        if (stats.size === 0) {
+          await fs.unlink(req.file.path);
+          return res.status(400).json({ error: 'Uploaded file is empty' });
+        }
+      } catch (statError) {
+        return res.status(400).json({ error: 'Failed to validate uploaded file' });
       }
 
       const filePath = req.file.path;
@@ -100,17 +169,48 @@ router.post(
   }
 );
 
+// Allowed image extensions
+const ALLOWED_IMAGE_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp', '.svg'];
+const ALLOWED_IMAGE_MIMETYPES = [
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+  'image/bmp',
+  'image/svg+xml',
+];
+
 const imageUpload = multer({
   storage,
   limits: {
     fileSize: 5 * 1024 * 1024, // 5MB
+    files: 1, // Only allow single file
   },
   fileFilter: (req, file, cb) => {
-    if (file.mimetype && file.mimetype.startsWith('image/')) {
-      cb(null, true);
-    } else {
-      cb(new Error('Invalid file type. Only image files are allowed.'));
+    if (!file || !file.originalname) {
+      return cb(new Error('Invalid file'));
     }
+    
+    // Get file extension
+    const ext = path.extname(file.originalname).toLowerCase();
+    
+    // Validate extension
+    if (!ALLOWED_IMAGE_EXTENSIONS.includes(ext)) {
+      return cb(new Error(`Invalid image extension. Allowed: ${ALLOWED_IMAGE_EXTENSIONS.join(', ')}`));
+    }
+    
+    // Validate MIME type
+    if (!file.mimetype || !file.mimetype.startsWith('image/')) {
+      // Check if it's in our allowed list
+      if (!ALLOWED_IMAGE_MIMETYPES.includes(file.mimetype)) {
+        console.warn(`MIME type mismatch for image ${file.originalname}: ${file.mimetype}`);
+      }
+    }
+    
+    // Sanitize filename
+    file.originalname = sanitizeFilename(file.originalname);
+    
+    cb(null, true);
   },
 });
 
@@ -139,12 +239,24 @@ const buildPublicUrl = (req, filename) => {
 router.post(
   '/image',
   requireAuth,
-  requireRole('DESIGNER', 'ADMIN'),
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can upload files
   imageUpload.single('image'),
+  handleMulterError,
   async (req, res, next) => {
     try {
       if (!req.file) {
         return res.status(400).json({ error: 'No image uploaded' });
+      }
+      
+      // Additional validation: check file actually exists and has content
+      try {
+        const stats = await fs.stat(req.file.path);
+        if (stats.size === 0) {
+          await fs.unlink(req.file.path);
+          return res.status(400).json({ error: 'Uploaded image is empty' });
+        }
+      } catch (statError) {
+        return res.status(400).json({ error: 'Failed to validate uploaded image' });
       }
 
       const fileName = req.file.filename;

@@ -5,6 +5,7 @@ import QuestionPaper from '../models/QuestionPaper.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
+import { hasExamPermission, ensureExamParticipant } from '../middleware/examPermissions.js';
 import { body, validationResult } from 'express-validator';
 import { generateSessionQRCode } from '../services/qrService.js';
 import { assignQuestionPaperToStudent } from '../services/sessionAssignment.js';
@@ -41,15 +42,14 @@ const validateSessionAvailability = async (session, user) => {
     return { valid: false, message: 'Session has ended' };
   }
 
-  if (user.role === 'STUDENT') {
-    const SystemConfig = (await import('../models/SystemConfig.js')).default;
-    const blockedConfig = await SystemConfig.findOne({
-      key: `blocked_student_${user._id}`,
-    });
+  // Universal: Check if user is blocked (changed from blocked_student_ to blocked_user_)
+  const SystemConfig = (await import('../models/SystemConfig.js')).default;
+  const blockedConfig = await SystemConfig.findOne({
+    key: `blocked_user_${user._id}`, // Universal: changed from blocked_student_
+  });
 
-    if (blockedConfig && blockedConfig.value === 'true') {
-      return { valid: false, message: 'Your account has been blocked' };
-    }
+  if (blockedConfig && blockedConfig.value === 'true') {
+    return { valid: false, message: 'Your account has been blocked' };
   }
 
   return { valid: true };
@@ -71,16 +71,37 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
       filter.isActive = isActive === 'true';
     }
 
-    // Students only see active sessions
-    if (req.user.role === 'STUDENT') {
-      filter.isActive = true;
-      const now = new Date();
-      filter.startTime = { $lte: now };
-      filter.endTime = { $gte: now };
-    } else if (req.user.role === 'DESIGNER') {
-      // Designers see sessions for their exams
-      const exams = await Exam.find({ createdBy: req.user._id });
-      filter.examId = { $in: exams.map((e) => e._id) };
+    // Filter based on exam permissions
+    if (req.user.role === 'SUPER_ADMIN' || req.user.role === 'EXAM_CREATOR') {
+      // Admins see all sessions in their scope
+      if (isActive !== undefined) {
+        filter.isActive = isActive === 'true';
+      }
+    } else {
+      // Regular users: check exam permissions
+      const ExamParticipant = (await import('../models/ExamParticipant.js')).default;
+      const participants = await ExamParticipant.find({ userId: req.user._id })
+        .select('examId examRole')
+        .lean();
+      
+      const examIds = participants.map(p => p.examId);
+      
+      if (examIds.length > 0) {
+        filter.examId = { $in: examIds };
+        // Candidates only see active sessions they can attempt
+        const candidateExamIds = participants
+          .filter(p => p.examRole === 'CANDIDATE')
+          .map(p => p.examId);
+        if (candidateExamIds.length > 0 && examIds.every(id => candidateExamIds.includes(id))) {
+          filter.isActive = true;
+          const now = new Date();
+          filter.startTime = { $lte: now };
+          filter.endTime = { $gte: now };
+        }
+      } else {
+        // User has no exam roles, return empty
+        filter.examId = { $in: [] };
+      }
     }
 
     const sessions = await ExamSession.find(filter)
@@ -124,8 +145,12 @@ router.get('/:sessionId', requireAuth, requireTenant, enforceTenantBoundaries, a
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    // For students, only show if active and within time
-    if (req.user.role === 'STUDENT') {
+    // Universal: Check exam permissions
+    const canAttempt = await hasExamPermission(req.user._id, session.examId._id, 'ATTEMPT_EXAM');
+    const canCreateSession = await hasExamPermission(req.user._id, session.examId._id, 'CREATE_SESSION');
+    
+    // For candidates, only show if active and within time
+    if (canAttempt && !canCreateSession) {
       const now = new Date();
       if (!session.isActive || now < session.startTime || now > session.endTime) {
         return res.status(403).json({ error: 'Session not available' });
@@ -133,7 +158,8 @@ router.get('/:sessionId', requireAuth, requireTenant, enforceTenantBoundaries, a
     }
 
     let assignment = null;
-    if (req.user.role === 'STUDENT') {
+    // Only assign question paper if user can attempt the exam
+    if (canAttempt) {
       await session.populate('questionPaperIds', 'setName');
       const result = await assignQuestionPaperToStudent({
         session,
@@ -151,12 +177,20 @@ router.get('/:sessionId', requireAuth, requireTenant, enforceTenantBoundaries, a
   }
 });
 
-// Create session (DESIGNER/ADMIN/TEACHER)
+/**
+ * Create session - Only EXAM_CREATOR can create sessions
+ * 
+ * Simple flow:
+ * 1. User must be EXAM_CREATOR role
+ * 2. User must belong to a tenant (except SUPER_ADMIN)
+ * 3. Session inherits tenantId from exam
+ * 4. QR code and manual token are generated
+ */
 router.post(
   '/',
   requireAuth,
   requireTenant,
-  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN'),
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can create sessions
   [
     body('examId').notEmpty().withMessage('Exam ID is required'),
     body('questionPaperId').optional().isMongoId(),
@@ -186,17 +220,20 @@ router.post(
 
       const normalizedMode = distributionMode || 'single';
 
-      // Verify exam exists
+      // Verify exam exists and user has CREATE_SESSION permission
       const exam = await Exam.findById(examId);
       if (!exam) {
         return res.status(404).json({ error: 'Exam not found' });
       }
 
-      // Inherit tenant IDs from exam (Organization OR Institute, not both)
-      const tenantData = {
-        organizationId: exam.organizationId || null,
-        instituteId: exam.instituteId || null,
-      };
+      // Check if user has CREATE_SESSION permission for this exam
+      const canCreateSession = await hasExamPermission(req.user._id, examId, 'CREATE_SESSION');
+      if (!canCreateSession && req.user.role !== 'SUPER_ADMIN' && req.user.role !== 'EXAM_CREATOR') {
+        return res.status(403).json({ error: 'You do not have permission to create sessions for this exam' });
+      }
+
+      // Inherit tenant ID from exam
+      const tenantId = exam.tenantId || null;
 
       let selectedPaperIds = Array.isArray(questionPaperIds)
         ? questionPaperIds.map((id) => id.toString())
@@ -256,9 +293,8 @@ router.post(
         startTime: start,
         endTime: end,
         createdBy: req.user._id,
-        // Inherit tenant IDs from exam
-        organizationId: tenantData.organizationId,
-        instituteId: tenantData.instituteId,
+        // Inherit tenant ID from exam
+        tenantId: tenantId,
       });
 
       const requestOrigin =
@@ -310,13 +346,25 @@ router.get('/validate/:qrCode', requireAuth, async (req, res, next) => {
       return res.json({ valid: false, message: validation.message });
     }
 
-    let assignment = null;
-    if (req.user.role === 'STUDENT') {
-      assignment = await assignQuestionPaperToStudent({
-        session,
-        userId: req.user._id,
-      });
+    // UNIVERSAL: Check exam permission and create ExamParticipant if needed
+    const canAttempt = await hasExamPermission(req.user._id, session.examId._id, 'ATTEMPT_EXAM');
+    if (!canAttempt) {
+      // User doesn't have permission yet - create ExamParticipant with CANDIDATE role
+      // This happens when user scans QR or enters token
+      await ensureExamParticipant(
+        req.user._id,
+        session.examId._id,
+        'CANDIDATE',
+        req.user._id
+      );
     }
+
+    let assignment = null;
+    // Assign question paper if user can attempt (now they have CANDIDATE role)
+    assignment = await assignQuestionPaperToStudent({
+      session,
+      userId: req.user._id,
+    });
 
     res.json({
       valid: true,
@@ -350,13 +398,25 @@ router.get('/manual-token/:token', requireAuth, async (req, res, next) => {
       return res.json({ valid: false, message: validation.message });
     }
 
-    let assignment = null;
-    if (req.user.role === 'STUDENT') {
-      assignment = await assignQuestionPaperToStudent({
-        session,
-        userId: req.user._id,
-      });
+    // UNIVERSAL: Check exam permission and create ExamParticipant if needed
+    const canAttempt = await hasExamPermission(req.user._id, session.examId._id, 'ATTEMPT_EXAM');
+    if (!canAttempt) {
+      // User doesn't have permission yet - create ExamParticipant with CANDIDATE role
+      // This happens when user scans QR or enters token
+      await ensureExamParticipant(
+        req.user._id,
+        session.examId._id,
+        'CANDIDATE',
+        req.user._id
+      );
     }
+
+    let assignment = null;
+    // Assign question paper if user can attempt (now they have CANDIDATE role)
+    assignment = await assignQuestionPaperToStudent({
+      session,
+      userId: req.user._id,
+    });
 
     res.json({
       valid: true,

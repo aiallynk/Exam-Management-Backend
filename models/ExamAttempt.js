@@ -33,16 +33,10 @@ const ExamAttemptSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
-    // Multi-tenant fields (inherited from exam, but stored for performance)
-    // Attempt belongs to EITHER organizationId OR instituteId (same as exam)
-    organizationId: {
+    // Tenant field (inherited from exam, but stored for performance)
+    tenantId: {
       type: mongoose.Schema.Types.ObjectId,
-      ref: 'Organization',
-      index: true,
-    },
-    instituteId: {
-      type: mongoose.Schema.Types.ObjectId,
-      ref: 'Institute',
+      ref: 'Tenant',
       index: true,
     },
     startTime: {
@@ -120,30 +114,34 @@ ExamAttemptSchema.pre('validate', async function (next) {
   next();
 });
 
-// Validate: Attempt must belong to EITHER organization OR institute (same as exam)
+// Validate: Attempt tenantId will be inherited from exam
+// Allow null initially - will be populated from exam
 ExamAttemptSchema.pre('save', function (next) {
-  const hasOrg = !!this.organizationId;
-  const hasInst = !!this.instituteId;
-  
-  // Both can be null initially (will be set from exam)
-  if (!hasOrg && !hasInst) {
-    // Allow null initially - will be populated from exam
-    return next();
-  }
-  
-  if (hasOrg && hasInst) {
-    return next(new Error('Attempt cannot belong to both Organization and Institute. Choose one.'));
-  }
-  
+  // tenantId can be null initially - will be set from exam
   next();
 });
 
+// Single field indexes
 ExamAttemptSchema.index({ uniqueId: 1 });
 ExamAttemptSchema.index({ userId: 1, createdAt: -1 });
-ExamAttemptSchema.index({ sessionId: 1, userId: 1 });
-ExamAttemptSchema.index({ organizationId: 1 });
-ExamAttemptSchema.index({ instituteId: 1 });
-ExamAttemptSchema.index({ instituteId: 1, userId: 1 });
+ExamAttemptSchema.index({ tenantId: 1 });
+
+// Compound indexes for common query patterns
+// For checking max attempts: { userId, examId, isCompleted }
+ExamAttemptSchema.index({ userId: 1, examId: 1, isCompleted: 1 });
+
+// For finding active attempts: { userId, sessionId, isCompleted }
+ExamAttemptSchema.index({ userId: 1, sessionId: 1, isCompleted: 1 });
+
+// For tenant-scoped queries: { tenantId, createdAt }
+ExamAttemptSchema.index({ tenantId: 1, createdAt: -1 });
+ExamAttemptSchema.index({ tenantId: 1, userId: 1 });
+
+// For results queries: { examId, isCompleted, isDisqualified }
+ExamAttemptSchema.index({ examId: 1, isCompleted: 1, isDisqualified: 1 });
+
+// For session queries: { sessionId, isCompleted }
+ExamAttemptSchema.index({ sessionId: 1, isCompleted: 1 });
 
 export default mongoose.model('ExamAttempt', ExamAttemptSchema);
 

@@ -46,13 +46,13 @@ router.get('/:examId/question-papers/:paperId/questions', requireAuth, requireTe
   }
 });
 
-// Create question (DESIGNER/ADMIN/TEACHER/ORG_ADMIN/INSTITUTE_ADMIN)
+// Create question (requires CREATE_SESSION permission or EXAM_CREATOR)
 router.post(
   '/:examId/questions',
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can create questions
   requireOwnershipOrAdmin,
   [
     body('questionText').trim().notEmpty().withMessage('Question text is required'),
@@ -92,11 +92,11 @@ router.post(
       }
 
       if (req.user.role !== 'SUPER_ADMIN') {
-        const userTenantId = req.user.organizationId || req.user.instituteId;
-        const examTenantId = exam.organizationId || exam.instituteId;
+        const userTenantId = req.user.tenantId;
+        const examTenantId = exam.tenantId;
         
         if (!examTenantId || examTenantId.toString() !== userTenantId?.toString()) {
-          return res.status(403).json({ error: 'Access denied - Exam does not belong to your organization/institute' });
+          return res.status(403).json({ error: 'Access denied - Exam does not belong to your tenant' });
         }
       }
 
@@ -152,7 +152,7 @@ router.put(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
+  requireRole('EXAM_CREATOR'), // Only EXAM_CREATOR can modify questions
   requireOwnershipOrAdmin,
   [
     body('questionText').optional().trim().notEmpty(),
@@ -212,7 +212,7 @@ router.delete(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
+  requireRole('EXAM_CREATOR'), // Only EXAM_CREATOR can modify questions
   requireOwnershipOrAdmin,
   async (req, res, next) => {
     try {
@@ -241,7 +241,7 @@ router.post(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
+  requireRole('EXAM_CREATOR'), // Only EXAM_CREATOR can modify questions
   requireOwnershipOrAdmin,
   async (req, res, next) => {
     try {

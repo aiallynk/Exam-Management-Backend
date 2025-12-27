@@ -2,11 +2,25 @@ import mongoose from 'mongoose';
 import { generateUniqueIdWithCheck, ID_PREFIXES } from '../utils/idGenerator.js';
 
 /**
- * Organization Model
- * Represents an organization (equal level with Institute)
- * Managed by Super Admin
+ * Tenant Model - Unified Exam Hosting Entity
+ * 
+ * Replaces Organization and Institute models with a single, simple entity.
+ * 
+ * TENANT TYPES:
+ * - SCHOOL: Educational institution (K-12)
+ * - COLLEGE: Higher education institution
+ * - COMPANY: Corporate entity
+ * - INSTITUTE: Training/research institute
+ * - GOVERNMENT: Government organization
+ * - OTHER: Other types
+ * 
+ * SIMPLE FLOW:
+ * 1. SUPER_ADMIN creates tenant
+ * 2. SUPER_ADMIN assigns users to tenant
+ * 3. EXAM_CREATOR creates exams for their tenant
+ * 4. CANDIDATE attempts exams within their tenant
  */
-const OrganizationSchema = new mongoose.Schema(
+const TenantSchema = new mongoose.Schema(
   {
     uniqueId: {
       type: String,
@@ -14,7 +28,7 @@ const OrganizationSchema = new mongoose.Schema(
       required: false, // Will be generated in pre-validate hook
       index: true,
       sparse: true,
-      immutable: true, // Cannot be changed once set
+      immutable: true,
     },
     name: {
       type: String,
@@ -30,6 +44,12 @@ const OrganizationSchema = new mongoose.Schema(
       trim: true,
       index: true,
       match: [/^[A-Z0-9_-]+$/, 'Code must contain only uppercase letters, numbers, hyphens, and underscores'],
+    },
+    type: {
+      type: String,
+      enum: ['SCHOOL', 'COLLEGE', 'COMPANY', 'INSTITUTE', 'GOVERNMENT', 'OTHER'],
+      required: true,
+      index: true,
     },
     contactEmail: {
       type: String,
@@ -52,6 +72,19 @@ const OrganizationSchema = new mongoose.Schema(
       default: 'ACTIVE',
       index: true,
     },
+    // Limits and quotas
+    examLimit: {
+      type: Number,
+      default: null, // null = unlimited
+    },
+    aiUsageLimit: {
+      type: Number,
+      default: null, // null = unlimited
+    },
+    currentAiUsage: {
+      type: Number,
+      default: 0,
+    },
     metadata: {
       type: mongoose.Schema.Types.Mixed,
       default: {},
@@ -69,12 +102,12 @@ const OrganizationSchema = new mongoose.Schema(
 );
 
 // Generate uniqueId before validation
-OrganizationSchema.pre('validate', async function (next) {
+TenantSchema.pre('validate', async function (next) {
   if (!this.uniqueId) {
     try {
       this.uniqueId = await generateUniqueIdWithCheck(
-        mongoose.model('Organization'),
-        ID_PREFIXES.ORGANIZATION
+        mongoose.model('Tenant'),
+        ID_PREFIXES.TENANT
       );
     } catch (error) {
       return next(error);
@@ -84,9 +117,10 @@ OrganizationSchema.pre('validate', async function (next) {
 });
 
 // Indexes for efficient queries
-OrganizationSchema.index({ uniqueId: 1 });
-OrganizationSchema.index({ code: 1 });
-OrganizationSchema.index({ status: 1, createdAt: -1 });
-OrganizationSchema.index({ createdBy: 1 });
+TenantSchema.index({ uniqueId: 1 });
+TenantSchema.index({ code: 1 });
+TenantSchema.index({ type: 1, status: 1 });
+TenantSchema.index({ status: 1, createdAt: -1 });
+TenantSchema.index({ createdBy: 1 });
 
-export default mongoose.model('Organization', OrganizationSchema);
+export default mongoose.model('Tenant', TenantSchema);

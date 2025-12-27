@@ -4,44 +4,71 @@ import { logError } from '../utils/logger.js';
 export const errorHandler = (err, req, res, next) => {
   logError(err, `${req.method} ${req.path}`);
 
+  // Standardized error response structure
+  const createErrorResponse = (statusCode, error, message, details = null) => {
+    const response = {
+      error,
+      message,
+      ...(details && { details }),
+      ...(config.nodeEnv !== 'production' && statusCode === 500 && { stack: err.stack }),
+    };
+    return res.status(statusCode).json(response);
+  };
+
   // Mongoose validation error
   if (err.name === 'ValidationError') {
     const errors = Object.values(err.errors).map((e) => e.message);
-    return res.status(400).json({
-      error: 'Validation error',
-      details: errors,
-    });
+    return createErrorResponse(400, 'Validation error', 'Invalid input data', errors);
   }
 
   // Mongoose duplicate key error
   if (err.code === 11000) {
     const field = Object.keys(err.keyPattern)[0];
-    return res.status(409).json({
-      error: 'Duplicate entry',
-      message: `${field} already exists`,
-    });
+    return createErrorResponse(409, 'Duplicate entry', `${field} already exists`);
+  }
+
+  // Mongoose CastError (invalid ObjectId)
+  if (err.name === 'CastError') {
+    return createErrorResponse(400, 'Invalid ID', 'The provided ID is invalid');
   }
 
   // JWT errors
   if (err.name === 'JsonWebTokenError') {
-    return res.status(401).json({ error: 'Invalid token' });
+    return createErrorResponse(401, 'Invalid token', 'Authentication token is invalid');
   }
 
   if (err.name === 'TokenExpiredError') {
-    return res.status(401).json({ error: 'Token expired' });
+    return createErrorResponse(401, 'Token expired', 'Authentication token has expired');
   }
 
-  // Default error
-  const statusCode = err.statusCode || 500;
+  // MongoDB connection errors
+  if (err.name === 'MongoServerError' || err.name === 'MongoNetworkError') {
+    return createErrorResponse(503, 'Database error', 'Database connection error. Please try again later.');
+  }
+
+  // Request timeout errors
+  if (err.message && err.message.includes('timeout')) {
+    return createErrorResponse(408, 'Request timeout', 'The request took too long to process');
+  }
+
+  // Custom error with status code
+  if (err.statusCode) {
+    return createErrorResponse(
+      err.statusCode,
+      err.name || 'Error',
+      err.message || 'An error occurred',
+      err.details
+    );
+  }
+
+  // Default error (500)
+  const statusCode = 500;
   const message =
-    config.nodeEnv === 'production' && statusCode === 500
+    config.nodeEnv === 'production'
       ? 'Internal server error'
       : err.message || 'Something went wrong';
 
-  res.status(statusCode).json({
-    error: message,
-    ...(config.nodeEnv !== 'production' && { stack: err.stack }),
-  });
+  return createErrorResponse(statusCode, 'Internal server error', message);
 };
 
 export const notFound = (req, res, next) => {

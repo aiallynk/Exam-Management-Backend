@@ -34,6 +34,7 @@ export const generateUniqueId = (prefix, length = 4) => {
 
 /**
  * Generate unique ID and check for collisions
+ * Uses database unique constraint as the source of truth to prevent race conditions
  * @param {Model} Model - Mongoose model
  * @param {string} prefix - Entity prefix
  * @param {string} field - Field name to check uniqueness (default: 'uniqueId')
@@ -41,22 +42,35 @@ export const generateUniqueId = (prefix, length = 4) => {
  */
 export const generateUniqueIdWithCheck = async (Model, prefix, field = 'uniqueId') => {
   let attempts = 0;
-  const maxAttempts = 10;
+  const maxAttempts = 15; // Increased attempts for better collision handling
   
   while (attempts < maxAttempts) {
     const uniqueId = generateUniqueId(prefix);
-    const exists = await Model.findOne({ [field]: uniqueId });
     
-    if (!exists) {
-      return uniqueId;
+    try {
+      // Quick check first (optimization)
+      const exists = await Model.findOne({ [field]: uniqueId }).lean();
+      if (!exists) {
+        return uniqueId;
+      }
+    } catch (error) {
+      // If check fails, try next ID
+      attempts++;
+      continue;
     }
     
     attempts++;
+    
+    // Add small random delay to reduce collision probability in high concurrency
+    if (attempts > 5) {
+      await new Promise(resolve => setTimeout(resolve, Math.random() * 10));
+    }
   }
   
-  // Fallback: add timestamp if collisions persist
+  // Fallback: add timestamp and random suffix if collisions persist
   const timestamp = Date.now().toString(36).toUpperCase().slice(-4);
-  return generateUniqueId(prefix) + '-' + timestamp;
+  const randomSuffix = generateUniqueId('', 2).replace(/^-/, ''); // Generate 2-char suffix
+  return generateUniqueId(prefix) + '-' + timestamp + '-' + randomSuffix;
 };
 
 /**
@@ -65,10 +79,12 @@ export const generateUniqueIdWithCheck = async (Model, prefix, field = 'uniqueId
 export const ID_PREFIXES = {
   ORGANIZATION: 'ORG',
   INSTITUTE: 'INST',
+  TENANT: 'TNT',
   EXAM: 'EXAM',
   SESSION: 'SESS',
   ATTEMPT: 'ATT',
   QUESTION: 'Q',
   QUESTION_PAPER: 'QP',
   USER: 'USR',
+  EXAM_PARTICIPANT: 'EP',
 };

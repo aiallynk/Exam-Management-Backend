@@ -24,7 +24,9 @@
     "csv-parse": "^5.5.3",
     "express-validator": "^7.0.1",
     "pdf-parse": "^1.1.1",
-    "read-excel-file": "^5.7.1"
+    "read-excel-file": "^5.7.1",
+    "express-rate-limit": "^7.1.5",
+    "compression": "^1.7.4"
   },
   "devDependencies": {
     "nodemon": "^3.0.2"

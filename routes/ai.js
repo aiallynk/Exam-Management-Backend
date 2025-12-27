@@ -2,6 +2,7 @@ import express from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { requireTenant } from '../middleware/multiTenant.js';
+import { aiRateLimiter } from '../middleware/rateLimiter.js';
 import { generateQuestions, extractQuestionsFromContent } from '../services/aiService.js';
 import { body, validationResult } from 'express-validator';
 import multer from 'multer';
@@ -111,11 +112,12 @@ const extractContentFromUploadedFile = async (file) => {
 
 const router = express.Router();
 
-// Generate questions using AI
+// Generate questions using AI (available to EXAM_CREATOR)
 router.post(
   '/import-questions',
+  aiRateLimiter, // Rate limit AI operations
   requireAuth,
-  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can generate questions
   upload.single('file'),
   async (req, res, next) => {
     try {
@@ -139,11 +141,12 @@ router.post(
 
 router.post(
   '/generate-questions',
+  aiRateLimiter, // Rate limit AI operations
   requireAuth,
   requireTenant,
-  requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'),
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can generate questions
   [
-    body('topic').trim().notEmpty().withMessage('Topic is required'),
+    body('topic').trim().notEmpty().withMessage('Topic/Domain is required'), // Universal: clarified as Topic/Domain
     body('count').isInt({ min: 5, max: 50 }).withMessage('Count must be between 5 and 50'),
     body('difficulty').isIn(['easy', 'medium', 'hard', 'ultra_hard']).withMessage('Invalid difficulty'),
     body('questionTypes').isArray().withMessage('Question types must be an array'),
@@ -160,16 +163,17 @@ router.post(
         count,
         difficulty,
         questionTypes,
+        questionTypeDistribution, // NEW: Array of { type, count } objects for specific distribution
         duration,
         uploadedContent,
         examTitle,
         examDescription,
+        existingQuestions, // Array of existing question texts to avoid duplicates
       } = req.body;
 
       // Store tenant metadata for AI generation tracking
       const aiMetadata = {
-        organizationId: req.user.organizationId || null,
-        instituteId: req.user.instituteId || null,
+        tenantId: req.user.tenantId || null,
         inputSource: uploadedContent ? 'DETAILED_CONTENT' : 'TOPIC_ONLY',
         generatedBy: req.user._id,
         generatedAt: new Date(),
@@ -180,10 +184,12 @@ router.post(
         count,
         difficulty,
         questionTypes,
+        questionTypeDistribution: Array.isArray(questionTypeDistribution) ? questionTypeDistribution : undefined,
         duration,
         uploadedContent,
         examTitle,
         examDescription,
+        existingQuestions: Array.isArray(existingQuestions) ? existingQuestions : [],
         metadata: aiMetadata, // Pass metadata to AI service for logging
       });
 

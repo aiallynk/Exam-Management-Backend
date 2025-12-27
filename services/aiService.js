@@ -125,16 +125,31 @@ const normalizeQuestionObject = (question, index = 0) => {
  * Generate exam questions using OpenAI
  */
 export const generateQuestions = async (params) => {
-  const {
+  // Extract and sanitize parameters
+  let {
     topic,
     count,
     difficulty,
     questionTypes,
+    questionTypeDistribution, // NEW: Array of { type, count } for specific distribution
     duration,
     uploadedContent,
     examTitle,
     examDescription,
+    existingQuestions = [], // Array of existing question texts to avoid duplicates
   } = params;
+
+  // Sanitize topic
+  topic = String(topic || '').trim().substring(0, 500);
+  
+  // Sanitize exam title and description
+  examTitle = examTitle ? String(examTitle).trim().substring(0, 200) : undefined;
+  examDescription = examDescription ? String(examDescription).trim().substring(0, 1000) : undefined;
+  
+  // Sanitize uploaded content (limit size to prevent abuse)
+  if (uploadedContent) {
+    uploadedContent = String(uploadedContent).trim().substring(0, 50000); // 50KB limit
+  }
 
   // Validate OpenAI API key
   if (!client) {
@@ -147,10 +162,30 @@ export const generateQuestions = async (params) => {
     throw new Error('Missing required parameters for question generation');
   }
 
-  if (count < 5 || count > 50) {
+  // Sanitize and validate topic (prevent prompt injection)
+  const sanitizedTopic = String(topic || '').trim().substring(0, 500); // Limit length
+  if (!sanitizedTopic || sanitizedTopic.length < 3) {
+    throw new Error('Topic must be at least 3 characters long');
+  }
+
+  // Validate count
+  const questionCount = parseInt(count, 10);
+  if (isNaN(questionCount) || questionCount < 5 || questionCount > 50) {
     throw new Error('Question count must be between 5 and 50');
   }
 
+  // Validate difficulty
+  const validDifficulties = ['easy', 'medium', 'hard', 'ultra_hard'];
+  if (!validDifficulties.includes(difficulty)) {
+    throw new Error(`Difficulty must be one of: ${validDifficulties.join(', ')}`);
+  }
+
+  // Validate question types array
+  if (!Array.isArray(questionTypes) || questionTypes.length === 0) {
+    throw new Error('Question types must be a non-empty array');
+  }
+  
+  // Sanitize question types (ensure they're valid)
   const validTypes = [
     'MULTIPLE_CHOICE',
     'MULTIPLE_OPTIONS',
@@ -159,10 +194,20 @@ export const generateQuestions = async (params) => {
     'PARAGRAPH',
     'NUMBER',
   ];
-
-  const invalidTypes = questionTypes.filter((t) => !validTypes.includes(t));
-  if (invalidTypes.length > 0) {
-    throw new Error(`Invalid question types: ${invalidTypes.join(', ')}`);
+  questionTypes = questionTypes
+    .map(type => String(type).toUpperCase())
+    .filter(type => validTypes.includes(type));
+  if (questionTypes.length === 0) {
+    throw new Error('At least one valid question type is required');
+  }
+  
+  // Sanitize exam title and description
+  examTitle = examTitle ? String(examTitle).trim().substring(0, 200) : undefined;
+  examDescription = examDescription ? String(examDescription).trim().substring(0, 1000) : undefined;
+  
+  // Sanitize uploaded content (limit size to prevent abuse)
+  if (uploadedContent) {
+    uploadedContent = String(uploadedContent).trim().substring(0, 50000); // 50KB limit
   }
 
   try {
@@ -185,14 +230,50 @@ These questions should be at the highest difficulty level, suitable for expert-l
     const difficultyGuidance = difficultyDescriptions[difficulty] || difficultyDescriptions.medium;
 
     // Calculate distribution of question types
-    const questionsPerType = Math.floor(count / questionTypes.length);
-    const remainder = count % questionTypes.length;
-    const typeDistribution = questionTypes.map((type, idx) => ({
-      type,
-      count: questionsPerType + (idx < remainder ? 1 : 0)
-    })).filter(item => item.count > 0);
+    // Use provided distribution if available, otherwise distribute evenly
+    let typeDistribution;
+    if (Array.isArray(questionTypeDistribution) && questionTypeDistribution.length > 0) {
+      // Use the provided distribution
+      typeDistribution = questionTypeDistribution
+        .filter(item => item && item.type && item.count > 0)
+        .map(item => ({
+          type: String(item.type).toUpperCase(),
+          count: parseInt(item.count, 10)
+        }))
+        .filter(item => validTypes.includes(item.type));
+      
+      // Verify the distribution matches the total count
+      const distributionSum = typeDistribution.reduce((sum, item) => sum + item.count, 0);
+      if (distributionSum !== count) {
+        console.warn(`Question type distribution sum (${distributionSum}) does not match total count (${count}). Adjusting...`);
+        // Adjust proportionally
+        const scale = count / distributionSum;
+        typeDistribution = typeDistribution.map(item => ({
+          ...item,
+          count: Math.round(item.count * scale)
+        }));
+        // Fix rounding errors
+        const newSum = typeDistribution.reduce((sum, item) => sum + item.count, 0);
+        const diff = count - newSum;
+        if (diff !== 0 && typeDistribution.length > 0) {
+          typeDistribution[0].count += diff;
+        }
+      }
+    } else {
+      // Default: distribute evenly
+      const questionsPerType = Math.floor(count / questionTypes.length);
+      const remainder = count % questionTypes.length;
+      typeDistribution = questionTypes.map((type, idx) => ({
+        type,
+        count: questionsPerType + (idx < remainder ? 1 : 0)
+      })).filter(item => item.count > 0);
+    }
 
     // Build system prompt with enhanced difficulty guidance
+    const existingQuestionsText = Array.isArray(existingQuestions) && existingQuestions.length > 0
+      ? existingQuestions.slice(0, 50).map((q, idx) => `${idx + 1}. ${String(q).substring(0, 200)}`).join('\n')
+      : '';
+
     let systemPrompt = `You are an expert exam question generator specializing in creating questions at precise difficulty levels. Generate high-quality exam questions in JSON format.
 
 CRITICAL REQUIREMENTS:
@@ -203,10 +284,19 @@ CRITICAL REQUIREMENTS:
 QUESTION TYPE ENFORCEMENT (MANDATORY):
 - You MUST ONLY use these question types: ${questionTypes.join(', ')}
 - DO NOT generate any question types other than: ${questionTypes.join(', ')}
-- Question type distribution: ${typeDistribution.map(item => `${item.count} ${item.type}`).join(', ')}
+- EXACT Question type distribution (CRITICAL - follow this precisely): ${typeDistribution.map(item => `${item.count} ${item.type}`).join(', ')}
+- You MUST generate EXACTLY the specified number for each type:
+${typeDistribution.map(item => `  - ${item.count} question${item.count > 1 ? 's' : ''} of type ${item.type}`).join('\n')}
 - Each question's questionType field MUST be one of: ${questionTypes.join(', ')}
-- If multiple types are selected, distribute questions across all selected types
-- If only one type is selected, ALL ${count} questions must be of that type
+- The total count MUST equal exactly ${count} questions
+- DO NOT deviate from the specified distribution - generate exactly as specified above
+
+${existingQuestionsText ? `\nCRITICAL: DUPLICATE PREVENTION
+- The following questions already exist in this exam. You MUST NOT generate questions that are similar or duplicate these:
+${existingQuestionsText}
+- Generate COMPLETELY NEW and UNIQUE questions that are different from the existing ones
+- Ensure each new question covers different aspects or concepts than the existing questions
+- Do not rephrase or slightly modify existing questions - create entirely new ones\n` : ''}
 
 Topic: ${topic}
 ${examTitle ? `Exam title: ${examTitle}` : ''}
@@ -236,9 +326,13 @@ Return a JSON object with a "questions" array containing exactly ${count} questi
 
 CRITICAL REQUIREMENTS:
 - Question Types: You MUST ONLY generate questions of these types: ${questionTypes.join(', ')}
-- Distribution: ${typeDistribution.map(item => `Generate ${item.count} ${item.type} question${item.count > 1 ? 's' : ''}`).join(', ')}
+- EXACT Distribution (MUST follow precisely):
+${typeDistribution.map(item => `  - Generate EXACTLY ${item.count} ${item.type} question${item.count > 1 ? 's' : ''}`).join('\n')}
+- Total questions: ${count} (sum of all types above)
 - DO NOT generate any question types that are NOT in the list: ${questionTypes.join(', ')}
 - Each question's questionType field MUST be exactly one of: ${questionTypes.join(', ')}
+- IMPORTANT: The distribution above is EXACT - generate exactly the specified number for each type, no more, no less
+${existingQuestionsText ? `\n- IMPORTANT: Do NOT create questions similar to the existing ones listed above. Generate completely new and unique questions covering different aspects of the topic.` : ''}
 
 Difficulty:
 - Strictly follow the ${difficulty.toUpperCase()} difficulty guidelines provided
@@ -255,82 +349,108 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
     };
     const temperature = temperatureMap[difficulty] || 0.7;
 
-    // Make API call with better error handling
-    const completion = await client.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      temperature: temperature,
-      response_format: { type: 'json_object' },
-    });
+    // Make API call with retry logic
+    const maxRetries = 3;
+    let lastError = null;
+    
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        const completion = await client.chat.completions.create({
+          model: 'gpt-4o-mini',
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          temperature: temperature,
+          response_format: { type: 'json_object' },
+        });
+        
+        // Success - process response
+        const responseContent = completion.choices[0].message.content;
+        let parsedResponse;
 
-    const responseContent = completion.choices[0].message.content;
-    let parsedResponse;
+        try {
+          parsedResponse = JSON.parse(responseContent);
+        } catch (parseError) {
+          // Try to extract JSON from markdown code blocks
+          const jsonMatch = responseContent.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
+          if (jsonMatch) {
+            parsedResponse = JSON.parse(jsonMatch[1]);
+          } else {
+            throw new Error('Failed to parse OpenAI response as JSON');
+          }
+        }
 
-    try {
-      parsedResponse = JSON.parse(responseContent);
-    } catch (parseError) {
-      // Try to extract JSON from markdown code blocks
-      const jsonMatch = responseContent.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
-      if (jsonMatch) {
-        parsedResponse = JSON.parse(jsonMatch[1]);
-      } else {
-        throw new Error('Failed to parse OpenAI response as JSON');
+        // Extract questions array
+        let questions = [];
+        if (Array.isArray(parsedResponse)) {
+          questions = parsedResponse;
+        } else if (parsedResponse.questions && Array.isArray(parsedResponse.questions)) {
+          questions = parsedResponse.questions;
+        } else if (parsedResponse.data && Array.isArray(parsedResponse.data)) {
+          questions = parsedResponse.data;
+        } else {
+          throw new Error('Invalid response format from OpenAI');
+        }
+
+        // Validate and normalize questions, ensuring they match selected question types
+        const normalizedQuestions = questions.slice(0, count).map((q, index) => {
+          let questionType = sanitizeString(q.questionType || q.type || '').toUpperCase();
+          
+          // Validate question type - must be one of the selected types
+          if (!questionTypes.includes(questionType)) {
+            // If AI generated wrong type, assign from selected types in round-robin fashion
+            questionType = questionTypes[index % questionTypes.length];
+            console.warn(`Question ${index + 1} had invalid type "${q.questionType}", corrected to "${questionType}"`);
+          }
+          
+          return {
+            questionText: q.questionText || q.question || '',
+            questionType: questionType,
+            options: q.options || (['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE'].includes(questionType) 
+              ? (questionType === 'TRUE_FALSE' ? ['True', 'False'] : ['Option A', 'Option B', 'Option C', 'Option D'])
+              : undefined),
+            correctAnswer: q.correctAnswer || q.answer || '',
+            points: q.points || 1,
+            order: q.order || index + 1,
+            passage:
+              sanitizeString(
+                q.passage ||
+                  q.context ||
+                  (questionType === 'PARAGRAPH' ? (q.reference || q.sourceText || '') : '')
+              ) || '',
+          };
+        });
+
+        // Final validation: Ensure all questions have valid types
+        const validatedQuestions = normalizedQuestions.map((q, idx) => {
+          if (!questionTypes.includes(q.questionType)) {
+            q.questionType = questionTypes[idx % questionTypes.length];
+          }
+          return q;
+        });
+
+        return validatedQuestions;
+      } catch (error) {
+        lastError = error;
+        
+        // Don't retry on certain errors (authentication, invalid request, etc.)
+        if (error.status === 401 || error.status === 403 || error.status === 400) {
+          throw error;
+        }
+        
+        // Exponential backoff: wait 1s, 2s, 4s before retrying
+        if (attempt < maxRetries - 1) {
+          const delayMs = Math.pow(2, attempt) * 1000;
+          console.warn(`OpenAI API call failed (attempt ${attempt + 1}/${maxRetries}), retrying in ${delayMs}ms...`, error.message);
+          await new Promise(resolve => setTimeout(resolve, delayMs));
+        }
       }
     }
-
-    // Extract questions array
-    let questions = [];
-    if (Array.isArray(parsedResponse)) {
-      questions = parsedResponse;
-    } else if (parsedResponse.questions && Array.isArray(parsedResponse.questions)) {
-      questions = parsedResponse.questions;
-    } else if (parsedResponse.data && Array.isArray(parsedResponse.data)) {
-      questions = parsedResponse.data;
-    } else {
-      throw new Error('Invalid response format from OpenAI');
-    }
-
-    // Validate and normalize questions, ensuring they match selected question types
-    const normalizedQuestions = questions.slice(0, count).map((q, index) => {
-      let questionType = sanitizeString(q.questionType || q.type || '').toUpperCase();
-      
-      // Validate question type - must be one of the selected types
-      if (!questionTypes.includes(questionType)) {
-        // If AI generated wrong type, assign from selected types in round-robin fashion
-        questionType = questionTypes[index % questionTypes.length];
-        console.warn(`Question ${index + 1} had invalid type "${q.questionType}", corrected to "${questionType}"`);
-      }
-      
-      return {
-        questionText: q.questionText || q.question || '',
-        questionType: questionType,
-        options: q.options || (['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE'].includes(questionType) 
-          ? (questionType === 'TRUE_FALSE' ? ['True', 'False'] : ['Option A', 'Option B', 'Option C', 'Option D'])
-          : undefined),
-        correctAnswer: q.correctAnswer || q.answer || '',
-        points: q.points || 1,
-        order: q.order || index + 1,
-        passage:
-          sanitizeString(
-            q.passage ||
-              q.context ||
-              (questionType === 'PARAGRAPH' ? (q.reference || q.sourceText || '') : '')
-          ) || '',
-      };
-    });
-
-    // Final validation: Ensure all questions have valid types
-    const validatedQuestions = normalizedQuestions.map((q, idx) => {
-      if (!questionTypes.includes(q.questionType)) {
-        q.questionType = questionTypes[idx % questionTypes.length];
-      }
-      return q;
-    });
-
-    return validatedQuestions;
+    
+    // All retries failed - fall back to template questions
+    console.error('OpenAI API call failed after all retries:', lastError?.message || 'Unknown error');
+    return generateFallbackQuestions(params);
   } catch (error) {
     console.error('OpenAI question generation error:', error);
     // Check if it's a network/connection error

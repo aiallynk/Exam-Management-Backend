@@ -2,13 +2,13 @@ import express from 'express';
 import ExamAttempt from '../models/ExamAttempt.js';
 import Answer from '../models/Answer.js';
 import { requireAuth } from '../middleware/auth.js';
-import { requireRole } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
+import { hasExamPermission } from '../middleware/examPermissions.js';
 
 const router = express.Router();
 
-// Get all results (DESIGNER/ADMIN/TEACHER only)
-router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, requireRole('DESIGNER', 'ADMIN', 'TEACHER', 'INSTITUTE_ADMIN', 'ORG_ADMIN'), async (req, res, next) => {
+// Get all results (universal: based on VIEW_RESULTS and REVIEW_ANSWERS permissions)
+router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
     const {
       page = 1,
@@ -32,7 +32,7 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, requireRole
     const attempts = await ExamAttempt.find(filter)
       .populate('examId', 'title duration')
       .populate('sessionId', 'startTime endTime')
-      .populate('userId', 'name email college')
+      .populate('userId', 'name email')
       .populate('questionPaperId', 'setName')
       .sort({ createdAt: -1 })
       .skip(skip)
@@ -58,7 +58,10 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, requireRole
       })
     );
 
-    const total = await ExamAttempt.countDocuments(filter);
+    // Count total (may differ from attempts.length if filtered by permissions)
+    const total = req.user.role === 'SUPER_ADMIN' || req.user.role === 'EXAM_CREATOR'
+      ? await ExamAttempt.countDocuments(filter)
+      : results.length; // Use filtered count for regular users
 
     res.json({
       results,
