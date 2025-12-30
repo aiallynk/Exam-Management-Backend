@@ -174,6 +174,15 @@ router.post(
 
       const { sessionId, examId } = req.body;
 
+      // UNIVERSAL: Ensure ExamParticipant exists with CANDIDATE role FIRST
+      // This must happen before permission check, so the participant exists when we check permissions
+      await ensureExamParticipant(
+        req.user._id,
+        examId,
+        'CANDIDATE',
+        req.user._id
+      );
+
       // Check exam permission: user must have ATTEMPT_EXAM permission
       const canAttempt = await hasExamPermission(req.user._id, examId, 'ATTEMPT_EXAM');
       if (!canAttempt) {
@@ -269,14 +278,7 @@ router.post(
         });
       }
 
-      // UNIVERSAL: Ensure ExamParticipant exists with CANDIDATE role
-      // This happens when user starts an attempt (if not already created via QR/token scan)
-      await ensureExamParticipant(
-        req.user._id,
-        examId,
-        'CANDIDATE',
-        req.user._id
-      );
+      // Note: ExamParticipant is already created above before permission check
 
       await session.populate('questionPaperIds', 'setName');
       const assignment = await assignQuestionPaperToStudent({
