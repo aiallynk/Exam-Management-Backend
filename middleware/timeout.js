@@ -10,6 +10,17 @@
  */
 export const requestTimeout = (timeoutMs = 30000) => {
   return (req, res, next) => {
+    // Routes that need longer timeouts (in milliseconds)
+    const extendedTimeoutRoutes = {
+      '/api/exams/generate-questions': 300000, // 5 minutes for AI question generation
+      '/api/exams/import-questions': 300000,    // 5 minutes for AI question extraction from files
+    };
+
+    // Check if this route needs an extended timeout
+    const routePath = req.path;
+    const extendedTimeout = extendedTimeoutRoutes[routePath];
+    const actualTimeout = extendedTimeout || timeoutMs;
+
     // Set timeout
     const timeout = setTimeout(() => {
       if (!res.headersSent) {
@@ -19,7 +30,7 @@ export const requestTimeout = (timeoutMs = 30000) => {
         });
         res.end();
       }
-    }, timeoutMs);
+    }, actualTimeout);
 
     // Clear timeout when response finishes
     const originalEnd = res.end;

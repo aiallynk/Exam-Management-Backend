@@ -139,12 +139,27 @@ router.post(
       // Find user
       const user = await User.findOne({ email });
       if (!user) {
+        // In development, provide more helpful error message
+        if (process.env.NODE_ENV === 'development') {
+          console.log(`⚠️  Login attempt failed: User not found - ${email}`);
+          // Check if similar email exists (case-insensitive)
+          const similarUser = await User.findOne({ 
+            email: { $regex: new RegExp(email.split('@')[0], 'i') } 
+          });
+          if (similarUser) {
+            console.log(`💡 Hint: Found similar user: ${similarUser.email}`);
+          }
+        }
         return res.status(401).json({ error: 'Invalid credentials' });
       }
 
       // Check password
       const isMatch = await user.comparePassword(password);
       if (!isMatch) {
+        // In development, log password mismatch
+        if (process.env.NODE_ENV === 'development') {
+          console.log(`⚠️  Login attempt failed: Password mismatch for ${email}`);
+        }
         return res.status(401).json({ error: 'Invalid credentials' });
       }
 
