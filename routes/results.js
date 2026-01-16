@@ -1,6 +1,7 @@
 import express from 'express';
 import ExamAttempt from '../models/ExamAttempt.js';
 import Answer from '../models/Answer.js';
+import Question from '../models/Question.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { hasExamPermission } from '../middleware/examPermissions.js';
@@ -42,10 +43,54 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
     const results = await Promise.all(
       attempts.map(async (attempt) => {
         const answers = await Answer.find({ attemptId: attempt._id })
-          .populate('questionId', 'points');
+          .populate('questionId', 'points sectionId');
         const totalScore = answers.reduce((sum, a) => sum + (a.pointsEarned || 0), 0);
         const maxScore = answers.reduce((sum, a) => sum + (a.questionId?.points || 0), 0);
         const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
+
+        // Get total questions for this attempt's question paper
+        let totalQuestions = 0;
+        let attemptedQuestions = 0;
+        
+        if (attempt.questionPaperId) {
+          const questionPaperId = attempt.questionPaperId._id || attempt.questionPaperId;
+          totalQuestions = await Question.countDocuments({ questionPaperId });
+          
+          // Count attempted questions (questions with non-empty answers)
+          attemptedQuestions = await Answer.countDocuments({
+            attemptId: attempt._id,
+            $or: [
+              { answerText: { $exists: true, $ne: '' } },
+              { answerText: { $exists: true, $ne: null } }
+            ]
+          });
+        }
+
+        // Get section-wise breakdown
+        const sectionBreakdown = {};
+        answers.forEach(answer => {
+          if (answer.questionId?.sectionId) {
+            const sectionId = answer.questionId.sectionId.toString();
+            if (!sectionBreakdown[sectionId]) {
+              sectionBreakdown[sectionId] = {
+                totalScore: 0,
+                maxScore: 0,
+                questionCount: 0,
+              };
+            }
+            sectionBreakdown[sectionId].totalScore += answer.pointsEarned || 0;
+            sectionBreakdown[sectionId].maxScore += answer.questionId.points || 0;
+            sectionBreakdown[sectionId].questionCount += 1;
+          }
+        });
+
+        // Calculate section percentages
+        Object.keys(sectionBreakdown).forEach(sectionId => {
+          const section = sectionBreakdown[sectionId];
+          section.percentage = section.maxScore > 0
+            ? Math.round((section.totalScore / section.maxScore) * 100)
+            : 0;
+        });
 
         return {
           attempt,
@@ -53,7 +98,16 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
             totalScore,
             maxScore,
             percentage,
+            normalizedScore: attempt.normalizedScore || null,
+            percentile: attempt.percentile || null,
+            sessionPercentile: attempt.sessionPercentile || null,
           },
+          sectionBreakdown,
+          attemptedQuestions,
+          totalQuestions,
+          progressPercentage: totalQuestions > 0 
+            ? Math.round((attemptedQuestions / totalQuestions) * 100) 
+            : 0,
         };
       })
     );

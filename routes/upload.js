@@ -6,6 +6,7 @@ import { fileURLToPath } from 'url';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import config from '../config/env.js';
+import { generateImportPreview } from '../services/importService.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -270,6 +271,43 @@ router.post(
         mimeType: req.file.mimetype,
         size: req.file.size,
       });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Import preview endpoint (for Excel, CSV, PDF, Image)
+const importUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB
+  },
+  fileFilter: (req, file, cb) => {
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    const allowedExtensions = ['.csv', '.xlsx', '.xls', '.pdf', '.jpg', '.jpeg', '.png'];
+    if (allowedExtensions.includes(ext)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`Invalid file type. Allowed: ${allowedExtensions.join(', ')}`));
+    }
+  },
+});
+
+router.post(
+  '/import-preview',
+  requireAuth,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
+  importUpload.single('file'),
+  handleMulterError,
+  async (req, res, next) => {
+    try {
+      if (!req.file) {
+        return res.status(400).json({ error: 'No file uploaded' });
+      }
+
+      const result = await generateImportPreview(req.file, req.file.originalname);
+      res.json(result);
     } catch (error) {
       next(error);
     }

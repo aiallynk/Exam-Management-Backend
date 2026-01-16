@@ -89,6 +89,13 @@ const ExamSessionSchema = new mongoose.Schema(
         ref: 'QuestionPaper',
       },
     },
+    normalizationApplied: {
+      type: Boolean,
+      default: false,
+    },
+    normalizationLockedAt: {
+      type: Date,
+    },
   },
   {
     timestamps: true,

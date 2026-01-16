@@ -31,6 +31,15 @@ const QuestionPaperSchema = new mongoose.Schema(
       ref: 'User',
       required: true,
     },
+    sections: {
+      type: [
+        {
+          type: mongoose.Schema.Types.ObjectId,
+          ref: 'Section',
+        },
+      ],
+      default: [],
+    },
   },
   {
     timestamps: true,

@@ -58,6 +58,20 @@ const QuestionSchema = new mongoose.Schema(
       required: true,
       min: 0,
     },
+    sectionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Section',
+      index: true,
+    },
+    translations: {
+      type: Map,
+      of: {
+        questionText: { type: String, trim: true },
+        options: { type: mongoose.Schema.Types.Mixed },
+        passage: { type: String, trim: true },
+      },
+      default: new Map(),
+    },
   },
   {
     timestamps: true,
@@ -81,6 +95,7 @@ QuestionSchema.pre('validate', async function (next) {
 
 QuestionSchema.index({ uniqueId: 1 });
 QuestionSchema.index({ questionPaperId: 1, order: 1 });
+QuestionSchema.index({ sectionId: 1, order: 1 });
 
 export default mongoose.model('Question', QuestionSchema);
 

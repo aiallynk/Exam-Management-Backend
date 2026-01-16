@@ -20,6 +20,11 @@ import {
   applyCertificateTemplate,
 } from '../utils/certificateTemplate.js';
 import { ensureScoreSummary } from '../utils/attemptScores.js';
+import {
+  reconcileOfflineAttempt,
+  validateTimestamps,
+  detectAnomalies,
+} from '../services/attemptReconciliationService.js';
 
 const parseArrayAnswer = (value) => {
   if (Array.isArray(value)) {
@@ -246,16 +251,30 @@ router.post(
       }
 
       // Check max attempts (exam already loaded above)
-      const existingAttempts = await ExamAttempt.countDocuments({
+      // First check if user has a re-attempt allowed flag on any completed attempt
+      const hasReAttemptAllowed = await ExamAttempt.findOne({
         userId: req.user._id,
         examId,
+        reAttemptAllowed: true,
         isCompleted: true,
-      });
+      }).sort({ createdAt: -1 });
 
-      if (existingAttempts >= exam.maxAttempts) {
-        return res.status(403).json({
-          error: `Maximum attempts (${exam.maxAttempts}) reached for this exam`,
+      if (!hasReAttemptAllowed) {
+        // Only check max attempts if no re-attempt is allowed
+        const existingAttempts = await ExamAttempt.countDocuments({
+          userId: req.user._id,
+          examId,
+          isCompleted: true,
         });
+
+        if (existingAttempts >= exam.maxAttempts) {
+          return res.status(403).json({
+            error: `Maximum attempts (${exam.maxAttempts}) reached for this exam. Please contact the exam administrator to request additional attempts.`,
+          });
+        }
+      } else {
+        // User has re-attempt allowed, log it for audit
+        console.log(`User ${req.user._id} attempting exam ${examId} with re-attempt flag from attempt ${hasReAttemptAllowed._id}`);
       }
 
       // Check if there's an active attempt
@@ -305,9 +324,25 @@ router.post(
         },
         // Inherit tenant ID from exam
         tenantId: examForTenant?.tenantId || null,
+        // Log device info
+        deviceInfo: {
+          ipAddress: req.ip || req.connection?.remoteAddress || '',
+          userAgent: req.get('user-agent') || '',
+          deviceId: req.body.deviceId || req.headers['x-device-id'] || '',
+        },
       });
 
       await attempt.save();
+      
+      // Check for multiple logins
+      const proctoringService = await import('../services/proctoringService.js');
+      await proctoringService.logDeviceInfo(attempt._id, attempt.deviceInfo);
+      const multipleLogins = await proctoringService.checkMultipleLogins(req.user._id, examId, attempt.deviceInfo);
+      if (multipleLogins.hasMultipleLogins) {
+        await proctoringService.flagSuspiciousActivity(attempt._id, 'MULTIPLE_LOGINS', {
+          attempts: multipleLogins.attempts,
+        });
+      }
       await attempt.populate('examId', 'title duration');
       await attempt.populate('sessionId', 'startTime endTime');
       await attempt.populate('questionPaperId', '_id');
@@ -703,6 +738,732 @@ router.get('/:attemptId/certificate', requireAuth, validateObjectId('attemptId')
     next(error);
   }
 });
+
+// Allow re-attempt for a candidate (admin only)
+router.post(
+  '/:attemptId/allow-reattempt',
+  requireAuth,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  validateObjectId('attemptId'),
+  [
+    body('reason').trim().notEmpty().withMessage('Reason is required'),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const attempt = await ExamAttempt.findById(req.params.attemptId);
+      if (!attempt) {
+        return res.status(404).json({ error: 'Attempt not found' });
+      }
+
+      const beforeState = {
+        reAttemptAllowed: attempt.reAttemptAllowed,
+      };
+
+      attempt.reAttemptAllowed = true;
+      attempt.reAttemptReason = req.body.reason;
+      attempt.reAttemptAllowedBy = req.user._id;
+      attempt.reAttemptAllowedAt = new Date();
+
+      await attempt.save();
+
+      // Log audit
+      const { logAuditEvent, AUDIT_ACTIONS } = await import('../utils/auditLogger.js');
+      await logAuditEvent(AUDIT_ACTIONS.ATTEMPT_RE_ENABLED || 'ATTEMPT_RE_ENABLED', {
+        userId: req.user._id,
+        userEmail: req.user.email,
+        userRole: req.user.role,
+        resourceType: 'ExamAttempt',
+        resourceId: attempt._id,
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
+        method: req.method,
+        path: req.path,
+        details: {
+          before: beforeState,
+          after: { reAttemptAllowed: true },
+          reason: req.body.reason,
+        },
+      });
+
+      res.json({ attempt, message: 'Re-attempt allowed successfully' });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Flag attempt (admin investigation tool)
+router.post(
+  '/:attemptId/flag',
+  requireAuth,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  validateObjectId('attemptId'),
+  [
+    body('status').isIn(['VALID', 'SUSPICIOUS', 'INVALID']).withMessage('Status must be VALID, SUSPICIOUS, or INVALID'),
+    body('reason').optional().trim(),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const attempt = await ExamAttempt.findById(req.params.attemptId);
+      if (!attempt) {
+        return res.status(404).json({ error: 'Attempt not found' });
+      }
+
+      const beforeStatus = attempt.adminFlags?.status || null;
+
+      attempt.adminFlags = {
+        status: req.body.status,
+        flaggedBy: req.user._id,
+        flaggedAt: new Date(),
+        reason: req.body.reason || null,
+      };
+
+      await attempt.save();
+
+      // Log audit
+      const { logAuditEvent, AUDIT_ACTIONS } = await import('../utils/auditLogger.js');
+      await logAuditEvent(AUDIT_ACTIONS.ATTEMPT_FLAGGED || 'ATTEMPT_FLAGGED', {
+        userId: req.user._id,
+        userEmail: req.user.email,
+        userRole: req.user.role,
+        resourceType: 'ExamAttempt',
+        resourceId: attempt._id,
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
+        method: req.method,
+        path: req.path,
+        details: {
+          before: beforeStatus,
+          after: req.body.status,
+          reason: req.body.reason,
+        },
+      });
+
+      res.json({ attempt, message: 'Attempt flagged successfully' });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Add admin note to attempt
+router.post(
+  '/:attemptId/notes',
+  requireAuth,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  validateObjectId('attemptId'),
+  [
+    body('note').trim().notEmpty().withMessage('Note is required'),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const attempt = await ExamAttempt.findById(req.params.attemptId);
+      if (!attempt) {
+        return res.status(404).json({ error: 'Attempt not found' });
+      }
+
+      if (!attempt.adminNotes) {
+        attempt.adminNotes = [];
+      }
+
+      attempt.adminNotes.push({
+        note: req.body.note,
+        addedBy: req.user._id,
+        addedAt: new Date(),
+      });
+
+      await attempt.save();
+
+      // Log audit
+      const { logAuditEvent, AUDIT_ACTIONS } = await import('../utils/auditLogger.js');
+      await logAuditEvent(AUDIT_ACTIONS.ATTEMPT_NOTE_ADDED || 'ATTEMPT_NOTE_ADDED', {
+        userId: req.user._id,
+        userEmail: req.user.email,
+        userRole: req.user.role,
+        resourceType: 'ExamAttempt',
+        resourceId: attempt._id,
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
+        method: req.method,
+        path: req.path,
+        details: {
+          noteLength: req.body.note.length,
+        },
+      });
+
+      res.json({ attempt, message: 'Note added successfully' });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Recalculate attempt result (admin only, requires confirmation)
+router.post(
+  '/:attemptId/recalculate',
+  requireAuth,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  validateObjectId('attemptId'),
+  [
+    body('confirmed').equals('true').withMessage('Recalculation must be confirmed'),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const attempt = await ExamAttempt.findById(req.params.attemptId);
+      if (!attempt) {
+        return res.status(404).json({ error: 'Attempt not found' });
+      }
+
+      if (!attempt.isCompleted) {
+        return res.status(400).json({ error: 'Cannot recalculate score for incomplete attempt' });
+      }
+
+      // Store before state for audit
+      const beforeState = {
+        totalScore: attempt.scoreSummary?.totalScore || 0,
+        maxScore: attempt.scoreSummary?.maxScore || 0,
+        percentage: attempt.scoreSummary?.percentage || 0,
+        normalizedScore: attempt.normalizedScore || null,
+        percentile: attempt.percentile || null,
+      };
+
+      // Recalculate score summary
+      const { ensureScoreSummary } = await import('../utils/attemptScores.js');
+      const scoreResult = await ensureScoreSummary(attempt, { includeAnswers: false });
+
+      // Recalculate normalization if applicable
+      let normalizationResult = null;
+      try {
+        const { calculateNormalizedScore } = await import('../services/normalizationService.js');
+        normalizationResult = await calculateNormalizedScore(attempt._id);
+        
+        attempt.normalizedScore = normalizationResult.normalizedScore;
+        attempt.percentile = normalizationResult.percentile;
+        attempt.sessionPercentile = normalizationResult.sessionPercentile;
+      } catch (err) {
+        // Normalization might not be configured - that's okay
+        console.warn('Normalization calculation failed:', err.message);
+      }
+
+      await attempt.save();
+
+      // Log audit
+      const { logAuditEvent, AUDIT_ACTIONS } = await import('../utils/auditLogger.js');
+      await logAuditEvent(AUDIT_ACTIONS.ATTEMPT_RECALCULATED || 'ATTEMPT_RECALCULATED', {
+        userId: req.user._id,
+        userEmail: req.user.email,
+        userRole: req.user.role,
+        resourceType: 'ExamAttempt',
+        resourceId: attempt._id,
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
+        method: req.method,
+        path: req.path,
+        details: {
+          before: beforeState,
+          after: {
+            totalScore: attempt.scoreSummary?.totalScore || 0,
+            maxScore: attempt.scoreSummary?.maxScore || 0,
+            percentage: attempt.scoreSummary?.percentage || 0,
+            normalizedScore: attempt.normalizedScore || null,
+            percentile: attempt.percentile || null,
+          },
+        },
+      });
+
+      res.json({
+        attempt,
+        message: 'Result recalculated successfully',
+        before: beforeState,
+        after: {
+          totalScore: attempt.scoreSummary?.totalScore || 0,
+          maxScore: attempt.scoreSummary?.maxScore || 0,
+          percentage: attempt.scoreSummary?.percentage || 0,
+          normalizedScore: attempt.normalizedScore || null,
+          percentile: attempt.percentile || null,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Recalculate attempt result (admin only, requires confirmation)
+router.post(
+  '/:attemptId/recalculate',
+  requireAuth,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  validateObjectId('attemptId'),
+  [
+    body('confirm').equals('true').withMessage('Confirmation required'),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const attempt = await ExamAttempt.findById(req.params.attemptId);
+      if (!attempt) {
+        return res.status(404).json({ error: 'Attempt not found' });
+      }
+
+      if (!attempt.isCompleted) {
+        return res.status(400).json({ error: 'Cannot recalculate score for incomplete attempt' });
+      }
+
+      // Store before state for audit
+      const beforeState = {
+        totalScore: attempt.scoreSummary?.totalScore || 0,
+        maxScore: attempt.scoreSummary?.maxScore || 0,
+        percentage: attempt.scoreSummary?.percentage || 0,
+        normalizedScore: attempt.normalizedScore,
+        percentile: attempt.percentile,
+      };
+
+      // Recalculate score summary
+      const { ensureScoreSummary } = await import('../utils/attemptScores.js');
+      const scoreResult = await ensureScoreSummary(attempt, { includeAnswers: false });
+
+      // Recalculate normalization if applicable
+      let normalizationResult = null;
+      try {
+        const { calculateNormalizedScore } = await import('../services/normalizationService.js');
+        normalizationResult = await calculateNormalizedScore(attempt._id);
+        
+        attempt.normalizedScore = normalizationResult.normalizedScore;
+        attempt.percentile = normalizationResult.percentile;
+        attempt.sessionPercentile = normalizationResult.sessionPercentile;
+      } catch (err) {
+        // Normalization might not be configured - that's okay
+        console.log('Normalization not available:', err.message);
+      }
+
+      await attempt.save();
+
+      // Log audit
+      const { logAuditEvent, AUDIT_ACTIONS } = await import('../utils/auditLogger.js');
+      await logAuditEvent(AUDIT_ACTIONS.ATTEMPT_RECALCULATED || 'ATTEMPT_RECALCULATED', {
+        userId: req.user._id,
+        userEmail: req.user.email,
+        userRole: req.user.role,
+        resourceType: 'ExamAttempt',
+        resourceId: attempt._id,
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
+        method: req.method,
+        path: req.path,
+        details: {
+          before: beforeState,
+          after: {
+            totalScore: attempt.scoreSummary?.totalScore || 0,
+            maxScore: attempt.scoreSummary?.maxScore || 0,
+            percentage: attempt.scoreSummary?.percentage || 0,
+            normalizedScore: attempt.normalizedScore,
+            percentile: attempt.percentile,
+          },
+        },
+      });
+
+      res.json({
+        attempt,
+        message: 'Result recalculated successfully',
+        before: beforeState,
+        after: {
+          totalScore: attempt.scoreSummary?.totalScore || 0,
+          maxScore: attempt.scoreSummary?.maxScore || 0,
+          percentage: attempt.scoreSummary?.percentage || 0,
+          normalizedScore: attempt.normalizedScore,
+          percentile: attempt.percentile,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Resume attempt (for inactivity/disconnection cases)
+router.post(
+  '/:attemptId/resume',
+  requireAuth,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  validateObjectId('attemptId'),
+  [
+    body('reason').trim().notEmpty().withMessage('Reason is required'),
+  ],
+  auditLog(AUDIT_ACTIONS.ATTEMPT_RESUMED, (req) => ({
+    resourceType: 'ExamAttempt',
+    resourceId: req.params.attemptId,
+    reason: req.body.reason,
+  })),
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const attempt = await ExamAttempt.findById(req.params.attemptId);
+      if (!attempt) {
+        return res.status(404).json({ error: 'Attempt not found' });
+      }
+
+      if (attempt.isCompleted) {
+        return res.status(400).json({ error: 'Cannot resume a completed attempt' });
+      }
+
+      attempt.isResumed = true;
+      attempt.resumeReason = req.body.reason;
+      attempt.resumeAllowedBy = req.user._id;
+      attempt.resumeAllowedAt = new Date();
+      attempt.lastActivity = new Date();
+
+      await attempt.save();
+      res.json({ attempt, message: 'Attempt resumed successfully' });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Get candidate attempt view (admin view of any candidate's attempt)
+router.get(
+  '/candidate/:userId/attempt/:attemptId',
+  requireAuth,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  validateObjectId('attemptId'),
+  validateObjectId('userId'),
+  async (req, res, next) => {
+    try {
+      const attempt = await ExamAttempt.findById(req.params.attemptId)
+        .populate('examId', 'title duration')
+        .populate('sessionId', 'startTime endTime')
+        .populate('userId', 'name email')
+        .populate('questionPaperId', 'setName');
+
+      if (!attempt) {
+        return res.status(404).json({ error: 'Attempt not found' });
+      }
+
+      if (attempt.userId._id.toString() !== req.params.userId) {
+        return res.status(403).json({ error: 'Attempt does not belong to this user' });
+      }
+
+      // Get all answers with question details
+      const answers = await Answer.find({ attemptId: attempt._id })
+        .populate('questionId', 'questionText questionType options points sectionId order');
+
+      // Get section-wise breakdown
+      const sectionBreakdown = {};
+      answers.forEach(answer => {
+        if (answer.questionId?.sectionId) {
+          const sectionId = answer.questionId.sectionId.toString();
+          if (!sectionBreakdown[sectionId]) {
+            sectionBreakdown[sectionId] = {
+              answers: [],
+              totalScore: 0,
+              maxScore: 0,
+            };
+          }
+          sectionBreakdown[sectionId].answers.push({
+            question: answer.questionId,
+            answer: answer.answerText,
+            isCorrect: answer.isCorrect,
+            pointsEarned: answer.pointsEarned,
+            timeSpent: answer.timeSpent,
+          });
+          sectionBreakdown[sectionId].totalScore += answer.pointsEarned || 0;
+          sectionBreakdown[sectionId].maxScore += answer.questionId.points || 0;
+        }
+      });
+
+      // Calculate section percentages
+      Object.keys(sectionBreakdown).forEach(sectionId => {
+        const section = sectionBreakdown[sectionId];
+        section.percentage = section.maxScore > 0
+          ? Math.round((section.totalScore / section.maxScore) * 100)
+          : 0;
+      });
+
+      res.json({
+        attempt,
+        answers,
+        sectionBreakdown,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * Allow individual candidate to re-attempt exam
+ * Only EXAM_CREATOR, TENANT_ADMIN, or SUPER_ADMIN can allow re-attempts
+ */
+router.post(
+  '/allow-reattempt/:attemptId',
+  requireAuth,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  requireTenant,
+  validateObjectId('attemptId'),
+  [
+    body('reason').optional().trim().isLength({ max: 500 }).withMessage('Reason must be less than 500 characters'),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const attempt = await ExamAttempt.findById(req.params.attemptId)
+        .populate('examId', 'title tenantId')
+        .populate('userId', 'name email');
+
+      if (!attempt) {
+        return res.status(404).json({ error: 'Attempt not found' });
+      }
+
+      // Verify tenant access
+      if (req.user.role !== 'SUPER_ADMIN') {
+        const userTenantId = req.user.tenantId;
+        const examTenantId = attempt.examId.tenantId;
+        if (userTenantId && examTenantId && userTenantId.toString() !== examTenantId.toString()) {
+          return res.status(403).json({ error: 'Access denied - Exam does not belong to your tenant' });
+        }
+      }
+
+      // Mark this attempt as allowing re-attempt
+      attempt.reAttemptAllowed = true;
+      attempt.reAttemptReason = req.body.reason || 'Re-attempt allowed by administrator';
+      attempt.reAttemptAllowedBy = req.user._id;
+      attempt.reAttemptAllowedAt = new Date();
+
+      await attempt.save();
+
+      res.json({
+        message: 'Re-attempt allowed successfully',
+        attempt: {
+          _id: attempt._id,
+          userId: attempt.userId,
+          examId: attempt.examId,
+          reAttemptAllowed: attempt.reAttemptAllowed,
+          reAttemptReason: attempt.reAttemptReason,
+        },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * Get all attempts for a specific candidate in an exam
+ * Used for managing individual candidate attempts
+ */
+router.get(
+  '/exam/:examId/candidate/:userId',
+  requireAuth,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  requireTenant,
+  validateObjectId('examId'),
+  validateObjectId('userId'),
+  async (req, res, next) => {
+    try {
+      const exam = await Exam.findById(req.params.examId);
+      if (!exam) {
+        return res.status(404).json({ error: 'Exam not found' });
+      }
+
+      // Verify tenant access
+      if (req.user.role !== 'SUPER_ADMIN') {
+        const userTenantId = req.user.tenantId;
+        const examTenantId = exam.tenantId;
+        if (userTenantId && examTenantId && userTenantId.toString() !== examTenantId.toString()) {
+          return res.status(403).json({ error: 'Access denied - Exam does not belong to your tenant' });
+        }
+      }
+
+      const attempts = await ExamAttempt.find({
+        examId: req.params.examId,
+        userId: req.params.userId,
+      })
+        .populate('sessionId', 'startTime endTime qrCode')
+        .populate('questionPaperId', 'setName')
+        .sort({ createdAt: -1 });
+
+      // Count completed attempts
+      const completedAttempts = attempts.filter(a => a.isCompleted).length;
+
+      // Get attempted questions count for each attempt
+      const attemptsWithStats = await Promise.all(
+        attempts.map(async (attempt) => {
+          const attemptObj = attempt.toObject();
+          
+          // Get total questions for this attempt's question paper
+          let totalQuestions = 0;
+          if (attempt.questionPaperId) {
+            const questionPaperId = attempt.questionPaperId._id || attempt.questionPaperId;
+            totalQuestions = await Question.countDocuments({ questionPaperId });
+          }
+          
+          // Count attempted questions (questions with answers)
+          const attemptedCount = await Answer.countDocuments({
+            attemptId: attempt._id,
+            $or: [
+              { answerText: { $exists: true, $ne: '' } },
+              { answerText: { $exists: true, $ne: null } }
+            ]
+          });
+          
+          attemptObj.attemptedQuestions = attemptedCount;
+          attemptObj.totalQuestions = totalQuestions;
+          attemptObj.progressPercentage = totalQuestions > 0 
+            ? Math.round((attemptedCount / totalQuestions) * 100) 
+            : 0;
+          
+          return attemptObj;
+        })
+      );
+
+      res.json({
+        attempts: attemptsWithStats,
+        completedAttempts,
+        maxAttempts: exam.maxAttempts,
+        canAttempt: completedAttempts < exam.maxAttempts || attempts.some(a => a.reAttemptAllowed),
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * Submit offline attempt
+ * POST /attempts/offline-submit
+ * Requires: CANDIDATE role
+ */
+router.post(
+  '/offline-submit',
+  requireAuth,
+  requireRole('CANDIDATE'),
+  [
+    body('attemptId').notEmpty().withMessage('Attempt ID is required'),
+    body('packageVersion').optional().isInt({ min: 1 }).withMessage('Package version must be a positive integer'),
+    body('packageHash').optional().isString().withMessage('Package hash must be a string'),
+    body('deviceFingerprint').optional().isString().withMessage('Device fingerprint must be a string'),
+    body('answers').isObject().withMessage('Answers must be an object'),
+    body('sectionTimings').optional().isArray().withMessage('Section timings must be an array'),
+    body('violationEvents').optional().isArray().withMessage('Violation events must be an array'),
+    body('timestampDrift').optional().isNumeric().withMessage('Timestamp drift must be a number'),
+    body('offlineStartTime').optional().isISO8601().withMessage('Offline start time must be a valid ISO 8601 date'),
+    body('offlineSubmitTime').optional().isISO8601().withMessage('Offline submit time must be a valid ISO 8601 date'),
+  ],
+  auditLog(AUDIT_ACTIONS.ATTEMPT_SUBMITTED, (req) => ({
+    attemptId: req.body.attemptId,
+    offlineMode: true,
+  })),
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const {
+        attemptId,
+        packageVersion,
+        packageHash,
+        deviceFingerprint,
+        answers,
+        sectionTimings,
+        violationEvents,
+        timestampDrift,
+        offlineStartTime,
+        offlineSubmitTime,
+      } = req.body;
+
+      // Verify attempt exists and belongs to user
+      const attempt = await ExamAttempt.findById(attemptId);
+      if (!attempt) {
+        return res.status(404).json({ error: 'Attempt not found' });
+      }
+
+      // Verify ownership
+      if (attempt.userId.toString() !== req.user._id.toString()) {
+        return res.status(403).json({ error: 'Forbidden - You can only submit your own attempts' });
+      }
+
+      if (attempt.isCompleted) {
+        return res.status(400).json({ error: 'Attempt already submitted' });
+      }
+
+      // Prepare attempt data for reconciliation
+      const attemptData = {
+        attemptId,
+        packageVersion,
+        packageHash,
+        deviceFingerprint,
+        answers,
+        sectionTimings: sectionTimings || [],
+        violationEvents: violationEvents || [],
+        timestampDrift: timestampDrift || 0,
+        offlineStartTime,
+        offlineSubmitTime,
+        startTime: attempt.startTime,
+        submitTime: new Date(),
+      };
+
+      // Reconcile offline attempt
+      const reconciliationResult = await reconcileOfflineAttempt(attemptData);
+
+      // Get updated attempt
+      const updatedAttempt = await ExamAttempt.findById(attemptId)
+        .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
+        .populate('sessionId', 'startTime endTime')
+        .populate('questionPaperId', '_id setName');
+
+      // Calculate score summary
+      const scoreSummary = await ensureScoreSummary(updatedAttempt);
+
+      res.json({
+        attempt: updatedAttempt,
+        score: scoreSummary,
+        reconciliation: {
+          warnings: reconciliationResult.warnings || [],
+          anomalies: reconciliationResult.anomalies || [],
+          flags: reconciliationResult.flags || [],
+        },
+        message: 'Offline attempt submitted successfully',
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 
 export default router;
 

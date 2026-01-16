@@ -4,40 +4,68 @@
  */
 
 import { logError } from './logger.js';
+import AuditLog from '../models/AuditLog.js';
 
 /**
  * Audit log entry structure
  */
 export const createAuditLog = (action, details) => {
   return {
-    timestamp: new Date().toISOString(),
+    timestamp: new Date(),
     action,
     ...details,
   };
 };
 
 /**
- * Log audit event
- * In production, this should write to a secure audit log store
+ * Log audit event to database
  * @param {string} action - Action performed (e.g., 'USER_CREATED', 'EXAM_DELETED')
  * @param {object} details - Additional details (userId, resourceId, etc.)
  */
-export const logAuditEvent = (action, details = {}) => {
-  const auditEntry = createAuditLog(action, details);
-  
-  // Log to console in development, to secure store in production
-  if (process.env.NODE_ENV === 'production') {
-    // In production, you might want to:
-    // - Write to a separate audit log file
-    // - Send to a logging service (e.g., CloudWatch, Datadog)
-    // - Store in a separate audit database
-    console.log('[AUDIT]', JSON.stringify(auditEntry));
-  } else {
-    console.log('[AUDIT]', JSON.stringify(auditEntry, null, 2));
+export const logAuditEvent = async (action, details = {}) => {
+  try {
+    const auditEntry = new AuditLog({
+      action,
+      userId: details.userId || null,
+      userEmail: details.userEmail || null,
+      userRole: details.userRole || null,
+      resourceType: details.resourceType || null,
+      resourceId: details.resourceId || null,
+      details: {
+        method: details.method,
+        path: details.path,
+        ...details,
+      },
+      ipAddress: details.ip || details.ipAddress || null,
+      userAgent: details.userAgent || null,
+      method: details.method || null,
+      path: details.path || null,
+      statusCode: details.statusCode || null,
+      timestamp: new Date(),
+    });
+    
+    // Save to database (non-blocking)
+    auditEntry.save().catch(error => {
+      // Log error but don't throw - audit logging should not break the main flow
+      console.error('[AUDIT ERROR] Failed to save audit log:', error);
+      logError(error, { context: 'auditLogger', action, details });
+    });
+    
+    // Also log to console in development
+    if (process.env.NODE_ENV !== 'production') {
+      console.log('[AUDIT]', JSON.stringify({
+        action,
+        userId: details.userId,
+        resourceType: details.resourceType,
+        resourceId: details.resourceId,
+        timestamp: new Date().toISOString(),
+      }, null, 2));
+    }
+  } catch (error) {
+    // Log error but don't throw - audit logging should not break the main flow
+    console.error('[AUDIT ERROR] Failed to create audit log:', error);
+    logError(error, { context: 'auditLogger', action, details });
   }
-  
-  // TODO: Implement persistent audit logging
-  // Example: await AuditLog.create(auditEntry);
 };
 
 /**
@@ -79,5 +107,31 @@ export const AUDIT_ACTIONS = {
   LOGOUT: 'LOGOUT',
   TOKEN_REFRESHED: 'TOKEN_REFRESHED',
   UNAUTHORIZED_ACCESS: 'UNAUTHORIZED_ACCESS',
+  
+  // New Phase 2 actions
+  RE_ATTEMPT_ALLOWED: 'RE_ATTEMPT_ALLOWED',
+  ATTEMPT_RESUMED: 'ATTEMPT_RESUMED',
+  NORMALIZATION_CONFIGURED: 'NORMALIZATION_CONFIGURED',
+  NORMALIZATION_RECALCULATED: 'NORMALIZATION_RECALCULATED',
+  NORMALIZATION_LOCKED: 'NORMALIZATION_LOCKED',
+  ANSWER_KEY_IMPORTED: 'ANSWER_KEY_IMPORTED',
+  ANSWER_KEY_APPLIED: 'ANSWER_KEY_APPLIED',
+  QUESTIONS_IMPORTED: 'QUESTIONS_IMPORTED',
+  SECTION_CREATED: 'SECTION_CREATED',
+  SECTION_UPDATED: 'SECTION_UPDATED',
+  SECTION_DELETED: 'SECTION_DELETED',
+  LANGUAGE_ADDED: 'LANGUAGE_ADDED',
+  TRANSLATION_ADDED: 'TRANSLATION_ADDED',
+  
+  // Admin visibility actions
+  EXAM_ENABLED: 'EXAM_ENABLED',
+  EXAM_DISABLED: 'EXAM_DISABLED',
+  EXAM_PREVIEWED: 'EXAM_PREVIEWED',
+  EXAM_AUDITED: 'EXAM_AUDITED',
+  ATTEMPT_RE_ENABLED: 'ATTEMPT_RE_ENABLED',
+  ATTEMPT_RECALCULATED: 'ATTEMPT_RECALCULATED',
+  ATTEMPT_OVERRIDE: 'ATTEMPT_OVERRIDE',
+  ATTEMPT_FLAGGED: 'ATTEMPT_FLAGGED',
+  ATTEMPT_NOTE_ADDED: 'ATTEMPT_NOTE_ADDED',
 };
 

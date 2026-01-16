@@ -93,6 +93,147 @@ const ExamAttemptSchema = new mongoose.Schema(
         type: Date,
       },
     },
+    normalizedScore: {
+      type: Number,
+    },
+    percentile: {
+      type: Number,
+      min: 0,
+      max: 100,
+    },
+    sessionPercentile: {
+      type: Number,
+      min: 0,
+      max: 100,
+    },
+    sectionTimers: {
+      type: Map,
+      of: {
+        startTime: { type: Date },
+        endTime: { type: Date },
+        isLocked: { type: Boolean, default: false },
+        timeSpent: { type: Number, default: 0 }, // seconds
+      },
+      default: new Map(),
+    },
+    reAttemptAllowed: {
+      type: Boolean,
+      default: false,
+    },
+    reAttemptReason: {
+      type: String,
+      trim: true,
+    },
+    reAttemptAllowedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    },
+    reAttemptAllowedAt: {
+      type: Date,
+    },
+    isResumed: {
+      type: Boolean,
+      default: false,
+    },
+    resumeReason: {
+      type: String,
+      trim: true,
+    },
+    resumeAllowedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+    },
+    resumeAllowedAt: {
+      type: Date,
+    },
+    deviceInfo: {
+      ipAddress: { type: String },
+      userAgent: { type: String },
+      deviceId: { type: String },
+    },
+    suspiciousActivity: {
+      type: Boolean,
+      default: false,
+    },
+    suspiciousActivityFlags: {
+      type: [String],
+      default: [],
+    },
+    adminFlags: {
+      status: {
+        type: String,
+        enum: ['VALID', 'SUSPICIOUS', 'INVALID'],
+        default: null,
+      },
+      flaggedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+      },
+      flaggedAt: {
+        type: Date,
+      },
+      reason: {
+        type: String,
+        trim: true,
+      },
+    },
+    adminNotes: [{
+      note: {
+        type: String,
+        required: true,
+        trim: true,
+      },
+      addedBy: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'User',
+        required: true,
+      },
+      addedAt: {
+        type: Date,
+        default: Date.now,
+      },
+    }],
+    // Offline exam attempt fields
+    offlineMode: {
+      type: Boolean,
+      default: false,
+    },
+    packageVersion: {
+      type: Number,
+    },
+    packageHash: {
+      type: String,
+      trim: true,
+    },
+    deviceFingerprint: {
+      type: String,
+      trim: true,
+    },
+    offlineStartTime: {
+      type: Date,
+    },
+    offlineSubmitTime: {
+      type: Date,
+    },
+    violationEvents: [{
+      type: {
+        type: String,
+        enum: ['SCREENSHOT', 'BACKGROUND', 'SCREEN_LOCK', 'APP_KILL', 'SPLIT_SCREEN', 'COPY_PASTE', 'OTHER'],
+        required: true,
+      },
+      timestamp: {
+        type: Date,
+        required: true,
+      },
+      details: {
+        type: String,
+        trim: true,
+      },
+    }],
+    timestampDrift: {
+      type: Number,
+      default: 0, // Difference in milliseconds between device time and server time
+    },
   },
   {
     timestamps: true,

@@ -34,66 +34,150 @@ router.get('/stats', async (req, res, next) => {
   try {
     const tenantId = req.user.tenantId;
 
+    // Calculate today's date range
+    const todayStart = new Date();
+    todayStart.setHours(0, 0, 0, 0);
+    const todayEnd = new Date();
+    todayEnd.setHours(23, 59, 59, 999);
+
+    // Calculate today's sessions range
+    const now = new Date();
+
     const [
-      totalUsers,
-      usersByRole,
       totalExams,
       activeExams,
       totalExamAttempts,
       completedAttempts,
+      todayAttempts,
       totalSessions,
       activeSessions,
+      totalCandidates,
     ] = await Promise.all([
-      User.countDocuments({ tenantId, role: { $ne: 'SUPER_ADMIN' } }),
-      User.aggregate([
-        { $match: { tenantId, role: { $ne: 'SUPER_ADMIN' } } },
-        { $group: { _id: '$role', count: { $sum: 1 } } },
-      ]),
       Exam.countDocuments({ tenantId }),
       Exam.countDocuments({ tenantId, isActive: true }),
       ExamAttempt.countDocuments({ tenantId }),
       ExamAttempt.countDocuments({ tenantId, isCompleted: true }),
+      ExamAttempt.countDocuments({
+        tenantId,
+        createdAt: { $gte: todayStart, $lte: todayEnd },
+      }),
       ExamSession.countDocuments({ tenantId }),
-      ExamSession.countDocuments({ tenantId, endTime: { $gte: new Date() } }),
+      ExamSession.countDocuments({ tenantId, endTime: { $gte: now } }),
+      User.countDocuments({ tenantId, role: 'CANDIDATE' }),
     ]);
 
-    // Calculate AI usage stats
-    const aiExams = await Exam.countDocuments({ tenantId, aiGenerated: true });
-    const recentAiExams = await Exam.countDocuments({
+    // Get pending results: completed attempts where results not released
+    const completedAttemptsNotReleased = await ExamAttempt.aggregate([
+      {
+        $match: {
+          tenantId,
+          isCompleted: true,
+          isDisqualified: false,
+        },
+      },
+      {
+        $lookup: {
+          from: 'exams',
+          localField: 'examId',
+          foreignField: '_id',
+          as: 'exam',
+        },
+      },
+      {
+        $unwind: '$exam',
+      },
+      {
+        $match: {
+          $or: [
+            { 'exam.showResultsImmediately': false, 'exam.resultsReleasedAt': null },
+            { 'exam.showResultsImmediately': false, 'exam.resultsReleasedAt': { $exists: false } },
+          ],
+        },
+      },
+      {
+        $count: 'count',
+      },
+    ]);
+
+    const completedNotReleased = completedAttemptsNotReleased[0]?.count || 0;
+    const inProgress = totalExamAttempts - completedAttempts;
+
+    // Get active exams list (last 5)
+    const activeExamsList = await Exam.find({ tenantId, isActive: true })
+      .select('_id title isActive createdAt')
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .lean();
+
+    // Get today's sessions
+    const todaySessions = await ExamSession.find({
       tenantId,
-      aiGenerated: true,
-      createdAt: { $gte: new Date(Date.now() - 30 * 24 * 60 * 60 * 1000) },
-    });
+      startTime: { $lte: todayEnd },
+      endTime: { $gte: todayStart },
+    })
+      .select('_id examId startTime endTime isActive')
+      .populate('examId', 'title')
+      .sort({ startTime: 1 })
+      .limit(10)
+      .lean();
+
+    // Get recent attempts (last 5)
+    const recentAttempts = await ExamAttempt.find({ tenantId })
+      .select('_id userId examId isCompleted isDisqualified createdAt')
+      .populate('userId', 'name email')
+      .populate('examId', 'title')
+      .sort({ createdAt: -1 })
+      .limit(5)
+      .lean();
 
     // Get tenant info
     const tenant = await Tenant.findById(tenantId).select('name code type status');
 
     res.json({
       tenant,
-      users: {
-        total: totalUsers,
-        byRole: usersByRole.reduce((acc, item) => {
-          acc[item._id] = item.count;
-          return acc;
-        }, {}),
-      },
       exams: {
         total: totalExams,
         active: activeExams,
-        inactive: totalExams - activeExams,
-        aiGenerated: aiExams,
-        recentAiGenerated: recentAiExams,
       },
       attempts: {
         total: totalExamAttempts,
         completed: completedAttempts,
-        inProgress: totalExamAttempts - completedAttempts,
+        todayAttempts,
       },
       sessions: {
         total: totalSessions,
         active: activeSessions,
-        completed: totalSessions - activeSessions,
       },
+      totalCandidates,
+      pendingResults: {
+        completedNotReleased,
+        inProgress,
+      },
+      activeExamsList: activeExamsList.map(e => ({
+        _id: e._id,
+        title: e.title,
+        isActive: e.isActive,
+        createdAt: e.createdAt,
+      })),
+      todaySessions: todaySessions.map(s => ({
+        _id: s._id,
+        examId: s.examId?._id || s.examId,
+        examTitle: s.examId?.title || 'N/A',
+        startTime: s.startTime,
+        endTime: s.endTime,
+        isActive: s.isActive,
+      })),
+      recentAttempts: recentAttempts.map(a => ({
+        _id: a._id,
+        userId: a.userId?._id || a.userId,
+        userName: a.userId?.name || 'N/A',
+        userEmail: a.userId?.email || 'N/A',
+        examId: a.examId?._id || a.examId,
+        examTitle: a.examId?.title || 'N/A',
+        isCompleted: a.isCompleted,
+        isDisqualified: a.isDisqualified,
+        createdAt: a.createdAt,
+      })),
     });
   } catch (error) {
     next(error);
@@ -413,7 +497,7 @@ router.get('/exams', async (req, res, next) => {
   }
 });
 
-// Get single exam
+// Get single exam with full details
 router.get('/exams/:examId', async (req, res, next) => {
   try {
     const exam = await Exam.findOne({
@@ -425,7 +509,197 @@ router.get('/exams/:examId', async (req, res, next) => {
       return res.status(404).json({ error: 'Exam not found' });
     }
 
-    res.json({ exam });
+    // Get question papers for this exam
+    const QuestionPaper = (await import('../models/QuestionPaper.js')).default;
+    const questionPapers = await QuestionPaper.find({ examId: exam._id, isActive: true });
+
+    // Get sections and question counts for each question paper
+    const Section = (await import('../models/Section.js')).default;
+    const Question = (await import('../models/Question.js')).default;
+
+    const examDetails = {
+      ...exam.toObject(),
+      questionPapers: [],
+      totalQuestions: 0,
+      totalMarks: 0,
+      sections: [],
+    };
+
+    // Process each question paper
+    for (const qp of questionPapers) {
+      const sections = await Section.find({ questionPaperId: qp._id, isActive: true })
+        .sort({ order: 1 })
+        .lean();
+
+      const sectionDetails = [];
+      let paperTotalQuestions = 0;
+      let paperTotalMarks = 0;
+
+      for (const section of sections) {
+        const questionCount = await Question.countDocuments({
+          questionPaperId: qp._id,
+          sectionId: section._id,
+        });
+
+        const sectionMarks = await Question.aggregate([
+          {
+            $match: {
+              questionPaperId: qp._id,
+              sectionId: section._id,
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              totalMarks: { $sum: '$points' },
+            },
+          },
+        ]);
+
+        const marks = sectionMarks.length > 0 ? sectionMarks[0].totalMarks : 0;
+
+        sectionDetails.push({
+          ...section,
+          questionCount,
+          totalMarks: marks,
+        });
+
+        paperTotalQuestions += questionCount;
+        paperTotalMarks += marks;
+      }
+
+      // Also count questions without sections
+      const questionsWithoutSection = await Question.countDocuments({
+        questionPaperId: qp._id,
+        sectionId: { $exists: false },
+      });
+
+      const marksWithoutSection = await Question.aggregate([
+        {
+          $match: {
+            questionPaperId: qp._id,
+            sectionId: { $exists: false },
+          },
+        },
+        {
+          $group: {
+            _id: null,
+            totalMarks: { $sum: '$points' },
+          },
+        },
+      ]);
+
+      const marksNoSection = marksWithoutSection.length > 0 ? marksWithoutSection[0].totalMarks : 0;
+
+      examDetails.questionPapers.push({
+        ...qp.toObject(),
+        sections: sectionDetails,
+        questionCount: paperTotalQuestions + questionsWithoutSection,
+        totalMarks: paperTotalMarks + marksNoSection,
+      });
+
+      examDetails.totalQuestions += paperTotalQuestions + questionsWithoutSection;
+      examDetails.totalMarks += paperTotalMarks + marksNoSection;
+      examDetails.sections.push(...sectionDetails);
+    }
+
+    // Get all attempts for this exam with candidate details
+    const ExamAttempt = (await import('../models/ExamAttempt.js')).default;
+    const Answer = (await import('../models/Answer.js')).default;
+    
+    const attempts = await ExamAttempt.find({ examId: exam._id })
+      .populate('userId', 'name email uniqueId')
+      .sort({ createdAt: -1 })
+      .lean();
+
+    // Aggregate candidate data
+    const candidatesMap = new Map();
+    
+    for (const attempt of attempts) {
+      const userId = attempt.userId?._id?.toString() || attempt.userId?.toString();
+      if (!userId) continue;
+
+      if (!candidatesMap.has(userId)) {
+        candidatesMap.set(userId, {
+          _id: userId,
+          name: attempt.userId?.name || 'Unknown',
+          email: attempt.userId?.email || '',
+          uniqueId: attempt.userId?.uniqueId || '',
+          attempts: [],
+          totalAttempts: 0,
+          bestScore: 0,
+          bestPercentage: 0,
+          latestAttempt: null,
+        });
+      }
+
+      const candidate = candidatesMap.get(userId);
+      candidate.totalAttempts++;
+
+      // Get answers for this attempt to calculate questions attempted
+      const answers = await Answer.find({ attemptId: attempt._id }).lean();
+      const questionsAttempted = answers.length;
+      const marksObtained = attempt.scoreSummary?.totalScore || 0;
+      const totalMarks = attempt.scoreSummary?.maxScore || examDetails.totalMarks || 0;
+      const percentage = attempt.scoreSummary?.percentage || 0;
+
+      candidate.attempts.push({
+        attemptId: attempt._id,
+        isCompleted: attempt.isCompleted || false,
+        isDisqualified: attempt.isDisqualified || false,
+        questionsAttempted,
+        marksObtained,
+        totalMarks,
+        percentage,
+        startTime: attempt.startTime,
+        submitTime: attempt.submitTime,
+      });
+
+      // Track best score
+      if (marksObtained > candidate.bestScore) {
+        candidate.bestScore = marksObtained;
+        candidate.bestPercentage = percentage;
+      }
+
+      // Track latest attempt
+      if (!candidate.latestAttempt || new Date(attempt.createdAt) > new Date(candidate.latestAttempt.createdAt)) {
+        candidate.latestAttempt = {
+          attemptId: attempt._id,
+          questionsAttempted,
+          marksObtained,
+          totalMarks,
+          percentage,
+          isCompleted: attempt.isCompleted || false,
+          isDisqualified: attempt.isDisqualified || false,
+          createdAt: attempt.createdAt,
+        };
+      }
+    }
+
+    // Convert map to array and format for response
+    const candidates = Array.from(candidatesMap.values()).map(candidate => ({
+      _id: candidate._id,
+      name: candidate.name,
+      email: candidate.email,
+      uniqueId: candidate.uniqueId,
+      totalAttempts: candidate.totalAttempts,
+      latestAttempt: candidate.latestAttempt ? {
+        questionsAttempted: candidate.latestAttempt.questionsAttempted,
+        marksObtained: candidate.latestAttempt.marksObtained,
+        totalMarks: candidate.latestAttempt.totalMarks,
+        percentage: candidate.latestAttempt.percentage,
+        isCompleted: candidate.latestAttempt.isCompleted,
+        isDisqualified: candidate.latestAttempt.isDisqualified,
+        attemptId: candidate.latestAttempt.attemptId,
+      } : null,
+      bestScore: candidate.bestScore,
+      bestPercentage: candidate.bestPercentage,
+    }));
+
+    examDetails.candidates = candidates;
+    examDetails.totalCandidates = candidates.length;
+
+    res.json({ exam: examDetails });
   } catch (error) {
     next(error);
   }
@@ -459,6 +733,11 @@ router.put(
 
       const { title, description, isActive, duration, maxAttempts } = req.body;
 
+      // Store before state for audit
+      const beforeState = {
+        isActive: exam.isActive,
+      };
+
       if (title) exam.title = title;
       if (description !== undefined) exam.description = description;
       if (isActive !== undefined) exam.isActive = isActive;
@@ -467,6 +746,29 @@ router.put(
 
       await exam.save();
       await exam.populate('createdBy', 'name email role');
+
+      // Log audit for enable/disable
+      if (isActive !== undefined && isActive !== beforeState.isActive) {
+        const { logAuditEvent, AUDIT_ACTIONS } = await import('../utils/auditLogger.js');
+        await logAuditEvent(
+          isActive ? AUDIT_ACTIONS.EXAM_ENABLED || 'EXAM_ENABLED' : AUDIT_ACTIONS.EXAM_DISABLED || 'EXAM_DISABLED',
+          {
+            userId: req.user._id,
+            userEmail: req.user.email,
+            userRole: req.user.role,
+            resourceType: 'Exam',
+            resourceId: exam._id,
+            ip: req.ip,
+            userAgent: req.get('user-agent'),
+            method: req.method,
+            path: req.path,
+            details: {
+              before: beforeState,
+              after: { isActive: exam.isActive },
+            },
+          }
+        );
+      }
 
       res.json({ exam });
     } catch (error) {
@@ -538,6 +840,379 @@ router.get('/sessions', async (req, res, next) => {
  */
 
 // List all exam attempts in tenant
+// Get single attempt with full details
+router.get('/attempts/:attemptId', async (req, res, next) => {
+  try {
+    const ExamAttempt = (await import('../models/ExamAttempt.js')).default;
+    const Answer = (await import('../models/Answer.js')).default;
+    const Section = (await import('../models/Section.js')).default;
+    const Question = (await import('../models/Question.js')).default;
+    const AnswerKey = (await import('../models/AnswerKey.js')).default;
+
+    const attempt = await ExamAttempt.findOne({
+      _id: req.params.attemptId,
+      tenantId: req.user.tenantId,
+    })
+      .populate('examId', 'title duration description passingPercentage')
+      .populate('sessionId', 'startTime endTime qrCode')
+      .populate('userId', 'name email')
+      .populate('questionPaperId', 'setName')
+      .populate('adminFlags.flaggedBy', 'name email')
+      .populate('adminNotes.addedBy', 'name email');
+
+    if (!attempt) {
+      return res.status(404).json({ error: 'Attempt not found' });
+    }
+
+    // Get all answers with question details
+    const answers = await Answer.find({ attemptId: attempt._id })
+      .populate('questionId', 'questionText questionType options points sectionId order passage imageUrl correctAnswer')
+      .sort({ 'questionId.order': 1 })
+      .lean();
+
+    // Get sections if question paper exists
+    let sections = [];
+    if (attempt.questionPaperId) {
+      sections = await Section.find({ questionPaperId: attempt.questionPaperId._id, isActive: true })
+        .sort({ order: 1 })
+        .lean();
+    }
+
+    // Get answer key for this exam with full details
+    let answerKeyDetails = null;
+    try {
+      const answerKey = await AnswerKey.findOne({ examId: attempt.examId._id, isActive: true })
+        .populate('importedBy', 'name email')
+        .lean();
+      
+      if (answerKey) {
+        // Convert Map to object for JSON serialization
+        const answersMap = answerKey.answers || new Map();
+        const answersObj = {};
+        if (answersMap instanceof Map) {
+          answersMap.forEach((value, key) => {
+            answersObj[key] = value;
+          });
+        } else if (typeof answersMap === 'object' && answersMap !== null) {
+          Object.assign(answersObj, answersMap);
+        }
+        
+        answerKeyDetails = {
+          _id: answerKey._id,
+          version: answerKey.version,
+          source: answerKey.source,
+          appliedAt: answerKey.appliedAt,
+          importedAt: answerKey.importedAt,
+          importedBy: answerKey.importedBy,
+          notes: answerKey.notes,
+          answers: answersObj,
+        };
+      }
+    } catch (err) {
+      console.error('Error loading answer key:', err);
+      // Answer key might not exist - that's okay
+    }
+
+    // Build section-wise breakdown
+    const sectionBreakdown = {};
+    const sectionTimers = attempt.sectionTimers || {};
+
+    for (const section of sections) {
+      const sectionAnswers = answers.filter(a => {
+        if (!a.questionId || !a.questionId.sectionId) return false;
+        const qSectionId = a.questionId.sectionId.toString();
+        const sId = section._id?.toString() || section._id;
+        return qSectionId === sId;
+      });
+
+      const sectionIdStr = section._id?.toString() || section._id;
+      const timer = sectionTimers[section._id] || sectionTimers[sectionIdStr] || {};
+
+      sectionBreakdown[sectionIdStr] = {
+        section: {
+          _id: section._id?.toString() || section._id,
+          name: section.name || '',
+          description: section.description || '',
+          order: section.order || 0,
+          duration: section.duration || 0,
+          marks: section.marks || 0,
+          negativeMarking: section.negativeMarking || 0,
+        },
+        questionsAttempted: sectionAnswers.length,
+        timeSpent: timer.timeSpent || 0,
+        marksObtained: sectionAnswers.reduce((sum, a) => sum + (Number(a.pointsEarned) || 0), 0),
+        maxMarks: sectionAnswers.reduce((sum, a) => sum + (Number(a.questionId?.points) || 0), 0),
+        isLocked: timer.isLocked || false,
+        startTime: timer.startTime || null,
+        endTime: timer.endTime || null,
+      };
+    }
+
+    // Questions without sections
+    const questionsWithoutSection = answers.filter(a => !a.questionId || !a.questionId.sectionId);
+    if (questionsWithoutSection.length > 0) {
+      sectionBreakdown['no-section'] = {
+        section: null,
+        questionsAttempted: questionsWithoutSection.length,
+        timeSpent: 0,
+        marksObtained: questionsWithoutSection.reduce((sum, a) => sum + (Number(a.pointsEarned) || 0), 0),
+        maxMarks: questionsWithoutSection.reduce((sum, a) => sum + (Number(a.questionId?.points) || 0), 0),
+        isLocked: false,
+      };
+    }
+
+    // Calculate duration used
+    let durationUsed = 0;
+    if (attempt.startTime && attempt.submitTime) {
+      durationUsed = Math.floor((new Date(attempt.submitTime) - new Date(attempt.startTime)) / 1000 / 60);
+    } else if (attempt.startTime) {
+      durationUsed = Math.floor((new Date() - new Date(attempt.startTime)) / 1000 / 60);
+    }
+
+    // Get violation summary
+    const { getSuspiciousActivitySummary } = await import('../services/proctoringService.js');
+    let violationSummary = null;
+    try {
+      violationSummary = await getSuspiciousActivitySummary(attempt._id);
+    } catch (err) {
+      console.error('Error loading violation summary:', err);
+      // Violation summary might fail - that's okay
+    }
+
+    // Convert attempt to object safely
+    const attemptObj = attempt.toObject ? attempt.toObject() : attempt;
+
+    res.json({
+      attempt: {
+        ...attemptObj,
+        durationUsed,
+      },
+      answers: answers.map(a => {
+        const question = a.questionId;
+        return {
+          _id: a._id?.toString() || a._id,
+          questionId: question?._id?.toString() || question?._id || null,
+          question: question ? {
+            _id: question._id?.toString() || question._id,
+            questionText: question.questionText || '',
+            questionType: question.questionType || '',
+            options: question.options || null,
+            points: question.points || 0,
+            sectionId: question.sectionId?.toString() || question.sectionId || null,
+            order: question.order || 0,
+            passage: question.passage || null,
+            imageUrl: question.imageUrl || null,
+            correctAnswer: question.correctAnswer || null,
+          } : null,
+          answerText: a.answerText || '',
+          isCorrect: a.isCorrect || false,
+          pointsEarned: a.pointsEarned || 0,
+          timeSpent: a.timeSpent || 0,
+          createdAt: a.createdAt || new Date(),
+        };
+      }),
+      sectionBreakdown,
+      answerKey: answerKeyDetails,
+      violationSummary,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Get exam results with statistics
+router.get('/results/exams', async (req, res, next) => {
+  try {
+    const ExamAttempt = (await import('../models/ExamAttempt.js')).default;
+    const Answer = (await import('../models/Answer.js')).default;
+
+    // Get all exams in tenant
+    const exams = await Exam.find({ tenantId: req.user.tenantId })
+      .populate('createdBy', 'name email')
+      .sort({ createdAt: -1 });
+
+    // Get statistics for each exam
+    const examsWithStats = await Promise.all(
+      exams.map(async (exam) => {
+        // Get all completed attempts for this exam
+        const attempts = await ExamAttempt.find({
+          examId: exam._id,
+          isCompleted: true,
+          isDisqualified: false,
+        }).populate('userId', 'name email uniqueId');
+
+        if (attempts.length === 0) {
+          return {
+            _id: exam._id,
+            title: exam.title,
+            description: exam.description,
+            createdAt: exam.createdAt,
+            totalCandidates: 0,
+            overallPercentage: 0,
+            averageScore: 0,
+            maxScore: 0,
+            minScore: 0,
+            averagePercentile: 0,
+            averageNormalizedScore: 0,
+          };
+        }
+
+        // Calculate scores for each attempt
+        const scores = await Promise.all(
+          attempts.map(async (attempt) => {
+            const answers = await Answer.find({ attemptId: attempt._id })
+              .populate('questionId', 'points');
+            const totalScore = answers.reduce((sum, a) => sum + (a.pointsEarned || 0), 0);
+            const maxScore = answers.reduce((sum, a) => sum + (a.questionId?.points || 0), 0);
+            const percentage = maxScore > 0 ? (totalScore / maxScore) * 100 : 0;
+
+            return {
+              attemptId: attempt._id,
+              userId: attempt.userId,
+              totalScore,
+              maxScore,
+              percentage,
+              normalizedScore: attempt.normalizedScore || null,
+              percentile: attempt.percentile || null,
+            };
+          })
+        );
+
+        const totalScores = scores.reduce((sum, s) => sum + s.totalScore, 0);
+        const totalMaxScores = scores.reduce((sum, s) => sum + s.maxScore, 0);
+        const overallPercentage = totalMaxScores > 0 ? (totalScores / totalMaxScores) * 100 : 0;
+        const averageScore = scores.reduce((sum, s) => sum + s.totalScore, 0) / scores.length;
+        const maxScore = Math.max(...scores.map(s => s.totalScore));
+        const minScore = Math.min(...scores.map(s => s.totalScore));
+        const percentiles = scores.map(s => s.percentile).filter(p => p !== null);
+        const normalizedScores = scores.map(s => s.normalizedScore).filter(s => s !== null);
+        const averagePercentile = percentiles.length > 0
+          ? percentiles.reduce((sum, p) => sum + p, 0) / percentiles.length
+          : 0;
+        const averageNormalizedScore = normalizedScores.length > 0
+          ? normalizedScores.reduce((sum, s) => sum + s, 0) / normalizedScores.length
+          : 0;
+
+        return {
+          _id: exam._id,
+          title: exam.title,
+          description: exam.description,
+          createdAt: exam.createdAt,
+          totalCandidates: attempts.length,
+          overallPercentage: Math.round(overallPercentage * 100) / 100,
+          averageScore: Math.round(averageScore * 100) / 100,
+          maxScore,
+          minScore,
+          averagePercentile: Math.round(averagePercentile * 100) / 100,
+          averageNormalizedScore: Math.round(averageNormalizedScore * 100) / 100,
+        };
+      })
+    );
+
+    res.json({ exams: examsWithStats });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Get detailed results for a specific exam
+router.get('/results/exams/:examId', async (req, res, next) => {
+  try {
+    const ExamAttempt = (await import('../models/ExamAttempt.js')).default;
+    const Answer = (await import('../models/Answer.js')).default;
+    const { getNormalizationStats } = await import('../services/normalizationService.js');
+
+    const exam = await Exam.findOne({
+      _id: req.params.examId,
+      tenantId: req.user.tenantId,
+    });
+
+    if (!exam) {
+      return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    // Get all completed attempts for this exam
+    const attempts = await ExamAttempt.find({
+      examId: exam._id,
+      isCompleted: true,
+      isDisqualified: false,
+    })
+      .populate('userId', 'name email uniqueId')
+      .sort({ createdAt: -1 });
+
+    // Calculate scores and get candidate data
+    const candidates = await Promise.all(
+      attempts.map(async (attempt) => {
+        const answers = await Answer.find({ attemptId: attempt._id })
+          .populate('questionId', 'points');
+        const totalScore = answers.reduce((sum, a) => sum + (a.pointsEarned || 0), 0);
+        const maxScore = answers.reduce((sum, a) => sum + (a.questionId?.points || 0), 0);
+        const percentage = maxScore > 0 ? (totalScore / maxScore) * 100 : 0;
+
+        return {
+          attemptId: attempt._id,
+          userId: attempt.userId._id,
+          name: attempt.userId.name,
+          email: attempt.userId.email,
+          uniqueId: attempt.userId.uniqueId,
+          totalScore,
+          maxScore,
+          percentage: Math.round(percentage * 100) / 100,
+          normalizedScore: attempt.normalizedScore || null,
+          percentile: attempt.percentile || null,
+          sessionPercentile: attempt.sessionPercentile || null,
+          rank: null, // Will be calculated after sorting
+        };
+      })
+    );
+
+    // Sort by totalScore descending to calculate rank
+    candidates.sort((a, b) => b.totalScore - a.totalScore);
+    candidates.forEach((candidate, index) => {
+      candidate.rank = index + 1;
+    });
+
+    // Get top 5 and bottom 5
+    const top5 = candidates.slice(0, 5);
+    const bottom5 = candidates.slice(-5).reverse();
+
+    // Get normalization statistics
+    const normalizationStats = await getNormalizationStats(exam._id);
+
+    // Prepare data for normalization curve
+    const scores = candidates.map(c => c.totalScore).sort((a, b) => a - b);
+    const normalizedScores = candidates
+      .map(c => c.normalizedScore)
+      .filter(s => s !== null)
+      .sort((a, b) => a - b);
+    const percentiles = candidates
+      .map(c => c.percentile)
+      .filter(p => p !== null)
+      .sort((a, b) => a - b);
+
+    res.json({
+      exam: {
+        _id: exam._id,
+        title: exam.title,
+        description: exam.description,
+        createdAt: exam.createdAt,
+      },
+      candidates,
+      top5,
+      bottom5,
+      normalizationStats,
+      scoreDistribution: {
+        rawScores: scores,
+        normalizedScores,
+        percentiles,
+      },
+      totalCandidates: candidates.length,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.get('/attempts', async (req, res, next) => {
   try {
     const { page = 1, limit = 20, examId, userId, isCompleted } = req.query;

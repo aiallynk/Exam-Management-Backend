@@ -34,11 +34,42 @@ router.get('/:examId/questions', requireAuth, requireTenant, enforceTenantBounda
 });
 
 // Get questions for a specific question paper
-router.get('/:examId/question-papers/:paperId/questions', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
+router.get('/:examId/question-papers/:paperId/questions', requireAuth, requireTenant, async (req, res, next) => {
   try {
+    const { examId, paperId } = req.params;
+    
+    // Verify exam exists and user has access
+    const exam = await Exam.findById(examId);
+    if (!exam) {
+      return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    // Check tenant boundaries - user must be in same tenant as exam (unless SUPER_ADMIN)
+    if (req.user.role !== 'SUPER_ADMIN') {
+      const userTenantId = req.user.tenantId;
+      const examTenantId = exam.tenantId;
+      
+      if (userTenantId && examTenantId && userTenantId.toString() !== examTenantId.toString()) {
+        return res.status(403).json({ error: 'Access denied - Exam belongs to different tenant' });
+      }
+    }
+
+    // Verify question paper belongs to this exam
+    const questionPaper = await QuestionPaper.findById(paperId);
+    if (!questionPaper) {
+      return res.status(404).json({ error: 'Question paper not found' });
+    }
+    
+    if (questionPaper.examId.toString() !== examId) {
+      return res.status(400).json({ error: 'Question paper does not belong to this exam' });
+    }
+
+    // Get questions for this question paper
     const questions = await Question.find({
-      questionPaperId: req.params.paperId,
-    }).sort({ order: 1 });
+      questionPaperId: paperId,
+    })
+      .populate('sectionId', 'name order duration') // Populate section info
+      .sort({ order: 1 });
 
     res.json({ questions });
   } catch (error) {
@@ -71,7 +102,7 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { questionText, questionType, options, correctAnswer, points, order, questionPaperId, imageUrl } =
+      const { questionText, questionType, options, correctAnswer, points, order, questionPaperId, imageUrl, sectionId } =
         req.body;
       const { passage } = req.body;
 
@@ -100,6 +131,18 @@ router.post(
         }
       }
 
+      // If sectionId is provided, verify it belongs to the question paper
+      if (sectionId) {
+        const Section = (await import('../models/Section.js')).default;
+        const section = await Section.findOne({
+          _id: sectionId,
+          questionPaperId: questionPaperId,
+        });
+        if (!section) {
+          return res.status(400).json({ error: 'Section does not belong to this question paper' });
+        }
+      }
+
       const question = new Question({
         questionPaperId,
         questionText,
@@ -110,6 +153,7 @@ router.post(
         passage: typeof passage === 'string' && passage.trim().length ? passage.trim() : undefined,
         points: points || 1,
         order: order || 0,
+        sectionId: sectionId || undefined, // Include sectionId if provided
       });
 
       await question.save();

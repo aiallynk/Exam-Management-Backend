@@ -53,9 +53,19 @@ export const apiRateLimiter = rateLimit({
   keyGenerator: (req) => {
     return req.ip || req.connection?.remoteAddress || 'unknown';
   },
-  // Skip rate limiting for exams routes (no limit for exam management)
+  // Skip rate limiting for exams routes and related exam management routes
   skip: (req) => {
-    return req.path.startsWith('/exams') || req.originalUrl.startsWith('/api/exams');
+    const path = req.path || req.originalUrl || '';
+    return path.startsWith('/exams') || 
+           path.startsWith('/api/exams') ||
+           path.startsWith('/exam-sessions') ||
+           path.startsWith('/api/exam-sessions') ||
+           path.startsWith('/exam-attempts') ||
+           path.startsWith('/api/exam-attempts') ||
+           path.startsWith('/sections') ||
+           path.startsWith('/api/sections') ||
+           path.startsWith('/proctoring') ||
+           path.startsWith('/api/proctoring');
   },
 });
 

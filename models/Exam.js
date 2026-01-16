@@ -89,6 +89,32 @@ const ExamSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
       default: {},
     },
+    supportedLanguages: {
+      type: [String],
+      default: ['en'],
+    },
+    defaultLanguage: {
+      type: String,
+      default: 'en',
+      trim: true,
+    },
+    allowMultiLanguage: {
+      type: Boolean,
+      default: false,
+    },
+    // Offline exam package fields
+    offlinePackageVersion: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    offlinePackageGeneratedAt: {
+      type: Date,
+    },
+    offlinePackageEnabled: {
+      type: Boolean,
+      default: false,
+    },
   },
   {
     timestamps: true,

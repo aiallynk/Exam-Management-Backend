@@ -2,6 +2,7 @@ import mongoose from 'mongoose';
 import crypto from 'crypto';
 import config from '../config/env.js';
 import User from '../models/User.js';
+import Language from '../models/Language.js';
 
 export const connect = async () => {
   try {
@@ -36,6 +37,9 @@ export const connect = async () => {
     
     // Auto-create Super Admin account if it doesn't exist
     await ensureSuperAdmin();
+    
+    // Auto-seed default languages if none exist
+    await ensureDefaultLanguages();
   } catch (error) {
     console.error('❌ MongoDB connection error:', error);
     process.exit(1);
@@ -115,6 +119,62 @@ async function ensureSuperAdmin() {
   } catch (error) {
     console.error('⚠️  Error ensuring Super Admin account:', error.message);
     // Don't throw - server can still start without Super Admin
+  }
+}
+
+/**
+ * Ensure default languages exist
+ * Seeds common languages if database is empty
+ */
+async function ensureDefaultLanguages() {
+  try {
+    const existingCount = await Language.countDocuments({ isActive: true });
+    
+    if (existingCount === 0) {
+      console.log('📝 No languages found. Seeding default languages...');
+      
+      const defaultLanguages = [
+        { code: 'EN', name: 'English', nativeName: 'English', isDefault: true },
+        { code: 'HI', name: 'Hindi', nativeName: 'हिन्दी', isDefault: false },
+        { code: 'MR', name: 'Marathi', nativeName: 'मराठी', isDefault: false },
+        { code: 'GU', name: 'Gujarati', nativeName: 'ગુજરાતી', isDefault: false },
+        { code: 'TA', name: 'Tamil', nativeName: 'தமிழ்', isDefault: false },
+        { code: 'TE', name: 'Telugu', nativeName: 'తెలుగు', isDefault: false },
+        { code: 'KN', name: 'Kannada', nativeName: 'ಕನ್ನಡ', isDefault: false },
+        { code: 'ML', name: 'Malayalam', nativeName: 'മലയാളം', isDefault: false },
+        { code: 'BN', name: 'Bengali', nativeName: 'বাংলা', isDefault: false },
+        { code: 'UR', name: 'Urdu', nativeName: 'اردو', isDefault: false },
+      ];
+      
+      let created = 0;
+      for (const langData of defaultLanguages) {
+        try {
+          const existing = await Language.findOne({ code: langData.code });
+          if (!existing) {
+            const language = new Language({
+              ...langData,
+              isActive: true,
+            });
+            await language.save();
+            created++;
+          }
+        } catch (error) {
+          // Skip if language already exists (race condition)
+          if (error.code !== 11000) {
+            console.error(`  ✗ Error creating language ${langData.code}:`, error.message);
+          }
+        }
+      }
+      
+      if (created > 0) {
+        console.log(`✅ Seeded ${created} default languages`);
+      } else {
+        console.log('✅ Default languages already exist');
+      }
+    }
+  } catch (error) {
+    console.error('⚠️  Error ensuring default languages:', error.message);
+    // Don't throw - server can still start without languages
   }
 }
 

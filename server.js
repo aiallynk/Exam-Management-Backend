@@ -26,6 +26,14 @@ import uploadRoutes from './routes/upload.js';
 import aiRoutes from './routes/ai.js';
 import superAdminRoutes from './routes/superAdmin.js';
 import tenantAdminRoutes from './routes/tenantAdmin.js';
+import languageRoutes from './routes/languages.js';
+import sectionRoutes from './routes/sections.js';
+import normalizationRoutes from './routes/normalization.js';
+import answerKeyRoutes from './routes/answerKeys.js';
+import analyticsRoutes from './routes/analytics.js';
+import auditLogRoutes from './routes/auditLogs.js';
+import proctoringRoutes from './routes/proctoring.js';
+import examPackageRoutes from './routes/examPackages.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -182,11 +190,13 @@ app.use('/api/upload', uploadRateLimiter, uploadRoutes);
 
 // Other API routes (already have general apiRateLimiter applied above)
 // Note: AI-specific rate limiting is applied within aiRoutes
+// AI routes - available at both /api/ai and /api/exams for backward compatibility
+app.use('/api/ai', aiRoutes);
 // Exams routes - no rate limiting (skipped in apiRateLimiter)
 app.use('/api/exams', examRoutes);
 app.use('/api/exams', questionRoutes);
 app.use('/api/exams', questionPaperRoutes);
-app.use('/api/exams', aiRoutes);
+app.use('/api/exams', aiRoutes); // Keep AI routes at /api/exams for backward compatibility
 app.use('/api/exam-sessions', sessionRoutes);
 app.use('/api/exam-attempts', attemptRoutes);
 app.use('/api/results', resultRoutes);
@@ -194,6 +204,14 @@ app.use('/api/candidates', candidateRoutes); // Universal: renamed from /api/stu
 app.use('/api/admin', adminRoutes);
 app.use('/api/super-admin', superAdminRoutes);
 app.use('/api/tenant-admin', tenantAdminRoutes);
+app.use('/api/languages', languageRoutes);
+app.use('/api/sections', sectionRoutes);
+app.use('/api/normalization', normalizationRoutes);
+app.use('/api/answer-keys', answerKeyRoutes);
+app.use('/api/analytics', analyticsRoutes);
+app.use('/api/audit-logs', auditLogRoutes);
+app.use('/api/proctoring', proctoringRoutes);
+app.use('/api/exam-packages', examPackageRoutes);
 
 // Error handling
 app.use(notFound);

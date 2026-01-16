@@ -87,4 +87,5 @@ export const ID_PREFIXES = {
   QUESTION_PAPER: 'QP',
   USER: 'USR',
   EXAM_PARTICIPANT: 'EP',
+  SECTION: 'SEC',
 };

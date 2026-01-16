@@ -103,6 +103,220 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, sanitizePag
 
 // Get single exam
 // Universal: Access based on exam permissions, not user role
+// Preview exam paper (questions without answers) - for admin preview
+router.get('/:examId/preview', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
+  try {
+    const exam = await Exam.findById(req.params.examId);
+    if (!exam) {
+      return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    // Check permissions - only admins can preview
+    if (req.user.role !== 'SUPER_ADMIN' && req.user.role !== 'TENANT_ADMIN' && req.user.role !== 'EXAM_CREATOR') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    // Get question papers
+    const QuestionPaper = (await import('../models/QuestionPaper.js')).default;
+    const questionPapers = await QuestionPaper.find({ examId: exam._id, isActive: true });
+
+    // Get questions for preview (without correct answers)
+    const Question = (await import('../models/Question.js')).default;
+    const Section = (await import('../models/Section.js')).default;
+
+    const previewData = {
+      exam: {
+        _id: exam._id,
+        title: exam.title,
+        description: exam.description,
+        duration: exam.duration,
+        passingPercentage: exam.passingPercentage,
+      },
+      questionPapers: [],
+    };
+
+    for (const qp of questionPapers) {
+      const sections = await Section.find({ questionPaperId: qp._id, isActive: true })
+        .sort({ order: 1 })
+        .lean();
+
+      const questions = await Question.find({ questionPaperId: qp._id })
+        .select('-correctAnswer') // Exclude correct answer
+        .sort({ order: 1 })
+        .lean();
+
+      previewData.questionPapers.push({
+        _id: qp._id,
+        setName: qp.setName,
+        sections: sections.map(s => ({
+          _id: s._id,
+          name: s.name,
+          description: s.description,
+          order: s.order,
+          duration: s.duration,
+          marks: s.marks,
+          negativeMarking: s.negativeMarking,
+        })),
+        questions: questions.map(q => ({
+          _id: q._id,
+          questionText: q.questionText,
+          questionType: q.questionType,
+          options: q.options,
+          points: q.points,
+          order: q.order,
+          sectionId: q.sectionId,
+          passage: q.passage,
+          imageUrl: q.imageUrl,
+        })),
+      });
+    }
+
+    // Log audit
+    const { logAuditEvent, AUDIT_ACTIONS } = await import('../utils/auditLogger.js');
+    await logAuditEvent(AUDIT_ACTIONS.EXAM_PREVIEWED || 'EXAM_PREVIEWED', {
+      userId: req.user._id,
+      userEmail: req.user.email,
+      userRole: req.user.role,
+      resourceType: 'Exam',
+      resourceId: exam._id,
+      ip: req.ip,
+      userAgent: req.get('user-agent'),
+      method: req.method,
+      path: req.path,
+    });
+
+    res.json(previewData);
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Audit exam structure - check for inconsistencies
+router.get('/:examId/audit', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
+  try {
+    const exam = await Exam.findById(req.params.examId);
+    if (!exam) {
+      return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    // Check permissions - only admins can audit
+    if (req.user.role !== 'SUPER_ADMIN' && req.user.role !== 'TENANT_ADMIN' && req.user.role !== 'EXAM_CREATOR') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const QuestionPaper = (await import('../models/QuestionPaper.js')).default;
+    const Question = (await import('../models/Question.js')).default;
+    const Section = (await import('../models/Section.js')).default;
+
+    const questionPapers = await QuestionPaper.find({ examId: exam._id, isActive: true });
+    const auditResults = {
+      examId: exam._id,
+      examTitle: exam.title,
+      issues: [],
+      warnings: [],
+      summary: {
+        totalQuestionPapers: questionPapers.length,
+        totalSections: 0,
+        totalQuestions: 0,
+        sectionsWithoutQuestions: 0,
+        questionsWithoutSections: 0,
+      },
+    };
+
+    for (const qp of questionPapers) {
+      const sections = await Section.find({ questionPaperId: qp._id, isActive: true })
+        .sort({ order: 1 })
+        .lean();
+
+      const questions = await Question.find({ questionPaperId: qp._id }).lean();
+
+      auditResults.summary.totalSections += sections.length;
+      auditResults.summary.totalQuestions += questions.length;
+
+      // Check for sections without questions
+      for (const section of sections) {
+        const sectionQuestions = questions.filter(q => 
+          q.sectionId && q.sectionId.toString() === section._id.toString()
+        );
+        if (sectionQuestions.length === 0) {
+          auditResults.warnings.push({
+            type: 'SECTION_WITHOUT_QUESTIONS',
+            severity: 'warning',
+            message: `Section "${section.name}" in question paper "${qp.setName}" has no questions`,
+            questionPaperId: qp._id,
+            sectionId: section._id,
+          });
+          auditResults.summary.sectionsWithoutQuestions++;
+        }
+      }
+
+      // Check for questions without sections
+      const questionsWithoutSection = questions.filter(q => !q.sectionId);
+      if (questionsWithoutSection.length > 0) {
+        auditResults.warnings.push({
+          type: 'QUESTIONS_WITHOUT_SECTIONS',
+          severity: 'warning',
+          message: `${questionsWithoutSection.length} question(s) in question paper "${qp.setName}" are not assigned to any section`,
+          questionPaperId: qp._id,
+          count: questionsWithoutSection.length,
+        });
+        auditResults.summary.questionsWithoutSections += questionsWithoutSection.length;
+      }
+
+      // Check for missing expected questions
+      for (const section of sections) {
+        if (section.expectedQuestions) {
+          const sectionQuestions = questions.filter(q => 
+            q.sectionId && q.sectionId.toString() === section._id.toString()
+          );
+          if (sectionQuestions.length !== section.expectedQuestions) {
+            auditResults.warnings.push({
+              type: 'QUESTION_COUNT_MISMATCH',
+              severity: 'warning',
+              message: `Section "${section.name}" has ${sectionQuestions.length} questions but expected ${section.expectedQuestions}`,
+              questionPaperId: qp._id,
+              sectionId: section._id,
+              expected: section.expectedQuestions,
+              actual: sectionQuestions.length,
+            });
+          }
+        }
+      }
+    }
+
+    // Check if exam has no question papers
+    if (questionPapers.length === 0) {
+      auditResults.issues.push({
+        type: 'NO_QUESTION_PAPERS',
+        severity: 'error',
+        message: 'Exam has no question papers assigned',
+      });
+    }
+
+    // Log audit
+    const { logAuditEvent, AUDIT_ACTIONS } = await import('../utils/auditLogger.js');
+    await logAuditEvent(AUDIT_ACTIONS.EXAM_AUDITED || 'EXAM_AUDITED', {
+      userId: req.user._id,
+      userEmail: req.user.email,
+      userRole: req.user.role,
+      resourceType: 'Exam',
+      resourceId: exam._id,
+      ip: req.ip,
+      userAgent: req.get('user-agent'),
+      method: req.method,
+      path: req.path,
+      details: {
+        issuesFound: auditResults.issues.length,
+        warningsFound: auditResults.warnings.length,
+      },
+    });
+
+    res.json(auditResults);
+  } catch (error) {
+    next(error);
+  }
+});
+
 router.get('/:examId', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
     const exam = await Exam.findById(req.params.examId).populate(
@@ -301,6 +515,46 @@ router.put(
       await exam.populate('createdBy', 'name email');
 
       res.json({ exam });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * Increase max attempts for an exam
+ * Allows exam creator to increase max attempts for all candidates
+ */
+router.patch(
+  '/:examId/increase-max-attempts',
+  requireAuth,
+  requireTenant,
+  requireOwnershipOrAdmin,
+  [
+    body('additionalAttempts').isInt({ min: 1 }).withMessage('Additional attempts must be a positive integer'),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const exam = await Exam.findById(req.params.examId);
+      if (!exam) {
+        return res.status(404).json({ error: 'Exam not found' });
+      }
+
+      const additionalAttempts = parseInt(req.body.additionalAttempts);
+      exam.maxAttempts = exam.maxAttempts + additionalAttempts;
+
+      await exam.save();
+      await exam.populate('createdBy', 'name email');
+
+      res.json({
+        message: `Max attempts increased by ${additionalAttempts}. New max attempts: ${exam.maxAttempts}`,
+        exam,
+      });
     } catch (error) {
       next(error);
     }

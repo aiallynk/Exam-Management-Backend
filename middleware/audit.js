@@ -27,13 +27,18 @@ export const auditLog = (action, getDetails = (req, res) => ({})) => {
         method: req.method,
         path: req.path,
         ip: req.ip || req.connection?.remoteAddress,
+        ipAddress: req.ip || req.connection?.remoteAddress,
+        userAgent: req.get('user-agent'),
         statusCode: res.statusCode,
         ...getDetails(req, res),
       };
       
       // Only log successful operations (2xx, 3xx) or important failures (4xx, 5xx)
       if (res.statusCode < 400 || res.statusCode >= 500) {
-        logAuditEvent(action, details);
+        // Call async function but don't await (non-blocking)
+        logAuditEvent(action, details).catch(err => {
+          console.error('[AUDIT MIDDLEWARE ERROR]', err);
+        });
       }
       
       return originalSend.call(this, body);
@@ -53,11 +58,16 @@ export const auditLogin = (req, res, next) => {
     const details = {
       email: req.body?.email || 'unknown',
       ip: req.ip || req.connection?.remoteAddress,
+      ipAddress: req.ip || req.connection?.remoteAddress,
       userAgent: req.get('user-agent'),
       statusCode: res.statusCode,
+      userId: data?.user?._id || data?.user?.id || null,
     };
     
-    logAuditEvent(action, details);
+    // Call async function but don't await (non-blocking)
+    logAuditEvent(action, details).catch(err => {
+      console.error('[AUDIT LOGIN ERROR]', err);
+    });
     return originalJson.call(this, data);
   };
   
@@ -77,8 +87,11 @@ export const auditUnauthorized = (req, res) => {
     method: req.method,
     path: req.path,
     ip: req.ip || req.connection?.remoteAddress,
+    ipAddress: req.ip || req.connection?.remoteAddress,
     userAgent: req.get('user-agent'),
     hasToken: !!req.headers.authorization,
+  }).catch(err => {
+    console.error('[AUDIT UNAUTHORIZED ERROR]', err);
   });
 };
 
