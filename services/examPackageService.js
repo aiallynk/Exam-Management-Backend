@@ -292,15 +292,21 @@ export const getExamPackage = async (examId, questionPaperId, version = null) =>
 /**
  * Get package info (metadata only, no data)
  * @param {string} examId - Exam ID
- * @param {string} questionPaperId - Question Paper ID
+ * @param {string} questionPaperId - Question Paper ID (optional, if not provided returns latest package for exam)
  * @returns {Promise<Object>} Package metadata
  */
-export const getPackageInfo = async (examId, questionPaperId) => {
-  const examPackage = await ExamPackage.findOne({
+export const getPackageInfo = async (examId, questionPaperId = null) => {
+  const query = {
     examId,
-    questionPaperId,
     isActive: true,
-  }).sort({ version: -1 });
+  };
+
+  // If questionPaperId provided, filter by it; otherwise get latest package for exam
+  if (questionPaperId) {
+    query.questionPaperId = questionPaperId;
+  }
+
+  const examPackage = await ExamPackage.findOne(query).sort({ version: -1 });
 
   if (!examPackage) {
     return null;
@@ -308,6 +314,7 @@ export const getPackageInfo = async (examId, questionPaperId) => {
 
   return {
     packageId: examPackage._id.toString(),
+    questionPaperId: examPackage.questionPaperId?.toString(),
     version: examPackage.version,
     size: examPackage.size,
     hash: examPackage.packageHash,
@@ -349,6 +356,23 @@ export const decryptPackage = async (encryptedData, examId, packageId, version) 
 
   // Parse JSON
   return JSON.parse(decompressedData.toString('utf8'));
+};
+
+/**
+ * Check if exam has valid question paper ready for package generation
+ * @param {string} examId - Exam ID
+ * @returns {Promise<boolean>} True if exam has valid question paper
+ */
+export const examHasValidQuestionPaper = async (examId) => {
+  const questionPapers = await QuestionPaper.find({ examId, isActive: true });
+  if (questionPapers.length === 0) return false;
+  
+  for (const qp of questionPapers) {
+    const sections = await Section.find({ questionPaperId: qp._id, isActive: true });
+    const questions = await Question.find({ questionPaperId: qp._id });
+    if (sections.length > 0 && questions.length > 0) return true;
+  }
+  return false;
 };
 
 /**

@@ -449,6 +449,23 @@ router.post(
       // Store exam ID for audit log
       res.locals.examId = exam._id.toString();
 
+      // Auto-generate packages if exam is active and has valid question paper
+      if (exam.isActive) {
+        try {
+          const { autoGeneratePackagesOnPublish, examHasValidQuestionPaper } = await import('../services/examPackageService.js');
+          const hasValidQuestionPaper = await examHasValidQuestionPaper(exam._id.toString());
+          if (hasValidQuestionPaper) {
+            const generationResult = await autoGeneratePackagesOnPublish(exam._id.toString(), req.user._id);
+            if (generationResult.errors.length > 0) {
+              console.warn(`Package generation completed with errors for exam ${exam._id}:`, generationResult.errors);
+            }
+          }
+        } catch (error) {
+          // Log error but don't fail the create operation
+          console.error(`Failed to auto-generate packages for exam ${exam._id}:`, error);
+        }
+      }
+
       res.status(201).json({ exam });
     } catch (error) {
       next(error);
@@ -518,18 +535,23 @@ router.put(
       await exam.save();
       await exam.populate('createdBy', 'name email');
 
-      // Auto-generate packages when exam is published
-      if (isBeingPublished) {
+      // Auto-generate packages when exam becomes ready
+      // Trigger if: exam is active AND has valid question paper
+      // This covers: publish toggle, exam created as active, question papers added later
+      if (exam.isActive) {
         try {
-          const { autoGeneratePackagesOnPublish } = await import('../services/examPackageService.js');
-          const generationResult = await autoGeneratePackagesOnPublish(exam._id.toString(), req.user._id);
-          
-          // Log generation result (don't fail the publish if generation fails)
-          if (generationResult.errors.length > 0) {
-            console.warn(`Package generation completed with errors for exam ${exam._id}:`, generationResult.errors);
+          const { autoGeneratePackagesOnPublish, examHasValidQuestionPaper } = await import('../services/examPackageService.js');
+          const hasValidQuestionPaper = await examHasValidQuestionPaper(exam._id.toString());
+          if (hasValidQuestionPaper) {
+            const generationResult = await autoGeneratePackagesOnPublish(exam._id.toString(), req.user._id);
+            
+            // Log generation result (don't fail the update if generation fails)
+            if (generationResult.errors.length > 0) {
+              console.warn(`Package generation completed with errors for exam ${exam._id}:`, generationResult.errors);
+            }
           }
         } catch (error) {
-          // Log error but don't fail the publish operation
+          // Log error but don't fail the update operation
           console.error(`Failed to auto-generate packages for exam ${exam._id}:`, error);
         }
       }

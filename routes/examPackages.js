@@ -106,10 +106,6 @@ router.get(
       const { examId } = req.params;
       const { questionPaperId } = req.query;
 
-      if (!questionPaperId) {
-        return res.status(400).json({ error: 'Question paper ID is required' });
-      }
-
       // Verify exam exists
       const exam = await Exam.findById(examId);
       if (!exam) {
@@ -129,13 +125,21 @@ router.get(
         req.user.role === 'TENANT_ADMIN'
       );
 
-      // Check if question paper exists
+      // Check if question papers exist (for status info)
       const QuestionPaper = (await import('../models/QuestionPaper.js')).default;
-      const questionPaper = await QuestionPaper.findById(questionPaperId);
-      const hasQuestionPapers = questionPaper !== null;
+      const questionPapers = await QuestionPaper.find({ examId, isActive: true });
+      const hasQuestionPapers = questionPapers.length > 0;
 
-      // Get package info
-      const packageInfo = await getPackageInfo(examId, questionPaperId);
+      // If questionPaperId provided, verify it exists
+      if (questionPaperId) {
+        const questionPaper = await QuestionPaper.findById(questionPaperId);
+        if (!questionPaper) {
+          return res.status(404).json({ error: 'Question paper not found' });
+        }
+      }
+
+      // Get package info (questionPaperId is optional - if not provided, returns latest package for exam)
+      const packageInfo = await getPackageInfo(examId, questionPaperId || null);
 
       if (!packageInfo) {
         return res.status(404).json({ 
@@ -201,18 +205,10 @@ router.get(
         return res.status(403).json({ error: 'You do not have permission to download this exam package' });
       }
 
-      // Optional: Check if user has an active session for this exam
-      // This ensures packages are only downloaded when there's an active session
-      const activeSession = await ExamSession.findOne({
-        examId,
-        isActive: true,
-        startTime: { $lte: new Date() },
-        endTime: { $gte: new Date() },
-      });
-
-      if (!activeSession) {
+      // Verify exam is active (pre-download allowed for active exams with valid packages)
+      if (!exam.isActive) {
         return res.status(403).json({ 
-          error: 'No active session found for this exam. Please check the exam schedule.' 
+          error: 'Exam is not active. Packages can only be downloaded for active exams.' 
         });
       }
 

@@ -142,7 +142,9 @@ router.get('/results', requireAuth, async (req, res, next) => {
       }
 
       const canViewResults = await hasExamPermission(req.user._id, attempt.examId._id, 'VIEW_RESULTS');
-      const resultsReleased = attempt.examId.showResultsImmediately || attempt.examId.resultsReleasedAt;
+      // Check if results are released: immediately OR resultsReleasedAt is in the past
+      const resultsReleased = attempt.examId.showResultsImmediately || 
+        (attempt.examId.resultsReleasedAt && attempt.examId.resultsReleasedAt <= new Date());
 
       if (canViewResults || resultsReleased) {
         filteredAttempts.push(attempt);
@@ -155,6 +157,9 @@ router.get('/results', requireAuth, async (req, res, next) => {
         return {
           attempt,
           score: summary,
+          // Include results release info for frontend
+          resultsReleasedAt: attempt.examId?.resultsReleasedAt || null,
+          showResultsImmediately: attempt.examId?.showResultsImmediately || false,
         };
       })
     );
