@@ -11,6 +11,7 @@ import Exam from '../models/Exam.js';
 import QuestionPaper from '../models/QuestionPaper.js';
 import Section from '../models/Section.js';
 import Question from '../models/Question.js';
+import { logInfo, logError } from '../utils/logger.js';
 
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
@@ -348,4 +349,118 @@ export const decryptPackage = async (encryptedData, examId, packageId, version) 
 
   // Parse JSON
   return JSON.parse(decompressedData.toString('utf8'));
+};
+
+/**
+ * Auto-generate exam packages when exam is published
+ * Generates packages for all active question papers with valid sections and questions
+ * @param {string} examId - Exam ID
+ * @param {string} userId - User ID who published the exam
+ * @returns {Promise<Object>} Generation results
+ */
+export const autoGeneratePackagesOnPublish = async (examId, userId) => {
+  try {
+    logInfo(`Starting auto-generation of packages for exam ${examId}`, 'ExamPackageService');
+
+    // Get exam
+    const exam = await Exam.findById(examId);
+    if (!exam) {
+      throw new Error('Exam not found');
+    }
+
+    // Get all active question papers for this exam
+    const questionPapers = await QuestionPaper.find({
+      examId,
+      isActive: true,
+    });
+
+    if (questionPapers.length === 0) {
+      logInfo(`No active question papers found for exam ${examId}. Skipping package generation.`, 'ExamPackageService');
+      return {
+        success: false,
+        message: 'No active question papers found',
+        generated: 0,
+        skipped: 0,
+        errors: [],
+      };
+    }
+
+    const results = {
+      success: true,
+      generated: 0,
+      skipped: 0,
+      errors: [],
+    };
+
+    // Default expiry: 30 days from now
+    const defaultExpiry = new Date();
+    defaultExpiry.setDate(defaultExpiry.getDate() + 30);
+
+    // Generate package for each question paper
+    for (const questionPaper of questionPapers) {
+      try {
+        // Validate question paper has sections
+        const sections = await Section.find({
+          questionPaperId: questionPaper._id,
+          isActive: true,
+        }).sort({ order: 1 });
+
+        if (sections.length === 0) {
+          logInfo(`Question paper ${questionPaper._id} has no active sections. Skipping.`, 'ExamPackageService');
+          results.skipped++;
+          continue;
+        }
+
+        // Validate sections have questions
+        const questions = await Question.find({
+          questionPaperId: questionPaper._id,
+        });
+
+        if (questions.length === 0) {
+          logInfo(`Question paper ${questionPaper._id} has no questions. Skipping.`, 'ExamPackageService');
+          results.skipped++;
+          continue;
+        }
+
+        // Check if package already exists and is valid
+        const existingPackage = await ExamPackage.findOne({
+          examId,
+          questionPaperId: questionPaper._id,
+          isActive: true,
+        });
+
+        if (existingPackage && existingPackage.expiresAt > new Date()) {
+          logInfo(`Valid package already exists for question paper ${questionPaper._id}. Skipping generation.`, 'ExamPackageService');
+          results.skipped++;
+          continue;
+        }
+
+        // Generate package
+        await generateExamPackage(
+          examId,
+          questionPaper._id.toString(),
+          userId,
+          defaultExpiry
+        );
+
+        logInfo(`Successfully generated package for question paper ${questionPaper._id} (${questionPaper.setName})`, 'ExamPackageService');
+        results.generated++;
+      } catch (error) {
+        const errorMsg = `Failed to generate package for question paper ${questionPaper._id}: ${error.message}`;
+        logError(error, `ExamPackageService - ${errorMsg}`);
+        results.errors.push({
+          questionPaperId: questionPaper._id.toString(),
+          questionPaperSetName: questionPaper.setName,
+          error: error.message,
+        });
+      }
+    }
+
+    logInfo(`Package generation completed for exam ${examId}. Generated: ${results.generated}, Skipped: ${results.skipped}, Errors: ${results.errors.length}`, 'ExamPackageService');
+
+    return results;
+  } catch (error) {
+    logError(error, `ExamPackageService - autoGeneratePackagesOnPublish for exam ${examId}`);
+    throw error;
+  }
 };

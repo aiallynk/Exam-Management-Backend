@@ -511,8 +511,28 @@ router.put(
         exam.resultsReleasedAt = resultsReleasedAt ? new Date(resultsReleasedAt) : null;
       }
 
+      // Check if exam is being published (isActive changing from false to true)
+      const wasInactive = !exam.isActive;
+      const isBeingPublished = isActive !== undefined && isActive && wasInactive;
+
       await exam.save();
       await exam.populate('createdBy', 'name email');
+
+      // Auto-generate packages when exam is published
+      if (isBeingPublished) {
+        try {
+          const { autoGeneratePackagesOnPublish } = await import('../services/examPackageService.js');
+          const generationResult = await autoGeneratePackagesOnPublish(exam._id.toString(), req.user._id);
+          
+          // Log generation result (don't fail the publish if generation fails)
+          if (generationResult.errors.length > 0) {
+            console.warn(`Package generation completed with errors for exam ${exam._id}:`, generationResult.errors);
+          }
+        } catch (error) {
+          // Log error but don't fail the publish operation
+          console.error(`Failed to auto-generate packages for exam ${exam._id}:`, error);
+        }
+      }
 
       res.json({ exam });
     } catch (error) {

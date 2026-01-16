@@ -122,14 +122,47 @@ router.get(
         return res.status(403).json({ error: 'You do not have permission to access this exam package' });
       }
 
+      // Check if user is admin (for canGenerate flag)
+      const isAdmin = req.user.role === 'EXAM_CREATOR' || req.user.role === 'TENANT_ADMIN';
+      const canGenerate = isAdmin && (
+        await hasExamPermission(req.user._id, examId, 'CREATE_SESSION') ||
+        req.user.role === 'TENANT_ADMIN'
+      );
+
+      // Check if question paper exists
+      const QuestionPaper = (await import('../models/QuestionPaper.js')).default;
+      const questionPaper = await QuestionPaper.findById(questionPaperId);
+      const hasQuestionPapers = questionPaper !== null;
+
       // Get package info
       const packageInfo = await getPackageInfo(examId, questionPaperId);
 
       if (!packageInfo) {
-        return res.status(404).json({ error: 'Exam package not found' });
+        return res.status(404).json({ 
+          error: 'Exam package not found. The exam package has not been generated yet. Please contact the exam administrator.',
+          examStatus: {
+            isActive: exam.isActive,
+            hasQuestionPapers,
+          },
+          canGenerate: canGenerate || undefined, // Only include if user is admin
+        });
       }
 
-      res.json({ package: packageInfo });
+      // Include exam status in response
+      const response = {
+        package: packageInfo,
+        examStatus: {
+          isActive: exam.isActive,
+          hasQuestionPapers,
+        }
+      };
+
+      // Add canGenerate flag for admins
+      if (canGenerate) {
+        response.canGenerate = true;
+      }
+
+      res.json(response);
     } catch (error) {
       next(error);
     }
@@ -201,6 +234,96 @@ router.get(
           expiresAt: packageData.expiresAt,
           createdAt: packageData.createdAt,
         },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+/**
+ * Regenerate exam package
+ * POST /exam-packages/:examId/regenerate
+ * Requires: EXAM_CREATOR or TENANT_ADMIN role
+ */
+router.post(
+  '/:examId/regenerate',
+  requireAuth,
+  requireTenant,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
+  validateObjectId('examId'),
+  [
+    body('questionPaperId').notEmpty().withMessage('Question paper ID is required'),
+    body('expiresAt').optional().isISO8601().withMessage('Expiry date must be a valid ISO 8601 date'),
+  ],
+  auditLog(AUDIT_ACTIONS.EXAM_PACKAGE_GENERATED, (req) => ({
+    resourceType: 'Exam',
+    resourceId: req.params.examId,
+  })),
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const { examId } = req.params;
+      const { questionPaperId, expiresAt } = req.body;
+
+      // Verify exam exists and user has permission
+      const exam = await Exam.findById(examId);
+      if (!exam) {
+        return res.status(404).json({ error: 'Exam not found' });
+      }
+
+      // Check tenant boundary
+      if (exam.tenantId.toString() !== req.user.tenantId?.toString()) {
+        return res.status(403).json({ error: 'Access denied' });
+      }
+
+      // Check permission (EXAM_CREATOR or TENANT_ADMIN)
+      const canCreate = await hasExamPermission(req.user._id, examId, 'CREATE_SESSION') ||
+        req.user.role === 'TENANT_ADMIN';
+      
+      if (!canCreate && req.user.role !== 'TENANT_ADMIN') {
+        return res.status(403).json({ error: 'You do not have permission to regenerate exam packages' });
+      }
+
+      // Set expiry date (default: 30 days from now)
+      let expiryDate;
+      if (expiresAt) {
+        expiryDate = new Date(expiresAt);
+        if (expiryDate <= new Date()) {
+          return res.status(400).json({ error: 'Expiry date must be in the future' });
+        }
+      } else {
+        expiryDate = new Date();
+        expiryDate.setDate(expiryDate.getDate() + 30);
+      }
+
+      // Deactivate old packages for this exam/question paper
+      await ExamPackage.updateMany(
+        {
+          examId,
+          questionPaperId,
+          isActive: true,
+        },
+        {
+          isActive: false,
+        }
+      );
+
+      // Generate new package
+      const packageInfo = await generateExamPackage(
+        examId,
+        questionPaperId,
+        req.user._id,
+        expiryDate
+      );
+
+      res.status(201).json({
+        message: 'Exam package regenerated successfully',
+        package: packageInfo,
       });
     } catch (error) {
       next(error);
