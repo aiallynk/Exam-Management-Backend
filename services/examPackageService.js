@@ -111,10 +111,19 @@ export const generateExamPackage = async (examId, questionPaperId, userId, expir
     questionPaperId,
   }).sort({ order: 1 });
 
+  // Get or increment version FIRST (needed for package data and key derivation)
+  const latestPackage = await ExamPackage.findOne({
+    examId,
+    questionPaperId,
+    isActive: true,
+  }).sort({ version: -1 });
+
+  const version = latestPackage ? latestPackage.version + 1 : 1;
+
   // Build package structure (without correct answers)
   const packageData = {
     examId: exam._id.toString(),
-    version: (exam.offlinePackageVersion || 0) + 1,
+    version: version,
     exam: {
       title: exam.title,
       description: exam.description,
@@ -181,15 +190,6 @@ export const generateExamPackage = async (examId, questionPaperId, userId, expir
   // Calculate size
   const size = encryptedData.length;
 
-  // Get or increment version
-  const latestPackage = await ExamPackage.findOne({
-    examId,
-    questionPaperId,
-    isActive: true,
-  }).sort({ version: -1 });
-
-  const version = latestPackage ? latestPackage.version + 1 : 1;
-
   // Deactivate old packages for this exam/question paper
   await ExamPackage.updateMany(
     {
@@ -241,8 +241,8 @@ export const generateExamPackage = async (examId, questionPaperId, userId, expir
   return {
     packageId: examPackage._id.toString(),
     version,
-    size,
-    hash: packageHash,
+    size: examPackage.size, // Use final size after re-encryption
+    hash: examPackage.packageHash, // Use final hash after re-encryption
     expiresAt,
     createdAt: examPackage.createdAt,
   };

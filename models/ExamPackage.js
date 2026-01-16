@@ -7,7 +7,6 @@ const ExamPackageSchema = new mongoose.Schema(
       type: String,
       unique: true,
       required: false, // Will be generated in pre-validate hook
-      index: true,
       sparse: true,
       immutable: true,
     },
@@ -15,13 +14,11 @@ const ExamPackageSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Exam',
       required: true,
-      index: true,
     },
     questionPaperId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'QuestionPaper',
       required: true,
-      index: true,
     },
     version: {
       type: Number,
@@ -51,7 +48,6 @@ const ExamPackageSchema = new mongoose.Schema(
     expiresAt: {
       type: Date,
       required: true,
-      index: true,
     },
     isActive: {
       type: Boolean,
@@ -62,7 +58,6 @@ const ExamPackageSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Tenant',
       required: true,
-      index: true,
     },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,

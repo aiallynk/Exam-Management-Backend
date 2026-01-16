@@ -7,7 +7,6 @@ const QuestionPaperSchema = new mongoose.Schema(
       type: String,
       unique: true,
       required: false, // Will be generated in pre-validate hook
-      index: true,
       sparse: true,
       immutable: true,
     },
@@ -15,7 +14,6 @@ const QuestionPaperSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Exam',
       required: true,
-      index: true,
     },
     setName: {
       type: String,

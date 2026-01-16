@@ -7,7 +7,6 @@ const QuestionSchema = new mongoose.Schema(
       type: String,
       unique: true,
       required: false, // Will be generated in pre-validate hook
-      index: true,
       sparse: true,
       immutable: true,
     },
@@ -15,7 +14,6 @@ const QuestionSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'QuestionPaper',
       required: true,
-      index: true,
     },
     questionText: {
       type: String,
@@ -61,7 +59,6 @@ const QuestionSchema = new mongoose.Schema(
     sectionId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Section',
-      index: true,
     },
     translations: {
       type: Map,

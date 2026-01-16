@@ -22,7 +22,6 @@ const UserSchema = new mongoose.Schema(
       type: String,
       unique: true,
       required: false, // Will be generated in pre-validate hook
-      index: true,
       sparse: true, // Allow null values temporarily
       immutable: true,
     },
@@ -49,13 +48,11 @@ const UserSchema = new mongoose.Schema(
       enum: ['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR', 'CANDIDATE'],
       default: 'CANDIDATE',
       required: true,
-      index: true,
     },
     // Tenant field - User belongs to a tenant (except SUPER_ADMIN)
     tenantId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Tenant',
-      index: true,
       // Not schema-level required - validated in pre-save hook
     },
     mobile: {
@@ -67,7 +64,6 @@ const UserSchema = new mongoose.Schema(
       type: String,
       enum: ['ACTIVE', 'INACTIVE', 'SUSPENDED', 'BLOCKED'],
       default: 'ACTIVE',
-      index: true,
     },
   },
   {

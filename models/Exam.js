@@ -7,7 +7,6 @@ const ExamSchema = new mongoose.Schema(
       type: String,
       unique: true,
       required: false, // Will be generated in pre-validate hook
-      index: true,
       sparse: true,
       immutable: true,
     },

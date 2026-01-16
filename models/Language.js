@@ -10,7 +10,6 @@ const LanguageSchema = new mongoose.Schema(
       uppercase: true,
       minlength: 2,
       maxlength: 10,
-      index: true,
     },
     name: {
       type: String,
@@ -24,7 +23,6 @@ const LanguageSchema = new mongoose.Schema(
     isActive: {
       type: Boolean,
       default: true,
-      index: true,
     },
     isDefault: {
       type: Boolean,

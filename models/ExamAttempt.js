@@ -7,7 +7,6 @@ const ExamAttemptSchema = new mongoose.Schema(
       type: String,
       unique: true,
       required: false, // Will be generated in pre-validate hook
-      index: true,
       sparse: true,
       immutable: true,
     },
@@ -15,13 +14,11 @@ const ExamAttemptSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Exam',
       required: true,
-      index: true,
     },
     sessionId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'ExamSession',
       required: true,
-      index: true,
     },
     questionPaperId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -31,13 +28,11 @@ const ExamAttemptSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: true,
-      index: true,
     },
     // Tenant field (inherited from exam, but stored for performance)
     tenantId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Tenant',
-      index: true,
     },
     startTime: {
       type: Date,

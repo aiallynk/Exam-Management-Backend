@@ -7,7 +7,6 @@ const SectionSchema = new mongoose.Schema(
       type: String,
       unique: true,
       required: false,
-      index: true,
       sparse: true,
       immutable: true,
     },
@@ -15,7 +14,6 @@ const SectionSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'QuestionPaper',
       required: true,
-      index: true,
     },
     name: {
       type: String,

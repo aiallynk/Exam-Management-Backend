@@ -26,7 +26,6 @@ const TenantSchema = new mongoose.Schema(
       type: String,
       unique: true,
       required: false, // Will be generated in pre-validate hook
-      index: true,
       sparse: true,
       immutable: true,
     },
@@ -42,14 +41,12 @@ const TenantSchema = new mongoose.Schema(
       unique: true,
       uppercase: true,
       trim: true,
-      index: true,
       match: [/^[A-Z0-9_-]+$/, 'Code must contain only uppercase letters, numbers, hyphens, and underscores'],
     },
     type: {
       type: String,
       enum: ['SCHOOL', 'COLLEGE', 'COMPANY', 'INSTITUTE', 'GOVERNMENT', 'OTHER'],
       required: true,
-      index: true,
     },
     contactEmail: {
       type: String,
@@ -70,7 +67,6 @@ const TenantSchema = new mongoose.Schema(
       type: String,
       enum: ['ACTIVE', 'INACTIVE', 'SUSPENDED'],
       default: 'ACTIVE',
-      index: true,
     },
     // Limits and quotas
     examLimit: {
@@ -93,7 +89,6 @@ const TenantSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: true,
-      index: true,
     },
   },
   {

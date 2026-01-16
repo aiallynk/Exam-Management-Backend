@@ -22,6 +22,8 @@ const router = express.Router();
  * Generate exam package
  * POST /exam-packages/:examId/generate
  * Requires: EXAM_CREATOR or TENANT_ADMIN role
+ * questionPaperId is optional - if not provided, uses first active question paper
+ * expiresAt is optional - defaults to 30 days from now
  */
 router.post(
   '/:examId/generate',
@@ -30,31 +32,38 @@ router.post(
   requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
   validateObjectId('examId'),
   [
-    body('questionPaperId').notEmpty().withMessage('Question paper ID is required'),
-    body('expiresAt').isISO8601().withMessage('Expiry date must be a valid ISO 8601 date'),
+    body('questionPaperId').optional().notEmpty().withMessage('Question paper ID must not be empty if provided'),
+    body('expiresAt').optional().isISO8601().withMessage('Expiry date must be a valid ISO 8601 date'),
   ],
   auditLog(AUDIT_ACTIONS.EXAM_PACKAGE_GENERATED, (req) => ({
     resourceType: 'Exam',
     resourceId: req.params.examId,
   })),
   async (req, res, next) => {
+    const { examId } = req.params;
+    const { questionPaperId, expiresAt } = req.body;
+
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) {
+        console.error(`[Package Generation] Validation errors for exam ${examId}:`, errors.array());
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { examId } = req.params;
-      const { questionPaperId, expiresAt } = req.body;
+      console.log(`[Package Generation] Starting package generation for exam ${examId} by user ${req.user._id}`);
 
-      // Verify exam exists and user has permission
+      // Verify exam exists
       const exam = await Exam.findById(examId);
       if (!exam) {
+        console.error(`[Package Generation] Exam ${examId} not found`);
         return res.status(404).json({ error: 'Exam not found' });
       }
 
+      console.log(`[Package Generation] Exam found: ${exam.title} (Active: ${exam.isActive})`);
+
       // Check tenant boundary
-      if (exam.tenantId.toString() !== req.user.tenantId?.toString()) {
+      if (req.user.role !== 'SUPER_ADMIN' && exam.tenantId.toString() !== req.user.tenantId?.toString()) {
+        console.error(`[Package Generation] Tenant mismatch for exam ${examId}`);
         return res.status(403).json({ error: 'Access denied' });
       }
 
@@ -63,29 +72,132 @@ router.post(
         req.user.role === 'TENANT_ADMIN';
       
       if (!canCreate && req.user.role !== 'TENANT_ADMIN') {
+        console.error(`[Package Generation] Permission denied for user ${req.user._id} on exam ${examId}`);
         return res.status(403).json({ error: 'You do not have permission to generate exam packages' });
       }
 
-      // Validate expiry date
-      const expiryDate = new Date(expiresAt);
-      if (expiryDate <= new Date()) {
-        return res.status(400).json({ error: 'Expiry date must be in the future' });
+      // Get question paper (if not provided, use first active one)
+      const QuestionPaper = (await import('../models/QuestionPaper.js')).default;
+      let resolvedQuestionPaperId = questionPaperId;
+
+      if (!resolvedQuestionPaperId) {
+        console.log(`[Package Generation] No questionPaperId provided, finding first active question paper for exam ${examId}`);
+        const questionPapers = await QuestionPaper.find({ examId, isActive: true });
+        if (questionPapers.length === 0) {
+          console.error(`[Package Generation] No active question papers found for exam ${examId}`);
+          return res.status(400).json({ 
+            error: 'No active question papers found for this exam. Please create a question paper first.' 
+          });
+        }
+        resolvedQuestionPaperId = questionPapers[0]._id.toString();
+        console.log(`[Package Generation] Using question paper: ${resolvedQuestionPaperId} (${questionPapers[0].setName})`);
       }
+
+      // Validate question paper exists and belongs to exam
+      const questionPaper = await QuestionPaper.findById(resolvedQuestionPaperId);
+      if (!questionPaper) {
+        console.error(`[Package Generation] Question paper ${resolvedQuestionPaperId} not found`);
+        return res.status(404).json({ error: 'Question paper not found' });
+      }
+
+      if (questionPaper.examId.toString() !== examId) {
+        console.error(`[Package Generation] Question paper ${resolvedQuestionPaperId} does not belong to exam ${examId}`);
+        return res.status(400).json({ error: 'Question paper does not belong to this exam' });
+      }
+
+      // Validate questions exist
+      const Question = (await import('../models/Question.js')).default;
+      const Section = (await import('../models/Section.js')).default;
+      
+      // Get all sections (both active and inactive) for debugging
+      const allSections = await Section.find({ questionPaperId: resolvedQuestionPaperId });
+      const activeSections = await Section.find({ questionPaperId: resolvedQuestionPaperId, isActive: true });
+      const questions = await Question.find({ questionPaperId: resolvedQuestionPaperId });
+
+      console.log(`[Package Generation] Validation for question paper ${resolvedQuestionPaperId}:`);
+      console.log(`  - Total sections: ${allSections.length} (Active: ${activeSections.length}, Inactive: ${allSections.length - activeSections.length})`);
+      console.log(`  - Total questions: ${questions.length}`);
+
+      // Validate that questions exist (required for all exams)
+      if (questions.length === 0) {
+        console.error(`[Package Generation] No questions found for question paper ${resolvedQuestionPaperId}`);
+        return res.status(400).json({ 
+          error: 'No questions found for this question paper. Please add questions first.' 
+        });
+      }
+
+      // Check if this is a section-based exam (questions have sectionId)
+      const questionsWithSections = questions.filter(q => q.sectionId);
+      const questionsWithoutSections = questions.filter(q => !q.sectionId);
+      
+      console.log(`  - Questions with sections: ${questionsWithSections.length}`);
+      console.log(`  - Questions without sections: ${questionsWithoutSections.length}`);
+
+      // For section-based exams, validate sections exist
+      // For non-section-based exams, questions can exist without sections
+      if (questionsWithSections.length > 0 && activeSections.length === 0) {
+        // Check if there are inactive sections
+        if (allSections.length > 0) {
+          console.error(`[Package Generation] Questions have sectionId but no ACTIVE sections found. Found ${allSections.length} inactive sections.`);
+          return res.status(400).json({ 
+            error: `This question paper has ${allSections.length} section(s), but none are active. Please activate sections or remove section assignments from questions.` 
+          });
+        } else {
+          console.error(`[Package Generation] Questions have sectionId but no sections found at all for question paper ${resolvedQuestionPaperId}`);
+          return res.status(400).json({ 
+            error: 'This question paper has questions assigned to sections, but no sections found. Please create sections or remove section assignments from questions.' 
+          });
+        }
+      }
+
+      // Log exam type
+      if (activeSections.length > 0) {
+        console.log(`[Package Generation] Section-based exam: ${activeSections.length} active sections, ${questions.length} questions`);
+      } else if (questionsWithoutSections.length > 0) {
+        console.log(`[Package Generation] Non-section-based exam: ${questions.length} questions (no sections required)`);
+      } else {
+        console.log(`[Package Generation] Mixed exam: ${questionsWithSections.length} questions with sections, ${questionsWithoutSections.length} without`);
+      }
+
+      // Set expiry date (default: 30 days from now)
+      let expiryDate;
+      if (expiresAt) {
+        expiryDate = new Date(expiresAt);
+        if (expiryDate <= new Date()) {
+          console.error(`[Package Generation] Invalid expiry date: ${expiresAt}`);
+          return res.status(400).json({ error: 'Expiry date must be in the future' });
+        }
+      } else {
+        expiryDate = new Date();
+        expiryDate.setDate(expiryDate.getDate() + 30);
+        console.log(`[Package Generation] Using default expiry: ${expiryDate.toISOString()}`);
+      }
+
+      console.log(`[Package Generation] Generating package for exam ${examId}, question paper ${resolvedQuestionPaperId}, expires ${expiryDate.toISOString()}`);
 
       // Generate package
       const packageInfo = await generateExamPackage(
         examId,
-        questionPaperId,
+        resolvedQuestionPaperId,
         req.user._id,
         expiryDate
       );
+
+      console.log(`[Package Generation] Package generated successfully: ID ${packageInfo.packageId}, Version ${packageInfo.version}, Size ${packageInfo.size} bytes`);
 
       res.status(201).json({
         message: 'Exam package generated successfully',
         package: packageInfo,
       });
     } catch (error) {
-      next(error);
+      console.error(`[Package Generation] Error generating package for exam ${examId}:`, error);
+      console.error(`[Package Generation] Error stack:`, error.stack);
+      // Don't fail silently - return error to client
+      return res.status(500).json({ 
+        error: 'Failed to generate exam package',
+        message: error.message || 'Unknown error occurred',
+        details: process.env.NODE_ENV === 'development' ? error.stack : undefined
+      });
     }
   }
 );

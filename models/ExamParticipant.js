@@ -25,7 +25,6 @@ const ExamParticipantSchema = new mongoose.Schema(
       type: String,
       unique: true,
       required: false, // Will be generated in pre-validate hook
-      index: true,
       sparse: true,
       immutable: true,
     },
@@ -33,19 +32,16 @@ const ExamParticipantSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Exam',
       required: true,
-      index: true,
     },
     userId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
       required: true,
-      index: true,
     },
     examRole: {
       type: String,
       enum: ['CREATOR', 'CANDIDATE', 'EVALUATOR'],
       required: true,
-      index: true,
     },
     permissions: {
       CREATE_SESSION: {
@@ -78,7 +74,6 @@ const ExamParticipantSchema = new mongoose.Schema(
     tenantId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Tenant',
-      index: true,
     },
   },
   {
