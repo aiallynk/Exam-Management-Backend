@@ -23,6 +23,8 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
     const filter = { ...req.tenantFilter };
+    const privilegedRoles = new Set(['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR']);
+    const isPrivilegedUser = privilegedRoles.has(req.user.role);
 
     if (examId) filter.examId = examId;
     if (sessionId) filter.sessionId = sessionId;
@@ -30,8 +32,13 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
     if (isCompleted !== undefined) filter.isCompleted = isCompleted === 'true';
     if (isDisqualified !== undefined) filter.isDisqualified = isDisqualified === 'true';
 
+    // Candidates/non-privileged users can only query their own results.
+    if (!isPrivilegedUser) {
+      filter.userId = req.user._id;
+    }
+
     const attempts = await ExamAttempt.find(filter)
-      .populate('examId', 'title duration')
+      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
       .populate('sessionId', 'startTime endTime')
       .populate('userId', 'name email')
       .populate('questionPaperId', 'setName')
@@ -39,9 +46,19 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
       .skip(skip)
       .limit(parseInt(limit));
 
+    const visibleAttempts = isPrivilegedUser
+      ? attempts
+      : attempts.filter((attempt) => {
+          const exam = attempt.examId;
+          if (!exam) return false;
+          if (exam.showResultsImmediately) return true;
+          if (!exam.resultsReleasedAt) return false;
+          return new Date(exam.resultsReleasedAt) <= new Date();
+        });
+
     // Calculate scores for each attempt
     const results = await Promise.all(
-      attempts.map(async (attempt) => {
+      visibleAttempts.map(async (attempt) => {
         const answers = await Answer.find({ attemptId: attempt._id })
           .populate('questionId', 'points sectionId');
         const totalScore = answers.reduce((sum, a) => sum + (a.pointsEarned || 0), 0);
@@ -113,7 +130,7 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
     );
 
     // Count total (may differ from attempts.length if filtered by permissions)
-    const total = req.user.role === 'SUPER_ADMIN' || req.user.role === 'EXAM_CREATOR'
+    const total = isPrivilegedUser
       ? await ExamAttempt.countDocuments(filter)
       : results.length; // Use filtered count for regular users
 
@@ -132,4 +149,3 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
 });
 
 export default router;
-

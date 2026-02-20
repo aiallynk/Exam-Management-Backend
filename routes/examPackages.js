@@ -460,8 +460,8 @@ router.get(
         return res.status(404).json({ error: 'Exam not found' });
       }
 
-      // Check tenant boundary
-      if (exam.tenantId.toString() !== req.user.tenantId?.toString()) {
+      // Check tenant boundary (SUPER_ADMIN can access all exams)
+      if (req.user.role !== 'SUPER_ADMIN' && exam.tenantId.toString() !== req.user.tenantId?.toString()) {
         return res.status(403).json({ error: 'Access denied' });
       }
 

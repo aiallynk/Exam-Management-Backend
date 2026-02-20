@@ -236,17 +236,27 @@ router.get(
         userId: user._id,
         isCompleted: true,
       })
-        .populate('examId', 'title duration')
+        .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
         .populate('sessionId', 'startTime endTime')
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parsedLimit);
 
+      const visibleAttempts = req.user.role === 'CANDIDATE'
+        ? attempts.filter((attempt) => {
+            const exam = attempt.examId;
+            if (!exam) return false;
+            if (exam.showResultsImmediately) return true;
+            if (!exam.resultsReleasedAt) return false;
+            return new Date(exam.resultsReleasedAt) <= new Date();
+          })
+        : attempts;
+
       // Use the ensureScoreSummary utility for consistent score calculation
       const { ensureScoreSummary } = await import('../utils/attemptScores.js');
       
       const results = await Promise.all(
-        attempts.map(async (attempt) => {
+        visibleAttempts.map(async (attempt) => {
           const { summary } = await ensureScoreSummary(attempt);
           
           return {
@@ -267,8 +277,10 @@ router.get(
         pagination: {
           page: parseInt(page),
           limit: parsedLimit,
-          total,
-          pages: Math.ceil(total / parsedLimit),
+          total: req.user.role === 'CANDIDATE' ? results.length : total,
+          pages: req.user.role === 'CANDIDATE'
+            ? Math.ceil(results.length / parsedLimit)
+            : Math.ceil(total / parsedLimit),
         },
       });
     } catch (error) {
@@ -413,4 +425,3 @@ router.put(
 );
 
 export default router;
-

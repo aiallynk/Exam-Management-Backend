@@ -91,6 +91,35 @@ const normalizeAnswerForStorage = (questionType, value) => {
   return String(value);
 };
 
+const parseStoredAnswerValue = (questionType, value) => {
+  if (questionType === 'MULTIPLE_OPTIONS') {
+    return parseArrayAnswer(value);
+  }
+  if (value === undefined || value === null) {
+    return '';
+  }
+  return value;
+};
+
+const ADMIN_VIEWER_ROLES = new Set(['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR']);
+
+const isExamResultsReleased = (exam) => {
+  if (!exam) return false;
+  if (Boolean(exam.showResultsImmediately)) return true;
+  if (!exam.resultsReleasedAt) return false;
+  const releasedAt = new Date(exam.resultsReleasedAt);
+  return !Number.isNaN(releasedAt.getTime()) && releasedAt <= new Date();
+};
+
+const isCertificatesReleased = (exam) => {
+  if (!exam?.certificatesSentAt) return false;
+  const sentAt = new Date(exam.certificatesSentAt);
+  return !Number.isNaN(sentAt.getTime()) && sentAt <= new Date();
+};
+
+const canBypassReleaseWindow = ({ userRole, canReviewAnswers = false }) =>
+  ADMIN_VIEWER_ROLES.has(userRole) || Boolean(canReviewAnswers);
+
 const router = express.Router();
 
 // Get all attempts (universal: based on exam permissions)
@@ -113,13 +142,13 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
     } else {
       // Regular users: check exam permissions
       if (examId) {
-        // Check if user has VIEW_RESULTS permission for this exam
-        const canViewResults = await hasExamPermission(req.user._id, examId, 'VIEW_RESULTS');
-        if (!canViewResults) {
+        // Only reviewers/admins can inspect attempts of other users.
+        const canReviewAnswers = await hasExamPermission(req.user._id, examId, 'REVIEW_ANSWERS');
+        if (!canReviewAnswers) {
           // User can only see their own attempts for this exam
           filter.userId = req.user._id;
         } else if (userId) {
-          // User has VIEW_RESULTS, can filter by userId
+          // Reviewer/admin can filter by any candidate userId
           filter.userId = userId;
         }
       } else {
@@ -129,7 +158,7 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
     }
 
     const attempts = await ExamAttempt.find(filter)
-      .populate('examId', 'title duration')
+      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
       .populate('sessionId', 'qrCode startTime endTime')
       .populate('userId', 'name email')
       .sort({ createdAt: -1 })
@@ -138,8 +167,32 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
 
     const total = await ExamAttempt.countDocuments(filter);
 
+    const privilegedViewer = ADMIN_VIEWER_ROLES.has(req.user.role);
+    const sanitizedAttempts = attempts.map((attemptDoc) => {
+      const attemptObj = attemptDoc.toObject();
+      const released = isExamResultsReleased(attemptObj.examId);
+      if (!privilegedViewer && !released) {
+        delete attemptObj.scoreSummary;
+        delete attemptObj.normalizedScore;
+        delete attemptObj.percentile;
+        delete attemptObj.sessionPercentile;
+      }
+
+      // Backward compatibility for clients expecting `status` and `score`.
+      attemptObj.status = attemptObj.isCompleted ? 'COMPLETED' : 'IN_PROGRESS';
+      attemptObj.score = attemptObj.scoreSummary
+        ? {
+            totalScore: Number(attemptObj.scoreSummary.totalScore) || 0,
+            maxScore: Number(attemptObj.scoreSummary.maxScore) || 0,
+            percentage: Number(attemptObj.scoreSummary.percentage) || 0,
+          }
+        : null;
+
+      return attemptObj;
+    });
+
     res.json({
-      attempts,
+      attempts: sanitizedAttempts,
       pagination: {
         page,
         limit,
@@ -363,6 +416,180 @@ router.post(
   }
 );
 
+// Save/restore attempt progress (autosave support)
+router.get('/:attemptId/progress', requireAuth, validateObjectId('attemptId'), async (req, res, next) => {
+  try {
+    const attempt = await ExamAttempt.findById(req.params.attemptId)
+      .populate('examId', '_id')
+      .populate('sessionId', '_id questionPaperId')
+      .populate('questionPaperId', '_id');
+
+    if (!attempt) {
+      return res.status(404).json({ error: 'Attempt not found' });
+    }
+
+    const canReview = await hasExamPermission(
+      req.user._id,
+      attempt.examId?._id || attempt.examId,
+      'REVIEW_ANSWERS'
+    );
+    if (!canReview && attempt.userId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: 'Forbidden - You can only view your own attempt progress' });
+    }
+
+    const assignedQuestionPaperId =
+      attempt.questionPaperId?._id ||
+      attempt.questionPaperId ||
+      attempt.sessionId?.questionPaperId;
+
+    if (!assignedQuestionPaperId) {
+      return res.status(400).json({ error: 'No question paper assigned for this attempt.' });
+    }
+
+    const questions = await Question.find({
+      questionPaperId: assignedQuestionPaperId,
+    }).select('_id questionType');
+
+    const questionTypeMap = new Map(
+      questions.map((question) => [question._id.toString(), question.questionType])
+    );
+    const answers = await Answer.find({ attemptId: attempt._id }).select('questionId answerText');
+
+    const progressAnswers = {};
+    answers.forEach((answerDoc) => {
+      const questionId = answerDoc.questionId?.toString();
+      if (!questionId || !questionTypeMap.has(questionId)) return;
+
+      progressAnswers[questionId] = parseStoredAnswerValue(
+        questionTypeMap.get(questionId),
+        answerDoc.answerText
+      );
+    });
+
+    res.json({
+      attempt: {
+        _id: attempt._id,
+        isCompleted: attempt.isCompleted,
+        lastActivity: attempt.lastActivity,
+      },
+      answers: progressAnswers,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.put(
+  '/:attemptId/progress',
+  requireAuth,
+  validateObjectId('attemptId'),
+  [
+    body('answers').isObject().withMessage('Answers must be an object'),
+    body('lastActivity').optional().isISO8601().withMessage('lastActivity must be an ISO 8601 date'),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const attempt = await ExamAttempt.findById(req.params.attemptId)
+        .populate('examId', '_id')
+        .populate('sessionId', '_id questionPaperId')
+        .populate('questionPaperId', '_id');
+
+      if (!attempt) {
+        return res.status(404).json({ error: 'Attempt not found' });
+      }
+
+      const canReview = await hasExamPermission(
+        req.user._id,
+        attempt.examId?._id || attempt.examId,
+        'REVIEW_ANSWERS'
+      );
+      if (!canReview && attempt.userId.toString() !== req.user._id.toString()) {
+        return res.status(403).json({ error: 'Forbidden - You can only update your own attempt progress' });
+      }
+
+      if (attempt.isCompleted) {
+        return res.status(400).json({ error: 'Attempt already submitted' });
+      }
+
+      const assignedQuestionPaperId =
+        attempt.questionPaperId?._id ||
+        attempt.questionPaperId ||
+        attempt.sessionId?.questionPaperId;
+
+      if (!assignedQuestionPaperId) {
+        return res.status(400).json({ error: 'No question paper assigned for this attempt.' });
+      }
+
+      const incomingAnswers = req.body.answers || {};
+      const validQuestionIds = Object.keys(incomingAnswers).filter((id) =>
+        /^[a-fA-F0-9]{24}$/.test(id)
+      );
+
+      let savedCount = 0;
+      if (validQuestionIds.length > 0) {
+        const questions = await Question.find({
+          _id: { $in: validQuestionIds },
+          questionPaperId: assignedQuestionPaperId,
+        }).select('_id questionType');
+
+        const questionMap = new Map(
+          questions.map((question) => [question._id.toString(), question.questionType])
+        );
+
+        const operations = [];
+        for (const [questionId, rawValue] of Object.entries(incomingAnswers)) {
+          const questionType = questionMap.get(questionId);
+          if (!questionType) continue;
+
+          operations.push({
+            updateOne: {
+              filter: { attemptId: attempt._id, questionId },
+              update: {
+                $set: {
+                  answerText: normalizeAnswerForStorage(questionType, rawValue),
+                  pointsEarned: 0,
+                  aiEvaluation: null,
+                  needsReview: false,
+                  updatedAt: new Date(),
+                },
+                $unset: {
+                  isCorrect: '',
+                },
+                $setOnInsert: {
+                  attemptId: attempt._id,
+                  questionId,
+                },
+              },
+              upsert: true,
+            },
+          });
+        }
+
+        if (operations.length > 0) {
+          await Answer.bulkWrite(operations, { ordered: false });
+          savedCount = operations.length;
+        }
+      }
+
+      attempt.lastActivity = req.body.lastActivity ? new Date(req.body.lastActivity) : new Date();
+      await attempt.save();
+
+      res.json({
+        success: true,
+        savedCount,
+        lastActivity: attempt.lastActivity,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 // Submit attempt
 router.post(
   '/:attemptId/submit',
@@ -373,7 +600,7 @@ router.post(
     isDisqualified: req.body.isDisqualified || false,
   })),
   [
-    body('answers').isObject().withMessage('Answers must be an object'),
+    body('answers').optional().isObject().withMessage('Answers must be an object'),
   ],
   async (req, res, next) => {
     try {
@@ -391,16 +618,45 @@ router.post(
       }
 
       // Verify ownership: users can only submit their own attempts (unless they have REVIEW_ANSWERS permission)
-      const canReview = await hasExamPermission(req.user._id, attempt.examId, 'REVIEW_ANSWERS');
+      const canReview = await hasExamPermission(
+        req.user._id,
+        attempt.examId?._id || attempt.examId,
+        'REVIEW_ANSWERS'
+      );
       if (!canReview && attempt.userId.toString() !== req.user._id.toString()) {
         return res.status(403).json({ error: 'Forbidden - You can only submit your own attempts' });
       }
 
       if (attempt.isCompleted) {
-        return res.status(400).json({ error: 'Attempt already submitted' });
+        await attempt.populate('questionPaperId', 'setName');
+        const canReviewAnswers = await hasExamPermission(
+          req.user._id,
+          attempt.examId?._id || attempt.examId,
+          'REVIEW_ANSWERS'
+        );
+        const scoringVisible =
+          canBypassReleaseWindow({
+            userRole: req.user.role,
+            canReviewAnswers,
+          }) || isExamResultsReleased(attempt.examId);
+        const summary = {
+          totalScore: Number(attempt.scoreSummary?.totalScore) || 0,
+          maxScore: Number(attempt.scoreSummary?.maxScore) || 0,
+          percentage: Number(attempt.scoreSummary?.percentage) || 0,
+        };
+        return res.json({
+          success: true,
+          alreadySubmitted: true,
+          attempt,
+          score: scoringVisible ? summary : null,
+          resultsAvailable: scoringVisible,
+        });
       }
 
-      const { answers, isDisqualified, disqualifyReason } = req.body;
+      const { isDisqualified, disqualifyReason } = req.body;
+      const submittedAnswers = req.body?.answers && typeof req.body.answers === 'object'
+        ? req.body.answers
+        : {};
 
       const assignedQuestionPaperId =
         attempt.questionPaperId?._id ||
@@ -416,14 +672,23 @@ router.post(
         questionPaperId: assignedQuestionPaperId,
       }).sort({ order: 1 });
 
-      const answerDocs = [];
+      const existingAnswers = await Answer.find({ attemptId: attempt._id }).select('questionId answerText');
+      const existingAnswerMap = new Map(
+        existingAnswers.map((answerDoc) => [answerDoc.questionId.toString(), answerDoc.answerText])
+      );
+
+      const answerWriteOperations = [];
       let totalScore = 0;
       let maxScore = 0;
 
       // Process each question
       for (const question of questions) {
         maxScore += question.points;
-        const rawAnswer = answers[question._id.toString()];
+        const questionId = question._id.toString();
+        const hasSubmittedAnswer = Object.prototype.hasOwnProperty.call(submittedAnswers, questionId);
+        const rawAnswer = hasSubmittedAnswer
+          ? submittedAnswers[questionId]
+          : existingAnswerMap.get(questionId);
         const studentAnswer = rawAnswer === undefined || rawAnswer === null ? '' : rawAnswer;
 
         let normalizedAnswerText = normalizeAnswerForStorage(
@@ -455,46 +720,62 @@ router.post(
             pointsEarned = isCorrect ? question.points : 0;
           }
         } else if (['SHORT_ANSWER', 'PARAGRAPH'].includes(question.questionType)) {
-          // AI evaluation for subjective questions
-          try {
-            aiEvaluation = await evaluateAnswer({
-              question: question.questionText,
-              correctAnswer: question.correctAnswer,
-              studentAnswer,
-              questionType: question.questionType,
-              points: question.points,
-            });
+          const hasSubjectiveAnswer = String(studentAnswer).trim().length > 0;
 
-            isCorrect = aiEvaluation.isCorrect;
-            pointsEarned = aiEvaluation.pointsEarned;
-          } catch (error) {
-            console.error('AI evaluation error:', error);
-            // Fallback: no points if AI fails
-            pointsEarned = 0;
-            aiEvaluation = {
-              error: 'Evaluation failed',
-              needsReview: true,
-            };
+          if (hasSubjectiveAnswer) {
+            // AI evaluation for subjective questions (skip empty answers)
+            try {
+              aiEvaluation = await evaluateAnswer({
+                question: question.questionText,
+                correctAnswer: question.correctAnswer,
+                studentAnswer,
+                questionType: question.questionType,
+                points: question.points,
+              });
+
+              isCorrect = aiEvaluation.isCorrect;
+              pointsEarned = aiEvaluation.pointsEarned;
+            } catch (error) {
+              console.error('AI evaluation error:', error);
+              // Fallback: no points if AI fails
+              pointsEarned = 0;
+              aiEvaluation = {
+                error: 'Evaluation failed',
+                needsReview: true,
+              };
+            }
           }
         }
 
         totalScore += pointsEarned;
 
-        const answerDoc = new Answer({
-          attemptId: attempt._id,
-          questionId: question._id,
-          answerText: normalizedAnswerText,
-          isCorrect,
-          pointsEarned,
-          aiEvaluation,
-          needsReview: aiEvaluation?.needsReview || false,
+        answerWriteOperations.push({
+          updateOne: {
+            filter: {
+              attemptId: attempt._id,
+              questionId: question._id,
+            },
+            update: {
+              $set: {
+                answerText: normalizedAnswerText,
+                isCorrect,
+                pointsEarned,
+                aiEvaluation,
+                needsReview: aiEvaluation?.needsReview || false,
+              },
+              $setOnInsert: {
+                attemptId: attempt._id,
+                questionId: question._id,
+              },
+            },
+            upsert: true,
+          },
         });
-
-        answerDocs.push(answerDoc);
       }
 
-      // Save all answers
-      await Answer.insertMany(answerDocs);
+      if (answerWriteOperations.length > 0) {
+        await Answer.bulkWrite(answerWriteOperations, { ordered: false });
+      }
 
       const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
       const submitTime = new Date();
@@ -515,16 +796,33 @@ router.post(
 
       await attempt.populate('examId', 'title duration showResultsImmediately resultsReleasedAt');
       await attempt.populate('questionPaperId', 'setName');
+      const savedAnswers = await Answer.find({ attemptId: attempt._id });
+      const canReviewAnswers = await hasExamPermission(
+        req.user._id,
+        attempt.examId?._id || attempt.examId,
+        'REVIEW_ANSWERS'
+      );
+      const scoringVisible =
+        canBypassReleaseWindow({
+          userRole: req.user.role,
+          canReviewAnswers,
+        }) || isExamResultsReleased(attempt.examId);
 
       res.json({
         success: true,
         attempt,
-        score: {
-          totalScore,
-          maxScore,
-          percentage,
-        },
-        answers: answerDocs,
+        score: scoringVisible
+          ? {
+              totalScore,
+              maxScore,
+              percentage,
+            }
+          : null,
+        answers: scoringVisible ? savedAnswers : [],
+        resultsAvailable: scoringVisible,
+        message: scoringVisible
+          ? 'Attempt submitted successfully.'
+          : 'Attempt submitted successfully. Results are not yet released for candidates.',
       });
     } catch (error) {
       next(error);
@@ -545,21 +843,25 @@ router.get('/:attemptId/results', requireAuth, validateObjectId('attemptId'), as
       return res.status(404).json({ error: 'Attempt not found' });
     }
 
-    // Verify ownership: users can only see their own results unless they have VIEW_RESULTS permission
-    const canViewResults = await hasExamPermission(req.user._id, attempt.examId._id, 'VIEW_RESULTS');
+    // Verify ownership and review privilege.
+    const canReviewAnswers = await hasExamPermission(req.user._id, attempt.examId._id, 'REVIEW_ANSWERS');
     const isOwnAttempt = attempt.userId._id.toString() === req.user._id.toString();
-    
-    if (!canViewResults && !isOwnAttempt) {
+
+    const canViewAnyAttempt = canBypassReleaseWindow({
+      userRole: req.user.role,
+      canReviewAnswers,
+    });
+
+    if (!isOwnAttempt && !canViewAnyAttempt) {
       return res.status(403).json({ error: 'Forbidden - You can only view your own results' });
     }
 
-    // For own attempts, check if results are released
+    // For candidate-owned attempts, enforce release window.
     if (
       isOwnAttempt &&
-      !canViewResults &&
+      !canViewAnyAttempt &&
       attempt.examId &&
-      !attempt.examId.showResultsImmediately &&
-      !attempt.examId.resultsReleasedAt
+      !isExamResultsReleased(attempt.examId)
     ) {
       return res.status(403).json({ error: 'Results are not yet available for this exam.' });
     }
@@ -620,12 +922,21 @@ router.get('/:attemptId/certificate', requireAuth, validateObjectId('attemptId')
       return res.status(404).json({ error: 'Attempt not found' });
     }
 
-    // Users can only see their own certificates unless they have VIEW_RESULTS permission
-    const canViewResults = await hasExamPermission(req.user._id, attempt.examId._id, 'VIEW_RESULTS');
+    // Users can only see their own certificates unless they are reviewers/admins.
+    const canReviewAnswers = await hasExamPermission(req.user._id, attempt.examId._id, 'REVIEW_ANSWERS');
     const isOwnAttempt = attempt.userId._id.toString() === req.user._id.toString();
-    
-    if (!canViewResults && !isOwnAttempt) {
+
+    const canViewAnyAttempt = canBypassReleaseWindow({
+      userRole: req.user.role,
+      canReviewAnswers,
+    });
+
+    if (!isOwnAttempt && !canViewAnyAttempt) {
       return res.status(403).json({ error: 'Forbidden - You can only view your own certificates' });
+    }
+
+    if (attempt.examId && attempt.examId.allowCertification === false) {
+      return res.status(403).json({ error: 'Certificate generation is disabled for this exam.' });
     }
 
     // Block certificate until results are released OR certificates are sent (for own attempts)
@@ -635,11 +946,10 @@ router.get('/:attemptId/certificate', requireAuth, validateObjectId('attemptId')
     // 3. Certificates have been sent separately
     if (
       isOwnAttempt &&
-      !canViewResults &&
+      !canViewAnyAttempt &&
       attempt.examId &&
-      !attempt.examId.showResultsImmediately &&
-      !attempt.examId.resultsReleasedAt &&
-      !attempt.examId.certificatesSentAt
+      !isExamResultsReleased(attempt.examId) &&
+      !isCertificatesReleased(attempt.examId)
     ) {
       return res.status(403).json({ error: 'Results are not yet available for this exam.' });
     }
@@ -1448,10 +1758,21 @@ router.post(
 
       // Calculate score summary
       const scoreSummary = await ensureScoreSummary(updatedAttempt);
+      const canReviewAnswers = await hasExamPermission(
+        req.user._id,
+        updatedAttempt.examId?._id || updatedAttempt.examId,
+        'REVIEW_ANSWERS'
+      );
+      const scoringVisible =
+        canBypassReleaseWindow({
+          userRole: req.user.role,
+          canReviewAnswers,
+        }) || isExamResultsReleased(updatedAttempt.examId);
 
       res.json({
         attempt: updatedAttempt,
-        score: scoreSummary,
+        score: scoringVisible ? scoreSummary : null,
+        resultsAvailable: scoringVisible,
         reconciliation: {
           warnings: reconciliationResult.warnings || [],
           anomalies: reconciliationResult.anomalies || [],
@@ -1466,4 +1787,3 @@ router.post(
 );
 
 export default router;
-

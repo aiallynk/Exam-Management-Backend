@@ -121,6 +121,335 @@ const normalizeQuestionObject = (question, index = 0) => {
   };
 };
 
+const parseCount = (value, fallback = 0) => {
+  const parsed = Number.parseInt(value, 10);
+  return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const buildQuestionTypeDistribution = ({ questionTypes, questionTypeDistribution, count }) => {
+  const safeTypes = Array.isArray(questionTypes)
+    ? questionTypes
+      .map((type) => sanitizeString(type).toUpperCase())
+      .filter((type) => VALID_QUESTION_TYPES.includes(type))
+    : [];
+
+  const safeCount = Math.max(1, parseCount(count, 5));
+
+  if (!safeTypes.length) {
+    return [{ type: 'MULTIPLE_CHOICE', count: safeCount }];
+  }
+
+  const distributionMap = {};
+  safeTypes.forEach((type) => {
+    distributionMap[type] = 0;
+  });
+
+  if (Array.isArray(questionTypeDistribution) && questionTypeDistribution.length > 0) {
+    questionTypeDistribution.forEach((item) => {
+      const type = sanitizeString(item?.type).toUpperCase();
+      const typeCount = Math.max(0, parseCount(item?.count, 0));
+      if (safeTypes.includes(type)) {
+        distributionMap[type] += typeCount;
+      }
+    });
+  }
+
+  let total = safeTypes.reduce((sum, type) => sum + distributionMap[type], 0);
+
+  if (total <= 0) {
+    const perType = Math.floor(safeCount / safeTypes.length);
+    const remainder = safeCount % safeTypes.length;
+    safeTypes.forEach((type, idx) => {
+      distributionMap[type] = perType + (idx < remainder ? 1 : 0);
+    });
+    total = safeCount;
+  }
+
+  if (total !== safeCount) {
+    if (total < safeCount) {
+      distributionMap[safeTypes[0]] += safeCount - total;
+    } else {
+      let overflow = total - safeCount;
+      const orderedTypes = [...safeTypes].sort((a, b) => distributionMap[b] - distributionMap[a]);
+      for (const type of orderedTypes) {
+        if (overflow <= 0) break;
+        const removable = Math.min(distributionMap[type], overflow);
+        distributionMap[type] -= removable;
+        overflow -= removable;
+      }
+
+      if (overflow > 0) {
+        const perType = Math.floor(safeCount / safeTypes.length);
+        const remainder = safeCount % safeTypes.length;
+        safeTypes.forEach((type, idx) => {
+          distributionMap[type] = perType + (idx < remainder ? 1 : 0);
+        });
+      }
+    }
+  }
+
+  const distribution = safeTypes
+    .map((type) => ({ type, count: Math.max(0, distributionMap[type] || 0) }))
+    .filter((item) => item.count > 0);
+
+  if (!distribution.length) {
+    return [{ type: safeTypes[0], count: safeCount }];
+  }
+
+  const finalTotal = distribution.reduce((sum, item) => sum + item.count, 0);
+  if (finalTotal !== safeCount) {
+    distribution[0].count += safeCount - finalTotal;
+  }
+
+  return distribution;
+};
+
+const buildFallbackQuestionForType = ({ type, index, topic }) => {
+  const safeType = VALID_QUESTION_TYPES.includes(type) ? type : 'SHORT_ANSWER';
+  const safeTopic = sanitizeString(topic) || 'the topic';
+  const typeLabel = safeType.replace(/_/g, ' ').toLowerCase();
+  const baseQuestionText = `Sample ${typeLabel} question ${index + 1} about ${safeTopic}?`;
+
+  if (safeType === 'TRUE_FALSE') {
+    return {
+      questionText: baseQuestionText,
+      questionType: safeType,
+      options: ['True', 'False'],
+      correctAnswer: 'True',
+      points: 1,
+      order: index + 1,
+      passage: '',
+    };
+  }
+
+  if (safeType === 'MULTIPLE_CHOICE') {
+    return {
+      questionText: baseQuestionText,
+      questionType: safeType,
+      options: ['Option A', 'Option B', 'Option C', 'Option D'],
+      correctAnswer: 'Option A',
+      points: 1,
+      order: index + 1,
+      passage: '',
+    };
+  }
+
+  if (safeType === 'MULTIPLE_OPTIONS') {
+    return {
+      questionText: baseQuestionText,
+      questionType: safeType,
+      options: ['Option A', 'Option B', 'Option C', 'Option D'],
+      correctAnswer: ['Option A'],
+      points: 1,
+      order: index + 1,
+      passage: '',
+    };
+  }
+
+  if (safeType === 'NUMBER') {
+    return {
+      questionText: baseQuestionText,
+      questionType: safeType,
+      options: undefined,
+      correctAnswer: '0',
+      points: 1,
+      order: index + 1,
+      passage: '',
+    };
+  }
+
+  if (safeType === 'PARAGRAPH') {
+    return {
+      questionText: baseQuestionText,
+      questionType: safeType,
+      options: undefined,
+      correctAnswer: 'Refer to passage',
+      points: 1,
+      order: index + 1,
+      passage: `Read the following passage about ${safeTopic} and answer the question.`,
+    };
+  }
+
+  return {
+    questionText: baseQuestionText,
+    questionType: safeType,
+    options: undefined,
+    correctAnswer: 'Sample answer',
+    points: 1,
+    order: index + 1,
+    passage: '',
+  };
+};
+
+const normalizeToRequestedType = ({ question, type, index, topic }) => {
+  const fallback = buildFallbackQuestionForType({ type, index, topic });
+  const source = question && typeof question === 'object' ? question : fallback;
+  const normalized =
+    normalizeQuestionObject({ ...source, questionType: type }, index + 1) ||
+    normalizeQuestionObject(fallback, index + 1) ||
+    fallback;
+
+  const questionText = sanitizeString(normalized.questionText) || fallback.questionText;
+  const points = Number.isFinite(Number(normalized.points)) ? Number(normalized.points) : 1;
+
+  if (type === 'MULTIPLE_CHOICE') {
+    const options = Array.isArray(normalized.options) && normalized.options.length
+      ? normalized.options
+      : ['Option A', 'Option B', 'Option C', 'Option D'];
+    const answer = sanitizeString(normalized.correctAnswer);
+    const correctAnswer = options.includes(answer) ? answer : options[0];
+    return {
+      questionText,
+      questionType: type,
+      options,
+      correctAnswer,
+      points,
+      order: index + 1,
+      passage: '',
+    };
+  }
+
+  if (type === 'MULTIPLE_OPTIONS') {
+    const options = Array.isArray(normalized.options) && normalized.options.length
+      ? normalized.options
+      : ['Option A', 'Option B', 'Option C', 'Option D'];
+    const answers = parseMultiAnswer(normalized.correctAnswer).filter((ans) => options.includes(ans));
+    return {
+      questionText,
+      questionType: type,
+      options,
+      correctAnswer: answers.length ? answers : [options[0]],
+      points,
+      order: index + 1,
+      passage: '',
+    };
+  }
+
+  if (type === 'TRUE_FALSE') {
+    const answer = sanitizeString(normalized.correctAnswer).toLowerCase();
+    return {
+      questionText,
+      questionType: type,
+      options: ['True', 'False'],
+      correctAnswer: answer.startsWith('f') ? 'False' : 'True',
+      points,
+      order: index + 1,
+      passage: '',
+    };
+  }
+
+  if (type === 'NUMBER') {
+    const answer = sanitizeString(normalized.correctAnswer);
+    return {
+      questionText,
+      questionType: type,
+      options: undefined,
+      correctAnswer: answer || '0',
+      points,
+      order: index + 1,
+      passage: '',
+    };
+  }
+
+  if (type === 'PARAGRAPH') {
+    const answer = sanitizeString(normalized.correctAnswer) || 'Refer to passage';
+    const passage = sanitizeString(normalized.passage) || fallback.passage;
+    return {
+      questionText,
+      questionType: type,
+      options: undefined,
+      correctAnswer: answer,
+      points,
+      order: index + 1,
+      passage,
+    };
+  }
+
+  return {
+    questionText,
+    questionType: 'SHORT_ANSWER',
+    options: undefined,
+    correctAnswer: sanitizeString(normalized.correctAnswer) || 'Sample answer',
+    points,
+    order: index + 1,
+    passage: '',
+  };
+};
+
+const enforceQuestionDistribution = ({ questions, typeDistribution, count, topic }) => {
+  const safeDistribution = Array.isArray(typeDistribution)
+    ? typeDistribution
+      .map((item) => ({
+        type: sanitizeString(item?.type).toUpperCase(),
+        count: Math.max(0, parseCount(item?.count, 0)),
+      }))
+      .filter((item) => VALID_QUESTION_TYPES.includes(item.type) && item.count > 0)
+    : [];
+
+  const safeCount = Math.max(1, parseCount(count, 5));
+  if (!safeDistribution.length) {
+    return Array.from({ length: safeCount }, (_, idx) =>
+      buildFallbackQuestionForType({ type: 'MULTIPLE_CHOICE', index: idx, topic })
+    );
+  }
+
+  const targetByType = {};
+  const poolsByType = {};
+  safeDistribution.forEach(({ type, count: typeCount }) => {
+    targetByType[type] = typeCount;
+    poolsByType[type] = [];
+  });
+
+  const overflowPool = [];
+  (Array.isArray(questions) ? questions : []).forEach((question, index) => {
+    const normalized = normalizeQuestionObject(question, index + 1);
+    if (!normalized) return;
+    const type = sanitizeString(normalized.questionType).toUpperCase();
+    if (!targetByType[type]) {
+      overflowPool.push(normalized);
+      return;
+    }
+    if (poolsByType[type].length < targetByType[type]) {
+      poolsByType[type].push(normalized);
+    } else {
+      overflowPool.push(normalized);
+    }
+  });
+
+  const result = [];
+  safeDistribution.forEach(({ type, count: targetCount }) => {
+    for (let i = 0; i < targetCount; i += 1) {
+      let candidate = poolsByType[type].shift();
+      if (!candidate && overflowPool.length > 0) {
+        candidate = overflowPool.shift();
+      }
+      result.push(
+        normalizeToRequestedType({
+          question: candidate,
+          type,
+          index: result.length,
+          topic,
+        })
+      );
+    }
+  });
+
+  while (result.length < safeCount) {
+    result.push(
+      normalizeToRequestedType({
+        question: null,
+        type: safeDistribution[0].type,
+        index: result.length,
+        topic,
+      })
+    );
+  }
+
+  return result
+    .slice(0, safeCount)
+    .map((question, index) => ({ ...question, order: index + 1 }));
+};
+
 /**
  * Generate exam questions using OpenAI
  */
@@ -229,45 +558,12 @@ These questions should be at the highest difficulty level, suitable for expert-l
 
     const difficultyGuidance = difficultyDescriptions[difficulty] || difficultyDescriptions.medium;
 
-    // Calculate distribution of question types
-    // Use provided distribution if available, otherwise distribute evenly
-    let typeDistribution;
-    if (Array.isArray(questionTypeDistribution) && questionTypeDistribution.length > 0) {
-      // Use the provided distribution
-      typeDistribution = questionTypeDistribution
-        .filter(item => item && item.type && item.count > 0)
-        .map(item => ({
-          type: String(item.type).toUpperCase(),
-          count: parseInt(item.count, 10)
-        }))
-        .filter(item => validTypes.includes(item.type));
-      
-      // Verify the distribution matches the total count
-      const distributionSum = typeDistribution.reduce((sum, item) => sum + item.count, 0);
-      if (distributionSum !== count) {
-        console.warn(`Question type distribution sum (${distributionSum}) does not match total count (${count}). Adjusting...`);
-        // Adjust proportionally
-        const scale = count / distributionSum;
-        typeDistribution = typeDistribution.map(item => ({
-          ...item,
-          count: Math.round(item.count * scale)
-        }));
-        // Fix rounding errors
-        const newSum = typeDistribution.reduce((sum, item) => sum + item.count, 0);
-        const diff = count - newSum;
-        if (diff !== 0 && typeDistribution.length > 0) {
-          typeDistribution[0].count += diff;
-        }
-      }
-    } else {
-      // Default: distribute evenly
-      const questionsPerType = Math.floor(count / questionTypes.length);
-      const remainder = count % questionTypes.length;
-      typeDistribution = questionTypes.map((type, idx) => ({
-        type,
-        count: questionsPerType + (idx < remainder ? 1 : 0)
-      })).filter(item => item.count > 0);
-    }
+    // Normalize requested distribution so backend always enforces exact totals.
+    const typeDistribution = buildQuestionTypeDistribution({
+      questionTypes,
+      questionTypeDistribution,
+      count: questionCount,
+    });
 
     // Build system prompt with enhanced difficulty guidance
     const existingQuestionsText = Array.isArray(existingQuestions) && existingQuestions.length > 0
@@ -277,7 +573,7 @@ These questions should be at the highest difficulty level, suitable for expert-l
     let systemPrompt = `You are an expert exam question generator specializing in creating questions at precise difficulty levels. Generate high-quality exam questions in JSON format.
 
 CRITICAL REQUIREMENTS:
-- Generate exactly ${count} questions
+- Generate exactly ${questionCount} questions
 - Difficulty level: ${difficulty.toUpperCase()}
 - ${difficultyGuidance}
 
@@ -288,7 +584,7 @@ QUESTION TYPE ENFORCEMENT (MANDATORY):
 - You MUST generate EXACTLY the specified number for each type:
 ${typeDistribution.map(item => `  - ${item.count} question${item.count > 1 ? 's' : ''} of type ${item.type}`).join('\n')}
 - Each question's questionType field MUST be one of: ${questionTypes.join(', ')}
-- The total count MUST equal exactly ${count} questions
+- The total count MUST equal exactly ${questionCount} questions
 - DO NOT deviate from the specified distribution - generate exactly as specified above
 
 ${existingQuestionsText ? `\nCRITICAL: DUPLICATE PREVENTION
@@ -320,15 +616,15 @@ For each question, provide:
 - points: Points for this question (default 1)
 - order: Sequential order starting from 1
 
-Return a JSON object with a "questions" array containing exactly ${count} questions. Format: { "questions": [...] }`;
+Return a JSON object with a "questions" array containing exactly ${questionCount} questions. Format: { "questions": [...] }`;
 
-    const userPrompt = `Generate exactly ${count} ${difficulty} difficulty level questions about "${topic}". 
+    const userPrompt = `Generate exactly ${questionCount} ${difficulty} difficulty level questions about "${topic}". 
 
 CRITICAL REQUIREMENTS:
 - Question Types: You MUST ONLY generate questions of these types: ${questionTypes.join(', ')}
 - EXACT Distribution (MUST follow precisely):
 ${typeDistribution.map(item => `  - Generate EXACTLY ${item.count} ${item.type} question${item.count > 1 ? 's' : ''}`).join('\n')}
-- Total questions: ${count} (sum of all types above)
+- Total questions: ${questionCount} (sum of all types above)
 - DO NOT generate any question types that are NOT in the list: ${questionTypes.join(', ')}
 - Each question's questionType field MUST be exactly one of: ${questionTypes.join(', ')}
 - IMPORTANT: The distribution above is EXACT - generate exactly the specified number for each type, no more, no less
@@ -393,44 +689,17 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
           throw new Error('Invalid response format from OpenAI');
         }
 
-        // Validate and normalize questions, ensuring they match selected question types
-        const normalizedQuestions = questions.slice(0, count).map((q, index) => {
-          let questionType = sanitizeString(q.questionType || q.type || '').toUpperCase();
-          
-          // Validate question type - must be one of the selected types
-          if (!questionTypes.includes(questionType)) {
-            // If AI generated wrong type, assign from selected types in round-robin fashion
-            questionType = questionTypes[index % questionTypes.length];
-            console.warn(`Question ${index + 1} had invalid type "${q.questionType}", corrected to "${questionType}"`);
-          }
-          
-          return {
-            questionText: q.questionText || q.question || '',
-            questionType: questionType,
-            options: q.options || (['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE'].includes(questionType) 
-              ? (questionType === 'TRUE_FALSE' ? ['True', 'False'] : ['Option A', 'Option B', 'Option C', 'Option D'])
-              : undefined),
-            correctAnswer: q.correctAnswer || q.answer || '',
-            points: q.points || 1,
-            order: q.order || index + 1,
-            passage:
-              sanitizeString(
-                q.passage ||
-                  q.context ||
-                  (questionType === 'PARAGRAPH' ? (q.reference || q.sourceText || '') : '')
-              ) || '',
-          };
-        });
+        const normalizedQuestions = questions
+          .map((q, index) => normalizeQuestionObject(q, index + 1))
+          .filter(Boolean);
 
-        // Final validation: Ensure all questions have valid types
-        const validatedQuestions = normalizedQuestions.map((q, idx) => {
-          if (!questionTypes.includes(q.questionType)) {
-            q.questionType = questionTypes[idx % questionTypes.length];
-          }
-          return q;
+        // Enforce exact requested type distribution and total count.
+        return enforceQuestionDistribution({
+          questions: normalizedQuestions,
+          typeDistribution,
+          count: questionCount,
+          topic: sanitizedTopic,
         });
-
-        return validatedQuestions;
       } catch (error) {
         lastError = error;
         
@@ -814,25 +1083,42 @@ const extractQuestionsFallback = ({ content, structuredRows }) => {
 };
 
 const generateFallbackQuestions = (params) => {
-  const { topic, count, difficulty, questionTypes } = params;
+  const {
+    topic,
+    count,
+    questionTypes = ['MULTIPLE_CHOICE'],
+    questionTypeDistribution,
+  } = params || {};
+
+  const safeCount = Math.max(1, parseCount(count, 5));
+  const safeQuestionTypes = Array.isArray(questionTypes) && questionTypes.length
+    ? questionTypes
+    : ['MULTIPLE_CHOICE'];
+  const typeDistribution = buildQuestionTypeDistribution({
+    questionTypes: safeQuestionTypes,
+    questionTypeDistribution,
+    count: safeCount,
+  });
+
   const questions = [];
+  typeDistribution.forEach(({ type, count: typeCount }) => {
+    for (let i = 0; i < typeCount; i += 1) {
+      questions.push(
+        buildFallbackQuestionForType({
+          type,
+          index: questions.length,
+          topic,
+        })
+      );
+    }
+  });
 
-  for (let i = 0; i < Math.min(count, 10); i++) {
-    const type = questionTypes[i % questionTypes.length];
-    questions.push({
-      questionText: `Sample ${type} question ${i + 1} about ${topic}?`,
-      questionType: type,
-      options: type.includes('MULTIPLE') || type === 'TRUE_FALSE'
-        ? ['Option A', 'Option B', 'Option C', 'Option D']
-        : undefined,
-      correctAnswer: 'Sample correct answer',
-      points: 1,
-      order: i + 1,
-      passage: type === 'PARAGRAPH' ? `Sample reading passage about ${topic} for comprehension.` : '',
-    });
-  }
-
-  return questions;
+  return enforceQuestionDistribution({
+    questions,
+    typeDistribution,
+    count: safeCount,
+    topic,
+  });
 };
 
 /**
@@ -876,4 +1162,3 @@ const evaluateFallbackAnswer = (params) => {
     needsReview: confidence < 0.8,
   };
 };
-

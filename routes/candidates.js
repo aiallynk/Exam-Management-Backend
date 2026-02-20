@@ -129,24 +129,26 @@ router.get('/results', requireAuth, async (req, res, next) => {
       .skip(skip)
       .limit(parseInt(limit));
 
-    // Filter attempts based on exam permissions
-    // Users can only see results for exams where:
-    // 1. Results are shown immediately, OR
-    // 2. Results have been released, OR
-    // 3. User has VIEW_RESULTS permission
+    // Filter attempts based on release windows.
+    // Candidates should see their own results only after release.
+    // Reviewers/admins may see results immediately.
     const filteredAttempts = [];
+    const privilegedRoles = new Set(['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR']);
+    const userIsPrivileged = privilegedRoles.has(req.user.role);
     for (const attempt of attempts) {
       if (!attempt.examId) {
         // Exam deleted, skip
         continue;
       }
 
-      const canViewResults = await hasExamPermission(req.user._id, attempt.examId._id, 'VIEW_RESULTS');
-      // Check if results are released: immediately OR resultsReleasedAt is in the past
-      const resultsReleased = attempt.examId.showResultsImmediately || 
+      const canReviewAnswers = userIsPrivileged
+        ? true
+        : await hasExamPermission(req.user._id, attempt.examId._id, 'REVIEW_ANSWERS');
+      const resultsReleased =
+        Boolean(attempt.examId.showResultsImmediately) ||
         (attempt.examId.resultsReleasedAt && attempt.examId.resultsReleasedAt <= new Date());
 
-      if (canViewResults || resultsReleased) {
+      if (canReviewAnswers || resultsReleased) {
         filteredAttempts.push(attempt);
       }
     }

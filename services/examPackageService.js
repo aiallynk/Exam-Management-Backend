@@ -112,10 +112,10 @@ export const generateExamPackage = async (examId, questionPaperId, userId, expir
   }).sort({ order: 1 });
 
   // Get or increment version FIRST (needed for package data and key derivation)
+  // Look at ALL packages (active and inactive) to ensure version increments correctly on regeneration
   const latestPackage = await ExamPackage.findOne({
     examId,
     questionPaperId,
-    isActive: true,
   }).sort({ version: -1 });
 
   const version = latestPackage ? latestPackage.version + 1 : 1;

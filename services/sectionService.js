@@ -147,11 +147,28 @@ export const startSectionTimer = async (attemptId, sectionId) => {
   if (!attempt.sectionTimers) {
     attempt.sectionTimers = new Map();
   }
+
+  const sectionKey = sectionId.toString();
+  const existingTimer = attempt.sectionTimers.get(sectionKey);
+  if (existingTimer) {
+    const now = new Date();
+    const existingEndTime = existingTimer.endTime ? new Date(existingTimer.endTime) : null;
+    const isExpired = existingEndTime ? existingEndTime.getTime() <= now.getTime() : false;
+
+    if (isExpired && !existingTimer.isLocked) {
+      existingTimer.isLocked = true;
+      attempt.sectionTimers.set(sectionKey, existingTimer);
+      return await attempt.save();
+    }
+
+    // Do not reset timer if section was already started.
+    return attempt;
+  }
   
   const now = new Date();
   const endTime = new Date(now.getTime() + section.duration * 60 * 1000);
   
-  attempt.sectionTimers.set(sectionId.toString(), {
+  attempt.sectionTimers.set(sectionKey, {
     startTime: now,
     endTime,
     isLocked: false,

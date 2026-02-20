@@ -1131,6 +1131,10 @@ router.get('/results/exams/:examId', async (req, res, next) => {
       return res.status(404).json({ error: 'Exam not found' });
     }
 
+    const passingPercentage = Number.isFinite(Number(exam.passingPercentage))
+      ? Number(exam.passingPercentage)
+      : 60;
+
     // Get all completed attempts for this exam
     const attempts = await ExamAttempt.find({
       examId: exam._id,
@@ -1161,6 +1165,8 @@ router.get('/results/exams/:examId', async (req, res, next) => {
           normalizedScore: attempt.normalizedScore || null,
           percentile: attempt.percentile || null,
           sessionPercentile: attempt.sessionPercentile || null,
+          isPassed: percentage >= passingPercentage,
+          status: percentage >= passingPercentage ? 'PASSED' : 'FAILED',
           rank: null, // Will be calculated after sorting
         };
       })
@@ -1195,6 +1201,7 @@ router.get('/results/exams/:examId', async (req, res, next) => {
         _id: exam._id,
         title: exam.title,
         description: exam.description,
+        passingPercentage,
         createdAt: exam.createdAt,
       },
       candidates,
@@ -1227,7 +1234,7 @@ router.get('/attempts', async (req, res, next) => {
       ExamAttempt.find(filter)
         .populate({
           path: 'examId',
-          select: 'title duration',
+          select: 'title duration passingPercentage',
         })
         .populate('userId', 'name email role')
         .populate('sessionId', 'startTime endTime')
@@ -1243,15 +1250,36 @@ router.get('/attempts', async (req, res, next) => {
         const attemptObj = attempt.toObject();
         if (attempt.isCompleted) {
           try {
-            const answers = await Answer.find({ attemptId: attempt._id })
-              .populate('questionId', 'points');
-            const totalScore = answers.reduce((sum, a) => sum + (a.pointsEarned || 0), 0);
-            const maxScore = answers.reduce((sum, a) => sum + (a.questionId?.points || 0), 0);
-            const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
+            const hasSummary =
+              Number.isFinite(Number(attemptObj.scoreSummary?.percentage)) &&
+              Number.isFinite(Number(attemptObj.scoreSummary?.totalScore)) &&
+              Number.isFinite(Number(attemptObj.scoreSummary?.maxScore));
+
+            let percentage = 0;
+            let totalScore = 0;
+            let maxScore = 0;
+
+            if (hasSummary) {
+              percentage = Number(attemptObj.scoreSummary.percentage) || 0;
+              totalScore = Number(attemptObj.scoreSummary.totalScore) || 0;
+              maxScore = Number(attemptObj.scoreSummary.maxScore) || 0;
+            } else {
+              const answers = await Answer.find({ attemptId: attempt._id })
+                .populate('questionId', 'points');
+              totalScore = answers.reduce((sum, a) => sum + (a.pointsEarned || 0), 0);
+              maxScore = answers.reduce((sum, a) => sum + (a.questionId?.points || 0), 0);
+              percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
+            }
+
+            const passingThreshold = Number(attemptObj.examId?.passingPercentage ?? 60);
             attemptObj.score = percentage;
+            attemptObj.resultStatus = percentage >= passingThreshold ? 'PASSED' : 'FAILED';
+            attemptObj.totalScore = totalScore;
+            attemptObj.maxScore = maxScore;
           } catch (err) {
             console.error(`Error calculating score for attempt ${attempt._id}:`, err);
             attemptObj.score = null;
+            attemptObj.resultStatus = null;
           }
         }
         return attemptObj;
