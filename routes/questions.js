@@ -5,10 +5,33 @@ import Exam from '../models/Exam.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole, requireOwnershipOrAdmin } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
+import { checkQuestionLimit } from '../middleware/planLimits.js';
 import { body, validationResult } from 'express-validator';
 import { parseCSV, validateQuestionCSV } from '../utils/csv.js';
+import { syncExamQuestionCount } from '../utils/planUsage.js';
 
 const router = express.Router();
+
+const prepareImportedQuestionCount = (req, res, next) => {
+  try {
+    const csvContent = req.body?.csvContent;
+    if (typeof csvContent !== 'string' || !csvContent.trim()) {
+      return res.status(400).json({
+        error: 'CSV content and question paper ID are required',
+      });
+    }
+
+    const records = parseCSV(csvContent);
+    req.planLimitContext = {
+      ...(req.planLimitContext || {}),
+      parsedCsvRecords: records,
+      questionsToAdd: records.length,
+    };
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+};
 
 // Get all questions for an exam (via question papers)
 router.get('/:examId/questions', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
@@ -85,6 +108,7 @@ router.post(
   enforceTenantBoundaries,
   requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can create questions
   requireOwnershipOrAdmin,
+  checkQuestionLimit,
   [
     body('questionText').trim().notEmpty().withMessage('Question text is required'),
     body('questionType')
@@ -158,6 +182,7 @@ router.post(
 
       await question.save();
       await question.populate('questionPaperId', 'setName');
+      await syncExamQuestionCount(req.params.examId);
 
       res.status(201).json({ question });
     } catch (error) {
@@ -272,6 +297,7 @@ router.delete(
       }
 
       await Question.findByIdAndDelete(req.params.questionId);
+      await syncExamQuestionCount(req.params.examId);
       res.json({ message: 'Question deleted successfully' });
     } catch (error) {
       next(error);
@@ -287,9 +313,12 @@ router.post(
   enforceTenantBoundaries,
   requireRole('EXAM_CREATOR'), // Only EXAM_CREATOR can modify questions
   requireOwnershipOrAdmin,
+  prepareImportedQuestionCount,
+  checkQuestionLimit,
   async (req, res, next) => {
     try {
       const { csvContent, questionPaperId } = req.body;
+      const preParsedRecords = req.planLimitContext?.parsedCsvRecords;
 
       if (!csvContent || !questionPaperId) {
         return res.status(400).json({
@@ -307,7 +336,9 @@ router.post(
         return res.status(404).json({ error: 'Question paper not found' });
       }
 
-      const records = parseCSV(csvContent);
+      const records = Array.isArray(preParsedRecords)
+        ? preParsedRecords
+        : parseCSV(csvContent);
       validateQuestionCSV(records);
 
       const questions = records.map((record, index) => ({
@@ -321,6 +352,7 @@ router.post(
       }));
 
       const createdQuestions = await Question.insertMany(questions);
+      await syncExamQuestionCount(req.params.examId);
 
       res.status(201).json({
         message: `Imported ${createdQuestions.length} questions`,

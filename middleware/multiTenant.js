@@ -5,7 +5,7 @@
  */
 
 import User from '../models/User.js';
-import Tenant from '../models/Tenant.js';
+import { resolveTenantSnapshot } from '../utils/tenantResolver.js';
 
 /**
  * Middleware to ensure user has tenantId (except SUPER_ADMIN)
@@ -24,7 +24,8 @@ export const requireTenant = async (req, res, next) => {
 
     // Load full user document to get tenantId
     const user = await User.findById(req.user._id)
-      .populate('tenantId', 'name code status uniqueId type');
+      .select('status tenantId')
+      .lean();
 
     if (!user) {
       return res.status(401).json({ error: 'User not found' });
@@ -37,9 +38,11 @@ export const requireTenant = async (req, res, next) => {
 
     // Allow users without tenant initially (they can be assigned later by Super Admin)
     // Users without tenant can still login, but won't be able to access tenant-specific routes
-    if (user.tenantId) {
+    const tenant = await resolveTenantSnapshot(user.tenantId, 'name code status uniqueId type');
+
+    if (tenant) {
       // Check tenant status
-      if (user.tenantId.status !== 'ACTIVE') {
+      if (tenant.status !== 'ACTIVE') {
         return res.status(403).json({ error: 'Tenant is not active' });
       }
     }
@@ -47,13 +50,13 @@ export const requireTenant = async (req, res, next) => {
     // Update req.user with full user data
     req.user = {
       ...req.user,
-      tenantId: user.tenantId?._id || null,
-      tenant: user.tenantId || null,
+      tenantId: tenant?._id || null,
+      tenant: tenant || null,
     };
 
     next();
   } catch (error) {
-    return res.status(500).json({ error: 'Multi-tenant validation error' });
+    next(error);
   }
 };
 
@@ -93,7 +96,7 @@ export const enforceTenantBoundaries = async (req, res, next) => {
 
     next();
   } catch (error) {
-    return res.status(500).json({ error: 'Tenant boundary enforcement error' });
+    next(error);
   }
 };
 

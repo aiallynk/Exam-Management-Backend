@@ -65,6 +65,18 @@ const UserSchema = new mongoose.Schema(
       enum: ['ACTIVE', 'INACTIVE', 'SUSPENDED', 'BLOCKED'],
       default: 'ACTIVE',
     },
+    planType: {
+      type: String,
+      enum: ['free', 'free_trial', 'demo', 'pro', 'enterprise'],
+      default: 'free',
+      lowercase: true,
+      trim: true,
+    },
+    examsCreated: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
   },
   {
     timestamps: true,
@@ -75,6 +87,7 @@ const UserSchema = new mongoose.Schema(
 UserSchema.index({ uniqueId: 1 });
 UserSchema.index({ tenantId: 1, role: 1 });
 UserSchema.index({ status: 1 });
+UserSchema.index({ planType: 1 });
 
 // Generate uniqueId before validation (only for new documents or existing ones without uniqueId)
 UserSchema.pre('validate', async function (next) {
@@ -102,7 +115,11 @@ UserSchema.pre('save', function (next) {
   
   // TENANT_ADMIN must have a tenantId
   if (this.role === 'TENANT_ADMIN' && !this.tenantId) {
-    return next(new Error('TENANT_ADMIN must be assigned to a tenant'));
+    const planType = String(this.planType || '').toLowerCase();
+    const allowTrialSelfSignup = planType === 'free_trial' || planType === 'demo';
+    if (!allowTrialSelfSignup) {
+      return next(new Error('TENANT_ADMIN must be assigned to a tenant'));
+    }
   }
   
   // Non-SUPER_ADMIN users should have a tenant, but allow null initially for assignment

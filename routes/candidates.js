@@ -16,19 +16,27 @@ import { body, validationResult } from 'express-validator';
 import bcrypt from 'bcryptjs';
 import { ensureScoreSummary } from '../utils/attemptScores.js';
 import { hasExamPermission } from '../middleware/examPermissions.js';
+import { resolveTenantSnapshot } from '../utils/tenantResolver.js';
 
 const router = express.Router();
 
 // Get own profile (universal: all authenticated users)
 router.get('/profile', requireAuth, async (req, res, next) => {
   try {
-    const user = await User.findById(req.user._id)
-      .select('-password')
-      .populate('tenantId', 'name code type');
+    const user = await User.findById(req.user._id).select('-password').lean();
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
-    res.json({ user });
+
+    const tenant = await resolveTenantSnapshot(user.tenantId, 'name code type');
+
+    res.json({
+      user: {
+        ...user,
+        tenantId: tenant?._id || null,
+        tenant: tenant || null,
+      },
+    });
   } catch (error) {
     next(error);
   }
@@ -122,8 +130,17 @@ router.get('/results', requireAuth, async (req, res, next) => {
     const attempts = await ExamAttempt.find({
       userId: req.user._id,
       isCompleted: true,
+      examId: { $type: 'objectId' },
+      $or: [
+        { sessionId: { $type: 'objectId' } },
+        { sessionId: null },
+        { sessionId: { $exists: false } },
+      ],
     })
-      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt certificatesSentAt')
+      .populate(
+        'examId',
+        'title duration showResultsImmediately resultsReleasedAt certificatesSentAt allowCertification passingPercentage'
+      )
       .populate('sessionId', 'startTime endTime')
       .sort({ createdAt: -1 })
       .skip(skip)
@@ -147,8 +164,11 @@ router.get('/results', requireAuth, async (req, res, next) => {
       const resultsReleased =
         Boolean(attempt.examId.showResultsImmediately) ||
         (attempt.examId.resultsReleasedAt && attempt.examId.resultsReleasedAt <= new Date());
+      const certificatesReleased =
+        Boolean(attempt.examId.certificatesSentAt) &&
+        new Date(attempt.examId.certificatesSentAt) <= new Date();
 
-      if (canReviewAnswers || resultsReleased) {
+      if (canReviewAnswers || resultsReleased || certificatesReleased) {
         filteredAttempts.push(attempt);
       }
     }

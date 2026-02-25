@@ -1,21 +1,140 @@
 /**
  * Enhanced Proctoring Service
  * Handles copy/paste blocking, multiple login detection, IP/device logging,
- * and suspicious activity flagging
+ * suspicious activity flagging, and strict focus-loss auto submit.
  */
 
 import ExamAttempt from '../models/ExamAttempt.js';
-import User from '../models/User.js';
+
+const FOCUS_VIOLATION_SUBMISSION_SOURCE = 'STRICT_FOCUS_LOSS_AUTO_SUBMIT';
+
+const toNonNegativeInt = (value, fallback = 0) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
+};
+
+const createHttpError = (statusCode, message) => {
+  const error = new Error(message);
+  error.statusCode = statusCode;
+  return error;
+};
+
+const assertAttemptOwnership = (attempt, actorUserId) => {
+  if (!actorUserId) return;
+  if (!attempt?.userId) {
+    throw createHttpError(403, 'Forbidden');
+  }
+  if (attempt.userId.toString() !== actorUserId.toString()) {
+    throw createHttpError(403, 'Forbidden - Attempt does not belong to current user');
+  }
+};
+
+const lockAllSectionTimersOnSubmit = (attempt, submitTime) => {
+  if (!attempt?.sectionTimers || typeof attempt.sectionTimers.entries !== 'function') {
+    return;
+  }
+
+  const nextSectionTimers = new Map();
+  for (const [sectionId, timerValue] of attempt.sectionTimers.entries()) {
+    const raw = timerValue?.toObject ? timerValue.toObject() : { ...(timerValue || {}) };
+    const durationSeconds = toNonNegativeInt(raw.durationSeconds, 0);
+    const currentRemaining = toNonNegativeInt(raw.remainingSeconds, 0);
+    const inferredSpent = Math.max(durationSeconds - currentRemaining, 0);
+    const currentSpent = toNonNegativeInt(raw.timeSpent, 0);
+
+    nextSectionTimers.set(sectionId, {
+      ...raw,
+      startTime: raw.startTime || raw.startedAt || submitTime,
+      startedAt: raw.startedAt || raw.startTime || submitTime,
+      endTime: submitTime,
+      completedAt: raw.completedAt || submitTime,
+      lastResumedAt: null,
+      isActive: false,
+      isLocked: true,
+      isCompleted: true,
+      remainingSeconds: 0,
+      timeSpent: Math.max(currentSpent, inferredSpent),
+    });
+  }
+
+  attempt.sectionTimers = nextSectionTimers;
+  attempt.currentSectionId = null;
+  attempt.sectionStateUpdatedAt = submitTime;
+};
+
+const appendSuspiciousFlag = (attempt, activityType, details = {}) => {
+  if (!attempt.suspiciousActivityFlags) {
+    attempt.suspiciousActivityFlags = [];
+  }
+
+  attempt.suspiciousActivityFlags.push({
+    type: activityType,
+    timestamp: new Date(),
+    details,
+  });
+  attempt.suspiciousActivity = true;
+};
+
+const autoSubmitAttemptOnFocusViolation = (attempt, violation = {}) => {
+  const submitTime = new Date();
+  const reason = violation.reason || 'Focus loss detected during exam';
+  const eventType = violation.eventType || 'FOCUS_VIOLATION';
+
+  attempt.isCompleted = true;
+  attempt.submitTime = submitTime;
+  attempt.submittedAt = submitTime;
+  attempt.isDisqualified = true;
+  attempt.disqualifyReason = reason;
+  attempt.lastActivity = submitTime;
+
+  const existingScore = attempt.scoreSummary || {};
+  attempt.scoreSummary = {
+    totalScore: Number(existingScore.totalScore) || 0,
+    maxScore: Number(existingScore.maxScore) || 0,
+    percentage: Number(existingScore.percentage) || 0,
+    computedAt: submitTime,
+  };
+
+  const submittedAtClient =
+    typeof violation.clientTimestamp === 'string'
+      ? new Date(violation.clientTimestamp)
+      : null;
+  attempt.submitMeta = {
+    submissionSource: FOCUS_VIOLATION_SUBMISSION_SOURCE,
+    submittedAtClient:
+      submittedAtClient && !Number.isNaN(submittedAtClient.getTime())
+        ? submittedAtClient
+        : null,
+    totalRemainingSeconds:
+      violation.totalRemainingSeconds !== undefined
+        ? toNonNegativeInt(violation.totalRemainingSeconds, 0)
+        : null,
+    currentSectionId:
+      typeof violation.currentSectionId === 'string' &&
+      /^[a-fA-F0-9]{24}$/.test(violation.currentSectionId)
+        ? violation.currentSectionId
+        : null,
+  };
+
+  lockAllSectionTimersOnSubmit(attempt, submitTime);
+  appendSuspiciousFlag(attempt, 'STRICT_FOCUS_VIOLATION', {
+    eventType,
+    reason,
+    submissionSource: FOCUS_VIOLATION_SUBMISSION_SOURCE,
+  });
+};
 
 /**
  * Log device and IP information for an attempt
  */
-export const logDeviceInfo = async (attemptId, deviceInfo) => {
+export const logDeviceInfo = async (attemptId, deviceInfo, actorUserId = null) => {
   const attempt = await ExamAttempt.findById(attemptId);
   if (!attempt) {
     throw new Error('Attempt not found');
   }
-  
+  assertAttemptOwnership(attempt, actorUserId);
+
   attempt.deviceInfo = {
     ipAddress: deviceInfo.ipAddress || '',
     userAgent: deviceInfo.userAgent || '',
@@ -24,7 +143,7 @@ export const logDeviceInfo = async (attemptId, deviceInfo) => {
     timezone: deviceInfo.timezone || '',
     language: deviceInfo.language || '',
   };
-  
+
   return await attempt.save();
 };
 
@@ -32,35 +151,33 @@ export const logDeviceInfo = async (attemptId, deviceInfo) => {
  * Check for multiple logins from different devices/IPs
  */
 export const checkMultipleLogins = async (userId, examId, currentDeviceInfo) => {
-  // Find active attempts for this user and exam
   const activeAttempts = await ExamAttempt.find({
     userId,
     examId,
     isCompleted: false,
     isDisqualified: false,
   });
-  
+
   if (activeAttempts.length === 0) {
     return { hasMultipleLogins: false, attempts: [] };
   }
-  
-  // Check if any attempt has different device info
-  const differentDevices = activeAttempts.filter(attempt => {
+
+  const differentDevices = activeAttempts.filter((attempt) => {
     if (!attempt.deviceInfo || !attempt.deviceInfo.ipAddress) {
       return false;
     }
-    
+
     const attemptIP = attempt.deviceInfo.ipAddress;
     const attemptDeviceId = attempt.deviceInfo.deviceId;
     const currentIP = currentDeviceInfo.ipAddress;
     const currentDeviceId = currentDeviceInfo.deviceId;
-    
+
     return attemptIP !== currentIP || attemptDeviceId !== currentDeviceId;
   });
-  
+
   return {
     hasMultipleLogins: differentDevices.length > 0,
-    attempts: differentDevices.map(a => ({
+    attempts: differentDevices.map((a) => ({
       attemptId: a._id,
       deviceInfo: a.deviceInfo,
       startTime: a.startTime,
@@ -71,138 +188,166 @@ export const checkMultipleLogins = async (userId, examId, currentDeviceInfo) => 
 /**
  * Flag suspicious activity
  */
-export const flagSuspiciousActivity = async (attemptId, activityType, details = {}) => {
+export const flagSuspiciousActivity = async (attemptId, activityType, details = {}, actorUserId = null) => {
   const attempt = await ExamAttempt.findById(attemptId);
   if (!attempt) {
     throw new Error('Attempt not found');
   }
-  
-  if (!attempt.suspiciousActivityFlags) {
-    attempt.suspiciousActivityFlags = [];
-  }
-  
-  const flag = {
-    type: activityType,
-    timestamp: new Date(),
-    details,
-  };
-  
-  attempt.suspiciousActivityFlags.push(flag);
-  attempt.suspiciousActivity = true;
-  
+  assertAttemptOwnership(attempt, actorUserId);
+
+  appendSuspiciousFlag(attempt, activityType, details);
   return await attempt.save();
 };
 
 /**
- * Record tab switch
+ * Strict anti-cheat: any focus loss immediately auto-submits and disqualifies.
  */
-export const recordTabSwitch = async (attemptId) => {
-  const attempt = await ExamAttempt.findById(attemptId);
-  if (!attempt) {
-    throw new Error('Attempt not found');
-  }
-  
-  attempt.tabSwitchCount = (attempt.tabSwitchCount || 0) + 1;
-  
-  // Flag if too many tab switches
-  if (attempt.tabSwitchCount > 3) {
-    await flagSuspiciousActivity(attemptId, 'EXCESSIVE_TAB_SWITCHES', {
-      count: attempt.tabSwitchCount,
-    });
-  }
-  
-  return await attempt.save();
-};
-
-/**
- * Record window blur
- */
-export const recordWindowBlur = async (attemptId) => {
+export const enforceStrictFocusViolation = async (
+  attemptId,
+  violation = {},
+  actorUserId = null
+) => {
   if (!attemptId) {
     throw new Error('Attempt ID is required');
   }
-  
+
   const attempt = await ExamAttempt.findById(attemptId);
   if (!attempt) {
     throw new Error('Attempt not found');
   }
-  
-  await flagSuspiciousActivity(attemptId, 'WINDOW_BLUR', {
-    timestamp: new Date(),
+  assertAttemptOwnership(attempt, actorUserId);
+
+  const eventType = String(violation?.eventType || 'FOCUS_VIOLATION').toUpperCase();
+  if (eventType === 'TAB_SWITCH' || eventType === 'TAB_HIDDEN') {
+    attempt.tabSwitchCount = (attempt.tabSwitchCount || 0) + 1;
+  }
+
+  if (attempt.isCompleted) {
+    appendSuspiciousFlag(attempt, 'STRICT_FOCUS_VIOLATION_AFTER_COMPLETION', {
+      eventType,
+      reason: violation?.reason || 'Focus loss reported after completion',
+    });
+    await attempt.save();
+    return {
+      autoSubmitted: false,
+      alreadyCompleted: true,
+      attempt,
+    };
+  }
+
+  autoSubmitAttemptOnFocusViolation(attempt, {
+    ...violation,
+    eventType,
   });
-  
-  return await attempt.save();
+  await attempt.save();
+
+  return {
+    autoSubmitted: true,
+    alreadyCompleted: false,
+    attempt,
+  };
+};
+
+/**
+ * Record tab switch (strict mode: auto submit)
+ */
+export const recordTabSwitch = async (attemptId, actorUserId = null, metadata = {}) => {
+  return enforceStrictFocusViolation(
+    attemptId,
+    {
+      eventType: 'TAB_SWITCH',
+      reason: 'Tab switch detected. Exam auto-submitted immediately.',
+      ...metadata,
+    },
+    actorUserId
+  );
+};
+
+/**
+ * Record window blur (strict mode: auto submit)
+ */
+export const recordWindowBlur = async (attemptId, actorUserId = null, metadata = {}) => {
+  return enforceStrictFocusViolation(
+    attemptId,
+    {
+      eventType: 'WINDOW_BLUR',
+      reason: 'Window focus change detected. Exam auto-submitted immediately.',
+      ...metadata,
+    },
+    actorUserId
+  );
 };
 
 /**
  * Record copy/paste attempt
  */
-export const recordCopyPasteAttempt = async (attemptId, action) => {
+export const recordCopyPasteAttempt = async (attemptId, action, actorUserId = null) => {
   const attempt = await ExamAttempt.findById(attemptId);
   if (!attempt) {
     throw new Error('Attempt not found');
   }
-  
-  await flagSuspiciousActivity(attemptId, 'COPY_PASTE_ATTEMPT', {
-    action, // 'copy' or 'paste'
+  assertAttemptOwnership(attempt, actorUserId);
+
+  appendSuspiciousFlag(attempt, 'COPY_PASTE_ATTEMPT', {
+    action,
     timestamp: new Date(),
   });
-  
+
   return await attempt.save();
 };
 
 /**
  * Record right-click attempt
  */
-export const recordRightClickAttempt = async (attemptId) => {
+export const recordRightClickAttempt = async (attemptId, actorUserId = null) => {
   if (!attemptId) {
     throw new Error('Attempt ID is required');
   }
-  
+
   const attempt = await ExamAttempt.findById(attemptId);
   if (!attempt) {
     throw new Error('Attempt not found');
   }
-  
-  await flagSuspiciousActivity(attemptId, 'RIGHT_CLICK_ATTEMPT', {
+  assertAttemptOwnership(attempt, actorUserId);
+
+  appendSuspiciousFlag(attempt, 'RIGHT_CLICK_ATTEMPT', {
     timestamp: new Date(),
   });
-  
+
   return await attempt.save();
 };
 
 /**
  * Record keyboard shortcut attempt
  */
-export const recordKeyboardShortcut = async (attemptId, shortcut) => {
+export const recordKeyboardShortcut = async (attemptId, shortcut, actorUserId = null) => {
   const attempt = await ExamAttempt.findById(attemptId);
   if (!attempt) {
     throw new Error('Attempt not found');
   }
-  
-  await flagSuspiciousActivity(attemptId, 'KEYBOARD_SHORTCUT_ATTEMPT', {
+  assertAttemptOwnership(attempt, actorUserId);
+
+  appendSuspiciousFlag(attempt, 'KEYBOARD_SHORTCUT_ATTEMPT', {
     shortcut,
     timestamp: new Date(),
   });
-  
+
   return await attempt.save();
 };
 
 /**
  * Get suspicious activity summary for an attempt
  */
-export const getSuspiciousActivitySummary = async (attemptId) => {
+export const getSuspiciousActivitySummary = async (attemptId, actorUserId = null) => {
   const attempt = await ExamAttempt.findById(attemptId);
   if (!attempt) {
     throw new Error('Attempt not found');
   }
-  
+  assertAttemptOwnership(attempt, actorUserId);
+
   const flags = attempt.suspiciousActivityFlags || [];
-  
-  // Process flags to ensure they have proper structure
-  const processedFlags = flags.map(flag => {
+  const processedFlags = flags.map((flag) => {
     if (typeof flag === 'string') {
-      // Legacy format - convert to object
       return {
         type: flag,
         timestamp: attempt.startTime || new Date(),
@@ -211,10 +356,9 @@ export const getSuspiciousActivitySummary = async (attemptId) => {
     }
     return flag;
   });
-  
-  // Group flags by type with timestamps
+
   const flagsByType = {};
-  processedFlags.forEach(flag => {
+  processedFlags.forEach((flag) => {
     if (!flagsByType[flag.type]) {
       flagsByType[flag.type] = [];
     }
@@ -223,16 +367,15 @@ export const getSuspiciousActivitySummary = async (attemptId) => {
       details: flag.details || {},
     });
   });
-  
+
   const summary = Object.keys(flagsByType).reduce((acc, type) => {
     acc[type] = flagsByType[type].length;
     return acc;
   }, {});
-  
-  // Determine status
+
   const isSuspicious = attempt.suspiciousActivity || processedFlags.length > 0;
   const isDisqualified = attempt.isDisqualified || false;
-  
+
   return {
     isSuspicious,
     isDisqualified,
@@ -246,6 +389,7 @@ export const getSuspiciousActivitySummary = async (attemptId) => {
     tabSwitchCount: attempt.tabSwitchCount || 0,
     deviceInfo: attempt.deviceInfo || {},
     disqualifyReason: attempt.disqualifyReason || null,
+    submissionSource: attempt.submitMeta?.submissionSource || null,
   };
 };
 
@@ -257,8 +401,8 @@ export const getSuspiciousAttempts = async (examId) => {
     examId,
     suspiciousActivity: true,
   }).populate('userId', 'name email').sort({ createdAt: -1 });
-  
-  return attempts.map(attempt => ({
+
+  return attempts.map((attempt) => ({
     attemptId: attempt._id,
     userId: attempt.userId._id,
     userName: attempt.userId.name,
@@ -274,12 +418,13 @@ export const getSuspiciousAttempts = async (examId) => {
 /**
  * Update last activity timestamp
  */
-export const updateLastActivity = async (attemptId) => {
+export const updateLastActivity = async (attemptId, actorUserId = null) => {
   const attempt = await ExamAttempt.findById(attemptId);
   if (!attempt) {
     throw new Error('Attempt not found');
   }
-  
+  assertAttemptOwnership(attempt, actorUserId);
+
   attempt.lastActivity = new Date();
   return await attempt.save();
 };
@@ -287,28 +432,30 @@ export const updateLastActivity = async (attemptId) => {
 /**
  * Check for inactivity timeout
  */
-export const checkInactivity = async (attemptId, timeoutMinutes = 5) => {
+export const checkInactivity = async (attemptId, timeoutMinutes = 5, actorUserId = null) => {
   const attempt = await ExamAttempt.findById(attemptId);
   if (!attempt) {
     throw new Error('Attempt not found');
   }
-  
+  assertAttemptOwnership(attempt, actorUserId);
+
   const lastActivity = attempt.lastActivity || attempt.startTime;
   const now = new Date();
   const minutesSinceActivity = (now - lastActivity) / (1000 * 60);
-  
+
   if (minutesSinceActivity > timeoutMinutes) {
-    await flagSuspiciousActivity(attemptId, 'INACTIVITY_TIMEOUT', {
+    appendSuspiciousFlag(attempt, 'INACTIVITY_TIMEOUT', {
       minutesSinceActivity: Math.floor(minutesSinceActivity),
       timeoutMinutes,
     });
-    
+    await attempt.save();
+
     return {
       isInactive: true,
       minutesSinceActivity: Math.floor(minutesSinceActivity),
     };
   }
-  
+
   return {
     isInactive: false,
     minutesSinceActivity: Math.floor(minutesSinceActivity),

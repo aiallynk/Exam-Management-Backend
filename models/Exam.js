@@ -114,6 +114,16 @@ const ExamSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    questionCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    candidateCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
   },
   {
     timestamps: true,

@@ -46,7 +46,7 @@ const SectionSchema = new mongoose.Schema(
     },
     navigationRule: {
       type: String,
-      enum: ['FREE', 'LINEAR', 'ADMIN_CONFIGURED'],
+      enum: ['FREE', 'LINEAR', 'NO_FREE', 'ADMIN_CONFIGURED'],
       default: 'FREE',
     },
     instructions: {

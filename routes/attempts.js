@@ -4,11 +4,13 @@ import Answer from '../models/Answer.js';
 import ExamSession from '../models/ExamSession.js';
 import Exam from '../models/Exam.js';
 import Question from '../models/Question.js';
+import Section from '../models/Section.js';
 import SystemConfig from '../models/SystemConfig.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { requireExamPermission, hasExamPermission, ensureExamParticipant } from '../middleware/examPermissions.js';
+import { checkCandidateAttemptLimit } from '../middleware/planLimits.js';
 import { body, validationResult } from 'express-validator';
 import { validateObjectId, sanitizePagination, validateObjectIds } from '../middleware/validation.js';
 import { auditLog, AUDIT_ACTIONS } from '../middleware/audit.js';
@@ -25,6 +27,8 @@ import {
   validateTimestamps,
   detectAnomalies,
 } from '../services/attemptReconciliationService.js';
+import { syncExamCandidateCount } from '../utils/planUsage.js';
+import { getAttemptSectionProgress, startSectionTimer } from '../services/sectionService.js';
 
 const parseArrayAnswer = (value) => {
   if (Array.isArray(value)) {
@@ -99,6 +103,124 @@ const parseStoredAnswerValue = (questionType, value) => {
     return '';
   }
   return value;
+};
+
+const toQuestionPaperIdString = (value) => {
+  if (!value) return null;
+  if (typeof value === 'string') return value;
+  if (typeof value === 'object' && value._id) return value._id.toString();
+  return String(value);
+};
+
+const toStrictPositiveInt = (value, fallback = 0) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+  return Math.floor(parsed);
+};
+
+const resolveSectionBasedDurationMinutes = async ({ questionPaperId, fallbackMinutes = 0 }) => {
+  const normalizedQuestionPaperId = toQuestionPaperIdString(questionPaperId);
+  if (!normalizedQuestionPaperId) {
+    return Math.max(toStrictPositiveInt(fallbackMinutes, 0), 0);
+  }
+
+  const sections = await Section.find({
+    questionPaperId: normalizedQuestionPaperId,
+    isActive: true,
+  })
+    .select('duration')
+    .lean();
+
+  if (!sections.length) {
+    return Math.max(toStrictPositiveInt(fallbackMinutes, 0), 0);
+  }
+
+  const totalDuration = sections.reduce(
+    (sum, section) => sum + toStrictPositiveInt(section?.duration, 0),
+    0
+  );
+
+  if (totalDuration <= 0) {
+    return Math.max(toStrictPositiveInt(fallbackMinutes, 0), 0);
+  }
+
+  return totalDuration;
+};
+
+const buildTotalTimerSnapshot = async (attempt, examRef, questionPaperId = null) => {
+  const fallbackExamDurationMinutes = Number(examRef?.duration) || 0;
+  let examDurationMinutes = fallbackExamDurationMinutes;
+  try {
+    examDurationMinutes = await resolveSectionBasedDurationMinutes({
+      questionPaperId,
+      fallbackMinutes: fallbackExamDurationMinutes,
+    });
+  } catch {
+    examDurationMinutes = fallbackExamDurationMinutes;
+  }
+
+  const graceMinutes = Number(examRef?.gracePeriod) || 0;
+  const totalDurationSeconds = Math.max(
+    Math.floor((examDurationMinutes + graceMinutes) * 60),
+    0
+  );
+  const examStartTime = attempt?.startTime ? new Date(attempt.startTime) : null;
+  const now = new Date();
+
+  let totalRemainingSeconds = totalDurationSeconds;
+  if (examStartTime && !Number.isNaN(examStartTime.getTime())) {
+    const elapsedSeconds = Math.max(
+      Math.floor((now.getTime() - examStartTime.getTime()) / 1000),
+      0
+    );
+    totalRemainingSeconds = Math.max(totalDurationSeconds - elapsedSeconds, 0);
+  }
+
+  return {
+    examStartTime: examStartTime ? examStartTime.toISOString() : null,
+    totalDurationSeconds,
+    totalRemainingSeconds,
+    serverTime: now.toISOString(),
+  };
+};
+
+const toNonNegativeInt = (value, fallback = 0) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
+};
+
+const lockAllSectionTimersOnSubmit = (attempt, submitTime) => {
+  if (!attempt?.sectionTimers || typeof attempt.sectionTimers.entries !== 'function') {
+    return;
+  }
+
+  const nextSectionTimers = new Map();
+  for (const [sectionId, timerValue] of attempt.sectionTimers.entries()) {
+    const raw = timerValue?.toObject ? timerValue.toObject() : { ...(timerValue || {}) };
+    const durationSeconds = toNonNegativeInt(raw.durationSeconds, 0);
+    const currentRemaining = toNonNegativeInt(raw.remainingSeconds, 0);
+    const inferredSpent = Math.max(durationSeconds - currentRemaining, 0);
+    const currentSpent = toNonNegativeInt(raw.timeSpent, 0);
+
+    nextSectionTimers.set(sectionId, {
+      ...raw,
+      startTime: raw.startTime || raw.startedAt || submitTime,
+      startedAt: raw.startedAt || raw.startTime || submitTime,
+      endTime: submitTime,
+      completedAt: raw.completedAt || submitTime,
+      lastResumedAt: null,
+      isActive: false,
+      isLocked: true,
+      isCompleted: true,
+      remainingSeconds: 0,
+      timeSpent: Math.max(currentSpent, inferredSpent),
+    });
+  }
+
+  attempt.sectionTimers = nextSectionTimers;
+  attempt.currentSectionId = null;
+  attempt.sectionStateUpdatedAt = submitTime;
 };
 
 const ADMIN_VIEWER_ROLES = new Set(['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR']);
@@ -180,6 +302,7 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
 
       // Backward compatibility for clients expecting `status` and `score`.
       attemptObj.status = attemptObj.isCompleted ? 'COMPLETED' : 'IN_PROGRESS';
+      attemptObj.submittedAt = attemptObj.submittedAt || attemptObj.submitTime || null;
       attemptObj.score = attemptObj.scoreSummary
         ? {
             totalScore: Number(attemptObj.scoreSummary.totalScore) || 0,
@@ -223,6 +346,7 @@ router.post(
     body('sessionId').notEmpty().withMessage('Session ID is required'),
     body('examId').notEmpty().withMessage('Exam ID is required'),
   ],
+  checkCandidateAttemptLimit,
   async (req, res, next) => {
     try {
       const errors = validationResult(req);
@@ -386,6 +510,9 @@ router.post(
       });
 
       await attempt.save();
+      if (req.planLimitContext?.shouldIncrementCandidateCount) {
+        await syncExamCandidateCount(examId);
+      }
       
       // Check for multiple logins
       const proctoringService = await import('../services/proctoringService.js');
@@ -420,7 +547,7 @@ router.post(
 router.get('/:attemptId/progress', requireAuth, validateObjectId('attemptId'), async (req, res, next) => {
   try {
     const attempt = await ExamAttempt.findById(req.params.attemptId)
-      .populate('examId', '_id')
+      .populate('examId', '_id duration gracePeriod')
       .populate('sessionId', '_id questionPaperId')
       .populate('questionPaperId', '_id');
 
@@ -455,6 +582,12 @@ router.get('/:attemptId/progress', requireAuth, validateObjectId('attemptId'), a
     );
     const answers = await Answer.find({ attemptId: attempt._id }).select('questionId answerText');
 
+    const totalTimerSnapshot = await buildTotalTimerSnapshot(
+      attempt,
+      attempt.examId,
+      assignedQuestionPaperId
+    );
+
     const progressAnswers = {};
     answers.forEach((answerDoc) => {
       const questionId = answerDoc.questionId?.toString();
@@ -469,10 +602,15 @@ router.get('/:attemptId/progress', requireAuth, validateObjectId('attemptId'), a
     res.json({
       attempt: {
         _id: attempt._id,
+        status: attempt.isCompleted ? 'COMPLETED' : 'IN_PROGRESS',
         isCompleted: attempt.isCompleted,
+        submitTime: attempt.submitTime || null,
+        submittedAt: attempt.submittedAt || attempt.submitTime || null,
         lastActivity: attempt.lastActivity,
       },
       answers: progressAnswers,
+      sectionProgress: await getAttemptSectionProgress(attempt._id),
+      timer: totalTimerSnapshot,
     });
   } catch (error) {
     next(error);
@@ -484,8 +622,9 @@ router.put(
   requireAuth,
   validateObjectId('attemptId'),
   [
-    body('answers').isObject().withMessage('Answers must be an object'),
+    body('answers').optional().isObject().withMessage('Answers must be an object'),
     body('lastActivity').optional().isISO8601().withMessage('lastActivity must be an ISO 8601 date'),
+    body('currentSectionId').optional().isMongoId().withMessage('currentSectionId must be a valid section id'),
   ],
   async (req, res, next) => {
     try {
@@ -495,7 +634,7 @@ router.put(
       }
 
       const attempt = await ExamAttempt.findById(req.params.attemptId)
-        .populate('examId', '_id')
+        .populate('examId', '_id duration gracePeriod')
         .populate('sessionId', '_id questionPaperId')
         .populate('questionPaperId', '_id');
 
@@ -525,7 +664,24 @@ router.put(
         return res.status(400).json({ error: 'No question paper assigned for this attempt.' });
       }
 
-      const incomingAnswers = req.body.answers || {};
+      let sectionProgress = null;
+      if (req.body.currentSectionId) {
+        try {
+          const timerSync = await startSectionTimer(
+            req.params.attemptId,
+            req.body.currentSectionId
+          );
+          sectionProgress = timerSync?.sectionState || null;
+        } catch (timerError) {
+          // For heartbeat requests, return latest state even if section became locked meanwhile.
+          sectionProgress = await getAttemptSectionProgress(req.params.attemptId);
+        }
+      }
+
+      const incomingAnswers =
+        req.body.answers && typeof req.body.answers === 'object'
+          ? req.body.answers
+          : {};
       const validQuestionIds = Object.keys(incomingAnswers).filter((id) =>
         /^[a-fA-F0-9]{24}$/.test(id)
       );
@@ -576,13 +732,32 @@ router.put(
         }
       }
 
-      attempt.lastActivity = req.body.lastActivity ? new Date(req.body.lastActivity) : new Date();
-      await attempt.save();
+      const nextLastActivity = req.body.lastActivity
+        ? new Date(req.body.lastActivity)
+        : new Date();
+      attempt.lastActivity = nextLastActivity;
+      await ExamAttempt.updateOne(
+        { _id: attempt._id },
+        { $set: { lastActivity: nextLastActivity } }
+      );
+
+      if (!sectionProgress) {
+        sectionProgress = await getAttemptSectionProgress(req.params.attemptId);
+      }
+
+      const totalTimerSnapshot = await buildTotalTimerSnapshot(
+        attempt,
+        attempt.examId,
+        assignedQuestionPaperId
+      );
 
       res.json({
         success: true,
+        attemptStatus: attempt.isCompleted ? 'COMPLETED' : 'IN_PROGRESS',
         savedCount,
         lastActivity: attempt.lastActivity,
+        sectionProgress,
+        timer: totalTimerSnapshot,
       });
     } catch (error) {
       next(error);
@@ -601,6 +776,8 @@ router.post(
   })),
   [
     body('answers').optional().isObject().withMessage('Answers must be an object'),
+    body('timerMeta').optional().isObject().withMessage('timerMeta must be an object'),
+    body('submissionSource').optional().isString().withMessage('submissionSource must be a string'),
   ],
   async (req, res, next) => {
     try {
@@ -648,15 +825,28 @@ router.post(
           success: true,
           alreadySubmitted: true,
           attempt,
+          attemptStatus: 'COMPLETED',
+          submittedAt: attempt.submittedAt || attempt.submitTime || null,
           score: scoringVisible ? summary : null,
           resultsAvailable: scoringVisible,
         });
       }
 
       const { isDisqualified, disqualifyReason } = req.body;
+      const timerMeta =
+        req.body?.timerMeta && typeof req.body.timerMeta === 'object'
+          ? req.body.timerMeta
+          : null;
       const submittedAnswers = req.body?.answers && typeof req.body.answers === 'object'
         ? req.body.answers
         : {};
+
+      // Sync section state before finalizing to avoid stale section timers.
+      try {
+        await getAttemptSectionProgress(attempt._id);
+      } catch (sectionError) {
+        // Continue submission even if section sync fails; submission lock still applies.
+      }
 
       const assignedQuestionPaperId =
         attempt.questionPaperId?._id ||
@@ -783,13 +973,41 @@ router.post(
       // Update attempt
       attempt.isCompleted = true;
       attempt.submitTime = submitTime;
+      attempt.submittedAt = submitTime;
       attempt.isDisqualified = isDisqualified || false;
       attempt.disqualifyReason = disqualifyReason || '';
+      attempt.lastActivity = submitTime;
       attempt.scoreSummary = {
         totalScore,
         maxScore,
         percentage,
         computedAt: new Date(),
+      };
+
+      lockAllSectionTimersOnSubmit(attempt, submitTime);
+
+      const submittedAtClient =
+        typeof timerMeta?.submittedAtClient === 'string'
+          ? new Date(timerMeta.submittedAtClient)
+          : null;
+      attempt.submitMeta = {
+        submissionSource:
+          typeof req.body?.submissionSource === 'string'
+            ? req.body.submissionSource.slice(0, 64)
+            : null,
+        submittedAtClient:
+          submittedAtClient && !Number.isNaN(submittedAtClient.getTime())
+            ? submittedAtClient
+            : null,
+        totalRemainingSeconds:
+          timerMeta?.totalRemainingSeconds !== undefined
+            ? toNonNegativeInt(timerMeta.totalRemainingSeconds, 0)
+            : null,
+        currentSectionId:
+          typeof timerMeta?.currentSectionId === 'string' &&
+          /^[a-fA-F0-9]{24}$/.test(timerMeta.currentSectionId)
+            ? timerMeta.currentSectionId
+            : null,
       };
 
       await attempt.save();
@@ -811,6 +1029,8 @@ router.post(
       res.json({
         success: true,
         attempt,
+        attemptStatus: 'COMPLETED',
+        submittedAt: submitTime.toISOString(),
         score: scoringVisible
           ? {
               totalScore,
@@ -834,7 +1054,10 @@ router.post(
 router.get('/:attemptId/results', requireAuth, validateObjectId('attemptId'), async (req, res, next) => {
   try {
     const attempt = await ExamAttempt.findById(req.params.attemptId)
-      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt certificatesSentAt')
+      .populate(
+        'examId',
+        'title duration showResultsImmediately resultsReleasedAt certificatesSentAt allowCertification passingPercentage'
+      )
       .populate('sessionId', 'startTime endTime')
       .populate('questionPaperId', '_id')
       .populate('userId', 'name email');
@@ -933,10 +1156,6 @@ router.get('/:attemptId/certificate', requireAuth, validateObjectId('attemptId')
 
     if (!isOwnAttempt && !canViewAnyAttempt) {
       return res.status(403).json({ error: 'Forbidden - You can only view your own certificates' });
-    }
-
-    if (attempt.examId && attempt.examId.allowCertification === false) {
-      return res.status(403).json({ error: 'Certificate generation is disabled for this exam.' });
     }
 
     // Block certificate until results are released OR certificates are sent (for own attempts)

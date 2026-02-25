@@ -164,8 +164,12 @@ router.post(
   requireAuth,
   async (req, res, next) => {
     try {
-      const attempt = await startSectionTimer(req.params.attemptId, req.params.sectionId);
-      res.json({ attempt });
+      const result = await startSectionTimer(req.params.attemptId, req.params.sectionId);
+      res.json({
+        attempt: result.attempt,
+        status: result.status,
+        sectionState: result.sectionState,
+      });
     } catch (error) {
       next(error);
     }
@@ -175,8 +179,12 @@ router.post(
 // Get section timer status
 router.get('/attempt/:attemptId/section/:sectionId/timer', requireAuth, async (req, res, next) => {
   try {
-    const status = await getSectionTimerStatus(req.params.attemptId, req.params.sectionId);
-    res.json({ status });
+    const result = await getSectionTimerStatus(req.params.attemptId, req.params.sectionId);
+    res.json({
+      status: result.status,
+      sectionState: result.sectionState,
+      nextSectionId: result.nextSectionId || null,
+    });
   } catch (error) {
     next(error);
   }
@@ -188,8 +196,13 @@ router.post(
   requireAuth,
   async (req, res, next) => {
     try {
-      const attempt = await lockSection(req.params.attemptId, req.params.sectionId);
-      res.json({ attempt });
+      const result = await lockSection(req.params.attemptId, req.params.sectionId);
+      res.json({
+        attempt: result.attempt,
+        status: result.status,
+        sectionState: result.sectionState,
+        nextSectionId: result.nextSectionId || null,
+      });
     } catch (error) {
       next(error);
     }
@@ -210,12 +223,16 @@ router.put(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const attempt = await updateSectionTimeSpent(
+      const result = await updateSectionTimeSpent(
         req.params.attemptId,
         req.params.sectionId,
         req.body.timeSpentSeconds
       );
-      res.json({ attempt });
+      res.json({
+        attempt: result.attempt,
+        status: result.status || null,
+        sectionState: result.sectionState || null,
+      });
     } catch (error) {
       next(error);
     }

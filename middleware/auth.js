@@ -36,7 +36,9 @@ export const requireAuth = async (req, res, next) => {
       req.user = {
         ...decoded,
         _id: decoded.sub,
+        role: user.role,
         tenantId: decoded.tenantId || user.tenantId?.toString() || null,
+        planType: user.planType,
       };
       next();
     } catch (error) {

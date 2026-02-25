@@ -11,20 +11,219 @@ import Answer from '../models/Answer.js';
 import SystemConfig from '../models/SystemConfig.js';
 import { validatePasswordStrength, generateSecurePassword } from '../utils/passwordValidator.js';
 import { auditLog, AUDIT_ACTIONS } from '../middleware/audit.js';
+import { checkTenantLimits } from '../middleware/planLimits.js';
+import { FREE_TRIAL_LIMITS, isTrialRestrictedPlan } from '../config/planLimits.js';
 
 const router = express.Router();
 
-// All Tenant Admin routes require TENANT_ADMIN role and tenantId
+// Tenant workspace routes require tenant-scoped admin/creator role and tenantId
 router.use(requireAuth);
-router.use(requireRole('TENANT_ADMIN'));
+router.use(requireRole('TENANT_ADMIN', 'EXAM_CREATOR'));
 
-// Middleware to ensure tenant admin has tenantId
+// Middleware to ensure tenant-scoped users have tenantId
 router.use((req, res, next) => {
   if (!req.user.tenantId) {
-    return res.status(403).json({ error: 'TENANT_ADMIN must be assigned to a tenant' });
+    return res.status(403).json({ error: 'Tenant-scoped account must be assigned to a tenant' });
   }
   next();
 });
+
+const BULK_IMPORT_MAX_ROWS = 500;
+const BULK_IMPORT_ALLOWED_ROLES = new Set(['EXAM_CREATOR', 'CANDIDATE']);
+const BULK_IMPORT_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const BULK_IMPORT_ROLE_LIMITS = Object.freeze({
+  EXAM_CREATOR: FREE_TRIAL_LIMITS.maxExamCreators,
+  CANDIDATE: FREE_TRIAL_LIMITS.maxCandidates,
+});
+
+const normalizeBulkHeader = (value) =>
+  String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s_-]+/g, '');
+
+const getBulkRowValue = (row, key) => {
+  if (!row || typeof row !== 'object') return '';
+  if (row[key] !== undefined) return row[key];
+
+  const expected = normalizeBulkHeader(key);
+  const matchedEntry = Object.entries(row).find(([header]) => normalizeBulkHeader(header) === expected);
+  return matchedEntry ? matchedEntry[1] : '';
+};
+
+const toTrimmedString = (value) => {
+  if (value === undefined || value === null) return '';
+  return String(value).trim();
+};
+
+const normalizeBulkImportRow = (row) => {
+  const name = toTrimmedString(getBulkRowValue(row, 'Name'));
+  const email = toTrimmedString(getBulkRowValue(row, 'Email')).toLowerCase();
+  const password = toTrimmedString(getBulkRowValue(row, 'Password'));
+  const requestedRole = toTrimmedString(getBulkRowValue(row, 'Role')).toUpperCase();
+  const normalizedRole = requestedRole.replace(/[\s-]+/g, '_');
+  const role = normalizedRole || 'CANDIDATE';
+
+  return { name, email, password, role };
+};
+
+const ensureTenantAdminBulkAccess = (req, res) => {
+  if (req.user.role !== 'TENANT_ADMIN') {
+    res.status(403).json({ error: 'Only tenant admins can bulk import users' });
+    return false;
+  }
+  return true;
+};
+
+const getBulkImportRoleAllowance = async (req) => {
+  const currentActor = await User.findById(req.user._id).select('planType').lean();
+  if (!currentActor || !isTrialRestrictedPlan(currentActor.planType)) {
+    return {
+      EXAM_CREATOR: Number.POSITIVE_INFINITY,
+      CANDIDATE: Number.POSITIVE_INFINITY,
+    };
+  }
+
+  const [existingCreators, existingCandidates] = await Promise.all([
+    User.countDocuments({
+      tenantId: req.user.tenantId,
+      role: 'EXAM_CREATOR',
+      status: { $ne: 'INACTIVE' },
+    }),
+    User.countDocuments({
+      tenantId: req.user.tenantId,
+      role: 'CANDIDATE',
+      status: { $ne: 'INACTIVE' },
+    }),
+  ]);
+
+  return {
+    EXAM_CREATOR: Math.max(0, BULK_IMPORT_ROLE_LIMITS.EXAM_CREATOR - existingCreators),
+    CANDIDATE: Math.max(0, BULK_IMPORT_ROLE_LIMITS.CANDIDATE - existingCandidates),
+  };
+};
+
+const toPreviewRow = (preparedRow) => ({
+  rowNumber: preparedRow.rowNumber,
+  status: preparedRow.status,
+  data: {
+    name: preparedRow.name,
+    email: preparedRow.email,
+    role: preparedRow.role,
+  },
+  errors: preparedRow.errors,
+  warning: preparedRow.warning,
+});
+
+const toFailureReason = (preparedRow) => {
+  if (preparedRow.errors.length > 0) return preparedRow.errors.join(' ');
+  if (preparedRow.warning) return preparedRow.warning;
+  return 'Row skipped.';
+};
+
+const prepareBulkImportRows = async (rows, req) => {
+  const limitedRows = rows.slice(0, BULK_IMPORT_MAX_ROWS);
+  const truncated = rows.length > BULK_IMPORT_MAX_ROWS;
+
+  const preparedRows = limitedRows.map((row, index) => {
+    const normalized = normalizeBulkImportRow(row);
+    return {
+      rowNumber: index + 2, // +1 for 1-based row index and +1 for header row
+      ...normalized,
+      status: 'valid',
+      errors: [],
+      warning: '',
+    };
+  });
+
+  const fileEmailToRowNumbers = new Map();
+  for (const row of preparedRows) {
+    if (!row.email) continue;
+    const currentRows = fileEmailToRowNumbers.get(row.email) || [];
+    currentRows.push(row.rowNumber);
+    fileEmailToRowNumbers.set(row.email, currentRows);
+  }
+
+  const roleAllowance = await getBulkImportRoleAllowance(req);
+  const candidateEmails = preparedRows
+    .map((row) => row.email)
+    .filter((email) => Boolean(email));
+  const uniqueCandidateEmails = [...new Set(candidateEmails)];
+
+  const existingUsers = uniqueCandidateEmails.length
+    ? await User.find({ email: { $in: uniqueCandidateEmails } }).select('email').lean()
+    : [];
+  const existingEmailSet = new Set(
+    existingUsers.map((user) => toTrimmedString(user.email).toLowerCase()).filter(Boolean)
+  );
+
+  for (const row of preparedRows) {
+    if (!row.name) {
+      row.errors.push('Name is required.');
+    }
+
+    if (!row.email) {
+      row.errors.push('Email is required.');
+    } else if (!BULK_IMPORT_EMAIL_PATTERN.test(row.email)) {
+      row.errors.push('Valid email is required.');
+    }
+
+    if (!row.password) {
+      row.errors.push('Password is required.');
+    } else if (row.password.length < 6) {
+      row.errors.push('Password must be at least 6 characters.');
+    }
+
+    if (!BULK_IMPORT_ALLOWED_ROLES.has(row.role)) {
+      row.errors.push('Role must be EXAM_CREATOR or CANDIDATE.');
+    }
+
+    if (row.errors.length > 0) {
+      row.status = 'invalid';
+      continue;
+    }
+
+    if (existingEmailSet.has(row.email)) {
+      row.status = 'duplicate';
+      row.warning = 'Email already registered.';
+      continue;
+    }
+
+    const matchingRowNumbers = fileEmailToRowNumbers.get(row.email) || [];
+    if (matchingRowNumbers.length > 1) {
+      row.status = 'duplicate';
+      row.warning = `Duplicate email in uploaded file (rows ${matchingRowNumbers.join(', ')}).`;
+      continue;
+    }
+
+    const remainingForRole = roleAllowance[row.role];
+    if (Number.isFinite(remainingForRole) && remainingForRole <= 0) {
+      row.status = 'invalid';
+      row.errors.push(`${row.role.replace('_', ' ')} limit reached for current plan.`);
+      continue;
+    }
+
+    if (Number.isFinite(roleAllowance[row.role])) {
+      roleAllowance[row.role] -= 1;
+    }
+  }
+
+  const summary = {
+    totalRows: preparedRows.length,
+    validRows: preparedRows.filter((row) => row.status === 'valid').length,
+    invalidRows: preparedRows.filter((row) => row.status === 'invalid').length,
+    duplicateRows: preparedRows.filter((row) => row.status === 'duplicate').length,
+  };
+  summary.failedRows = summary.invalidRows + summary.duplicateRows;
+
+  return {
+    preparedRows,
+    previewRows: preparedRows.map(toPreviewRow),
+    summary,
+    truncated,
+    maxRows: BULK_IMPORT_MAX_ROWS,
+  };
+};
 
 /**
  * TENANT ADMIN DASHBOARD STATS
@@ -227,6 +426,109 @@ router.get('/users', async (req, res, next) => {
   }
 });
 
+// Download CSV template for tenant user bulk import
+router.get('/users/bulk-import/template', (req, res) => {
+  if (!ensureTenantAdminBulkAccess(req, res)) return;
+
+  const templateRows = [
+    'Name,Email,Password,Role',
+    'Aarav Sharma,aarav.sharma@example.com,Test@12345,CANDIDATE',
+    'Neha Singh,neha.singh@example.com,Test@12345,EXAM_CREATOR',
+  ];
+
+  res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+  res.setHeader('Content-Disposition', 'attachment; filename=\"tenant_users_bulk_import_template.csv\"');
+  res.send(templateRows.join('\n'));
+});
+
+// Preview tenant user bulk import rows before creating users
+router.post('/users/bulk-import/preview', async (req, res, next) => {
+  if (!ensureTenantAdminBulkAccess(req, res)) return;
+
+  try {
+    const { rows } = req.body || {};
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.status(400).json({ error: 'Rows array is required for preview.' });
+    }
+
+    const previewData = await prepareBulkImportRows(rows, req);
+
+    res.json({
+      preview: previewData.previewRows,
+      summary: previewData.summary,
+      truncated: previewData.truncated,
+      maxRows: previewData.maxRows,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Import tenant users in bulk
+router.post('/users/bulk-import', async (req, res, next) => {
+  if (!ensureTenantAdminBulkAccess(req, res)) return;
+
+  try {
+    const { rows } = req.body || {};
+    if (!Array.isArray(rows) || rows.length === 0) {
+      return res.status(400).json({ error: 'Rows array is required for import.' });
+    }
+
+    const previewData = await prepareBulkImportRows(rows, req);
+    const failures = previewData.preparedRows
+      .filter((row) => row.status !== 'valid')
+      .map((row) => ({
+        rowNumber: row.rowNumber,
+        email: row.email || '',
+        reason: toFailureReason(row),
+      }));
+
+    let totalImported = 0;
+    let duplicateRowsSkipped = previewData.summary.duplicateRows;
+    for (const row of previewData.preparedRows) {
+      if (row.status !== 'valid') continue;
+
+      try {
+        const user = new User({
+          name: row.name,
+          email: row.email,
+          password: row.password,
+          role: row.role,
+          tenantId: req.user.tenantId,
+          status: 'ACTIVE',
+        });
+
+        await user.save();
+        totalImported += 1;
+      } catch (error) {
+        const isDuplicateEmail = error?.code === 11000;
+        if (isDuplicateEmail) {
+          duplicateRowsSkipped += 1;
+        }
+        failures.push({
+          rowNumber: row.rowNumber,
+          email: row.email || '',
+          reason: isDuplicateEmail ? 'Email already registered.' : (error?.message || 'Failed to create user.'),
+        });
+      }
+    }
+
+    res.json({
+      summary: {
+        totalRows: previewData.summary.totalRows,
+        totalImported,
+        totalFailed: failures.length,
+        duplicateRowsSkipped,
+      },
+      failures,
+      truncated: previewData.truncated,
+      maxRows: previewData.maxRows,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // Get single user
 router.get('/users/:userId', async (req, res, next) => {
   try {
@@ -255,6 +557,7 @@ router.post(
     body('role').isIn(['EXAM_CREATOR', 'CANDIDATE']).withMessage('Invalid role. Must be EXAM_CREATOR or CANDIDATE'),
     body('mobile').optional().trim(),
   ],
+  checkTenantLimits,
   async (req, res, next) => {
     try {
       const errors = validationResult(req);
@@ -301,6 +604,7 @@ router.put(
     body('status').optional().isIn(['ACTIVE', 'INACTIVE', 'SUSPENDED', 'BLOCKED']),
     body('mobile').optional().trim(),
   ],
+  checkTenantLimits,
   async (req, res, next) => {
     try {
       const errors = validationResult(req);

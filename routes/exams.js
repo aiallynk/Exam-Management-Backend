@@ -7,6 +7,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireRole, requireOwnershipOrAdmin } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { ensureExamParticipant } from '../middleware/examPermissions.js';
+import { checkExamCreationLimit } from '../middleware/planLimits.js';
 import { body, validationResult } from 'express-validator';
 import { sanitizePagination } from '../middleware/validation.js';
 import { auditLog, AUDIT_ACTIONS } from '../middleware/audit.js';
@@ -16,8 +17,46 @@ import {
   MIN_CERTIFICATION_PERCENTAGE,
 } from '../utils/certificateTemplate.js';
 import { ensureScoreSummary } from '../utils/attemptScores.js';
+import { syncUserExamCount } from '../utils/planUsage.js';
 
 const router = express.Router();
+const SECTION_BASED_EXAM_TYPE = 'SECTION_BASED';
+
+const toPositiveInt = (value, fallback = null) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  const normalized = Math.floor(parsed);
+  return normalized > 0 ? normalized : fallback;
+};
+
+const normalizeExamType = (value) => {
+  if (typeof value !== 'string') return null;
+  const normalized = value.trim().toUpperCase();
+  return normalized || null;
+};
+
+const sanitizeSectionDurationPayload = (sections) => {
+  if (!Array.isArray(sections) || sections.length === 0) {
+    throw new Error('At least one section is required for section-based exams.');
+  }
+
+  return sections.map((section, index) => {
+    const name = typeof section?.name === 'string' ? section.name.trim() : '';
+    if (!name) {
+      throw new Error(`Section ${index + 1} name is required.`);
+    }
+
+    const duration = toPositiveInt(section?.duration, null);
+    if (!duration) {
+      throw new Error(`Section ${index + 1} duration must be greater than 0.`);
+    }
+
+    return { name, duration };
+  });
+};
+
+const computeSectionDurationTotal = (sections) =>
+  sections.reduce((sum, section) => sum + section.duration, 0);
 
 // Get all exams (filtered by exam permissions and tenant)
 // Universal: Shows exams based on exam context roles, not user system role
@@ -378,16 +417,19 @@ router.post(
   requireAuth,
   requireTenant, // Ensure user belongs to a tenant (except SUPER_ADMIN)
   requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can create exams
+  checkExamCreationLimit,
   auditLog(AUDIT_ACTIONS.EXAM_CREATED, (req, res) => ({
     examTitle: req.body.title,
     examId: res.locals.examId, // Will be set after creation
   })),
   [
     body('title').trim().notEmpty().withMessage('Title is required'),
-    body('duration').isInt({ min: 1 }).withMessage('Duration must be a positive number'),
+    body('duration').optional().isInt({ min: 1 }).withMessage('Duration must be a positive number'),
     body('gracePeriod').optional().isInt({ min: 0 }),
     body('maxAttempts').optional().isInt({ min: 1 }),
     body('showResultsImmediately').optional().isBoolean(),
+    body('examType').optional().isString(),
+    body('sections').optional().isArray(),
   ],
   async (req, res, next) => {
     try {
@@ -407,15 +449,45 @@ router.post(
         allowCertification,
         passingPercentage,
         certificateTemplate,
+        examType,
+        sections,
       } =
         req.body;
+
+      const requestedDuration = toPositiveInt(duration, null);
+      const requestedExamType = normalizeExamType(examType);
+      const sectionPayloadProvided = Array.isArray(sections);
+      const sectionBasedRequest =
+        requestedExamType === SECTION_BASED_EXAM_TYPE || sectionPayloadProvided;
+
+      let resolvedDuration = requestedDuration;
+      if (sectionBasedRequest) {
+        let safeSections;
+        try {
+          safeSections = sanitizeSectionDurationPayload(sections);
+        } catch (validationError) {
+          return res.status(400).json({ error: validationError.message });
+        }
+
+        const computedDuration = computeSectionDurationTotal(safeSections);
+        if (requestedDuration !== null && requestedDuration !== computedDuration) {
+          return res.status(400).json({
+            error: `Duration mismatch for section-based exam. Expected ${computedDuration} minutes from sections.`,
+          });
+        }
+        resolvedDuration = computedDuration;
+      }
+
+      if (resolvedDuration === null) {
+        return res.status(400).json({ error: 'Duration must be a positive number.' });
+      }
 
       // Set tenant IDs based on user's tenant (Organization OR Institute)
       // SUPER_ADMIN can create exams without tenant (for global use)
       const examData = {
         title,
         description,
-        duration,
+        duration: resolvedDuration,
         gracePeriod: gracePeriod || 0,
         maxAttempts: maxAttempts || 1,
         isActive: isActive !== undefined ? isActive : true,
@@ -445,6 +517,9 @@ router.post(
         'CREATOR',
         req.user._id
       );
+
+      // Keep denormalized creator counters in sync for plan enforcement.
+      await syncUserExamCount(req.user._id);
 
       // Store exam ID for audit log
       res.locals.examId = exam._id.toString();
@@ -487,6 +562,8 @@ router.put(
     body('gracePeriod').optional().isInt({ min: 0 }),
     body('maxAttempts').optional().isInt({ min: 1 }),
     body('showResultsImmediately').optional().isBoolean(),
+    body('examType').optional().isString(),
+    body('sections').optional().isArray(),
   ],
   async (req, res, next) => {
     try {
@@ -509,12 +586,49 @@ router.put(
         isActive,
         showResultsImmediately,
         resultsReleasedAt,
+        examType,
+        sections,
       } =
         req.body;
 
+      const requestedDuration = duration !== undefined ? toPositiveInt(duration, null) : null;
+      if (duration !== undefined && requestedDuration === null) {
+        return res.status(400).json({ error: 'Duration must be a positive number.' });
+      }
+
+      const requestedExamType = normalizeExamType(examType);
+      const sectionPayloadProvided = Array.isArray(sections);
+      const sectionBasedUpdate =
+        requestedExamType === SECTION_BASED_EXAM_TYPE || sectionPayloadProvided;
+
+      if (sectionBasedUpdate) {
+        if (!Array.isArray(sections)) {
+          return res.status(400).json({
+            error: 'sections payload is required for section-based exam duration validation.',
+          });
+        }
+
+        let safeSections;
+        try {
+          safeSections = sanitizeSectionDurationPayload(sections);
+        } catch (validationError) {
+          return res.status(400).json({ error: validationError.message });
+        }
+
+        const computedDuration = computeSectionDurationTotal(safeSections);
+        if (requestedDuration !== null && requestedDuration !== computedDuration) {
+          return res.status(400).json({
+            error: `Duration mismatch for section-based exam. Expected ${computedDuration} minutes from sections.`,
+          });
+        }
+        exam.duration = computedDuration;
+      }
+
       if (title) exam.title = title;
       if (description !== undefined) exam.description = description;
-      if (duration) exam.duration = duration;
+      if (!sectionBasedUpdate && duration !== undefined) {
+        exam.duration = requestedDuration;
+      }
       if (gracePeriod !== undefined) exam.gracePeriod = gracePeriod;
       if (maxAttempts !== undefined) exam.maxAttempts = maxAttempts;
       if (isActive !== undefined) exam.isActive = isActive;
@@ -621,6 +735,7 @@ router.delete(
       }
 
       await Exam.findByIdAndDelete(req.params.examId);
+      await syncUserExamCount(exam.createdBy);
       res.json({ message: 'Exam deleted successfully' });
     } catch (error) {
       next(error);

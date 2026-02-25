@@ -2,19 +2,134 @@ import express from 'express';
 import jwt from 'jsonwebtoken';
 import config from '../config/env.js';
 import User from '../models/User.js';
+import Tenant from '../models/Tenant.js';
 import { requireAuth } from '../middleware/auth.js';
 import { body, validationResult } from 'express-validator';
 import { addToBlacklist, isBlacklisted } from '../utils/tokenBlacklist.js';
 import { validatePasswordStrength as validatePassword } from '../utils/passwordValidator.js';
 import { auditLogin, auditLogout } from '../middleware/audit.js';
+import { resolveTenantSnapshot } from '../utils/tenantResolver.js';
+import { isTrialRestrictedPlan } from '../config/planLimits.js';
 
 const router = express.Router();
+
+const toTenantIdString = (tenantRef) => {
+  if (!tenantRef) return null;
+  if (typeof tenantRef === 'object' && tenantRef._id) return String(tenantRef._id);
+  return String(tenantRef);
+};
+
+const normalizePlanType = (value) => String(value || '').trim().toLowerCase();
+const escapeRegex = (value) => String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const buildTenantCodeCandidate = (seed, attemptIndex = 0) => {
+  const normalizedSeed = String(seed || '')
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '')
+    .slice(0, 5) || 'DEMO';
+
+  const timestampSuffix = Date.now().toString().slice(-5);
+  const randomSuffix = Math.floor(Math.random() * 900 + 100).toString();
+  const retrySuffix = attemptIndex > 0 ? String(attemptIndex).padStart(2, '0') : '';
+
+  return `TRI${normalizedSeed}${timestampSuffix}${randomSuffix}${retrySuffix}`;
+};
+
+const ensureTrialTenant = async ({ user }) => {
+  if (!user?._id) return null;
+
+  const existingTenantId = toTenantIdString(user.tenantId);
+  if (existingTenantId) {
+    return existingTenantId;
+  }
+
+  const baseSeed = user.email?.split('@')?.[0] || user.name || 'demo';
+  let lastError = null;
+
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const code = buildTenantCodeCandidate(baseSeed, attempt);
+    try {
+      const tenant = await Tenant.create({
+        name: `${user.name || 'Demo'} Workspace`,
+        code,
+        type: 'INSTITUTE',
+        contactEmail: user.email,
+        status: 'ACTIVE',
+        createdBy: user._id,
+        metadata: {
+          source: 'self_signup',
+          signupPlanType: user.planType,
+        },
+      });
+
+      user.tenantId = tenant._id;
+      await user.save();
+
+      return String(tenant._id);
+    } catch (error) {
+      lastError = error;
+      const isDuplicateCodeError = error?.code === 11000;
+      if (!isDuplicateCodeError) {
+        throw error;
+      }
+    }
+  }
+
+  throw lastError || new Error('Unable to create tenant for free trial signup');
+};
+
+const ensureTrialAdminRole = async (user) => {
+  if (!user?._id || !user?.tenantId) return user;
+  if (user.role !== 'EXAM_CREATOR') return user;
+  if (!isTrialRestrictedPlan(user.planType)) return user;
+
+  const tenant = await Tenant.findById(user.tenantId).select('_id createdBy metadata');
+  if (!tenant) return user;
+
+  const createdByMatchesUser =
+    tenant.createdBy && String(tenant.createdBy) === String(user._id);
+  const signupSource = String(tenant.metadata?.source || '').toLowerCase();
+  const isSelfSignupOwner = createdByMatchesUser && signupSource === 'self_signup';
+
+  if (!isSelfSignupOwner) return user;
+
+  user.role = 'TENANT_ADMIN';
+  await user.save();
+  return user;
+};
+
+const verifyPasswordSafely = async (user, candidatePassword) => {
+  const storedPassword = typeof user.password === 'string' ? user.password : '';
+  const candidate = String(candidatePassword ?? '');
+
+  try {
+    const isValid = await user.comparePassword(candidatePassword);
+    if (isValid) {
+      return true;
+    }
+  } catch (error) {
+    // Continue with legacy fallback below.
+    if (process.env.NODE_ENV === 'development') {
+      console.warn('[AUTH][LOGIN] comparePassword fallback path triggered:', error?.message || error);
+    }
+  }
+
+  // Backward compatibility for legacy users that may have stored plaintext passwords.
+  if (storedPassword && storedPassword === candidate) {
+    user.password = candidate;
+    await user.save();
+    return true;
+  }
+
+  return false;
+};
 
 /**
  * Register - Create new user account
  * 
  * Simple flow:
- * - Only EXAM_CREATOR and CANDIDATE roles can register
+ * - Self-signup allows EXAM_CREATOR/CANDIDATE for regular plans
+ * - TENANT_ADMIN self-signup is allowed only for free_trial/demo plans
  * - SUPER_ADMIN cannot register (must be created manually)
  * - Users start without tenantId (must be assigned by SUPER_ADMIN)
  */
@@ -41,7 +156,7 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { name, email, password, role } = req.body;
+      const { name, email, password, role, planType } = req.body;
 
       // Check if user exists
       const existingUser = await User.findOne({ email });
@@ -49,10 +164,16 @@ router.post(
         return res.status(409).json({ error: 'Email already registered' });
       }
 
-      // Simple role system: Only EXAM_CREATOR and CANDIDATE can register
-      // SUPER_ADMIN cannot register - must be created manually
-      const validRoles = ['EXAM_CREATOR', 'CANDIDATE'];
-      const selectedRole = role || 'CANDIDATE';
+      // Simple role system:
+      // - Regular plans: EXAM_CREATOR/CANDIDATE self-signup
+      // - Trial/demo: TENANT_ADMIN self-signup enabled
+      // - SUPER_ADMIN cannot self-register
+      const selectedRole = String(role || 'CANDIDATE').toUpperCase();
+      const requestedPlanType = normalizePlanType(planType);
+      const allowTenantAdminSelfSignup = isTrialRestrictedPlan(requestedPlanType);
+      const validRoles = allowTenantAdminSelfSignup
+        ? ['TENANT_ADMIN', 'EXAM_CREATOR', 'CANDIDATE']
+        : ['EXAM_CREATOR', 'CANDIDATE'];
       
       // Prevent SUPER_ADMIN registration
       if (selectedRole === 'SUPER_ADMIN') {
@@ -61,7 +182,11 @@ router.post(
       
       // Validate role
       if (!validRoles.includes(selectedRole)) {
-        return res.status(400).json({ error: 'Invalid role for registration. Must be EXAM_CREATOR or CANDIDATE' });
+        return res.status(400).json({
+          error: allowTenantAdminSelfSignup
+            ? 'Invalid role for registration. Must be TENANT_ADMIN, EXAM_CREATOR, or CANDIDATE'
+            : 'Invalid role for registration. Must be EXAM_CREATOR or CANDIDATE',
+        });
       }
 
       // Create user
@@ -72,15 +197,21 @@ router.post(
         password,
         role: selectedRole,
       };
+      if (isTrialRestrictedPlan(requestedPlanType)) {
+        userData.planType = requestedPlanType;
+      }
 
       const user = new User(userData);
 
       await user.save();
 
-      // Populate tenant info (if applicable)
-      if (user.tenantId) {
-        await user.populate('tenantId', 'name code status type');
+      // Trial/demo self-signups should receive their own tenant workspace.
+      if (isTrialRestrictedPlan(user.planType) && ['EXAM_CREATOR', 'TENANT_ADMIN'].includes(user.role)) {
+        await ensureTrialTenant({ user });
       }
+
+      const tenant = await resolveTenantSnapshot(user.tenantId, 'name code status type');
+      const tenantId = toTenantIdString(user.tenantId);
 
       // Generate tokens with tenant info
       const accessToken = jwt.sign(
@@ -89,7 +220,7 @@ router.post(
           email: user.email,
           name: user.name,
           role: user.role,
-          tenantId: user.tenantId?._id?.toString() || null,
+          tenantId: tenantId || null,
         },
         config.jwtSecret,
         { expiresIn: `${config.tokenTtlMinutes}m` }
@@ -109,8 +240,10 @@ router.post(
           name: user.name,
           email: user.email,
           role: user.role,
-          tenantId: user.tenantId?._id || null,
-          tenant: user.tenantId || null,
+          planType: user.planType,
+          examsCreated: user.examsCreated ?? 0,
+          tenantId: tenant?._id || null,
+          tenant: tenant || null,
         },
       });
     } catch (error) {
@@ -137,7 +270,12 @@ router.post(
       const { email, password } = req.body;
 
       // Find user
-      const user = await User.findOne({ email });
+      let user = await User.findOne({ email });
+      if (!user) {
+        user = await User.findOne({
+          email: { $regex: new RegExp(`^${escapeRegex(email)}$`, 'i') },
+        });
+      }
       if (!user) {
         // In development, provide more helpful error message
         if (process.env.NODE_ENV === 'development') {
@@ -154,7 +292,15 @@ router.post(
       }
 
       // Check password
-      const isMatch = await user.comparePassword(password);
+      let isMatch = false;
+      try {
+        isMatch = await verifyPasswordSafely(user, password);
+      } catch (passwordError) {
+        if (process.env.NODE_ENV === 'development') {
+          console.error('[AUTH][LOGIN] Password verification failed:', passwordError?.message || passwordError);
+        }
+        return res.status(401).json({ error: 'Invalid credentials' });
+      }
       if (!isMatch) {
         // In development, log password mismatch
         if (process.env.NODE_ENV === 'development') {
@@ -168,8 +314,40 @@ router.post(
         return res.status(403).json({ error: 'Account is not active' });
       }
 
-      // Populate tenant info
-      await user.populate('tenantId', 'name code status type');
+      if (
+        isTrialRestrictedPlan(user.planType) &&
+        ['EXAM_CREATOR', 'TENANT_ADMIN'].includes(user.role) &&
+        !user.tenantId
+      ) {
+        try {
+          await ensureTrialTenant({ user });
+        } catch (tenantError) {
+          if (process.env.NODE_ENV === 'development') {
+            console.error('[AUTH][LOGIN] Trial tenant bootstrap failed:', tenantError?.message || tenantError);
+          }
+          return res.status(503).json({
+            error: 'Unable to initialize tenant workspace. Please try again.',
+          });
+        }
+      }
+
+      try {
+        await ensureTrialAdminRole(user);
+      } catch (roleError) {
+        if (process.env.NODE_ENV === 'development') {
+          console.error('[AUTH][LOGIN] Trial role sync failed:', roleError?.message || roleError);
+        }
+      }
+
+      let tenant = null;
+      try {
+        tenant = await resolveTenantSnapshot(user.tenantId, 'name code status type');
+      } catch (tenantResolveError) {
+        if (process.env.NODE_ENV === 'development') {
+          console.error('[AUTH][LOGIN] Tenant resolution failed:', tenantResolveError?.message || tenantResolveError);
+        }
+      }
+      const tenantId = toTenantIdString(user.tenantId);
 
       // Generate tokens with tenant info
       const accessToken = jwt.sign(
@@ -178,7 +356,7 @@ router.post(
           email: user.email,
           name: user.name,
           role: user.role,
-          tenantId: user.tenantId?._id?.toString() || null,
+          tenantId: tenantId || null,
         },
         config.jwtSecret,
         { expiresIn: `${config.tokenTtlMinutes}m` }
@@ -198,8 +376,10 @@ router.post(
           name: user.name,
           email: user.email,
           role: user.role,
-          tenantId: user.tenantId?._id || null,
-          tenant: user.tenantId || null,
+          planType: user.planType,
+          examsCreated: user.examsCreated ?? 0,
+          tenantId: tenant?._id || null,
+          tenant: tenant || null,
         },
       });
     } catch (error) {
@@ -229,8 +409,10 @@ router.post('/refresh', async (req, res, next) => {
         return res.status(401).json({ error: 'User not found' });
       }
 
-      // Populate tenant info
-      await user.populate('tenantId', 'name code status type');
+      await ensureTrialAdminRole(user);
+
+      const tenant = await resolveTenantSnapshot(user.tenantId, 'name code status type');
+      const tenantId = toTenantIdString(user.tenantId);
 
       const accessToken = jwt.sign(
         {
@@ -238,7 +420,7 @@ router.post('/refresh', async (req, res, next) => {
           email: user.email,
           name: user.name,
           role: user.role,
-          tenantId: user.tenantId?._id?.toString() || null,
+          tenantId: tenantId || null,
         },
         config.jwtSecret,
         { expiresIn: `${config.tokenTtlMinutes}m` }
@@ -251,8 +433,10 @@ router.post('/refresh', async (req, res, next) => {
           name: user.name,
           email: user.email,
           role: user.role,
-          tenantId: user.tenantId?._id || null,
-          tenant: user.tenantId || null,
+          planType: user.planType,
+          examsCreated: user.examsCreated ?? 0,
+          tenantId: tenant?._id || null,
+          tenant: tenant || null,
         },
       });
     } catch (error) {
@@ -302,15 +486,24 @@ router.post('/logout', requireAuth, auditLogout, async (req, res) => {
 // Get current user
 router.get('/me', requireAuth, async (req, res, next) => {
   try {
-    const user = await User.findById(req.user._id)
-      .select('-password')
-      .populate('tenantId', 'name code status uniqueId type');
+    const user = await User.findById(req.user._id).select('-password');
     
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
     }
 
-    res.json({ user });
+    await ensureTrialAdminRole(user);
+
+    const userPayload = user.toObject();
+    const tenant = await resolveTenantSnapshot(user.tenantId, 'name code status uniqueId type');
+
+    res.json({
+      user: {
+        ...userPayload,
+        tenantId: tenant?._id || null,
+        tenant: tenant || null,
+      },
+    });
   } catch (error) {
     next(error);
   }

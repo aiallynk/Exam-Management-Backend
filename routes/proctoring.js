@@ -12,7 +12,7 @@ router.post(
   validateObjectId('attemptId'),
   async (req, res, next) => {
     try {
-      await proctoringService.logDeviceInfo(req.params.attemptId, req.body);
+      await proctoringService.logDeviceInfo(req.params.attemptId, req.body, req.user._id);
       res.json({ success: true });
     } catch (error) {
       next(error);
@@ -45,8 +45,17 @@ router.post(
   validateObjectId('attemptId'),
   async (req, res, next) => {
     try {
-      await proctoringService.recordTabSwitch(req.params.attemptId);
-      res.json({ success: true });
+      const result = await proctoringService.recordTabSwitch(
+        req.params.attemptId,
+        req.user._id,
+        req.body || {}
+      );
+      res.json({
+        success: true,
+        autoSubmitted: Boolean(result?.autoSubmitted),
+        attemptStatus: result?.attempt?.isCompleted ? 'COMPLETED' : 'IN_PROGRESS',
+        disqualified: Boolean(result?.attempt?.isDisqualified),
+      });
     } catch (error) {
       next(error);
     }
@@ -60,8 +69,43 @@ router.post(
   validateObjectId('attemptId'),
   async (req, res, next) => {
     try {
-      await proctoringService.recordWindowBlur(req.params.attemptId);
-      res.json({ success: true });
+      const result = await proctoringService.recordWindowBlur(
+        req.params.attemptId,
+        req.user._id,
+        req.body || {}
+      );
+      res.json({
+        success: true,
+        autoSubmitted: Boolean(result?.autoSubmitted),
+        attemptStatus: result?.attempt?.isCompleted ? 'COMPLETED' : 'IN_PROGRESS',
+        disqualified: Boolean(result?.attempt?.isDisqualified),
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Strict focus violation (tab switch, minimize, blur) -> immediate auto submit
+router.post(
+  '/attempt/:attemptId/focus-violation',
+  requireAuth,
+  validateObjectId('attemptId'),
+  async (req, res, next) => {
+    try {
+      const result = await proctoringService.enforceStrictFocusViolation(
+        req.params.attemptId,
+        req.body || {},
+        req.user._id
+      );
+      res.json({
+        success: true,
+        autoSubmitted: Boolean(result?.autoSubmitted),
+        alreadyCompleted: Boolean(result?.alreadyCompleted),
+        attemptStatus: result?.attempt?.isCompleted ? 'COMPLETED' : 'IN_PROGRESS',
+        disqualified: Boolean(result?.attempt?.isDisqualified),
+        disqualifyReason: result?.attempt?.disqualifyReason || null,
+      });
     } catch (error) {
       next(error);
     }
@@ -75,7 +119,11 @@ router.post(
   validateObjectId('attemptId'),
   async (req, res, next) => {
     try {
-      await proctoringService.recordCopyPasteAttempt(req.params.attemptId, req.body.action);
+      await proctoringService.recordCopyPasteAttempt(
+        req.params.attemptId,
+        req.body.action,
+        req.user._id
+      );
       res.json({ success: true });
     } catch (error) {
       next(error);
@@ -90,7 +138,7 @@ router.post(
   validateObjectId('attemptId'),
   async (req, res, next) => {
     try {
-      await proctoringService.recordRightClickAttempt(req.params.attemptId);
+      await proctoringService.recordRightClickAttempt(req.params.attemptId, req.user._id);
       res.json({ success: true });
     } catch (error) {
       next(error);
@@ -105,7 +153,11 @@ router.post(
   validateObjectId('attemptId'),
   async (req, res, next) => {
     try {
-      await proctoringService.recordKeyboardShortcut(req.params.attemptId, req.body.shortcut);
+      await proctoringService.recordKeyboardShortcut(
+        req.params.attemptId,
+        req.body.shortcut,
+        req.user._id
+      );
       res.json({ success: true });
     } catch (error) {
       next(error);
@@ -120,7 +172,10 @@ router.get(
   validateObjectId('attemptId'),
   async (req, res, next) => {
     try {
-      const result = await proctoringService.getSuspiciousActivitySummary(req.params.attemptId);
+      const result = await proctoringService.getSuspiciousActivitySummary(
+        req.params.attemptId,
+        req.user._id
+      );
       res.json(result);
     } catch (error) {
       next(error);

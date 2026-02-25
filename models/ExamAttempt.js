@@ -42,6 +42,26 @@ const ExamAttemptSchema = new mongoose.Schema(
     submitTime: {
       type: Date,
     },
+    submittedAt: {
+      type: Date,
+    },
+    submitMeta: {
+      submissionSource: {
+        type: String,
+        trim: true,
+      },
+      submittedAtClient: {
+        type: Date,
+      },
+      totalRemainingSeconds: {
+        type: Number,
+        min: 0,
+      },
+      currentSectionId: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: 'Section',
+      },
+    },
     isCompleted: {
       type: Boolean,
       default: false,
@@ -101,6 +121,19 @@ const ExamAttemptSchema = new mongoose.Schema(
       min: 0,
       max: 100,
     },
+    currentSectionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Section',
+    },
+    navigationRule: {
+      type: String,
+      enum: ['FREE', 'NO_FREE'],
+      default: 'FREE',
+    },
+    sectionStateUpdatedAt: {
+      type: Date,
+      default: Date.now,
+    },
     sectionTimers: {
       type: Map,
       of: {
@@ -108,6 +141,13 @@ const ExamAttemptSchema = new mongoose.Schema(
         endTime: { type: Date },
         isLocked: { type: Boolean, default: false },
         timeSpent: { type: Number, default: 0 }, // seconds
+        durationSeconds: { type: Number, min: 0, default: 0 },
+        remainingSeconds: { type: Number, min: 0, default: 0 },
+        isActive: { type: Boolean, default: false },
+        isCompleted: { type: Boolean, default: false },
+        startedAt: { type: Date },
+        lastResumedAt: { type: Date },
+        completedAt: { type: Date },
       },
       default: new Map(),
     },
