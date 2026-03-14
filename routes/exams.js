@@ -11,6 +11,7 @@ import { checkExamCreationLimit } from '../middleware/planLimits.js';
 import { body, validationResult } from 'express-validator';
 import { sanitizePagination } from '../middleware/validation.js';
 import { auditLog, AUDIT_ACTIONS } from '../middleware/audit.js';
+import { submitAttemptHandler } from './attempts.js';
 import {
   loadCertificateTemplate,
   applyCertificateTemplate,
@@ -18,15 +19,27 @@ import {
 } from '../utils/certificateTemplate.js';
 import { ensureScoreSummary } from '../utils/attemptScores.js';
 import { syncUserExamCount } from '../utils/planUsage.js';
+import { ensureQuestionsImageAvailability } from '../services/questionImportImageService.js';
+import { sanitizeQuestionOptions } from '../utils/questionOptionSanitizer.js';
 
 const router = express.Router();
 const SECTION_BASED_EXAM_TYPE = 'SECTION_BASED';
+const OMR_EXAM_TYPE = 'OMR';
+const ONLINE_EXAM_TYPE = 'ONLINE';
+const MAX_OMR_OPTIONS = 4;
+const OMR_OPTION_LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
 
 const toPositiveInt = (value, fallback = null) => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return fallback;
   const normalized = Math.floor(parsed);
   return normalized > 0 ? normalized : fallback;
+};
+
+const toNonNegativeNumber = (value, fallback = 0) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return parsed;
 };
 
 const normalizeExamType = (value) => {
@@ -58,15 +71,609 @@ const sanitizeSectionDurationPayload = (sections) => {
 const computeSectionDurationTotal = (sections) =>
   sections.reduce((sum, section) => sum + section.duration, 0);
 
+const toAnswerKeyArray = (answerKey, totalQuestions) => {
+  if (Array.isArray(answerKey)) {
+    return answerKey;
+  }
+
+  if (!answerKey || typeof answerKey !== 'object') {
+    return [];
+  }
+
+  const result = Array.from({ length: totalQuestions }, () => null);
+  Object.entries(answerKey).forEach(([key, value]) => {
+    const numericPart = String(key).match(/\d+/);
+    if (!numericPart) return;
+    const index = Number.parseInt(numericPart[0], 10) - 1;
+    if (index < 0 || index >= totalQuestions) return;
+    result[index] = value;
+  });
+  return result;
+};
+
+const normalizeAnswerKeyOption = (value, optionsPerQuestion, questionIndex) => {
+  const maxLabelIndex = optionsPerQuestion - 1;
+  const allowedLabels = OMR_OPTION_LABELS.slice(0, optionsPerQuestion);
+  const raw = String(value ?? '').trim().toUpperCase();
+
+  if (!raw) {
+    throw new Error(`Answer key missing for question ${questionIndex + 1}.`);
+  }
+
+  if (/^\d+$/.test(raw)) {
+    const numeric = Number.parseInt(raw, 10);
+    if (numeric >= 1 && numeric <= optionsPerQuestion) {
+      return OMR_OPTION_LABELS[numeric - 1];
+    }
+  }
+
+  if (raw.length === 1) {
+    const labelIndex = raw.charCodeAt(0) - 65;
+    if (labelIndex >= 0 && labelIndex <= maxLabelIndex) {
+      return raw;
+    }
+  }
+
+  throw new Error(
+    `Invalid answer key option "${value}" for question ${questionIndex + 1}. Allowed: ${allowedLabels.join(', ')}.`
+  );
+};
+
+const sanitizeOmrPayload = ({ markingRules = {}, answerKey = [] }) => {
+  const totalQuestions = toPositiveInt(markingRules?.totalQuestions, null);
+  if (!totalQuestions) {
+    throw new Error('OMR exam requires markingRules.totalQuestions > 0.');
+  }
+
+  const optionsPerQuestion = toPositiveInt(markingRules?.optionsPerQuestion, 4);
+  if (optionsPerQuestion !== MAX_OMR_OPTIONS) {
+    throw new Error('OMR optionsPerQuestion must be 4 (A/B/C/D).');
+  }
+
+  const marksPerQuestion = toNonNegativeNumber(markingRules?.marksPerQuestion, 1);
+  const negativeMarking = Boolean(markingRules?.negativeMarking);
+  const negativeMarks = negativeMarking
+    ? toNonNegativeNumber(markingRules?.negativeMarks, 0)
+    : 0;
+
+  const answerKeyArray = toAnswerKeyArray(answerKey, totalQuestions);
+  if (answerKeyArray.length !== totalQuestions) {
+    throw new Error(`Answer key must contain exactly ${totalQuestions} entries.`);
+  }
+
+  const normalizedAnswerKey = answerKeyArray.map((entry, index) =>
+    normalizeAnswerKeyOption(entry, optionsPerQuestion, index)
+  );
+
+  return {
+    answerKey: normalizedAnswerKey,
+    markingRules: {
+      totalQuestions,
+      optionsPerQuestion,
+      marksPerQuestion,
+      negativeMarking,
+      negativeMarks,
+    },
+  };
+};
+
+const normalizeAutoAssignText = (value) =>
+  String(value || '')
+    .toLowerCase()
+    .replace(/[_/\\|]+/g, ' ')
+    .replace(/[^a-z0-9\s]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const tokenizeAutoAssign = (value) => {
+  const text = normalizeAutoAssignText(value);
+  if (!text) return [];
+  const stop = new Set([
+    'the',
+    'a',
+    'an',
+    'and',
+    'or',
+    'of',
+    'to',
+    'in',
+    'on',
+    'for',
+    'with',
+    'from',
+    'by',
+    'is',
+    'are',
+    'was',
+    'were',
+    'be',
+    'as',
+    'at',
+    'this',
+    'that',
+    'these',
+    'those',
+    'it',
+    'its',
+    'their',
+    'your',
+    'you',
+    'we',
+    'they',
+  ]);
+  const tokens = text
+    .split(' ')
+    .map((token) => token.trim())
+    .filter((token) => token.length >= 2 && !stop.has(token));
+  return Array.from(new Set(tokens));
+};
+
+const normalizeQuestionTypeKey = (value) => {
+  const raw = normalizeAutoAssignText(value).toUpperCase();
+  if (!raw) return '';
+  if (['MCQ', 'SINGLE_CHOICE', 'MULTIPLE_CHOICE'].includes(raw)) return 'MULTIPLE_CHOICE';
+  if (['MULTI_SELECT', 'MULTIPLE_OPTIONS', 'MULTI_CHOICE'].includes(raw)) return 'MULTIPLE_OPTIONS';
+  if (['TRUE_FALSE', 'TRUEFALSE', 'TF'].includes(raw)) return 'TRUE_FALSE';
+  if (['SHORT', 'SHORT_ANSWER'].includes(raw)) return 'SHORT_ANSWER';
+  if (['LONG_ANSWER', 'DESCRIPTIVE', 'PARAGRAPH'].includes(raw)) return 'PARAGRAPH';
+  if (['NUMERIC', 'NUMBER'].includes(raw)) return 'NUMBER';
+  if (['CODING', 'CODE'].includes(raw)) return 'CODING';
+  if (['IMAGE', 'IMAGE_BASED'].includes(raw)) return 'IMAGE_BASED';
+  return raw;
+};
+
+const normalizeDifficultyKey = (value) => {
+  const normalized = normalizeAutoAssignText(value);
+  if (['easy', 'medium', 'hard'].includes(normalized)) return normalized;
+  return normalized || 'medium';
+};
+
+const buildSectionContext = (section) => {
+  const tagsRaw =
+    section?.tags ||
+    section?.keywords ||
+    section?.metadata?.tags ||
+    section?.meta?.tags ||
+    section?.tag ||
+    [];
+  const tags = Array.isArray(tagsRaw)
+    ? tagsRaw
+    : String(tagsRaw || '')
+        .split(/[,\n\r;|]+/g)
+        .map((tag) => tag.trim())
+        .filter(Boolean);
+  const subject = normalizeAutoAssignText(
+    section?.subject ||
+      section?.subjectName ||
+      section?.subject_name ||
+      section?.metadata?.subject ||
+      section?.meta?.subject ||
+      ''
+  );
+  const topic = normalizeAutoAssignText(
+    section?.topic ||
+      section?.topicName ||
+      section?.topic_name ||
+      section?.metadata?.topic ||
+      section?.meta?.topic ||
+      ''
+  );
+  const name = normalizeAutoAssignText(section?.name || '');
+  const instructions = normalizeAutoAssignText(
+    section?.instructions || section?.description || section?.overview || ''
+  );
+  const baseText = [name, subject, topic, tags.join(' '), instructions]
+    .filter(Boolean)
+    .join(' ')
+    .trim();
+
+  const tokens = tokenizeAutoAssign(baseText);
+
+  const rawId =
+    section?._id || section?.id || section?.sectionId || section?.section_id || section?.name;
+  return {
+    id: rawId ? String(rawId) : '',
+    name: section?.name || '',
+    expectedQuestions: Number.isFinite(Number(section?.expectedQuestions))
+      ? Math.max(Number(section.expectedQuestions), 0)
+      : 0,
+    order: Number.isFinite(Number(section?.order)) ? Number(section.order) : 0,
+    subject,
+    topic,
+    tags,
+    tokens,
+    tokenSet: new Set(tokens),
+  };
+};
+
+const buildQuestionMeta = (question, index) => {
+  const subject = normalizeAutoAssignText(
+    question?.subject ||
+      question?.subjectName ||
+      question?.subject_name ||
+      question?.metadata?.subject ||
+      question?.meta?.subject ||
+      ''
+  );
+  const topic = normalizeAutoAssignText(
+    question?.topic ||
+      question?.topicName ||
+      question?.topic_name ||
+      question?.metadata?.topic ||
+      question?.meta?.topic ||
+      ''
+  );
+  const tagsRaw =
+    question?.tags ||
+    question?.metadata?.tags ||
+    question?.meta?.tags ||
+    question?.tag ||
+    [];
+  const tags = Array.isArray(tagsRaw)
+    ? tagsRaw
+    : String(tagsRaw || '')
+        .split(/[,\n\r;|]+/g)
+        .map((tag) => tag.trim())
+        .filter(Boolean);
+  const questionText =
+    question?.questionText ||
+    question?.question_text ||
+    question?.question ||
+    question?.text ||
+    question?.title ||
+    '';
+  const passage = question?.passage || '';
+  const combinedText = `${questionText} ${passage}`.trim();
+
+  const rawId =
+    question?._id ||
+    question?.id ||
+    question?.questionId ||
+    question?.question_id ||
+    question?.uniqueId ||
+    `local-${index}`;
+  return {
+    question,
+    index,
+    id: rawId ? String(rawId) : `local-${index}`,
+    subject,
+    topic,
+    tags,
+    subjectTokens: tokenizeAutoAssign(subject),
+    topicTokens: tokenizeAutoAssign(topic),
+    tagTokens: Array.from(
+      new Set(tags.flatMap((tag) => tokenizeAutoAssign(tag)).filter(Boolean))
+    ),
+    keywordTokens: tokenizeAutoAssign(combinedText),
+    typeKey: normalizeQuestionTypeKey(
+      question?.questionType || question?.type || question?.question_type || ''
+    ),
+    difficultyKey: normalizeDifficultyKey(question?.difficulty),
+  };
+};
+
+const computeTargetCounts = (total, ratios) => {
+  const entries = Object.entries(ratios || {}).filter(([, value]) => value > 0);
+  if (!total || entries.length === 0) return {};
+  const ratioTotal = entries.reduce((sum, [, value]) => sum + value, 0);
+  if (!ratioTotal) return {};
+  const normalized = entries.map(([key, value], idx) => {
+    const exact = (value / ratioTotal) * total;
+    return {
+      key,
+      base: Math.floor(exact),
+      remainder: exact - Math.floor(exact),
+      index: idx,
+    };
+  });
+  let assigned = normalized.reduce((sum, entry) => sum + entry.base, 0);
+  let remaining = Math.max(total - assigned, 0);
+  normalized.sort((a, b) => b.remainder - a.remainder || a.index - b.index);
+  while (remaining > 0) {
+    normalized[remaining % normalized.length].base += 1;
+    remaining -= 1;
+  }
+  const result = {};
+  normalized.forEach((entry) => {
+    result[entry.key] = entry.base;
+  });
+  return result;
+};
+
+const subtractCounts = (targets, existing) => {
+  const result = {};
+  Object.entries(targets || {}).forEach(([key, value]) => {
+    const remaining = Math.max(value - (existing?.[key] || 0), 0);
+    if (remaining > 0) {
+      result[key] = remaining;
+    }
+  });
+  return result;
+};
+
+const runContextAutoAssign = (questions, sections, options = {}) => {
+  const safeQuestions = Array.isArray(questions) ? questions : [];
+  const safeSections = Array.isArray(sections) ? sections : [];
+  const {
+    preserveExistingAssignments = true,
+    questionTypeDistribution,
+    difficultyDistribution,
+  } = options;
+
+  if (!safeSections.length) {
+    return { sectionAssignments: [], unassignedIds: safeQuestions.map((q, idx) => q?._id || q?.id || `local-${idx}`) };
+  }
+
+  const sectionContexts = safeSections
+    .map((section) => buildSectionContext(section))
+    .sort((a, b) => (a.order || 0) - (b.order || 0));
+
+  const questionMeta = safeQuestions.map((question, index) => buildQuestionMeta(question, index));
+  const assignedQuestionIds = new Set();
+  const sectionStats = new Map();
+  const assignmentsBySection = new Map();
+
+  const registerAssignment = (meta, sectionId) => {
+    if (!sectionId) return;
+    const normalizedSectionId = String(sectionId);
+    if (!sectionStats.has(normalizedSectionId)) {
+      sectionStats.set(normalizedSectionId, { total: 0, types: {}, difficulties: {} });
+    }
+    const stats = sectionStats.get(normalizedSectionId);
+    stats.total += 1;
+    stats.types[meta.typeKey] = (stats.types[meta.typeKey] || 0) + 1;
+    stats.difficulties[meta.difficultyKey] =
+      (stats.difficulties[meta.difficultyKey] || 0) + 1;
+    assignedQuestionIds.add(meta.id);
+    if (!assignmentsBySection.has(normalizedSectionId)) {
+      assignmentsBySection.set(normalizedSectionId, []);
+    }
+    assignmentsBySection.get(normalizedSectionId).push(meta.id);
+  };
+
+  const resolveSectionKey = (question) => {
+    const raw =
+      question?.sectionId ||
+      question?.section_id ||
+      question?.assignedSectionId ||
+      question?.assignedSectionName ||
+      '';
+    return raw ? String(raw) : '';
+  };
+
+  if (preserveExistingAssignments) {
+    questionMeta.forEach((meta) => {
+      const sectionId = resolveSectionKey(meta.question);
+      if (sectionId) {
+        registerAssignment(meta, sectionId);
+      }
+    });
+  }
+
+  const typeRatioMap = {};
+  if (questionTypeDistribution && typeof questionTypeDistribution === 'object') {
+    Object.entries(questionTypeDistribution).forEach(([key, value]) => {
+      const count = Number(value);
+      if (Number.isFinite(count) && count > 0) {
+        typeRatioMap[normalizeQuestionTypeKey(key)] = count;
+      }
+    });
+  } else {
+    questionMeta.forEach((meta) => {
+      const key = meta.typeKey || 'MULTIPLE_CHOICE';
+      typeRatioMap[key] = (typeRatioMap[key] || 0) + 1;
+    });
+  }
+
+  const difficultyRatioMap = {};
+  if (difficultyDistribution && typeof difficultyDistribution === 'object') {
+    Object.entries(difficultyDistribution).forEach(([key, value]) => {
+      const count = Number(value);
+      if (Number.isFinite(count) && count > 0) {
+        difficultyRatioMap[normalizeDifficultyKey(key)] = count;
+      }
+    });
+  } else {
+    questionMeta.forEach((meta) => {
+      const key = meta.difficultyKey || 'medium';
+      difficultyRatioMap[key] = (difficultyRatioMap[key] || 0) + 1;
+    });
+  }
+
+  const matchTokens = (tokens, sectionContext, minOverlap, minSim) => {
+    if (!tokens || tokens.length === 0) return false;
+    const overlap = tokens.filter((token) => sectionContext.tokenSet.has(token)).length;
+    const overlapRatio = overlap / Math.max(tokens.length, 1);
+    if (overlapRatio >= minOverlap) return true;
+    return overlapRatio >= minSim;
+  };
+
+  const computeMatch = (meta, sectionContext) => {
+    if (meta.subject && sectionContext.subject) {
+      if (
+        meta.subject === sectionContext.subject ||
+        sectionContext.subject.includes(meta.subject) ||
+        meta.subject.includes(sectionContext.subject)
+      ) {
+        return { level: 4, score: 1 };
+      }
+    }
+    if (matchTokens(meta.subjectTokens, sectionContext, 0.45, 0.4)) {
+      return { level: 4, score: 0.8 };
+    }
+    if (meta.topic && sectionContext.topic) {
+      if (
+        meta.topic === sectionContext.topic ||
+        sectionContext.topic.includes(meta.topic) ||
+        meta.topic.includes(sectionContext.topic)
+      ) {
+        return { level: 3, score: 0.75 };
+      }
+    }
+    if (matchTokens(meta.topicTokens, sectionContext, 0.4, 0.35)) {
+      return { level: 3, score: 0.6 };
+    }
+    if (matchTokens(meta.tagTokens, sectionContext, 0.3, 0.3)) {
+      return { level: 2, score: 0.5 };
+    }
+    if (matchTokens(meta.keywordTokens, sectionContext, 0.25, 0.2)) {
+      return { level: 1, score: 0.4 };
+    }
+    return { level: 0, score: 0 };
+  };
+
+  const assignments = new Map();
+
+  sectionContexts.forEach((sectionContext) => {
+    const expected = sectionContext.expectedQuestions || 0;
+    if (!expected) return;
+    const existing = sectionStats.get(sectionContext.id) || {
+      total: 0,
+      types: {},
+      difficulties: {},
+    };
+    let remainingSlots = Math.max(expected - existing.total, 0);
+    if (!remainingSlots) return;
+
+    const typeTargets = computeTargetCounts(expected, typeRatioMap);
+    const difficultyTargets = computeTargetCounts(expected, difficultyRatioMap);
+    const remainingTypeTargets = subtractCounts(typeTargets, existing.types);
+    const remainingDifficultyTargets = subtractCounts(
+      difficultyTargets,
+      existing.difficulties
+    );
+
+    const buckets = {
+      subject: [],
+      topic: [],
+      tags: [],
+      keywords: [],
+    };
+
+    questionMeta.forEach((meta) => {
+      if (assignedQuestionIds.has(meta.id)) return;
+      const match = computeMatch(meta, sectionContext);
+      if (!match.level) return;
+      const entry = { meta, score: match.score };
+      if (match.level === 4) buckets.subject.push(entry);
+      else if (match.level === 3) buckets.topic.push(entry);
+      else if (match.level === 2) buckets.tags.push(entry);
+      else buckets.keywords.push(entry);
+    });
+
+    const fillBucket = (entries) => {
+      if (!entries.length || remainingSlots <= 0) return;
+      const hasTypeTargets = Object.keys(remainingTypeTargets).length > 0;
+      const hasDifficultyTargets = Object.keys(remainingDifficultyTargets).length > 0;
+      const ordered = [...entries].sort(
+        (a, b) => b.score - a.score || a.meta.index - b.meta.index
+      );
+      const used = new Set();
+
+      const consume = (candidate) => {
+        if (remainingSlots <= 0) return false;
+        if (assignedQuestionIds.has(candidate.meta.id) || used.has(candidate.meta.id)) return false;
+        assignedQuestionIds.add(candidate.meta.id);
+        used.add(candidate.meta.id);
+        assignments.set(candidate.meta.index, sectionContext.id);
+        if (remainingTypeTargets[candidate.meta.typeKey] !== undefined) {
+          remainingTypeTargets[candidate.meta.typeKey] = Math.max(
+            remainingTypeTargets[candidate.meta.typeKey] - 1,
+            0
+          );
+        }
+        if (remainingDifficultyTargets[candidate.meta.difficultyKey] !== undefined) {
+          remainingDifficultyTargets[candidate.meta.difficultyKey] = Math.max(
+            remainingDifficultyTargets[candidate.meta.difficultyKey] - 1,
+            0
+          );
+        }
+        remainingSlots -= 1;
+        return true;
+      };
+
+      const runPass = (requireType, requireDifficulty) => {
+        for (const candidate of ordered) {
+          if (remainingSlots <= 0) break;
+          if (used.has(candidate.meta.id)) continue;
+          const typeOk =
+            !requireType ||
+            !hasTypeTargets ||
+            (remainingTypeTargets[candidate.meta.typeKey] || 0) > 0;
+          const difficultyOk =
+            !requireDifficulty ||
+            !hasDifficultyTargets ||
+            (remainingDifficultyTargets[candidate.meta.difficultyKey] || 0) > 0;
+          if (typeOk && difficultyOk) {
+            consume(candidate);
+          }
+        }
+      };
+
+      runPass(true, true);
+      if (remainingSlots > 0 && hasTypeTargets) runPass(true, false);
+      if (remainingSlots > 0 && hasDifficultyTargets) runPass(false, true);
+      if (remainingSlots > 0) runPass(false, false);
+    };
+
+    fillBucket(buckets.subject);
+    fillBucket(buckets.topic);
+    fillBucket(buckets.tags);
+    fillBucket(buckets.keywords);
+
+    if (remainingSlots > 0 && sectionContext.subject) {
+      const subjectFallback = questionMeta
+        .filter((meta) => !assignedQuestionIds.has(meta.id))
+        .filter((meta) => matchTokens(meta.subjectTokens, sectionContext, 0.25, 0.2))
+        .map((meta) => ({ meta, score: 0.2 }));
+      fillBucket(subjectFallback);
+    }
+
+    if (remainingSlots > 0) {
+      const randomFallback = questionMeta
+        .filter((meta) => !assignedQuestionIds.has(meta.id))
+        .map((meta) => ({ meta, score: 0 }));
+      fillBucket(randomFallback);
+    }
+  });
+
+  assignments.forEach((sectionId, index) => {
+    const normalizedSectionId = sectionId ? String(sectionId) : '';
+    if (!normalizedSectionId) return;
+    if (!assignmentsBySection.has(normalizedSectionId)) {
+      assignmentsBySection.set(normalizedSectionId, []);
+    }
+    assignmentsBySection.get(normalizedSectionId).push(questionMeta[index].id);
+  });
+
+  const unassignedIds = questionMeta
+    .filter((meta) => !assignedQuestionIds.has(meta.id))
+    .map((meta) => meta.id);
+
+  const sectionAssignments = sectionContexts.map((section) => ({
+    section_id: section.id,
+    assigned_questions: assignmentsBySection.get(section.id) || [],
+  }));
+
+  return { sectionAssignments, unassignedIds };
+};
+
 // Get all exams (filtered by exam permissions and tenant)
 // Universal: Shows exams based on exam context roles, not user system role
 router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, sanitizePagination, async (req, res, next) => {
   try {
-    const { page, limit, isActive, filterBy } = req.query;
+    const { page, limit, isActive, filterBy, examType } = req.query;
     const skip = (page - 1) * limit;
 
     let filter = { ...req.tenantFilter };
-    
+    const normalizedExamType = normalizeExamType(examType);
+    if (
+      normalizedExamType &&
+      [ONLINE_EXAM_TYPE, OMR_EXAM_TYPE].includes(normalizedExamType)
+    ) {
+      filter.examType = normalizedExamType;
+    }
+
     // SUPER_ADMIN, TENANT_ADMIN, and EXAM_CREATOR see all exams in their scope
     if (req.user.role === 'SUPER_ADMIN' || req.user.role === 'TENANT_ADMIN' || req.user.role === 'EXAM_CREATOR') {
       if (isActive !== undefined) {
@@ -78,9 +685,9 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, sanitizePag
       const participants = await ExamParticipant.find({ userId: req.user._id })
         .select('examId examRole')
         .lean();
-      
+
       const examIds = participants.map(p => p.examId);
-      
+
       if (filterBy === 'created') {
         // Show only exams user created (CREATOR role)
         const creatorExamIds = participants
@@ -140,6 +747,103 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, sanitizePag
   }
 });
 
+// Unified exam submit endpoint used by candidate exam page.
+router.post(
+  '/submit',
+  requireAuth,
+  requireTenant,
+  enforceTenantBoundaries,
+  auditLog(AUDIT_ACTIONS.ATTEMPT_SUBMITTED, (req) => ({
+    examId: req.body?.examId,
+    userId: req.body?.userId || req.user?._id,
+    isDisqualified: req.body?.isDisqualified || false,
+  })),
+  [
+    body('examId').isMongoId().withMessage('examId must be a valid id'),
+    body('userId').optional().isMongoId().withMessage('userId must be a valid id'),
+    body('attemptId').optional().isMongoId().withMessage('attemptId must be a valid id'),
+    body('answers').optional().isObject().withMessage('Answers must be an object'),
+    body('codingSubmissions').optional().isArray().withMessage('codingSubmissions must be an array'),
+    body('codingAnswers').optional().isArray().withMessage('codingAnswers must be an array'),
+    body('timerMeta').optional().isObject().withMessage('timerMeta must be an object'),
+    body('submissionSource').optional().isString().withMessage('submissionSource must be a string'),
+    body('disqualifyStatus').optional().isString().withMessage('disqualifyStatus must be a string'),
+    body('violationType').optional().isString().withMessage('violationType must be a string'),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const requestedUserId = req.body?.userId || req.user._id;
+      const canSubmitForOtherCandidate =
+        ['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR'].includes(req.user.role);
+
+      if (
+        String(requestedUserId) !== String(req.user._id) &&
+        !canSubmitForOtherCandidate
+      ) {
+        return res.status(403).json({
+          error: 'Forbidden - You can only submit exams for your own account',
+        });
+      }
+
+      const examFilter = {
+        _id: req.body.examId,
+        ...(req.tenantFilter || {}),
+      };
+      const exam = await Exam.findOne(examFilter).select('_id').lean();
+      if (!exam) {
+        return res.status(404).json({ error: 'Exam not found' });
+      }
+
+      const attemptFilter = {
+        examId: exam._id,
+        userId: requestedUserId,
+        ...(req.body.attemptId
+          ? { _id: req.body.attemptId }
+          : { isCompleted: false }),
+      };
+      if (req.tenantFilter?.tenantId) {
+        attemptFilter.tenantId = req.tenantFilter.tenantId;
+      }
+
+      let attempt = await ExamAttempt.findOne(attemptFilter)
+        .sort({ startTime: -1 })
+        .select('_id')
+        .lean();
+
+      if (!attempt && !req.body.attemptId) {
+        const completedFilter = {
+          examId: exam._id,
+          userId: requestedUserId,
+          isCompleted: true,
+        };
+        if (req.tenantFilter?.tenantId) {
+          completedFilter.tenantId = req.tenantFilter.tenantId;
+        }
+
+        attempt = await ExamAttempt.findOne(completedFilter)
+          .sort({ submitTime: -1, updatedAt: -1 })
+          .select('_id')
+          .lean();
+      }
+
+      if (!attempt?._id) {
+        return res.status(404).json({ error: 'Exam attempt not found' });
+      }
+
+      req.params.attemptId = attempt._id.toString();
+      return submitAttemptHandler(req, res, next);
+    } catch (error) {
+      console.error('Exam submission error:', error);
+      return next(error);
+    }
+  }
+);
+
 // Get single exam
 // Universal: Access based on exam permissions, not user role
 // Preview exam paper (questions without answers) - for admin preview
@@ -181,8 +885,13 @@ router.get('/:examId/preview', requireAuth, requireTenant, enforceTenantBoundari
 
       const questions = await Question.find({ questionPaperId: qp._id })
         .select('-correctAnswer') // Exclude correct answer
-        .sort({ order: 1 })
-        .lean();
+        .sort({ order: 1 });
+
+      await ensureQuestionsImageAvailability({
+        questions,
+        examId: req.params.examId,
+        persist: true,
+      });
 
       previewData.questionPapers.push({
         _id: qp._id,
@@ -196,17 +905,29 @@ router.get('/:examId/preview', requireAuth, requireTenant, enforceTenantBoundari
           marks: s.marks,
           negativeMarking: s.negativeMarking,
         })),
-        questions: questions.map(q => ({
-          _id: q._id,
-          questionText: q.questionText,
-          questionType: q.questionType,
-          options: q.options,
-          points: q.points,
-          order: q.order,
-          sectionId: q.sectionId,
-          passage: q.passage,
-          imageUrl: q.imageUrl,
-        })),
+        questions: questions.map((q) => {
+          const sanitizedOptions = sanitizeQuestionOptions(q.options);
+          return {
+            _id: q._id,
+            question: q.questionText,
+            questionText: q.questionText,
+            question_text: q.questionText,
+            questionType: q.questionType,
+            options: sanitizedOptions,
+            points: q.points,
+            order: q.order,
+            sectionId: q.sectionId,
+            passage: q.passage,
+            paragraphGroupId: q.paragraphGroupId || '',
+            image: q.imageUrl || q.generatedImage || q.imageBase64 || '',
+            imageUrl: q.imageUrl,
+            image_path: q.imageUrl || '',
+            imageBase64: q.imageBase64,
+            image_base64: q.imageBase64 || '',
+            generatedImage: q.generatedImage,
+            generated_image: q.generatedImage || '',
+          };
+        }),
       });
     }
 
@@ -274,7 +995,7 @@ router.get('/:examId/audit', requireAuth, requireTenant, enforceTenantBoundaries
 
       // Check for sections without questions
       for (const section of sections) {
-        const sectionQuestions = questions.filter(q => 
+        const sectionQuestions = questions.filter(q =>
           q.sectionId && q.sectionId.toString() === section._id.toString()
         );
         if (sectionQuestions.length === 0) {
@@ -305,7 +1026,7 @@ router.get('/:examId/audit', requireAuth, requireTenant, enforceTenantBoundaries
       // Check for missing expected questions
       for (const section of sections) {
         if (section.expectedQuestions) {
-          const sectionQuestions = questions.filter(q => 
+          const sectionQuestions = questions.filter(q =>
             q.sectionId && q.sectionId.toString() === section._id.toString()
           );
           if (sectionQuestions.length !== section.expectedQuestions) {
@@ -375,7 +1096,7 @@ router.get('/:examId', requireAuth, requireTenant, enforceTenantBoundaries, asyn
     if (req.user.role === 'TENANT_ADMIN' || req.user.role === 'EXAM_CREATOR') {
       const userTenantId = req.user.tenantId;
       const examTenantId = exam.tenantId;
-      
+
       if (userTenantId && examTenantId && userTenantId.toString() === examTenantId.toString()) {
         return res.json({ exam });
       }
@@ -430,6 +1151,11 @@ router.post(
     body('showResultsImmediately').optional().isBoolean(),
     body('examType').optional().isString(),
     body('sections').optional().isArray(),
+    body('markingRules').optional().isObject(),
+    body('answerKey').optional(),
+    body('omrTemplateImage').optional().isString(),
+    body('instructions').optional().isString(),
+    body('totalMarks').optional().isFloat({ min: 0 }),
   ],
   async (req, res, next) => {
     try {
@@ -438,9 +1164,17 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
+      if (req.user.role !== 'SUPER_ADMIN' && !req.user.tenantId) {
+        return res.status(403).json({
+          error:
+            'Your account is not assigned to a tenant workspace yet. Please contact your Super Admin before creating exams.',
+        });
+      }
+
       const {
         title,
         description,
+        instructions,
         duration,
         gracePeriod,
         maxAttempts,
@@ -451,16 +1185,41 @@ router.post(
         certificateTemplate,
         examType,
         sections,
+        answerKey,
+        markingRules,
+        omrTemplateImage,
+        totalMarks,
       } =
         req.body;
 
       const requestedDuration = toPositiveInt(duration, null);
       const requestedExamType = normalizeExamType(examType);
+      const isOmrRequest = requestedExamType === OMR_EXAM_TYPE;
       const sectionPayloadProvided = Array.isArray(sections);
       const sectionBasedRequest =
-        requestedExamType === SECTION_BASED_EXAM_TYPE || sectionPayloadProvided;
+        !isOmrRequest &&
+        (requestedExamType === SECTION_BASED_EXAM_TYPE || sectionPayloadProvided);
+
+      if (isOmrRequest && sectionPayloadProvided) {
+        return res.status(400).json({
+          error: 'Sections are not supported for OMR exams.',
+        });
+      }
 
       let resolvedDuration = requestedDuration;
+      let safeOmrPayload = null;
+
+      if (isOmrRequest) {
+        try {
+          safeOmrPayload = sanitizeOmrPayload({
+            markingRules,
+            answerKey,
+          });
+        } catch (validationError) {
+          return res.status(400).json({ error: validationError.message });
+        }
+      }
+
       if (sectionBasedRequest) {
         let safeSections;
         try {
@@ -479,7 +1238,11 @@ router.post(
       }
 
       if (resolvedDuration === null) {
-        return res.status(400).json({ error: 'Duration must be a positive number.' });
+        if (isOmrRequest) {
+          resolvedDuration = 60;
+        } else {
+          return res.status(400).json({ error: 'Duration must be a positive number.' });
+        }
       }
 
       // Set tenant IDs based on user's tenant (Organization OR Institute)
@@ -487,18 +1250,27 @@ router.post(
       const examData = {
         title,
         description,
+        instructions: typeof instructions === 'string' ? instructions.trim() : '',
         duration: resolvedDuration,
         gracePeriod: gracePeriod || 0,
         maxAttempts: maxAttempts || 1,
         isActive: isActive !== undefined ? isActive : true,
         showResultsImmediately: Boolean(showResultsImmediately),
         allowCertification: Boolean(allowCertification),
-        passingPercentage: passingPercentage !== undefined 
+        passingPercentage: passingPercentage !== undefined
           ? Math.max(0, Math.min(100, parseInt(passingPercentage) || 60))
           : 60,
         certificateTemplate: allowCertification ? (certificateTemplate || null) : null,
+        examType: isOmrRequest ? OMR_EXAM_TYPE : ONLINE_EXAM_TYPE,
+        totalMarks: Number.isFinite(Number(totalMarks)) ? Math.max(0, Number(totalMarks)) : 0,
         createdBy: req.user._id,
       };
+
+      if (isOmrRequest) {
+        examData.answerKey = safeOmrPayload.answerKey;
+        examData.markingRules = safeOmrPayload.markingRules;
+        examData.omrTemplateImage = String(omrTemplateImage || '').trim();
+      }
 
       // Set tenant ID
       if (req.user.role !== 'SUPER_ADMIN' && req.user.tenantId) {
@@ -525,7 +1297,7 @@ router.post(
       res.locals.examId = exam._id.toString();
 
       // Auto-generate packages if exam is active and has valid question paper
-      if (exam.isActive) {
+      if (exam.isActive && exam.examType !== OMR_EXAM_TYPE) {
         try {
           const { autoGeneratePackagesOnPublish, examHasValidQuestionPaper } = await import('../services/examPackageService.js');
           const hasValidQuestionPaper = await examHasValidQuestionPaper(exam._id.toString());
@@ -564,6 +1336,11 @@ router.put(
     body('showResultsImmediately').optional().isBoolean(),
     body('examType').optional().isString(),
     body('sections').optional().isArray(),
+    body('markingRules').optional().isObject(),
+    body('answerKey').optional(),
+    body('omrTemplateImage').optional().isString(),
+    body('instructions').optional().isString(),
+    body('totalMarks').optional().isFloat({ min: 0 }),
   ],
   async (req, res, next) => {
     try {
@@ -580,6 +1357,7 @@ router.put(
       const {
         title,
         description,
+        instructions,
         duration,
         gracePeriod,
         maxAttempts,
@@ -588,6 +1366,10 @@ router.put(
         resultsReleasedAt,
         examType,
         sections,
+        answerKey,
+        markingRules,
+        omrTemplateImage,
+        totalMarks,
       } =
         req.body;
 
@@ -597,9 +1379,32 @@ router.put(
       }
 
       const requestedExamType = normalizeExamType(examType);
+      const existingExamType = normalizeExamType(exam.examType) || ONLINE_EXAM_TYPE;
+      const resolvedExamType = [ONLINE_EXAM_TYPE, OMR_EXAM_TYPE].includes(requestedExamType)
+        ? requestedExamType
+        : existingExamType;
       const sectionPayloadProvided = Array.isArray(sections);
       const sectionBasedUpdate =
-        requestedExamType === SECTION_BASED_EXAM_TYPE || sectionPayloadProvided;
+        resolvedExamType !== OMR_EXAM_TYPE &&
+        (requestedExamType === SECTION_BASED_EXAM_TYPE || sectionPayloadProvided);
+
+      if (resolvedExamType === OMR_EXAM_TYPE && sectionPayloadProvided) {
+        return res.status(400).json({
+          error: 'Sections are not supported for OMR exams.',
+        });
+      }
+
+      let safeOmrPayload = null;
+      if (resolvedExamType === OMR_EXAM_TYPE) {
+        try {
+          safeOmrPayload = sanitizeOmrPayload({
+            markingRules: markingRules !== undefined ? markingRules : exam.markingRules,
+            answerKey: answerKey !== undefined ? answerKey : exam.answerKey,
+          });
+        } catch (validationError) {
+          return res.status(400).json({ error: validationError.message });
+        }
+      }
 
       if (sectionBasedUpdate) {
         if (!Array.isArray(sections)) {
@@ -626,12 +1431,35 @@ router.put(
 
       if (title) exam.title = title;
       if (description !== undefined) exam.description = description;
+      if (instructions !== undefined) {
+        exam.instructions = typeof instructions === 'string' ? instructions.trim() : '';
+      }
       if (!sectionBasedUpdate && duration !== undefined) {
         exam.duration = requestedDuration;
+      }
+      if (totalMarks !== undefined) {
+        exam.totalMarks = Math.max(0, Number(totalMarks) || 0);
+      }
+      if (resolvedExamType === OMR_EXAM_TYPE && duration === undefined && !exam.duration) {
+        exam.duration = 60;
       }
       if (gracePeriod !== undefined) exam.gracePeriod = gracePeriod;
       if (maxAttempts !== undefined) exam.maxAttempts = maxAttempts;
       if (isActive !== undefined) exam.isActive = isActive;
+      if ([ONLINE_EXAM_TYPE, OMR_EXAM_TYPE].includes(requestedExamType)) {
+        exam.examType = requestedExamType;
+      }
+      if (resolvedExamType === OMR_EXAM_TYPE) {
+        exam.answerKey = safeOmrPayload.answerKey;
+        exam.markingRules = safeOmrPayload.markingRules;
+        if (omrTemplateImage !== undefined) {
+          exam.omrTemplateImage = String(omrTemplateImage || '').trim();
+        }
+      } else if (requestedExamType === ONLINE_EXAM_TYPE) {
+        exam.answerKey = [];
+        exam.markingRules = {};
+        exam.omrTemplateImage = '';
+      }
       if (showResultsImmediately !== undefined) {
         exam.showResultsImmediately = showResultsImmediately;
         if (showResultsImmediately) {
@@ -652,13 +1480,13 @@ router.put(
       // Auto-generate packages when exam becomes ready
       // Trigger if: exam is active AND has valid question paper
       // This covers: publish toggle, exam created as active, question papers added later
-      if (exam.isActive) {
+      if (exam.isActive && exam.examType !== OMR_EXAM_TYPE) {
         try {
           const { autoGeneratePackagesOnPublish, examHasValidQuestionPaper } = await import('../services/examPackageService.js');
           const hasValidQuestionPaper = await examHasValidQuestionPaper(exam._id.toString());
           if (hasValidQuestionPaper) {
             const generationResult = await autoGeneratePackagesOnPublish(exam._id.toString(), req.user._id);
-            
+
             // Log generation result (don't fail the update if generation fails)
             if (generationResult.errors.length > 0) {
               console.warn(`Package generation completed with errors for exam ${exam._id}:`, generationResult.errors);
@@ -861,6 +1689,99 @@ router.post(
           title: exam.title,
           certificatesSentAt: exam.certificatesSentAt,
         },
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Auto-assign questions to sections based on context matching
+router.post(
+  '/auto-assign',
+  requireAuth,
+  requireTenant,
+  enforceTenantBoundaries,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
+  async (req, res, next) => {
+    try {
+      const {
+        examId,
+        questionPaperId,
+        sections,
+        questions,
+        preserveExistingAssignments = true,
+        questionTypeDistribution,
+        difficultyDistribution,
+      } = req.body || {};
+
+      let resolvedSections = Array.isArray(sections) ? sections : null;
+      let resolvedQuestions = Array.isArray(questions) ? questions : null;
+
+      if ((!resolvedSections || !resolvedQuestions) && examId) {
+        const exam = await Exam.findOne({ _id: examId, ...req.tenantFilter });
+        if (!exam) {
+          return res.status(404).json({ error: 'Exam not found' });
+        }
+
+        const QuestionPaper = (await import('../models/QuestionPaper.js')).default;
+        const Section = (await import('../models/Section.js')).default;
+        const Question = (await import('../models/Question.js')).default;
+
+        const questionPapers = await QuestionPaper.find({ examId: exam._id, isActive: true })
+          .sort({ order: 1 })
+          .lean();
+
+        if (!questionPapers.length) {
+          return res.status(404).json({ error: 'No question papers found for this exam.' });
+        }
+
+        let targetPaper = null;
+        if (questionPaperId) {
+          targetPaper = questionPapers.find(
+            (paper) => String(paper._id) === String(questionPaperId)
+          );
+          if (!targetPaper) {
+            return res.status(404).json({ error: 'Question paper not found for this exam.' });
+          }
+        } else if (questionPapers.length > 1) {
+          return res.status(400).json({
+            error: 'Multiple question papers found. Please provide questionPaperId.',
+          });
+        } else {
+          targetPaper = questionPapers[0];
+        }
+
+        resolvedSections = await Section.find({
+          questionPaperId: targetPaper._id,
+          isActive: true,
+        })
+          .sort({ order: 1 })
+          .lean();
+        resolvedQuestions = await Question.find({ questionPaperId: targetPaper._id })
+          .sort({ order: 1 })
+          .lean();
+      }
+
+      if (!Array.isArray(resolvedSections) || !Array.isArray(resolvedQuestions)) {
+        return res.status(400).json({
+          error: 'sections and questions are required when examId is not provided.',
+        });
+      }
+
+      const { sectionAssignments, unassignedIds } = runContextAutoAssign(
+        resolvedQuestions,
+        resolvedSections,
+        {
+          preserveExistingAssignments: Boolean(preserveExistingAssignments),
+          questionTypeDistribution,
+          difficultyDistribution,
+        }
+      );
+
+      return res.json({
+        sections: sectionAssignments,
+        unassigned_questions: unassignedIds,
       });
     } catch (error) {
       next(error);

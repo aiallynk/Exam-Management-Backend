@@ -7,6 +7,7 @@
 import ExamAttempt from '../models/ExamAttempt.js';
 
 const FOCUS_VIOLATION_SUBMISSION_SOURCE = 'STRICT_FOCUS_LOSS_AUTO_SUBMIT';
+const TAB_SWITCH_DISQUALIFY_STATUS = 'DISQUALIFIED_TAB_SWITCH';
 
 const toNonNegativeInt = (value, fallback = 0) => {
   const parsed = Number(value);
@@ -76,16 +77,70 @@ const appendSuspiciousFlag = (attempt, activityType, details = {}) => {
   attempt.suspiciousActivity = true;
 };
 
+const appendProctoringViolationLog = (attempt, violationType, details = {}) => {
+  if (!attempt.proctoringViolations) {
+    attempt.proctoringViolations = [];
+  }
+
+  attempt.proctoringViolations.push({
+    userId: attempt.userId || null,
+    examId: attempt.examId || null,
+    timestamp: new Date(),
+    violationType,
+    ...details,
+  });
+};
+
+const resolveDisqualifyStatus = (violation = {}) => {
+  const explicitStatus =
+    typeof violation?.disqualifyStatus === 'string' ? violation.disqualifyStatus.trim() : '';
+  if (explicitStatus) {
+    return explicitStatus;
+  }
+
+  const eventType = String(violation?.eventType || violation?.violationType || '').toUpperCase();
+  if (eventType === 'TAB_SWITCH' || eventType === 'TAB_HIDDEN') {
+    return TAB_SWITCH_DISQUALIFY_STATUS;
+  }
+
+  return '';
+};
+
+const normalizeViolationDetails = (details = {}) => {
+  if (!details || typeof details !== 'object') {
+    return {};
+  }
+  return { ...details };
+};
+
+const shouldEnforceStrictFocus = (metadata = {}) => {
+  if (metadata?.strict !== undefined) {
+    return Boolean(metadata.strict);
+  }
+  if (metadata?.autoSubmit !== undefined) {
+    return Boolean(metadata.autoSubmit);
+  }
+  if (metadata?.mode && String(metadata.mode).toLowerCase() === 'log') {
+    return false;
+  }
+  return true;
+};
+
 const autoSubmitAttemptOnFocusViolation = (attempt, violation = {}) => {
   const submitTime = new Date();
   const reason = violation.reason || 'Focus loss detected during exam';
   const eventType = violation.eventType || 'FOCUS_VIOLATION';
+  const violationType = String(violation.violationType || eventType || 'FOCUS_VIOLATION').toUpperCase();
+  const disqualifyStatus = resolveDisqualifyStatus(violation);
 
   attempt.isCompleted = true;
   attempt.submitTime = submitTime;
   attempt.submittedAt = submitTime;
   attempt.isDisqualified = true;
   attempt.disqualifyReason = reason;
+  if (disqualifyStatus) {
+    attempt.disqualifyStatus = disqualifyStatus;
+  }
   attempt.lastActivity = submitTime;
 
   const existingScore = attempt.scoreSummary || {};
@@ -102,6 +157,7 @@ const autoSubmitAttemptOnFocusViolation = (attempt, violation = {}) => {
       : null;
   attempt.submitMeta = {
     submissionSource: FOCUS_VIOLATION_SUBMISSION_SOURCE,
+    violationType,
     submittedAtClient:
       submittedAtClient && !Number.isNaN(submittedAtClient.getTime())
         ? submittedAtClient
@@ -115,12 +171,23 @@ const autoSubmitAttemptOnFocusViolation = (attempt, violation = {}) => {
       /^[a-fA-F0-9]{24}$/.test(violation.currentSectionId)
         ? violation.currentSectionId
         : null,
+    finalizedAfterViolation: false,
   };
 
   lockAllSectionTimersOnSubmit(attempt, submitTime);
+  appendProctoringViolationLog(attempt, violationType, {
+    eventType,
+    reason,
+    browserSessionId: violation.browserSessionId || null,
+    count: violation.count !== undefined ? toNonNegativeInt(violation.count, 0) : null,
+    disqualifyStatus: disqualifyStatus || null,
+    submissionSource: FOCUS_VIOLATION_SUBMISSION_SOURCE,
+  });
   appendSuspiciousFlag(attempt, 'STRICT_FOCUS_VIOLATION', {
     eventType,
     reason,
+    violationType,
+    disqualifyStatus: disqualifyStatus || null,
     submissionSource: FOCUS_VIOLATION_SUBMISSION_SOURCE,
   });
 };
@@ -248,10 +315,36 @@ export const enforceStrictFocusViolation = async (
   };
 };
 
+export {
+  FOCUS_VIOLATION_SUBMISSION_SOURCE,
+  TAB_SWITCH_DISQUALIFY_STATUS,
+};
+
 /**
  * Record tab switch (strict mode: auto submit)
  */
 export const recordTabSwitch = async (attemptId, actorUserId = null, metadata = {}) => {
+  if (!shouldEnforceStrictFocus(metadata)) {
+    const attempt = await ExamAttempt.findById(attemptId);
+    if (!attempt) {
+      throw new Error('Attempt not found');
+    }
+    assertAttemptOwnership(attempt, actorUserId);
+
+    attempt.tabSwitchCount = (attempt.tabSwitchCount || 0) + 1;
+    appendSuspiciousFlag(attempt, 'TAB_SWITCH', {
+      reason: metadata?.reason || 'Tab switch detected.',
+      ...normalizeViolationDetails(metadata),
+    });
+    await attempt.save();
+
+    return {
+      autoSubmitted: false,
+      alreadyCompleted: Boolean(attempt.isCompleted),
+      attempt,
+    };
+  }
+
   return enforceStrictFocusViolation(
     attemptId,
     {
@@ -267,6 +360,26 @@ export const recordTabSwitch = async (attemptId, actorUserId = null, metadata = 
  * Record window blur (strict mode: auto submit)
  */
 export const recordWindowBlur = async (attemptId, actorUserId = null, metadata = {}) => {
+  if (!shouldEnforceStrictFocus(metadata)) {
+    const attempt = await ExamAttempt.findById(attemptId);
+    if (!attempt) {
+      throw new Error('Attempt not found');
+    }
+    assertAttemptOwnership(attempt, actorUserId);
+
+    appendSuspiciousFlag(attempt, 'WINDOW_BLUR', {
+      reason: metadata?.reason || 'Window focus change detected.',
+      ...normalizeViolationDetails(metadata),
+    });
+    await attempt.save();
+
+    return {
+      autoSubmitted: false,
+      alreadyCompleted: Boolean(attempt.isCompleted),
+      attempt,
+    };
+  }
+
   return enforceStrictFocusViolation(
     attemptId,
     {
@@ -281,14 +394,22 @@ export const recordWindowBlur = async (attemptId, actorUserId = null, metadata =
 /**
  * Record copy/paste attempt
  */
-export const recordCopyPasteAttempt = async (attemptId, action, actorUserId = null) => {
+export const recordCopyPasteAttempt = async (attemptId, payload, actorUserId = null) => {
   const attempt = await ExamAttempt.findById(attemptId);
   if (!attempt) {
     throw new Error('Attempt not found');
   }
   assertAttemptOwnership(attempt, actorUserId);
 
-  appendSuspiciousFlag(attempt, 'COPY_PASTE_ATTEMPT', {
+  const action =
+    typeof payload === 'string' ? payload : payload?.action || payload?.type || 'copy';
+  const violationType =
+    typeof payload === 'object' && payload?.violationType
+      ? String(payload.violationType)
+      : 'COPY_PASTE_ATTEMPT';
+
+  appendSuspiciousFlag(attempt, violationType, {
+    ...normalizeViolationDetails(payload),
     action,
     timestamp: new Date(),
   });
@@ -299,7 +420,7 @@ export const recordCopyPasteAttempt = async (attemptId, action, actorUserId = nu
 /**
  * Record right-click attempt
  */
-export const recordRightClickAttempt = async (attemptId, actorUserId = null) => {
+export const recordRightClickAttempt = async (attemptId, payload = {}, actorUserId = null) => {
   if (!attemptId) {
     throw new Error('Attempt ID is required');
   }
@@ -310,7 +431,12 @@ export const recordRightClickAttempt = async (attemptId, actorUserId = null) => 
   }
   assertAttemptOwnership(attempt, actorUserId);
 
-  appendSuspiciousFlag(attempt, 'RIGHT_CLICK_ATTEMPT', {
+  const violationType =
+    typeof payload === 'object' && payload?.violationType
+      ? String(payload.violationType)
+      : 'RIGHT_CLICK_ATTEMPT';
+  appendSuspiciousFlag(attempt, violationType, {
+    ...normalizeViolationDetails(payload),
     timestamp: new Date(),
   });
 
@@ -320,17 +446,49 @@ export const recordRightClickAttempt = async (attemptId, actorUserId = null) => 
 /**
  * Record keyboard shortcut attempt
  */
-export const recordKeyboardShortcut = async (attemptId, shortcut, actorUserId = null) => {
+export const recordKeyboardShortcut = async (attemptId, payload, actorUserId = null) => {
   const attempt = await ExamAttempt.findById(attemptId);
   if (!attempt) {
     throw new Error('Attempt not found');
   }
   assertAttemptOwnership(attempt, actorUserId);
 
-  appendSuspiciousFlag(attempt, 'KEYBOARD_SHORTCUT_ATTEMPT', {
+  const shortcut =
+    typeof payload === 'string' ? payload : payload?.shortcut || payload?.key || 'Unknown';
+  const violationType =
+    typeof payload === 'object' && payload?.violationType
+      ? String(payload.violationType)
+      : 'KEYBOARD_SHORTCUT_ATTEMPT';
+
+  appendSuspiciousFlag(attempt, violationType, {
+    ...normalizeViolationDetails(payload),
     shortcut,
     timestamp: new Date(),
   });
+
+  return await attempt.save();
+};
+
+export const recordViolationEvent = async (attemptId, violation = {}, actorUserId = null) => {
+  const attempt = await ExamAttempt.findById(attemptId);
+  if (!attempt) {
+    throw new Error('Attempt not found');
+  }
+  assertAttemptOwnership(attempt, actorUserId);
+
+  const type = String(violation?.type || violation?.eventType || 'OTHER').toUpperCase();
+  const details = normalizeViolationDetails(violation);
+  delete details.type;
+  delete details.eventType;
+
+  appendSuspiciousFlag(attempt, type, {
+    ...details,
+    timestamp: details?.timestamp || new Date(),
+  });
+
+  if (type === 'TAB_SWITCH') {
+    attempt.tabSwitchCount = (attempt.tabSwitchCount || 0) + 1;
+  }
 
   return await attempt.save();
 };

@@ -59,8 +59,28 @@ export const getExamUsageSnapshot = async (exam) => {
 
 export const syncExamQuestionCount = async (examId) => {
   if (!examId) return 0;
-  const count = asNonNegativeInt(await getQuestionCountForExam(examId));
-  await Exam.updateOne({ _id: examId }, { $set: { questionCount: count } });
+  const paperIds = await QuestionPaper.find({ examId }).distinct('_id');
+  const count = paperIds.length
+    ? asNonNegativeInt(await Question.countDocuments({ questionPaperId: { $in: paperIds } }))
+    : 0;
+  const marksAggregation = paperIds.length
+    ? await Question.aggregate([
+        { $match: { questionPaperId: { $in: paperIds } } },
+        {
+          $group: {
+            _id: null,
+            totalMarks: { $sum: { $ifNull: ['$points', 0] } },
+          },
+        },
+      ])
+    : [];
+  const totalMarks = Number.isFinite(Number(marksAggregation?.[0]?.totalMarks))
+    ? Math.max(0, Number(marksAggregation[0].totalMarks))
+    : 0;
+  await Exam.updateOne(
+    { _id: examId },
+    { $set: { questionCount: count, totalMarks } }
+  );
   return count;
 };
 
@@ -77,4 +97,3 @@ export const syncUserExamCount = async (userId) => {
   await User.updateOne({ _id: userId }, { $set: { examsCreated: count } });
   return count;
 };
-

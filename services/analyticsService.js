@@ -9,37 +9,105 @@ import Answer from '../models/Answer.js';
 import Question from '../models/Question.js';
 import Section from '../models/Section.js';
 import Exam from '../models/Exam.js';
+import QuestionPaper from '../models/QuestionPaper.js';
+
+const roundMetric = (value, digits = 2) => {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return 0;
+  const factor = 10 ** digits;
+  return Math.round(numeric * factor) / factor;
+};
+
+const normalizeId = (value) => {
+  if (!value) return '';
+  if (typeof value === 'object' && value._id) {
+    return String(value._id);
+  }
+  return String(value);
+};
+
+const buildCompletedAttemptQuery = (examId, questionPaperId = null) => {
+  const query = {
+    examId,
+    isCompleted: true,
+    isDisqualified: false,
+  };
+
+  if (questionPaperId) {
+    query.questionPaperId = questionPaperId;
+  }
+
+  return query;
+};
+
+const resolveQuestionPaperIdsForExam = async (examId, questionPaperId = null) => {
+  if (questionPaperId) {
+    return [questionPaperId];
+  }
+
+  const papers = await QuestionPaper.find({
+    examId,
+    isActive: true,
+  })
+    .select('_id')
+    .lean();
+
+  return papers.map((paper) => paper._id);
+};
+
+const buildQuestionPaperQuery = (questionPaperIds, questionPaperId = null) => {
+  if (questionPaperId) {
+    return questionPaperId;
+  }
+
+  if (!Array.isArray(questionPaperIds) || questionPaperIds.length === 0) {
+    return null;
+  }
+
+  return { $in: questionPaperIds };
+};
+
+const classifyDifficultyFromSuccessRatio = (successRatio) => {
+  if (successRatio >= 80) return 'EASY';
+  if (successRatio < 50) return 'HARD';
+  return 'MEDIUM';
+};
+
+const getAttemptPercentage = (attempt) => {
+  return Number(attempt?.scoreSummary?.percentage) || 0;
+};
 
 /**
  * Get section-wise difficulty analysis
  */
 export const getSectionDifficultyAnalysis = async (examId, questionPaperId = null) => {
-  const query = { examId };
-  if (questionPaperId) {
-    query.questionPaperId = questionPaperId;
+  const questionPaperIds = await resolveQuestionPaperIdsForExam(examId, questionPaperId);
+  const questionPaperQuery = buildQuestionPaperQuery(questionPaperIds, questionPaperId);
+  if (!questionPaperQuery) {
+    return [];
   }
-  
-  const attempts = await ExamAttempt.find({
-    ...query,
-    isCompleted: true,
-    isDisqualified: false,
-  });
-  
+
+  const attempts = await ExamAttempt.find(buildCompletedAttemptQuery(examId, questionPaperId));
+
   if (attempts.length === 0) {
     return [];
   }
-  
+
   // Get all sections for the question paper(s)
   const sections = await Section.find({
-    questionPaperId: questionPaperId || { $exists: true },
+    questionPaperId: questionPaperQuery,
     isActive: true,
-  }).sort({ order: 1 });
-  
+  })
+    .sort({ order: 1 })
+    .lean();
+
   const sectionAnalysis = await Promise.all(
     sections.map(async (section) => {
-      const questions = await Question.find({ sectionId: section._id });
-      const questionIds = questions.map(q => q._id);
-      
+      const questions = await Question.find({ sectionId: section._id })
+        .select('_id questionText points')
+        .lean();
+      const questionIds = questions.map((q) => q._id);
+
       if (questionIds.length === 0) {
         return {
           sectionId: section._id,
@@ -56,14 +124,15 @@ export const getSectionDifficultyAnalysis = async (examId, questionPaperId = nul
       const answers = await Answer.find({
         attemptId: { $in: attempts.map(a => a._id) },
         questionId: { $in: questionIds },
-      }).populate('questionId', 'points');
-      
+      })
+        .populate('questionId', 'points');
+
       // Calculate statistics
       const questionStats = {};
       questions.forEach(q => {
         questionStats[q._id.toString()] = {
           questionId: q._id,
-          questionText: q.questionText.substring(0, 50),
+          questionText: String(q.questionText || '').substring(0, 50),
           totalAttempts: 0,
           correctAttempts: 0,
           totalTimeSpent: 0,
@@ -89,28 +158,20 @@ export const getSectionDifficultyAnalysis = async (examId, questionPaperId = nul
       
       const averageScore = totalAttempts > 0 ? (totalCorrect / totalAttempts) * 100 : 0;
       const averageTimeSpent = totalAttempts > 0 ? totalTimeSpent / totalAttempts : 0;
-      
-      // Determine difficulty
-      let difficulty = 'MEDIUM';
-      if (averageScore >= 80) {
-        difficulty = 'EASY';
-      } else if (averageScore < 50) {
-        difficulty = 'HARD';
-      }
-      
+
       return {
         sectionId: section._id,
         sectionName: section.name,
         totalQuestions: questions.length,
         totalAttempts,
-        averageScore: Math.round(averageScore * 100) / 100,
+        averageScore: roundMetric(averageScore),
         averageTimeSpent: Math.round(averageTimeSpent),
-        difficulty,
+        difficulty: classifyDifficultyFromSuccessRatio(averageScore),
         questionStats: questionStatsArray,
       };
     })
   );
-  
+
   return sectionAnalysis;
 };
 
@@ -118,24 +179,24 @@ export const getSectionDifficultyAnalysis = async (examId, questionPaperId = nul
  * Get question success ratio
  */
 export const getQuestionSuccessRatio = async (examId, questionPaperId = null) => {
-  const query = { examId };
-  if (questionPaperId) {
-    query.questionPaperId = questionPaperId;
+  const questionPaperIds = await resolveQuestionPaperIdsForExam(examId, questionPaperId);
+  const questionPaperQuery = buildQuestionPaperQuery(questionPaperIds, questionPaperId);
+  if (!questionPaperQuery) {
+    return [];
   }
-  
-  const attempts = await ExamAttempt.find({
-    ...query,
-    isCompleted: true,
-    isDisqualified: false,
-  });
-  
+
+  const attempts = await ExamAttempt.find(buildCompletedAttemptQuery(examId, questionPaperId));
+
   if (attempts.length === 0) {
     return [];
   }
-  
-  const questionQuery = { questionPaperId: questionPaperId || { $exists: true } };
-  const questions = await Question.find(questionQuery).sort({ order: 1 });
-  
+
+  const questionQuery = { questionPaperId: questionPaperQuery };
+  const questions = await Question.find(questionQuery)
+    .select('questionText questionType questionFormat options correctAnswer points order title')
+    .sort({ order: 1 })
+    .lean();
+
   const questionStats = await Promise.all(
     questions.map(async (question) => {
       const answers = await Answer.find({
@@ -152,19 +213,23 @@ export const getQuestionSuccessRatio = async (examId, questionPaperId = null) =>
       
       return {
         questionId: question._id,
-        questionText: question.questionText.substring(0, 100),
+        questionText: String(question.questionText || question.title || '').substring(0, 100),
         questionType: question.questionType,
+        questionFormat: question.questionFormat,
         order: question.order,
         points: question.points,
+        options: Array.isArray(question.options) ? question.options : [],
+        correctAnswer: question.correctAnswer || '',
         totalAttempts,
         correctAttempts,
         incorrectAttempts: totalAttempts - correctAttempts,
-        successRatio: Math.round(successRatio * 100) / 100,
+        successRatio: roundMetric(successRatio),
         averageTimeSpent: Math.round(averageTimeSpent),
+        difficulty: classifyDifficultyFromSuccessRatio(successRatio),
       };
     })
   );
-  
+
   return questionStats;
 };
 
@@ -183,8 +248,14 @@ export const getSectionDropoffAnalysis = async (examId, questionPaperId = null) 
     isDisqualified: false,
   });
   
+  const questionPaperIds = await resolveQuestionPaperIdsForExam(examId, questionPaperId);
+  const questionPaperQuery = buildQuestionPaperQuery(questionPaperIds, questionPaperId);
+  if (!questionPaperQuery) {
+    return [];
+  }
+
   const sections = await Section.find({
-    questionPaperId: questionPaperId || { $exists: true },
+    questionPaperId: questionPaperQuery,
     isActive: true,
   }).sort({ order: 1 });
   
@@ -220,17 +291,8 @@ export const getSectionDropoffAnalysis = async (examId, questionPaperId = null) 
  * Get time vs accuracy graph data
  */
 export const getTimeAccuracyData = async (examId, questionPaperId = null) => {
-  const query = { examId };
-  if (questionPaperId) {
-    query.questionPaperId = questionPaperId;
-  }
-  
-  const attempts = await ExamAttempt.find({
-    ...query,
-    isCompleted: true,
-    isDisqualified: false,
-  });
-  
+  const attempts = await ExamAttempt.find(buildCompletedAttemptQuery(examId, questionPaperId));
+
   if (attempts.length === 0) {
     return [];
   }
@@ -239,13 +301,13 @@ export const getTimeAccuracyData = async (examId, questionPaperId = null) => {
     const startTime = new Date(attempt.startTime);
     const submitTime = attempt.submitTime ? new Date(attempt.submitTime) : new Date();
     const totalTimeMinutes = (submitTime - startTime) / (1000 * 60);
-    const accuracy = attempt.scoreSummary?.percentage || 0;
+    const accuracy = getAttemptPercentage(attempt);
     
     return {
       attemptId: attempt._id,
       userId: attempt.userId,
       totalTimeMinutes: Math.round(totalTimeMinutes),
-      accuracy: Math.round(accuracy * 100) / 100,
+      accuracy: roundMetric(accuracy),
       score: attempt.scoreSummary?.totalScore || 0,
       maxScore: attempt.scoreSummary?.maxScore || 0,
     };
@@ -274,7 +336,7 @@ export const getTimeAccuracyData = async (examId, questionPaperId = null) => {
       minMinutes: range.min,
       maxMinutes: range.max === Infinity ? null : range.max,
       attemptCount: rangeData.length,
-      averageAccuracy: Math.round(averageAccuracy * 100) / 100,
+      averageAccuracy: roundMetric(averageAccuracy),
       dataPoints: rangeData,
     };
   });
@@ -293,41 +355,365 @@ export const getExamAnalytics = async (examId) => {
   if (!exam) {
     throw new Error('Exam not found');
   }
-  
-  const attempts = await ExamAttempt.find({
-    examId,
-    isCompleted: true,
-    isDisqualified: false,
-  });
-  
+
+  const attempts = await ExamAttempt.find(buildCompletedAttemptQuery(examId));
+
   const totalAttempts = attempts.length;
   const totalCandidates = new Set(attempts.map(a => a.userId.toString())).size;
-  
-  const scores = attempts.map(a => a.scoreSummary?.percentage || 0);
+
+  const scores = attempts.map((attempt) => getAttemptPercentage(attempt));
   const averageScore = scores.length > 0
     ? scores.reduce((a, b) => a + b, 0) / scores.length
     : 0;
-  
+
   const sortedScores = [...scores].sort((a, b) => a - b);
   const medianScore = sortedScores.length > 0
     ? sortedScores[Math.floor(sortedScores.length / 2)]
     : 0;
-  
+  const passingThreshold = Number.isFinite(Number(exam.passingPercentage))
+    ? Number(exam.passingPercentage)
+    : 60;
+  const passCount = attempts.filter((attempt) => getAttemptPercentage(attempt) >= passingThreshold).length;
+  const failCount = Math.max(totalAttempts - passCount, 0);
   const sectionAnalysis = await getSectionDifficultyAnalysis(examId);
   const questionStats = await getQuestionSuccessRatio(examId);
   const timeAccuracyData = await getTimeAccuracyData(examId);
-  
+
   return {
     examId,
     examTitle: exam.title,
     totalAttempts,
     totalCandidates,
-    averageScore: Math.round(averageScore * 100) / 100,
-    medianScore: Math.round(medianScore * 100) / 100,
+    totalStudents: totalCandidates,
+    averageScore: roundMetric(averageScore),
+    medianScore: roundMetric(medianScore),
     minScore: sortedScores.length > 0 ? Math.min(...scores) : 0,
     maxScore: sortedScores.length > 0 ? Math.max(...scores) : 0,
+    passCount,
+    failCount,
+    passedCount: passCount,
+    failedCount: failCount,
     sectionAnalysis,
     questionStats,
     timeAccuracyData,
   };
+};
+
+const buildEmptyDashboardAnalytics = ({ exams, selectedExamId }) => ({
+  exams: exams.map((exam) => ({
+    _id: exam._id,
+    title: exam.title,
+  })),
+  totalExams: exams.length,
+  totalAttempts: 0,
+  totalStudents: 0,
+  totalParticipants: 0,
+  averageScore: 0,
+  averagePercentile: 0,
+  passCount: 0,
+  failCount: 0,
+  passedCount: 0,
+  failedCount: 0,
+  successRate: 0,
+  activityTrend: [],
+  charts: {
+    performance: [],
+  },
+  performanceOverview: [],
+  questionStats: [],
+  emptyStateMessage: selectedExamId
+    ? 'No candidates have attempted this exam yet.'
+    : 'No candidates have attempted your exams yet.',
+});
+
+export const getTenantAnalyticsDashboard = async ({
+  tenantId,
+  viewerRole,
+  viewerUserId,
+  examId = null,
+  startDate = null,
+}) => {
+  const examFilter = { tenantId };
+  if (viewerRole === 'EXAM_CREATOR') {
+    examFilter.createdBy = viewerUserId;
+  }
+
+  const exams = await Exam.find(examFilter)
+    .select('_id title passingPercentage createdAt')
+    .sort({ createdAt: -1 })
+    .lean();
+
+  const examLookup = new Map(
+    exams.map((exam) => [normalizeId(exam._id), exam])
+  );
+  const selectedExamId = examId && examLookup.has(normalizeId(examId))
+    ? normalizeId(examId)
+    : '';
+
+  if (exams.length === 0) {
+    return buildEmptyDashboardAnalytics({ exams: [], selectedExamId });
+  }
+
+  const attemptFilter = {
+    tenantId,
+    examId: selectedExamId
+      ? selectedExamId
+      : { $in: exams.map((exam) => exam._id) },
+    isCompleted: true,
+    isDisqualified: false,
+  };
+
+  if (startDate instanceof Date && !Number.isNaN(startDate.getTime())) {
+    attemptFilter.submitTime = { $gte: startDate };
+  }
+
+  const attempts = await ExamAttempt.find(attemptFilter)
+    .select('_id examId userId submitTime submittedAt createdAt scoreSummary percentile')
+    .lean();
+
+  const baseResponse = buildEmptyDashboardAnalytics({ exams, selectedExamId });
+
+  const selectedQuestionStats = selectedExamId
+    ? (() => resolveQuestionPaperIdsForExam(selectedExamId))()
+    : Promise.resolve([]);
+
+  if (attempts.length === 0) {
+    const questionPaperIds = await selectedQuestionStats;
+    if (selectedExamId && questionPaperIds.length > 0) {
+      const questions = await Question.find({
+        questionPaperId: { $in: questionPaperIds },
+      })
+        .select('questionText title questionType questionFormat options correctAnswer points order')
+        .sort({ order: 1, createdAt: 1 })
+        .lean();
+
+      baseResponse.questionStats = questions.map((question, index) => ({
+        questionId: question._id,
+        questionText: String(question.questionText || question.title || '').trim(),
+        questionType: question.questionType,
+        questionFormat: question.questionFormat,
+        order: Number.isFinite(Number(question.order)) ? Number(question.order) : index + 1,
+        points: Number(question.points) || 0,
+        options: Array.isArray(question.options) ? question.options : [],
+        correctAnswer: question.correctAnswer || '',
+        totalAttempts: 0,
+        correctAttempts: 0,
+        incorrectAttempts: 0,
+        successRatio: 0,
+        difficulty: 'MEDIUM',
+      }));
+    }
+
+    return baseResponse;
+  }
+
+  let passedCount = 0;
+  let failedCount = 0;
+  const uniqueStudents = new Set();
+  const scores = [];
+  const percentiles = [];
+  const trendMap = new Map();
+  const examPerformanceMap = new Map();
+
+  attempts.forEach((attempt) => {
+    const normalizedExamId = normalizeId(attempt.examId);
+    const exam = examLookup.get(normalizedExamId);
+    if (!exam) {
+      return;
+    }
+
+    const percentage = getAttemptPercentage(attempt);
+    const percentile = Number(attempt.percentile);
+    const threshold = Number.isFinite(Number(exam.passingPercentage))
+      ? Number(exam.passingPercentage)
+      : 60;
+    const dateValue = attempt.submitTime || attempt.submittedAt || attempt.createdAt;
+    const dateKey = new Date(dateValue).toISOString().split('T')[0];
+
+    scores.push(percentage);
+    if (Number.isFinite(percentile)) {
+      percentiles.push(percentile);
+    }
+    uniqueStudents.add(normalizeId(attempt.userId));
+    if (percentage >= threshold) {
+      passedCount += 1;
+    } else {
+      failedCount += 1;
+    }
+
+    trendMap.set(dateKey, (trendMap.get(dateKey) || 0) + 1);
+
+    if (!examPerformanceMap.has(normalizedExamId)) {
+      examPerformanceMap.set(normalizedExamId, {
+        attempts: 0,
+        passed: 0,
+        totalScore: 0,
+        maxScore: null,
+        minScore: null,
+      });
+    }
+
+    const performanceEntry = examPerformanceMap.get(normalizedExamId);
+    performanceEntry.attempts += 1;
+    performanceEntry.totalScore += percentage;
+    performanceEntry.maxScore =
+      performanceEntry.maxScore === null
+        ? percentage
+        : Math.max(performanceEntry.maxScore, percentage);
+    performanceEntry.minScore =
+      performanceEntry.minScore === null
+        ? percentage
+        : Math.min(performanceEntry.minScore, percentage);
+    if (percentage >= threshold) {
+      performanceEntry.passed += 1;
+    }
+  });
+
+  const activityTrend = [...trendMap.entries()]
+    .map(([date, count]) => ({
+      date,
+      attempts: count,
+    }))
+    .sort((left, right) => new Date(left.date).getTime() - new Date(right.date).getTime());
+
+  const performanceSource = selectedExamId
+    ? exams.filter((exam) => normalizeId(exam._id) === selectedExamId)
+    : exams;
+
+  const performance = performanceSource
+    .map((exam) => {
+      const stats = examPerformanceMap.get(normalizeId(exam._id));
+      if (!stats || stats.attempts === 0) {
+        return null;
+      }
+
+      const averageExamScore = stats.totalScore / stats.attempts;
+      const passRate = (stats.passed / stats.attempts) * 100;
+
+      return {
+        id: exam._id,
+        examId: exam._id,
+        name: exam.title,
+        examTitle: exam.title,
+        attempts: stats.attempts,
+        score: roundMetric(averageExamScore),
+        averageScore: roundMetric(averageExamScore),
+        passRate: roundMetric(passRate),
+        maxScore: roundMetric(stats.maxScore),
+        minScore: roundMetric(stats.minScore),
+      };
+    })
+    .filter(Boolean);
+
+  const response = {
+    exams: exams.map((exam) => ({
+      _id: exam._id,
+      title: exam.title,
+    })),
+    totalExams: exams.length,
+    totalAttempts: attempts.length,
+    totalStudents: uniqueStudents.size,
+    totalParticipants: uniqueStudents.size,
+    averageScore: roundMetric(
+      scores.reduce((sum, value) => sum + value, 0) / scores.length
+    ),
+    averagePercentile: percentiles.length > 0
+      ? roundMetric(percentiles.reduce((sum, value) => sum + value, 0) / percentiles.length)
+      : 0,
+    passCount: passedCount,
+    failCount: failedCount,
+    passedCount,
+    failedCount,
+    successRate: attempts.length > 0
+      ? roundMetric((passedCount / attempts.length) * 100)
+      : 0,
+    activityTrend,
+    charts: {
+      performance,
+    },
+    performanceOverview: performance,
+    questionStats: [],
+    emptyStateMessage: selectedExamId
+      ? 'No candidates have attempted this exam yet.'
+      : 'No candidates have attempted your exams yet.',
+  };
+
+  if (!selectedExamId) {
+    return response;
+  }
+
+  const selectedExamQuestionPaperIds = await selectedQuestionStats;
+  if (selectedExamQuestionPaperIds.length === 0) {
+    return response;
+  }
+
+  const questions = await Question.find({
+    questionPaperId: { $in: selectedExamQuestionPaperIds },
+  })
+    .select('questionText title questionType questionFormat options correctAnswer points order')
+    .sort({ order: 1, createdAt: 1 })
+    .lean();
+
+  if (questions.length === 0) {
+    return response;
+  }
+
+  const questionStatsMap = new Map(
+    questions.map((question, index) => [
+      normalizeId(question._id),
+      {
+        questionId: question._id,
+        questionText: String(question.questionText || question.title || '').trim(),
+        questionType: question.questionType,
+        questionFormat: question.questionFormat,
+        order: Number.isFinite(Number(question.order)) ? Number(question.order) : index + 1,
+        points: Number(question.points) || 0,
+        options: Array.isArray(question.options) ? question.options : [],
+        correctAnswer: question.correctAnswer || '',
+        totalAttempts: 0,
+        correctAttempts: 0,
+        incorrectAttempts: 0,
+      },
+    ])
+  );
+
+  const answers = await Answer.find({
+    attemptId: { $in: attempts.map((attempt) => attempt._id) },
+    questionId: { $in: questions.map((question) => question._id) },
+  })
+    .select('questionId isCorrect aiEvaluation')
+    .lean();
+
+  answers.forEach((answer) => {
+    const entry = questionStatsMap.get(normalizeId(answer.questionId));
+    if (!entry) {
+      return;
+    }
+
+    entry.totalAttempts += 1;
+    const codingPassed =
+      answer?.aiEvaluation?.type === 'CODING' &&
+      Number(answer?.aiEvaluation?.failed) === 0 &&
+      Number(answer?.aiEvaluation?.passed) > 0;
+
+    if (answer.isCorrect === true || codingPassed) {
+      entry.correctAttempts += 1;
+    } else {
+      entry.incorrectAttempts += 1;
+    }
+  });
+
+  response.questionStats = [...questionStatsMap.values()].map((entry) => {
+    const successRatio = entry.totalAttempts > 0
+      ? (entry.correctAttempts / entry.totalAttempts) * 100
+      : 0;
+
+    return {
+      ...entry,
+      successRatio: roundMetric(successRatio),
+      difficulty: classifyDifficultyFromSuccessRatio(successRatio),
+    };
+  });
+
+  return response;
 };

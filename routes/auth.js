@@ -281,11 +281,15 @@ router.post(
         if (process.env.NODE_ENV === 'development') {
           console.log(`⚠️  Login attempt failed: User not found - ${email}`);
           // Check if similar email exists (case-insensitive)
-          const similarUser = await User.findOne({ 
-            email: { $regex: new RegExp(email.split('@')[0], 'i') } 
-          });
-          if (similarUser) {
-            console.log(`💡 Hint: Found similar user: ${similarUser.email}`);
+          const localPart =
+            typeof email === 'string' && email.includes('@') ? email.split('@')[0] : '';
+          if (localPart) {
+            const similarUser = await User.findOne({
+              email: { $regex: new RegExp(escapeRegex(localPart), 'i') },
+            });
+            if (similarUser) {
+              console.log(`💡 Hint: Found similar user: ${similarUser.email}`);
+            }
           }
         }
         return res.status(401).json({ error: 'Invalid credentials' });
@@ -391,7 +395,7 @@ router.post(
 // Refresh token
 router.post('/refresh', async (req, res, next) => {
   try {
-    const { refreshToken } = req.body;
+    const { refreshToken } = req.body || {};
     if (!refreshToken) {
       return res.status(400).json({ error: 'Refresh token required' });
     }
@@ -409,9 +413,22 @@ router.post('/refresh', async (req, res, next) => {
         return res.status(401).json({ error: 'User not found' });
       }
 
-      await ensureTrialAdminRole(user);
+      try {
+        await ensureTrialAdminRole(user);
+      } catch (roleError) {
+        if (process.env.NODE_ENV === 'development') {
+          console.error('[AUTH][REFRESH] Trial role sync failed:', roleError?.message || roleError);
+        }
+      }
 
-      const tenant = await resolveTenantSnapshot(user.tenantId, 'name code status type');
+      let tenant = null;
+      try {
+        tenant = await resolveTenantSnapshot(user.tenantId, 'name code status type');
+      } catch (tenantResolveError) {
+        if (process.env.NODE_ENV === 'development') {
+          console.error('[AUTH][REFRESH] Tenant resolution failed:', tenantResolveError?.message || tenantResolveError);
+        }
+      }
       const tenantId = toTenantIdString(user.tenantId);
 
       const accessToken = jwt.sign(

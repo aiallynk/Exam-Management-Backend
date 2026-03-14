@@ -2,6 +2,7 @@ import express from 'express';
 import ExamSession from '../models/ExamSession.js';
 import Exam from '../models/Exam.js';
 import QuestionPaper from '../models/QuestionPaper.js';
+import Question from '../models/Question.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
@@ -83,9 +84,9 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
       const participants = await ExamParticipant.find({ userId: req.user._id })
         .select('examId examRole')
         .lean();
-      
+
       const examIds = participants.map(p => p.examId);
-      
+
       if (examIds.length > 0) {
         filter.examId = { $in: examIds };
         // Candidates only see active sessions they can attempt
@@ -135,7 +136,7 @@ router.get('/:sessionId', requireAuth, requireTenant, enforceTenantBoundaries, a
     const session = await ExamSession.findById(req.params.sessionId)
       .populate(
         'examId',
-        'title description duration gracePeriod maxAttempts showResultsImmediately resultsReleasedAt'
+        'title description duration gracePeriod maxAttempts showResultsImmediately resultsReleasedAt allowCertification passingPercentage'
       )
       .populate('questionPaperId', 'setName')
       .populate('questionPaperIds', 'setName')
@@ -148,7 +149,7 @@ router.get('/:sessionId', requireAuth, requireTenant, enforceTenantBoundaries, a
     // Universal: Check exam permissions
     const canAttempt = await hasExamPermission(req.user._id, session.examId._id, 'ATTEMPT_EXAM');
     const canCreateSession = await hasExamPermission(req.user._id, session.examId._id, 'CREATE_SESSION');
-    
+
     // For candidates, only show if active and within time
     if (canAttempt && !canCreateSession) {
       const now = new Date();
@@ -165,9 +166,14 @@ router.get('/:sessionId', requireAuth, requireTenant, enforceTenantBoundaries, a
         session,
         userId: req.user._id,
       });
+      const resolvedQuestionPaperId = result.questionPaperId?._id || result.questionPaperId || null;
+      const questionCount = resolvedQuestionPaperId
+        ? await Question.countDocuments({ questionPaperId: resolvedQuestionPaperId })
+        : 0;
       assignment = {
-        questionPaperId: result.questionPaperId?._id || result.questionPaperId,
+        questionPaperId: resolvedQuestionPaperId,
         setName: result.questionPaperId?.setName,
+        questionCount,
       };
     }
 
@@ -373,9 +379,9 @@ router.get('/validate/:qrCode', requireAuth, async (req, res, next) => {
       manualToken: session.manualToken,
       assignment: assignment
         ? {
-            questionPaperId: assignment.questionPaperId?._id || assignment.questionPaperId,
-            setName: assignment.questionPaperId?.setName,
-          }
+          questionPaperId: assignment.questionPaperId?._id || assignment.questionPaperId,
+          setName: assignment.questionPaperId?.setName,
+        }
         : null,
       message: 'QR code is valid',
     });
@@ -424,9 +430,9 @@ router.get('/manual-token/:token', requireAuth, async (req, res, next) => {
       session,
       assignment: assignment
         ? {
-            questionPaperId: assignment.questionPaperId?._id || assignment.questionPaperId,
-            setName: assignment.questionPaperId?.setName,
-          }
+          questionPaperId: assignment.questionPaperId?._id || assignment.questionPaperId,
+          setName: assignment.questionPaperId?.setName,
+        }
         : null,
       message: 'Manual token is valid',
     });

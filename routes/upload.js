@@ -181,39 +181,43 @@ const ALLOWED_IMAGE_MIMETYPES = [
   'image/svg+xml',
 ];
 
-const imageUpload = multer({
-  storage,
-  limits: {
-    fileSize: 5 * 1024 * 1024, // 5MB
-    files: 1, // Only allow single file
-  },
-  fileFilter: (req, file, cb) => {
-    if (!file || !file.originalname) {
-      return cb(new Error('Invalid file'));
-    }
-    
-    // Get file extension
-    const ext = path.extname(file.originalname).toLowerCase();
-    
-    // Validate extension
-    if (!ALLOWED_IMAGE_EXTENSIONS.includes(ext)) {
-      return cb(new Error(`Invalid image extension. Allowed: ${ALLOWED_IMAGE_EXTENSIONS.join(', ')}`));
-    }
-    
-    // Validate MIME type
-    if (!file.mimetype || !file.mimetype.startsWith('image/')) {
-      // Check if it's in our allowed list
-      if (!ALLOWED_IMAGE_MIMETYPES.includes(file.mimetype)) {
-        console.warn(`MIME type mismatch for image ${file.originalname}: ${file.mimetype}`);
+const createImageUploadMiddleware = () =>
+  multer({
+    storage,
+    limits: {
+      fileSize: 5 * 1024 * 1024, // 5MB
+      files: 1, // Only allow single file
+    },
+    fileFilter: (req, file, cb) => {
+      if (!file || !file.originalname) {
+        return cb(new Error('Invalid file'));
       }
-    }
-    
-    // Sanitize filename
-    file.originalname = sanitizeFilename(file.originalname);
-    
-    cb(null, true);
-  },
-});
+      
+      // Get file extension
+      const ext = path.extname(file.originalname).toLowerCase();
+      
+      // Validate extension
+      if (!ALLOWED_IMAGE_EXTENSIONS.includes(ext)) {
+        return cb(new Error(`Invalid image extension. Allowed: ${ALLOWED_IMAGE_EXTENSIONS.join(', ')}`));
+      }
+      
+      // Validate MIME type
+      if (!file.mimetype || !file.mimetype.startsWith('image/')) {
+        // Check if it's in our allowed list
+        if (!ALLOWED_IMAGE_MIMETYPES.includes(file.mimetype)) {
+          console.warn(`MIME type mismatch for image ${file.originalname}: ${file.mimetype}`);
+        }
+      }
+      
+      // Sanitize filename
+      file.originalname = sanitizeFilename(file.originalname);
+      
+      cb(null, true);
+    },
+  });
+
+const imageUpload = createImageUploadMiddleware();
+const legacyImageUpload = createImageUploadMiddleware();
 
 const buildPublicUrl = (req, filename) => {
   const configured = (config.assetBaseUrl || '').trim();
@@ -237,44 +241,62 @@ const buildPublicUrl = (req, filename) => {
   return `${base}/uploads/${filename}`;
 };
 
+const getUploadedImageFile = (req) =>
+  req.file || req.files?.image?.[0] || req.files?.file?.[0] || null;
+
+const handleImageUploadRequest = async (req, res, next) => {
+  try {
+    const uploadedFile = getUploadedImageFile(req);
+    if (!uploadedFile) {
+      return res.status(400).json({ error: 'No image uploaded' });
+    }
+    
+    // Additional validation: check file actually exists and has content
+    try {
+      const stats = await fs.stat(uploadedFile.path);
+      if (stats.size === 0) {
+        await fs.unlink(uploadedFile.path);
+        return res.status(400).json({ error: 'Uploaded image is empty' });
+      }
+    } catch (statError) {
+      return res.status(400).json({ error: 'Failed to validate uploaded image' });
+    }
+
+    const fileName = uploadedFile.filename;
+    const fileUrl = buildPublicUrl(req, fileName);
+
+    res.json({
+      success: true,
+      url: fileUrl,
+      fileName: uploadedFile.originalname,
+      storedFileName: fileName,
+      mimeType: uploadedFile.mimetype,
+      size: uploadedFile.size,
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
+router.post(
+  '/',
+  requireAuth,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
+  legacyImageUpload.fields([
+    { name: 'image', maxCount: 1 },
+    { name: 'file', maxCount: 1 },
+  ]),
+  handleMulterError,
+  handleImageUploadRequest
+);
+
 router.post(
   '/image',
   requireAuth,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can upload files
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
   imageUpload.single('image'),
   handleMulterError,
-  async (req, res, next) => {
-    try {
-      if (!req.file) {
-        return res.status(400).json({ error: 'No image uploaded' });
-      }
-      
-      // Additional validation: check file actually exists and has content
-      try {
-        const stats = await fs.stat(req.file.path);
-        if (stats.size === 0) {
-          await fs.unlink(req.file.path);
-          return res.status(400).json({ error: 'Uploaded image is empty' });
-        }
-      } catch (statError) {
-        return res.status(400).json({ error: 'Failed to validate uploaded image' });
-      }
-
-      const fileName = req.file.filename;
-      const fileUrl = buildPublicUrl(req, fileName);
-
-      res.json({
-        success: true,
-        url: fileUrl,
-        fileName: req.file.originalname,
-        storedFileName: fileName,
-        mimeType: req.file.mimetype,
-        size: req.file.size,
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
+  handleImageUploadRequest
 );
 
 // Import preview endpoint (for Excel, CSV, PDF, Image)

@@ -65,6 +65,15 @@ const config = {
     'https://exam-management-frontend-psi.vercel.app',
   assetBaseUrl: process.env.ASSET_BASE_URL || '',
   nodeEnv: process.env.NODE_ENV || 'development',
+  judge0BaseUrl: process.env.JUDGE0_BASE_URL || 'https://ce.judge0.com',
+  judge0ApiKey: process.env.JUDGE0_API_KEY || '',
+  judge0ApiUser: process.env.JUDGE0_API_USER || '',
+  judge0CpuTimeLimit: Number(process.env.JUDGE0_CPU_TIME_LIMIT || 2),
+  judge0WallTimeLimit: Number(process.env.JUDGE0_WALL_TIME_LIMIT || 5),
+  judge0MemoryLimitKb: Number(process.env.JUDGE0_MEMORY_LIMIT_KB || 131072),
+  judge0EnableNetwork: String(process.env.JUDGE0_ENABLE_NETWORK || 'false').toLowerCase() === 'true',
+  judge0PollingIntervalMs: Number(process.env.JUDGE0_POLLING_INTERVAL_MS || 1000),
+  judge0MaxPolls: Number(process.env.JUDGE0_MAX_POLLS || 20),
 };
 
 export default config;

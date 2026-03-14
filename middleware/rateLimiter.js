@@ -4,6 +4,9 @@
  */
 
 import rateLimit from 'express-rate-limit';
+import config from '../config/env.js';
+
+const isDevelopmentMode = () => config.nodeEnv === 'development';
 
 /**
  * Rate limiter for authentication endpoints
@@ -32,9 +35,7 @@ export const authRateLimiter = rateLimit({
     return req.ip || req.connection?.remoteAddress || 'unknown';
   },
   // Skip rate limiting in development mode
-  skip: (req) => {
-    return process.env.NODE_ENV === 'development';
-  },
+  skip: () => isDevelopmentMode(),
 });
 
 /**
@@ -84,6 +85,8 @@ export const aiRateLimiter = rateLimit({
   keyGenerator: (req) => {
     return req.ip || req.connection?.remoteAddress || 'unknown';
   },
+  // Skip AI throttling during local development so exam creation work is not blocked.
+  skip: () => isDevelopmentMode(),
 });
 
 /**

@@ -15,10 +15,22 @@ export const requestTimeout = (timeoutMs = 30000) => {
       '/api/exams/generate-questions': 300000, // 5 minutes for AI question generation
       '/api/exams/import-questions': 300000,    // 5 minutes for AI question extraction from files
     };
+    const extendedTimeoutPatterns = [
+      {
+        pattern: /^\/api\/exam-attempts\/[a-fA-F0-9]{24}\/submit$/,
+        timeout: 120000, // 2 minutes for exam submission payload persistence
+      },
+      {
+        pattern: /^\/api\/exams\/submit$/,
+        timeout: 120000, // 2 minutes for unified exam submit endpoint
+      },
+    ];
 
     // Check if this route needs an extended timeout
     const routePath = req.path;
-    const extendedTimeout = extendedTimeoutRoutes[routePath];
+    const extendedTimeout =
+      extendedTimeoutRoutes[routePath] ||
+      extendedTimeoutPatterns.find((entry) => entry.pattern.test(routePath))?.timeout;
     const actualTimeout = extendedTimeout || timeoutMs;
 
     // Set timeout

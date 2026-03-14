@@ -1,5 +1,11 @@
 import OpenAI from 'openai';
 import config from '../config/env.js';
+import { createGeneratedQuestionImage } from './questionImportImageService.js';
+import {
+  normalizeQuestionCorrectAnswer,
+  sanitizeQuestionOptions,
+} from '../utils/questionOptionSanitizer.js';
+import { extractCodingFields, getSupportedCodingLanguages } from '../utils/codingQuestions.js';
 
 const client = config.openaiApiKey
   ? new OpenAI({ apiKey: config.openaiApiKey })
@@ -12,7 +18,22 @@ const VALID_QUESTION_TYPES = [
   'SHORT_ANSWER',
   'PARAGRAPH',
   'NUMBER',
+  'CODING',
 ];
+
+const IMAGE_BASED_GENERATION_MODES = new Set(['percentage', 'per_count']);
+const VALID_IMAGE_QUESTION_TYPES = ['diagram', 'graph', 'chart', 'object_identification'];
+const DEFAULT_IMAGE_QUESTION_TYPES = ['diagram'];
+const MAX_PARALLEL_IMAGE_VARIANTS = 2;
+const DEFAULT_IMAGE_QUESTIONS_PER_IMAGE = 1;
+const DEFAULT_PARAGRAPH_QUESTIONS_PER_PARAGRAPH = 1;
+const DEFAULT_CODING_LANGUAGES = ['python', 'javascript'];
+const DEFAULT_CODING_STARTER_CODE = {
+  python: 'def solve():\n    pass\n',
+  java: 'public class Main {\n    public static void main(String[] args) {\n        \n    }\n}\n',
+  cpp: '#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n    return 0;\n}\n',
+  javascript: 'function solve(input) {\n  return input;\n}\n',
+};
 
 const sanitizeString = (value) => {
   if (value === undefined || value === null) return '';
@@ -51,16 +72,48 @@ const normalizeQuestionObject = (question, index = 0) => {
     return null;
   }
 
-  const questionText = sanitizeString(question.questionText || question.question || question.text);
+  const rawType = sanitizeString(
+    question.questionType || question.type || question.question_type
+  ).toUpperCase();
+  const resolvedType = rawType === 'IMAGE_BASED' ? 'MULTIPLE_CHOICE' : rawType;
+  const questionType = VALID_QUESTION_TYPES.includes(resolvedType) ? resolvedType : 'SHORT_ANSWER';
+  const questionText = sanitizeString(
+    question.questionText || question.title || question.question || question.text
+  );
   if (!questionText) {
     return null;
   }
 
-  const rawType = sanitizeString(question.questionType || question.type || question.question_type).toUpperCase();
-  const questionType = VALID_QUESTION_TYPES.includes(rawType) ? rawType : 'SHORT_ANSWER';
+  const points = Number.isFinite(Number(question.points)) ? Number(question.points) : 1;
+
+  if (questionType === 'CODING') {
+    const codingFields = extractCodingFields(question);
+    return {
+      questionText,
+      title: questionText,
+      description: sanitizeString(
+        question.description || question.problemStatement || question.prompt || question.details
+      ),
+      difficulty: sanitizeString(question.difficulty || 'medium') || 'medium',
+      category: sanitizeString(question.category || codingFields.category),
+      questionType,
+      points,
+      order: Number.isFinite(Number(question.order)) ? Number(question.order) : index,
+      languages: codingFields.languages.length ? codingFields.languages : [...DEFAULT_CODING_LANGUAGES],
+      starterCode: {
+        ...DEFAULT_CODING_STARTER_CODE,
+        ...codingFields.starterCode,
+      },
+      testCases: codingFields.testCases,
+      timeLimit: codingFields.timeLimit,
+      passage: '',
+      paragraphGroupId: '',
+      imageUrl: '',
+    };
+  }
 
   let options = Array.isArray(question.options)
-    ? question.options.map((opt) => sanitizeString(opt)).filter(Boolean)
+    ? sanitizeQuestionOptions(question.options)
     : undefined;
 
   if (['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE'].includes(questionType)) {
@@ -77,28 +130,18 @@ const normalizeQuestionObject = (question, index = 0) => {
 
   let correctAnswer;
   if (questionType === 'MULTIPLE_OPTIONS') {
-    const answers = parseMultiAnswer(question.correctAnswer || question.answers || question.correctAnswers);
-    correctAnswer = answers.filter((ans) => !options || options.includes(ans));
-  } else if (questionType === 'TRUE_FALSE') {
-    const val = sanitizeString(question.correctAnswer || question.answer || question.correct_option);
-    correctAnswer = val.toLowerCase().startsWith('t') ? 'True' : val.toLowerCase().startsWith('f') ? 'False' : 'True';
-  } else if (questionType === 'NUMBER') {
-    correctAnswer = sanitizeString(question.correctAnswer || question.answer || question.correct_option);
-  } else if (questionType === 'MULTIPLE_CHOICE') {
-    const val = sanitizeString(question.correctAnswer || question.answer || question.correct_option);
-    if (options && options.includes(val)) {
-      correctAnswer = val;
-    } else if (val.length === 1) {
-      const idx = val.toUpperCase().charCodeAt(0) - 'A'.charCodeAt(0);
-      correctAnswer = options && options[idx] ? options[idx] : options ? options[0] : '';
-    } else {
-      correctAnswer = options ? options[0] : val;
-    }
+    correctAnswer = normalizeQuestionCorrectAnswer({
+      questionType,
+      correctAnswer: question.correctAnswer || question.answers || question.correctAnswers,
+      options,
+    });
   } else {
-    correctAnswer = sanitizeString(question.correctAnswer || question.answer || '');
+    correctAnswer = normalizeQuestionCorrectAnswer({
+      questionType,
+      correctAnswer: question.correctAnswer || question.answer || question.correct_option || '',
+      options,
+    });
   }
-
-  const points = Number.isFinite(Number(question.points)) ? Number(question.points) : 1;
 
   const passage = sanitizeString(
     question.passage ||
@@ -109,6 +152,9 @@ const normalizeQuestionObject = (question, index = 0) => {
       question.reading ||
       ''
   );
+  const paragraphGroupId = sanitizeString(
+    question.paragraphGroupId || question.paragraph_group_id || question.scenarioGroupId || ''
+  );
 
   return {
     questionText,
@@ -118,12 +164,164 @@ const normalizeQuestionObject = (question, index = 0) => {
     points,
     order: Number.isFinite(Number(question.order)) ? Number(question.order) : index,
     passage,
+    paragraphGroupId,
+    imageUrl: sanitizeString(
+      question.imageUrl || question.image_path || question.imagePath || question.diagram || question.figure || ''
+    ),
+    sourceRowIndex: Number.isInteger(question.sourceRowIndex)
+      ? question.sourceRowIndex
+      : Number.isInteger(question._sourceRowIndex)
+        ? question._sourceRowIndex
+        : undefined,
   };
 };
 
 const parseCount = (value, fallback = 0) => {
   const parsed = Number.parseInt(value, 10);
   return Number.isFinite(parsed) ? parsed : fallback;
+};
+
+const clampNumber = (value, min, max) => Math.min(Math.max(value, min), max);
+
+const chunkArray = (values = [], size = 1) => {
+  const safeSize = Math.max(1, Number.isFinite(Number(size)) ? Number(size) : 1);
+  const chunks = [];
+  for (let index = 0; index < values.length; index += safeSize) {
+    chunks.push(values.slice(index, index + safeSize));
+  }
+  return chunks;
+};
+
+const normalizeImageQuestionTypes = (value) => {
+  const requestedTypes = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/[,;|\n]/)
+      : [];
+
+  const normalized = requestedTypes
+    .map((item) => sanitizeString(item).toLowerCase())
+    .filter((item, index, items) => VALID_IMAGE_QUESTION_TYPES.includes(item) && items.indexOf(item) === index);
+
+  return normalized.length ? normalized : [...DEFAULT_IMAGE_QUESTION_TYPES];
+};
+
+const normalizeQuestionsPerParagraph = (value, fallback = DEFAULT_PARAGRAPH_QUESTIONS_PER_PARAGRAPH, max = 50) =>
+  clampNumber(parseCount(value, fallback), 1, Math.max(1, max));
+
+const createParagraphGroupId = (groupIndex = 0) =>
+  `paragraph-${Date.now().toString(36)}-${groupIndex + 1}-${Math.random().toString(36).slice(2, 8)}`;
+
+const normalizeImageQuestionConfig = ({
+  enableImageQuestions,
+  imageQuestionCount,
+  imageQuestionRatio,
+  imageQuestionPerCount,
+  imageQuestionsPerImage,
+  imageQuestionMode,
+  imageQuestionTypes,
+  count,
+}) => {
+  const totalQuestions = Math.max(1, parseCount(count, 5));
+  const requestedCount = clampNumber(parseCount(imageQuestionCount, 0), 0, totalQuestions);
+  const normalizedMode = IMAGE_BASED_GENERATION_MODES.has(sanitizeString(imageQuestionMode))
+    ? sanitizeString(imageQuestionMode)
+    : 'percentage';
+  const ratioPercent = clampNumber(Number.parseFloat(imageQuestionRatio) || 0, 0, 100);
+  const perCount = clampNumber(parseCount(imageQuestionPerCount, 5), 1, totalQuestions);
+  const questionsPerImage = clampNumber(
+    parseCount(imageQuestionsPerImage, DEFAULT_IMAGE_QUESTIONS_PER_IMAGE),
+    1,
+    totalQuestions
+  );
+  const enabled = enableImageQuestions === true || requestedCount > 0;
+
+  let resolvedCount = requestedCount;
+  if (!resolvedCount && enabled) {
+    if (normalizedMode === 'per_count') {
+      resolvedCount = Math.floor(totalQuestions / Math.max(perCount, 1));
+    } else {
+      resolvedCount = Math.round((totalQuestions * ratioPercent) / 100);
+    }
+  }
+
+  resolvedCount = clampNumber(resolvedCount, 0, totalQuestions);
+
+  return {
+    enabled: enabled && resolvedCount > 0,
+    count: resolvedCount,
+    mode: normalizedMode,
+    ratioPercent,
+    perCount,
+    questionsPerImage,
+    imageTypes: normalizeImageQuestionTypes(imageQuestionTypes),
+  };
+};
+
+const normalizeRequestedQuestionTypes = (questionTypes) =>
+  (Array.isArray(questionTypes) ? questionTypes : [])
+    .map((type) => sanitizeString(type).toUpperCase())
+    .map((type) => (type === 'IMAGE_BASED' ? 'MULTIPLE_CHOICE' : type))
+    .filter((type, index, items) => VALID_QUESTION_TYPES.includes(type) && items.indexOf(type) === index);
+
+const normalizeScenarioQuestionTypes = (questionTypes) => {
+  const normalized = normalizeRequestedQuestionTypes(questionTypes);
+  return normalized.length ? normalized : ['PARAGRAPH'];
+};
+
+const shuffleArray = (values = []) => {
+  const items = [...values];
+  for (let i = items.length - 1; i > 0; i -= 1) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [items[i], items[j]] = [items[j], items[i]];
+  }
+  return items;
+};
+
+const pickRandomIndexes = (total, count) =>
+  shuffleArray(Array.from({ length: Math.max(0, total) }, (_, index) => index))
+    .slice(0, Math.max(0, count))
+    .sort((left, right) => left - right);
+
+const pickRandomImageType = (imageTypes = []) => {
+  const safeTypes = normalizeImageQuestionTypes(imageTypes);
+  return safeTypes[Math.floor(Math.random() * safeTypes.length)] || 'diagram';
+};
+
+const buildFallbackImagePrompt = ({ topic, questionText, imageType }) => {
+  const safeTopic = sanitizeString(topic) || 'the topic';
+  const safeQuestionText = sanitizeString(questionText) || `an assessment question about ${safeTopic}`;
+
+  if (imageType === 'graph') {
+    return `Create a clean educational graph that supports this exam question about ${safeTopic}: ${safeQuestionText}`;
+  }
+  if (imageType === 'chart') {
+    return `Create a clean educational chart that supports this exam question about ${safeTopic}: ${safeQuestionText}`;
+  }
+  if (imageType === 'object_identification') {
+    return `Create a clear, realistic educational object image for identification that supports this exam question about ${safeTopic}: ${safeQuestionText}`;
+  }
+  return `Create a clean educational diagram that supports this exam question about ${safeTopic}: ${safeQuestionText}`;
+};
+
+const buildSharedFallbackImagePrompt = ({ topic, questions, imageType }) => {
+  const safeTopic = sanitizeString(topic) || 'the topic';
+  const safeQuestions = (Array.isArray(questions) ? questions : [])
+    .map((question) => sanitizeString(question?.questionText))
+    .filter(Boolean)
+    .slice(0, 5);
+  const context = safeQuestions.join(' | ') || `related exam questions about ${safeTopic}`;
+
+  if (imageType === 'graph') {
+    return `Create one clear educational graph about ${safeTopic} that supports these related exam questions: ${context}`;
+  }
+  if (imageType === 'chart') {
+    return `Create one clear educational chart about ${safeTopic} that supports these related exam questions: ${context}`;
+  }
+  if (imageType === 'object_identification') {
+    return `Create one clear realistic educational object image about ${safeTopic} that supports these related exam questions: ${context}`;
+  }
+  return `Create one clear educational diagram about ${safeTopic} that supports these related exam questions: ${context}`;
 };
 
 const buildQuestionTypeDistribution = ({ questionTypes, questionTypeDistribution, count }) => {
@@ -270,6 +468,33 @@ const buildFallbackQuestionForType = ({ type, index, topic }) => {
     };
   }
 
+  if (safeType === 'CODING') {
+    return {
+      questionText: `Coding challenge ${index + 1}: Solve a ${sanitizeString(topic) || 'programming'} task`,
+      title: `Coding challenge ${index + 1}`,
+      description: `Write a program related to ${sanitizeString(topic) || 'the topic'} and print the expected output.`,
+      difficulty: 'medium',
+      category: 'General Programming',
+      questionType: safeType,
+      options: undefined,
+      correctAnswer: '',
+      points: 1,
+      order: index + 1,
+      languages: [...DEFAULT_CODING_LANGUAGES],
+      starterCode: { ...DEFAULT_CODING_STARTER_CODE },
+      testCases: [
+        {
+          input: 'sample input',
+          expectedOutput: 'sample output',
+          hidden: false,
+          isSample: true,
+        },
+      ],
+      timeLimit: 2,
+      passage: '',
+    };
+  }
+
   return {
     questionText: baseQuestionText,
     questionType: safeType,
@@ -291,6 +516,15 @@ const normalizeToRequestedType = ({ question, type, index, topic }) => {
 
   const questionText = sanitizeString(normalized.questionText) || fallback.questionText;
   const points = Number.isFinite(Number(normalized.points)) ? Number(normalized.points) : 1;
+  const paragraphGroupId = sanitizeString(
+    normalized.paragraphGroupId || source?.paragraphGroupId || source?.paragraph_group_id || ''
+  );
+  const scenarioPassage = sanitizeString(normalized.passage || source?.passage || source?.context || '');
+  const attachScenarioContext = (questionData, fallbackPassage = '') => ({
+    ...questionData,
+    passage: scenarioPassage || fallbackPassage || '',
+    ...(paragraphGroupId ? { paragraphGroupId } : {}),
+  });
 
   if (type === 'MULTIPLE_CHOICE') {
     const options = Array.isArray(normalized.options) && normalized.options.length
@@ -298,7 +532,7 @@ const normalizeToRequestedType = ({ question, type, index, topic }) => {
       : ['Option A', 'Option B', 'Option C', 'Option D'];
     const answer = sanitizeString(normalized.correctAnswer);
     const correctAnswer = options.includes(answer) ? answer : options[0];
-    return {
+    return attachScenarioContext({
       questionText,
       questionType: type,
       options,
@@ -306,7 +540,7 @@ const normalizeToRequestedType = ({ question, type, index, topic }) => {
       points,
       order: index + 1,
       passage: '',
-    };
+    });
   }
 
   if (type === 'MULTIPLE_OPTIONS') {
@@ -314,7 +548,7 @@ const normalizeToRequestedType = ({ question, type, index, topic }) => {
       ? normalized.options
       : ['Option A', 'Option B', 'Option C', 'Option D'];
     const answers = parseMultiAnswer(normalized.correctAnswer).filter((ans) => options.includes(ans));
-    return {
+    return attachScenarioContext({
       questionText,
       questionType: type,
       options,
@@ -322,12 +556,12 @@ const normalizeToRequestedType = ({ question, type, index, topic }) => {
       points,
       order: index + 1,
       passage: '',
-    };
+    });
   }
 
   if (type === 'TRUE_FALSE') {
     const answer = sanitizeString(normalized.correctAnswer).toLowerCase();
-    return {
+    return attachScenarioContext({
       questionText,
       questionType: type,
       options: ['True', 'False'],
@@ -335,12 +569,12 @@ const normalizeToRequestedType = ({ question, type, index, topic }) => {
       points,
       order: index + 1,
       passage: '',
-    };
+    });
   }
 
   if (type === 'NUMBER') {
     const answer = sanitizeString(normalized.correctAnswer);
-    return {
+    return attachScenarioContext({
       questionText,
       questionType: type,
       options: undefined,
@@ -348,13 +582,13 @@ const normalizeToRequestedType = ({ question, type, index, topic }) => {
       points,
       order: index + 1,
       passage: '',
-    };
+    });
   }
 
   if (type === 'PARAGRAPH') {
     const answer = sanitizeString(normalized.correctAnswer) || 'Refer to passage';
     const passage = sanitizeString(normalized.passage) || fallback.passage;
-    return {
+    return attachScenarioContext({
       questionText,
       questionType: type,
       options: undefined,
@@ -362,10 +596,36 @@ const normalizeToRequestedType = ({ question, type, index, topic }) => {
       points,
       order: index + 1,
       passage,
+    }, passage);
+  }
+
+  if (type === 'CODING') {
+    const fallbackCoding = buildFallbackQuestionForType({ type, index, topic });
+    const codingFields = extractCodingFields(normalized);
+    return {
+      questionText,
+      title: sanitizeString(normalized.title) || questionText,
+      description: sanitizeString(normalized.description) || fallbackCoding.description,
+      difficulty: sanitizeString(normalized.difficulty) || 'medium',
+      category: sanitizeString(normalized.category || fallbackCoding.category),
+      questionType: type,
+      questionFormat: 'CODING',
+      options: undefined,
+      correctAnswer: '',
+      points,
+      order: index + 1,
+      languages: codingFields.languages.length ? codingFields.languages : fallbackCoding.languages,
+      starterCode: {
+        ...fallbackCoding.starterCode,
+        ...codingFields.starterCode,
+      },
+      testCases: codingFields.testCases.length ? codingFields.testCases : fallbackCoding.testCases,
+      timeLimit: codingFields.timeLimit || fallbackCoding.timeLimit,
+      passage: '',
     };
   }
 
-  return {
+  return attachScenarioContext({
     questionText,
     questionType: 'SHORT_ANSWER',
     options: undefined,
@@ -373,7 +633,7 @@ const normalizeToRequestedType = ({ question, type, index, topic }) => {
     points,
     order: index + 1,
     passage: '',
-  };
+  });
 };
 
 const enforceQuestionDistribution = ({ questions, typeDistribution, count, topic }) => {
@@ -450,6 +710,315 @@ const enforceQuestionDistribution = ({ questions, typeDistribution, count, topic
     .map((question, index) => ({ ...question, order: index + 1 }));
 };
 
+const buildFallbackParagraphScenarioGroups = ({
+  questions,
+  groupIndexes,
+  topic,
+  scenarioQuestionTypes,
+}) => {
+  const safeQuestions = Array.isArray(questions) ? questions : [];
+  const safeGroupIndexes = Array.isArray(groupIndexes) ? groupIndexes : [];
+  const safeTopic = sanitizeString(topic) || 'the topic';
+  const safeScenarioQuestionTypes = normalizeScenarioQuestionTypes(scenarioQuestionTypes);
+  let scenarioQuestionCursor = 0;
+
+  return safeGroupIndexes.map((indexes, groupIndex) => {
+    const groupId = createParagraphGroupId(groupIndex);
+    const baseQuestions = (Array.isArray(indexes) ? indexes : []).map((questionIndex) => {
+      const targetType = safeScenarioQuestionTypes[scenarioQuestionCursor % safeScenarioQuestionTypes.length];
+      scenarioQuestionCursor += 1;
+
+      return normalizeToRequestedType({
+        question: safeQuestions[questionIndex],
+        type: targetType,
+        index: questionIndex,
+        topic: safeTopic,
+      });
+    });
+    const focusPoints = baseQuestions
+      .map((question) => sanitizeString(question?.questionText).replace(/[?!.]+$/g, ''))
+      .filter(Boolean)
+      .slice(0, 3);
+    const scenarioSummary = focusPoints.length
+      ? `It focuses on ${focusPoints.join('; ')}.`
+      : `It presents a realistic case study related to ${safeTopic}.`;
+    const passage = `Scenario ${groupIndex + 1}: Consider the following case study about ${safeTopic}. ${scenarioSummary} Use this scenario to answer the related questions.`;
+
+    return {
+      groupId,
+      passage,
+      questions: baseQuestions.map((question, localIndex) => ({
+        ...question,
+        questionText:
+          sanitizeString(question?.questionText) ||
+          `Based on the scenario, answer question ${localIndex + 1} about ${safeTopic}.`,
+        correctAnswer:
+          question?.questionType === 'MULTIPLE_OPTIONS'
+            ? (() => {
+                const answers = parseMultiAnswer(question?.correctAnswer);
+                if (answers.length) return answers;
+                const fallbackOption = Array.isArray(question?.options) && question.options.length
+                  ? question.options[0]
+                  : 'Option A';
+                return [fallbackOption];
+              })()
+            : sanitizeString(question?.correctAnswer) ||
+              `Reference response for Scenario ${groupIndex + 1}, Question ${localIndex + 1}.`,
+        passage,
+        paragraphGroupId: groupId,
+      })),
+    };
+  });
+};
+
+const applyParagraphScenarioGroups = ({ questions, groupIndexes, groups, topic }) => {
+  const safeQuestions = Array.isArray(questions) ? [...questions] : [];
+  const safeGroupIndexes = Array.isArray(groupIndexes) ? groupIndexes : [];
+  const safeGroups = Array.isArray(groups) ? groups : [];
+
+  safeGroupIndexes.forEach((indexes, groupIndex) => {
+    const group = safeGroups[groupIndex];
+    if (!group || !Array.isArray(group.questions)) return;
+
+    indexes.forEach((questionIndex, localIndex) => {
+      const targetType = sanitizeString(
+        group.questions?.[localIndex]?.questionType || safeQuestions[questionIndex]?.questionType || 'PARAGRAPH'
+      ).toUpperCase();
+      const normalizedTargetType = VALID_QUESTION_TYPES.includes(targetType) ? targetType : 'PARAGRAPH';
+
+      const normalizedQuestion = normalizeToRequestedType({
+        question: {
+          ...(safeQuestions[questionIndex] || {}),
+          ...(group.questions[localIndex] || {}),
+          questionType: normalizedTargetType,
+          passage: sanitizeString(group?.passage || group.questions?.[localIndex]?.passage),
+          paragraphGroupId: sanitizeString(group?.groupId || group.questions?.[localIndex]?.paragraphGroupId),
+        },
+        type: normalizedTargetType,
+        index: questionIndex,
+        topic,
+      });
+
+      safeQuestions[questionIndex] = {
+        ...(safeQuestions[questionIndex] || {}),
+        ...normalizedQuestion,
+        passage: sanitizeString(group?.passage || normalizedQuestion?.passage),
+        paragraphGroupId: sanitizeString(
+          group?.groupId || normalizedQuestion?.paragraphGroupId || group.questions?.[localIndex]?.paragraphGroupId
+        ),
+        order: questionIndex + 1,
+      };
+    });
+  });
+
+  return safeQuestions.map((question, index) => ({ ...question, order: index + 1 }));
+};
+
+const enhanceParagraphScenarioQuestions = async ({
+  questions,
+  questionsPerParagraph = DEFAULT_PARAGRAPH_QUESTIONS_PER_PARAGRAPH,
+  scenarioQuestionTypes = ['PARAGRAPH'],
+  topic,
+  difficulty,
+  uploadedContent,
+  examTitle,
+  examDescription,
+  existingQuestions = [],
+}) => {
+  const safeQuestions = Array.isArray(questions) ? [...questions] : [];
+  const paragraphIndexes = safeQuestions.reduce((indexes, question, index) => {
+    if (sanitizeString(question?.questionType).toUpperCase() === 'PARAGRAPH') {
+      indexes.push(index);
+    }
+    return indexes;
+  }, []);
+
+  if (!paragraphIndexes.length) {
+    return safeQuestions.map((question, index) => ({ ...question, order: index + 1 }));
+  }
+
+  const normalizedQuestionsPerParagraph = normalizeQuestionsPerParagraph(
+    questionsPerParagraph,
+    DEFAULT_PARAGRAPH_QUESTIONS_PER_PARAGRAPH,
+    paragraphIndexes.length
+  );
+  const normalizedScenarioQuestionTypes = normalizeScenarioQuestionTypes(scenarioQuestionTypes);
+  const groupIndexes = chunkArray(paragraphIndexes, normalizedQuestionsPerParagraph);
+  const fallbackGroups = buildFallbackParagraphScenarioGroups({
+    questions: safeQuestions,
+    groupIndexes,
+    topic,
+    scenarioQuestionTypes: normalizedScenarioQuestionTypes,
+  });
+
+  if (!client) {
+    return applyParagraphScenarioGroups({
+      questions: safeQuestions,
+      groupIndexes,
+      groups: fallbackGroups,
+      topic,
+    });
+  }
+
+  const groupBlueprint = groupIndexes.map((indexes, groupIndex) => ({
+    groupNumber: groupIndex + 1,
+    questionCount: indexes.length,
+    baseQuestions: fallbackGroups[groupIndex].questions.map((question) => ({
+      targetQuestionType: sanitizeString(question?.questionType).toUpperCase() || 'PARAGRAPH',
+      questionText: question.questionText,
+      referenceAnswer:
+        sanitizeString(question?.questionType).toUpperCase() === 'MULTIPLE_OPTIONS'
+          ? parseMultiAnswer(question.correctAnswer)
+          : question.correctAnswer,
+      points: question.points || 1,
+    })),
+  }));
+  const uploadedExcerpt = sanitizeString(uploadedContent).slice(0, 1500);
+  const existingQuestionsText = Array.isArray(existingQuestions) && existingQuestions.length > 0
+    ? existingQuestions
+      .slice(0, 40)
+      .map((question, index) => `${index + 1}. ${sanitizeString(question).slice(0, 220)}`)
+      .filter(Boolean)
+      .join('\n')
+    : '';
+
+  try {
+    const completion = await client.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        {
+          role: 'system',
+          content: `You create shared scenario-based exam question groups.
+
+Return JSON with:
+- groups: an array of exactly ${groupBlueprint.length} scenario groups in the SAME ORDER as the input groups
+
+Each group must include:
+- passage: one shared scenario/case-study paragraph
+- questions: an array of exactly the required number of question objects for that group
+
+Each question object must include:
+- questionType
+- questionText
+- options
+- correctAnswer
+- points
+
+Rules:
+- All questions inside a group must depend only on that group's shared passage
+- Each questionType must EXACTLY match the requested targetQuestionType for that slot
+- Group question counts must match the requested counts exactly
+- Keep the questions aligned with the base question intents and requested difficulty
+- For MULTIPLE_CHOICE, provide 4 plausible options and make correctAnswer match one option exactly
+- For MULTIPLE_OPTIONS, provide 4 plausible options and return correctAnswer as an array of exact option strings
+- For TRUE_FALSE, use options ["True", "False"] and set correctAnswer to exactly one of those values
+- For SHORT_ANSWER, PARAGRAPH, and NUMBER, do not add unnecessary options
+- For NUMBER, correctAnswer must be the numeric answer as a string
+- Make the passage analytical, educational, and rich enough to support every question in the group
+- Avoid duplicate or near-duplicate questions
+- Do not include markdown, commentary, or extra fields`,
+        },
+        {
+          role: 'user',
+          content: `Create shared-scenario question groups.
+
+Topic: ${sanitizeString(topic)}
+Difficulty: ${sanitizeString(difficulty)}
+${sanitizeString(examTitle) ? `Exam title: ${sanitizeString(examTitle)}` : ''}
+${sanitizeString(examDescription) ? `Exam description: ${sanitizeString(examDescription).slice(0, 500)}` : ''}
+${uploadedExcerpt ? `Relevant source content:\n${uploadedExcerpt}` : ''}
+${existingQuestionsText ? `Avoid duplicating these existing questions:\n${existingQuestionsText}` : ''}
+Scenario question types to use: ${normalizedScenarioQuestionTypes.join(', ')}
+
+Required scenario groups:
+${JSON.stringify(groupBlueprint)}`,
+        },
+      ],
+      temperature: 0.7,
+      response_format: { type: 'json_object' },
+    });
+
+    const responseContent = completion?.choices?.[0]?.message?.content || '{}';
+    let parsedResponse;
+    try {
+      parsedResponse = JSON.parse(responseContent);
+    } catch {
+      const jsonMatch = responseContent.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
+      parsedResponse = jsonMatch ? JSON.parse(jsonMatch[1]) : {};
+    }
+
+    const parsedGroups = Array.isArray(parsedResponse?.groups)
+      ? parsedResponse.groups
+      : Array.isArray(parsedResponse?.scenarios)
+        ? parsedResponse.scenarios
+        : [];
+
+    const normalizedGroups = fallbackGroups.map((fallbackGroup, groupIndex) => {
+      const parsedGroup = parsedGroups[groupIndex] && typeof parsedGroups[groupIndex] === 'object'
+        ? parsedGroups[groupIndex]
+        : {};
+      const sharedPassage =
+        sanitizeString(parsedGroup?.passage || parsedGroup?.paragraph || parsedGroup?.scenario) ||
+        fallbackGroup.passage;
+      const parsedQuestions = Array.isArray(parsedGroup?.questions) ? parsedGroup.questions : [];
+
+      return {
+        groupId: fallbackGroup.groupId,
+        passage: sharedPassage,
+        questions: fallbackGroup.questions.map((fallbackQuestion, localIndex) => {
+          const questionIndex = groupIndexes[groupIndex]?.[localIndex] ?? localIndex;
+          const targetType = sanitizeString(fallbackQuestion?.questionType).toUpperCase() || 'PARAGRAPH';
+          const parsedQuestion = parsedQuestions[localIndex] && typeof parsedQuestions[localIndex] === 'object'
+            ? parsedQuestions[localIndex]
+            : {};
+
+          return {
+            ...normalizeToRequestedType({
+              question: {
+                ...fallbackQuestion,
+                ...parsedQuestion,
+                questionType: targetType,
+                options: Array.isArray(parsedQuestion?.options)
+                  ? parsedQuestion.options
+                  : fallbackQuestion.options,
+                correctAnswer:
+                  parsedQuestion?.correctAnswer !== undefined
+                    ? parsedQuestion.correctAnswer
+                    : fallbackQuestion.correctAnswer,
+                passage: sharedPassage,
+                paragraphGroupId: fallbackGroup.groupId,
+                points: Number.isFinite(Number(parsedQuestion?.points))
+                  ? Number(parsedQuestion.points)
+                  : fallbackQuestion.points,
+              },
+              type: targetType,
+              index: questionIndex,
+              topic,
+            }),
+            passage: sharedPassage,
+            paragraphGroupId: fallbackGroup.groupId,
+          };
+        }),
+      };
+    });
+
+    return applyParagraphScenarioGroups({
+      questions: safeQuestions,
+      groupIndexes,
+      groups: normalizedGroups,
+      topic,
+    });
+  } catch (error) {
+    console.warn('Falling back to local paragraph scenario grouping:', error?.message || error);
+    return applyParagraphScenarioGroups({
+      questions: safeQuestions,
+      groupIndexes,
+      groups: fallbackGroups,
+      topic,
+    });
+  }
+};
+
 /**
  * Generate exam questions using OpenAI
  */
@@ -460,12 +1029,21 @@ export const generateQuestions = async (params) => {
     count,
     difficulty,
     questionTypes,
+    scenarioQuestionTypes = ['PARAGRAPH'],
     questionTypeDistribution, // NEW: Array of { type, count } for specific distribution
     duration,
     uploadedContent,
     examTitle,
     examDescription,
     existingQuestions = [], // Array of existing question texts to avoid duplicates
+    enableImageQuestions = false,
+    imageQuestionCount = 0,
+    imageQuestionRatio = 0,
+    imageQuestionPerCount = 5,
+    imageQuestionsPerImage = DEFAULT_IMAGE_QUESTIONS_PER_IMAGE,
+    questionsPerParagraph = DEFAULT_PARAGRAPH_QUESTIONS_PER_PARAGRAPH,
+    imageQuestionMode = 'percentage',
+    imageQuestionTypes = [],
   } = params;
 
   // Sanitize topic
@@ -480,14 +1058,8 @@ export const generateQuestions = async (params) => {
     uploadedContent = String(uploadedContent).trim().substring(0, 50000); // 50KB limit
   }
 
-  // Validate OpenAI API key
-  if (!client) {
-    console.warn('OpenAI API key not configured, using fallback templates');
-    return generateFallbackQuestions(params);
-  }
-
   // Validate inputs
-  if (!topic || !count || !difficulty || !questionTypes) {
+  if (!topic || !count || !difficulty || !Array.isArray(questionTypes)) {
     throw new Error('Missing required parameters for question generation');
   }
 
@@ -502,6 +1074,49 @@ export const generateQuestions = async (params) => {
   if (isNaN(questionCount) || questionCount < 5 || questionCount > 50) {
     throw new Error('Question count must be between 5 and 50');
   }
+  const normalizedQuestionsPerParagraph = normalizeQuestionsPerParagraph(
+    questionsPerParagraph,
+    DEFAULT_PARAGRAPH_QUESTIONS_PER_PARAGRAPH,
+    questionCount
+  );
+
+  const imageQuestionConfig = normalizeImageQuestionConfig({
+    enableImageQuestions,
+    imageQuestionCount,
+    imageQuestionRatio,
+    imageQuestionPerCount,
+    imageQuestionsPerImage,
+    imageQuestionMode,
+    imageQuestionTypes,
+    count: questionCount,
+  });
+  const requestedQuestionTypes = normalizeRequestedQuestionTypes(questionTypes);
+  const imageOnlyGeneration = requestedQuestionTypes.length === 0 && imageQuestionConfig.enabled;
+  const effectiveImageQuestionConfig = imageOnlyGeneration
+    ? {
+        ...imageQuestionConfig,
+        enabled: true,
+        count: questionCount,
+        ratioPercent: 100,
+        perCount: 1,
+      }
+    : imageQuestionConfig;
+
+  // Validate OpenAI API key
+  if (!client) {
+    console.warn('OpenAI API key not configured, using fallback templates');
+    return generateFallbackQuestions({
+      ...params,
+      enableImageQuestions: effectiveImageQuestionConfig.enabled,
+      imageQuestionCount: effectiveImageQuestionConfig.count,
+      imageQuestionRatio: effectiveImageQuestionConfig.ratioPercent,
+      imageQuestionPerCount: effectiveImageQuestionConfig.perCount,
+      imageQuestionsPerImage: effectiveImageQuestionConfig.questionsPerImage,
+      questionsPerParagraph: normalizedQuestionsPerParagraph,
+      imageQuestionMode: effectiveImageQuestionConfig.mode,
+      imageQuestionTypes: effectiveImageQuestionConfig.imageTypes,
+    });
+  }
 
   // Validate difficulty
   const validDifficulties = ['easy', 'medium', 'hard', 'ultra_hard'];
@@ -509,23 +1124,12 @@ export const generateQuestions = async (params) => {
     throw new Error(`Difficulty must be one of: ${validDifficulties.join(', ')}`);
   }
 
-  // Validate question types array
-  if (!Array.isArray(questionTypes) || questionTypes.length === 0) {
-    throw new Error('Question types must be a non-empty array');
+  // Sanitize question types and support image-only generation by resolving
+  // to image-based MCQ when no base type is explicitly selected.
+  questionTypes = requestedQuestionTypes;
+  if (questionTypes.length === 0 && effectiveImageQuestionConfig.enabled) {
+    questionTypes = ['MULTIPLE_CHOICE'];
   }
-  
-  // Sanitize question types (ensure they're valid)
-  const validTypes = [
-    'MULTIPLE_CHOICE',
-    'MULTIPLE_OPTIONS',
-    'TRUE_FALSE',
-    'SHORT_ANSWER',
-    'PARAGRAPH',
-    'NUMBER',
-  ];
-  questionTypes = questionTypes
-    .map(type => String(type).toUpperCase())
-    .filter(type => validTypes.includes(type));
   if (questionTypes.length === 0) {
     throw new Error('At least one valid question type is required');
   }
@@ -611,8 +1215,15 @@ For each question, provide:
 - questionText: The question itself (must match the difficulty level)
 - questionType: MUST be one of ONLY these types: ${questionTypes.join(', ')}. DO NOT use any other types.
 - options: Array of options (for MULTIPLE_CHOICE, MULTIPLE_OPTIONS, TRUE_FALSE). For harder difficulties, make distractors more plausible and challenging.
-- correctAnswer: The correct answer (string)
+- correctAnswer: The correct answer (string) for non-coding questions. Use an empty string for CODING questions.
 - passage: For PARAGRAPH questions, include the supporting passage students must read. Use an empty string for other question types.
+- title: For CODING questions, provide a short problem title.
+- description: For CODING questions, provide a full problem statement.
+- category: For CODING questions, provide a short category label such as Data Structures or Algorithms.
+- languages: For CODING questions, return an array chosen from ${getSupportedCodingLanguages().join(', ')}.
+- starterCode: For CODING questions, return an object keyed by language with starter templates.
+- testCases: For CODING questions, return an array of objects with input, expectedOutput, and hidden (boolean). Include at least one visible sample with hidden=false.
+- timeLimit: For CODING questions, provide a time limit in seconds.
 - points: Points for this question (default 1)
 - order: Sequential order starting from 1
 
@@ -694,11 +1305,32 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
           .filter(Boolean);
 
         // Enforce exact requested type distribution and total count.
-        return enforceQuestionDistribution({
+        const distributedQuestions = enforceQuestionDistribution({
           questions: normalizedQuestions,
           typeDistribution,
           count: questionCount,
           topic: sanitizedTopic,
+        });
+        const paragraphEnhancedQuestions = await enhanceParagraphScenarioQuestions({
+          questions: distributedQuestions,
+          questionsPerParagraph: normalizedQuestionsPerParagraph,
+          scenarioQuestionTypes,
+          topic: sanitizedTopic,
+          difficulty,
+          uploadedContent,
+          examTitle,
+          examDescription,
+          existingQuestions,
+        });
+
+        return attachImageBasedQuestions({
+          questions: paragraphEnhancedQuestions,
+          imageConfig: effectiveImageQuestionConfig,
+          topic: sanitizedTopic,
+          difficulty,
+          uploadedContent,
+          examTitle,
+          examDescription,
         });
       } catch (error) {
         lastError = error;
@@ -719,7 +1351,18 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
     
     // All retries failed - fall back to template questions
     console.error('OpenAI API call failed after all retries:', lastError?.message || 'Unknown error');
-    return generateFallbackQuestions(params);
+    return generateFallbackQuestions({
+      ...params,
+      scenarioQuestionTypes,
+      enableImageQuestions: effectiveImageQuestionConfig.enabled,
+      imageQuestionCount: effectiveImageQuestionConfig.count,
+      imageQuestionRatio: effectiveImageQuestionConfig.ratioPercent,
+      imageQuestionPerCount: effectiveImageQuestionConfig.perCount,
+      imageQuestionsPerImage: effectiveImageQuestionConfig.questionsPerImage,
+      questionsPerParagraph: normalizedQuestionsPerParagraph,
+      imageQuestionMode: effectiveImageQuestionConfig.mode,
+      imageQuestionTypes: effectiveImageQuestionConfig.imageTypes,
+    });
   } catch (error) {
     console.error('OpenAI question generation error:', error);
     // Check if it's a network/connection error
@@ -727,7 +1370,18 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
       console.warn('Network error during AI generation, using fallback questions');
     }
     // Always return fallback questions on error
-    return generateFallbackQuestions(params);
+    return generateFallbackQuestions({
+      ...params,
+      scenarioQuestionTypes,
+      enableImageQuestions: effectiveImageQuestionConfig.enabled,
+      imageQuestionCount: effectiveImageQuestionConfig.count,
+      imageQuestionRatio: effectiveImageQuestionConfig.ratioPercent,
+      imageQuestionPerCount: effectiveImageQuestionConfig.perCount,
+      imageQuestionsPerImage: effectiveImageQuestionConfig.questionsPerImage,
+      questionsPerParagraph: normalizedQuestionsPerParagraph,
+      imageQuestionMode: effectiveImageQuestionConfig.mode,
+      imageQuestionTypes: effectiveImageQuestionConfig.imageTypes,
+    });
   }
 };
 
@@ -735,6 +1389,15 @@ export const extractQuestionsFromContent = async (params) => {
   const { content, filename = 'uploaded document', structuredRows } = params;
 
   const trimmedContent = sanitizeString(content);
+  const normalizedFromRows = Array.isArray(structuredRows)
+    ? structuredRows
+      .map((row, idx) => normalizeStructuredRow(row, idx))
+      .filter(Boolean)
+    : [];
+
+  if (normalizedFromRows.length) {
+    return normalizedFromRows;
+  }
 
   if (!trimmedContent) {
     throw new Error('No content provided to extract questions');
@@ -761,6 +1424,7 @@ Requirements:
 - For MULTIPLE_CHOICE and TRUE_FALSE, correctAnswer must be a single string that matches one of the provided options.
 - For NUMBER, correctAnswer must be the numeric solution as a string.
 - For SHORT_ANSWER or PARAGRAPH, correctAnswer should be a concise reference response (string) or empty if unknown.
+- For CODING, include title, description, category, languages, starterCode, testCases, and timeLimit. Use an empty string for correctAnswer.
 - Default points to 1 if not specified in the source.
 - Ignore instructions or metadata that are not actual questions.
 - Do not fabricate questions that are not present in the source content.`;
@@ -900,39 +1564,56 @@ Evaluate this answer and provide your assessment.`;
  */
 const collectOptionsFromRow = (row) => {
   const options = [];
+  const pushOption = (value) => {
+    const normalized = sanitizeString(value);
+    if (normalized) {
+      options.push(normalized);
+    }
+  };
   Object.entries(row || {}).forEach(([key, value]) => {
     if (value === undefined || value === null) return;
     const lower = key.toLowerCase();
     if (lower.startsWith('option') || lower.startsWith('choice')) {
-      options.push(sanitizeString(value));
+      if (Array.isArray(value)) {
+        value.forEach((item) => pushOption(item));
+      } else {
+        pushOption(value);
+      }
     } else if (['a', 'b', 'c', 'd', 'e', 'f', 'opt1', 'opt2', 'opt3', 'opt4', 'opt5', 'opt6'].includes(lower)) {
-      options.push(sanitizeString(value));
+      if (Array.isArray(value)) {
+        value.forEach((item) => pushOption(item));
+      } else {
+        pushOption(value);
+      }
     }
   });
 
   if (!options.length && row) {
     const rawOptions = row.options || row.choices;
     if (rawOptions) {
-      const text = sanitizeString(rawOptions);
-      if (text) {
-        try {
-          const parsed = JSON.parse(text);
-          if (Array.isArray(parsed)) {
-            parsed.forEach((item) => options.push(sanitizeString(item)));
+      if (Array.isArray(rawOptions)) {
+        rawOptions.forEach((item) => pushOption(item));
+      } else {
+        const text = sanitizeString(rawOptions);
+        if (text) {
+          try {
+            const parsed = JSON.parse(text);
+            if (Array.isArray(parsed)) {
+              parsed.forEach((item) => pushOption(item));
+            }
+          } catch (error) {
+            text
+              .split(/[,;|\n]/)
+              .map((item) => sanitizeString(item))
+              .filter(Boolean)
+              .forEach((item) => options.push(item));
           }
-        } catch (error) {
-          text
-            .split(/[,;|\n]/)
-            .map((item) => sanitizeString(item))
-            .filter(Boolean)
-            .forEach((item) => options.push(item));
         }
       }
     }
   }
 
-  const unique = Array.from(new Set(options.filter(Boolean)));
-  return unique;
+  return sanitizeQuestionOptions(Array.from(new Set(options.filter(Boolean))));
 };
 
 const inferQuestionType = (rawType, options, answer, questionText) => {
@@ -1013,25 +1694,17 @@ const normalizeStructuredRow = (row, index) => {
 
   let correctAnswer;
   if (questionType === 'MULTIPLE_OPTIONS') {
-    const answers = parseMultiAnswer(answer).filter((ans) =>
-      normalizedOptions ? normalizedOptions.includes(ans) : Boolean(ans)
-    );
-    correctAnswer = answers;
-  } else if (questionType === 'TRUE_FALSE') {
-    const val = sanitizeString(answer);
-    correctAnswer = val.toLowerCase().startsWith('t') ? 'True' : val.toLowerCase().startsWith('f') ? 'False' : 'True';
-  } else if (questionType === 'MULTIPLE_CHOICE') {
-    const val = sanitizeString(answer);
-    if (normalizedOptions && normalizedOptions.includes(val)) {
-      correctAnswer = val;
-    } else if (val.length === 1) {
-      const idx = val.toUpperCase().charCodeAt(0) - 'A'.charCodeAt(0);
-      correctAnswer = normalizedOptions && normalizedOptions[idx] ? normalizedOptions[idx] : normalizedOptions ? normalizedOptions[0] : '';
-    } else {
-      correctAnswer = normalizedOptions ? normalizedOptions[0] : val;
-    }
+    correctAnswer = normalizeQuestionCorrectAnswer({
+      questionType,
+      correctAnswer: answer,
+      options: normalizedOptions,
+    });
   } else {
-    correctAnswer = sanitizeString(answer);
+    correctAnswer = normalizeQuestionCorrectAnswer({
+      questionType,
+      correctAnswer: answer,
+      options: normalizedOptions,
+    });
   }
 
   const pointsRaw = get('points') || get('score') || get('marks');
@@ -1040,6 +1713,25 @@ const normalizeStructuredRow = (row, index) => {
   const rawPassage =
     get('passage') || get('context') || get('reference') || get('reading') || row?.passage;
   const passage = sanitizeString(rawPassage);
+  const paragraphGroupId = sanitizeString(
+    get('paragraphGroupId') ||
+      get('paragraph_group_id') ||
+      get('scenarioGroupId') ||
+      row?.paragraphGroupId ||
+      row?.paragraph_group_id ||
+      ''
+  );
+  const imageUrl = sanitizeString(
+    get('imageUrl') ||
+      get('image_url') ||
+      get('imagePath') ||
+      get('image_path') ||
+      get('diagram') ||
+      get('figure') ||
+      row?.imageUrl ||
+      row?.image_path ||
+      ''
+  );
 
   return {
     questionText,
@@ -1048,8 +1740,501 @@ const normalizeStructuredRow = (row, index) => {
     correctAnswer,
     points,
     order: index,
-    passage: questionType === 'PARAGRAPH' ? passage : '',
+    passage,
+    paragraphGroupId,
+    imageUrl,
+    sourceRowIndex: index,
   };
+};
+
+const buildFallbackImageBasedQuestion = ({ question, index, topic, imageType }) => {
+  const normalizedBase =
+    normalizeQuestionObject(question, index + 1) ||
+    buildFallbackQuestionForType({
+      type: sanitizeString(question?.questionType).toUpperCase() || 'MULTIPLE_CHOICE',
+      index,
+      topic,
+    });
+  const type = sanitizeString(normalizedBase.questionType).toUpperCase() || 'MULTIPLE_CHOICE';
+  const imageLabel =
+    imageType === 'graph'
+      ? 'graph'
+      : imageType === 'chart'
+        ? 'chart'
+        : imageType === 'object_identification'
+          ? 'object image'
+          : 'diagram';
+  const imageAwareQuestionText =
+    type === 'TRUE_FALSE'
+      ? `Based on the ${imageLabel}, determine whether the following statement is true or false: ${normalizedBase.questionText}`
+      : `Refer to the ${imageLabel} and answer: ${normalizedBase.questionText}`;
+
+  const normalizedVariant = normalizeToRequestedType({
+    question: {
+      ...normalizedBase,
+      questionText: imageAwareQuestionText,
+      points: normalizedBase.points,
+    },
+    type,
+    index,
+    topic,
+  });
+
+  return {
+    ...normalizedVariant,
+    imagePrompt: buildFallbackImagePrompt({
+      topic,
+      questionText: normalizedVariant.questionText,
+      imageType,
+    }),
+    diagramType: imageType,
+  };
+};
+
+const buildFallbackImageBasedQuestionGroup = ({
+  questions,
+  indexes,
+  topic,
+  imageType,
+}) => {
+  const normalizedQuestions = (Array.isArray(questions) ? questions : []).map((question, localIndex) =>
+    buildFallbackImageBasedQuestion({
+      question,
+      index: Array.isArray(indexes) && Number.isInteger(indexes[localIndex]) ? indexes[localIndex] : localIndex,
+      topic,
+      imageType,
+    })
+  );
+
+  return {
+    questions: normalizedQuestions,
+    imagePrompt: buildSharedFallbackImagePrompt({
+      topic,
+      questions: normalizedQuestions,
+      imageType,
+    }),
+    diagramType: imageType,
+  };
+};
+
+const generateImageBasedQuestionVariant = async ({
+  question,
+  index,
+  topic,
+  difficulty,
+  uploadedContent,
+  examTitle,
+  examDescription,
+  imageType,
+}) => {
+  const fallbackVariant = buildFallbackImageBasedQuestion({
+    question,
+    index,
+    topic,
+    imageType,
+  });
+
+  if (!client) {
+    return fallbackVariant;
+  }
+
+  const normalizedBase = normalizeQuestionObject(question, index + 1);
+  if (!normalizedBase) {
+    return fallbackVariant;
+  }
+
+  const safeImageType = pickRandomImageType([imageType]);
+  const baseQuestionPayload = {
+    questionText: normalizedBase.questionText,
+    questionType: normalizedBase.questionType,
+    options: Array.isArray(normalizedBase.options) ? normalizedBase.options : [],
+    correctAnswer: normalizedBase.correctAnswer,
+    passage: normalizedBase.passage || '',
+    points: normalizedBase.points || 1,
+  };
+
+  const systemPrompt = `You create image-dependent exam questions.
+
+Return JSON with:
+- questionText
+- questionType
+- options
+- correctAnswer
+- passage
+- points
+- imagePrompt
+- diagramType
+
+Rules:
+- Keep questionType EXACTLY as ${normalizedBase.questionType}
+- The question MUST require the student to inspect a ${safeImageType.replace(/_/g, ' ')}
+- Keep the question academically aligned with the topic and requested difficulty
+- For MULTIPLE_CHOICE and TRUE_FALSE, correctAnswer must be a single option string from options
+- For MULTIPLE_OPTIONS, correctAnswer must be an array of exact option strings
+- For SHORT_ANSWER, PARAGRAPH, NUMBER do not invent options
+- Preserve any provided passage/context when the base question includes one
+- imagePrompt must be a concise but specific prompt for generating the educational image
+- diagramType must be one of: ${VALID_IMAGE_QUESTION_TYPES.join(', ')}
+- Do not mention missing images, placeholders, or instructions for the test creator`;
+
+  const uploadedExcerpt = sanitizeString(uploadedContent).slice(0, 1200);
+
+  const userPrompt = `Convert this question into an image-based question.
+
+Topic: ${sanitizeString(topic)}
+Difficulty: ${sanitizeString(difficulty)}
+Requested image type: ${safeImageType}
+${sanitizeString(examTitle) ? `Exam title: ${sanitizeString(examTitle)}` : ''}
+${sanitizeString(examDescription) ? `Exam description: ${sanitizeString(examDescription).slice(0, 400)}` : ''}
+${uploadedExcerpt ? `Relevant source content:\n${uploadedExcerpt}` : ''}
+
+Base question:
+${JSON.stringify(baseQuestionPayload)}
+
+Create one improved image-based variant now.`;
+
+  try {
+    const completion = await client.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      temperature: 0.7,
+      response_format: { type: 'json_object' },
+    });
+
+    const responseContent = completion?.choices?.[0]?.message?.content || '{}';
+    let parsedResponse;
+    try {
+      parsedResponse = JSON.parse(responseContent);
+    } catch {
+      const jsonMatch = responseContent.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
+      parsedResponse = jsonMatch ? JSON.parse(jsonMatch[1]) : {};
+    }
+
+    const normalizedVariant = normalizeToRequestedType({
+      question: {
+        ...parsedResponse,
+        questionType: normalizedBase.questionType,
+        passage: sanitizeString(parsedResponse?.passage || normalizedBase.passage),
+        paragraphGroupId: sanitizeString(parsedResponse?.paragraphGroupId || normalizedBase.paragraphGroupId),
+        points: Number.isFinite(Number(parsedResponse?.points))
+          ? Number(parsedResponse.points)
+          : normalizedBase.points,
+      },
+      type: normalizedBase.questionType,
+      index,
+      topic,
+    });
+
+    return {
+      ...normalizedVariant,
+      imagePrompt:
+        sanitizeString(parsedResponse?.imagePrompt) ||
+        buildFallbackImagePrompt({
+          topic,
+          questionText: normalizedVariant.questionText,
+          imageType: safeImageType,
+        }),
+      diagramType:
+        sanitizeString(parsedResponse?.diagramType).toLowerCase() && VALID_IMAGE_QUESTION_TYPES.includes(sanitizeString(parsedResponse?.diagramType).toLowerCase())
+          ? sanitizeString(parsedResponse.diagramType).toLowerCase()
+          : safeImageType,
+    };
+  } catch (error) {
+    console.warn('Falling back to local image-based question variant:', error?.message || error);
+    return fallbackVariant;
+  }
+};
+
+const generateImageBasedQuestionGroup = async ({
+  questions,
+  indexes,
+  topic,
+  difficulty,
+  uploadedContent,
+  examTitle,
+  examDescription,
+  imageType,
+}) => {
+  const groupQuestions = Array.isArray(questions) ? questions : [];
+  const safeIndexes = Array.isArray(indexes) ? indexes : [];
+  const safeImageType = pickRandomImageType([imageType]);
+
+  if (groupQuestions.length <= 1) {
+    const variant = await generateImageBasedQuestionVariant({
+      question: groupQuestions[0],
+      index: Number.isInteger(safeIndexes[0]) ? safeIndexes[0] : 0,
+      topic,
+      difficulty,
+      uploadedContent,
+      examTitle,
+      examDescription,
+      imageType: safeImageType,
+    });
+
+    return {
+      questions: [variant],
+      imagePrompt:
+        sanitizeString(variant.imagePrompt) ||
+        buildSharedFallbackImagePrompt({
+          topic,
+          questions: [variant],
+          imageType: safeImageType,
+        }),
+      diagramType: sanitizeString(variant.diagramType).toLowerCase() || safeImageType,
+    };
+  }
+
+  const fallbackGroup = buildFallbackImageBasedQuestionGroup({
+    questions: groupQuestions,
+    indexes: safeIndexes,
+    topic,
+    imageType: safeImageType,
+  });
+
+  if (!client) {
+    return fallbackGroup;
+  }
+
+  const normalizedBases = groupQuestions
+    .map((question, localIndex) =>
+      normalizeQuestionObject(
+        question,
+        Number.isInteger(safeIndexes[localIndex]) ? safeIndexes[localIndex] + 1 : localIndex + 1
+      )
+    )
+    .filter(Boolean);
+
+  if (normalizedBases.length !== groupQuestions.length) {
+    return fallbackGroup;
+  }
+
+  const baseQuestionPayload = normalizedBases.map((question) => ({
+    questionText: question.questionText,
+    questionType: question.questionType,
+    options: Array.isArray(question.options) ? question.options : [],
+    correctAnswer: question.correctAnswer,
+    passage: question.passage || '',
+    points: question.points || 1,
+  }));
+
+  const systemPrompt = `You create sets of exam questions that all depend on one shared educational image.
+
+Return JSON with:
+- imagePrompt
+- diagramType
+- questions: array of exactly ${normalizedBases.length} question objects in the SAME ORDER as the input questions
+
+Each question object must include:
+- questionText
+- questionType
+- options
+- correctAnswer
+- passage
+- points
+
+Rules:
+- All returned questions MUST be answerable by inspecting the SAME shared ${safeImageType.replace(/_/g, ' ')}
+- Keep each questionType EXACTLY aligned to its matching input question type
+- The shared image must be rich enough to support every question in the set
+- For MULTIPLE_CHOICE and TRUE_FALSE, correctAnswer must be one option string from options
+- For MULTIPLE_OPTIONS, correctAnswer must be an array of exact option strings from options
+- For SHORT_ANSWER, PARAGRAPH, NUMBER do not invent unnecessary options
+- Preserve any provided passage/context when a base question includes one
+- diagramType must be one of: ${VALID_IMAGE_QUESTION_TYPES.join(', ')}
+- Do not mention placeholders, missing images, or test-creator instructions
+- Make each question clearly refer to the shared image`;
+
+  const uploadedExcerpt = sanitizeString(uploadedContent).slice(0, 1200);
+
+  const userPrompt = `Create ${normalizedBases.length} related image-based questions that all use one shared image.
+
+Topic: ${sanitizeString(topic)}
+Difficulty: ${sanitizeString(difficulty)}
+Requested image type: ${safeImageType}
+${sanitizeString(examTitle) ? `Exam title: ${sanitizeString(examTitle)}` : ''}
+${sanitizeString(examDescription) ? `Exam description: ${sanitizeString(examDescription).slice(0, 400)}` : ''}
+${uploadedExcerpt ? `Relevant source content:\n${uploadedExcerpt}` : ''}
+
+Base questions in required order:
+${JSON.stringify(baseQuestionPayload)}`;
+
+  try {
+    const completion = await client.chat.completions.create({
+      model: 'gpt-4o',
+      messages: [
+        { role: 'system', content: systemPrompt },
+        { role: 'user', content: userPrompt },
+      ],
+      temperature: 0.7,
+      response_format: { type: 'json_object' },
+    });
+
+    const responseContent = completion?.choices?.[0]?.message?.content || '{}';
+    let parsedResponse;
+    try {
+      parsedResponse = JSON.parse(responseContent);
+    } catch {
+      const jsonMatch = responseContent.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
+      parsedResponse = jsonMatch ? JSON.parse(jsonMatch[1]) : {};
+    }
+
+    const parsedQuestions = Array.isArray(parsedResponse?.questions) ? parsedResponse.questions : [];
+    const normalizedQuestions = normalizedBases.map((baseQuestion, localIndex) =>
+      normalizeToRequestedType({
+        question: {
+          ...baseQuestion,
+          ...(parsedQuestions[localIndex] && typeof parsedQuestions[localIndex] === 'object'
+            ? parsedQuestions[localIndex]
+            : {}),
+          questionType: baseQuestion.questionType,
+          passage: sanitizeString(parsedQuestions?.[localIndex]?.passage || baseQuestion.passage),
+          paragraphGroupId: sanitizeString(
+            parsedQuestions?.[localIndex]?.paragraphGroupId || baseQuestion.paragraphGroupId
+          ),
+          points: Number.isFinite(Number(parsedQuestions?.[localIndex]?.points))
+            ? Number(parsedQuestions[localIndex].points)
+            : baseQuestion.points,
+        },
+        type: baseQuestion.questionType,
+        index: Number.isInteger(safeIndexes[localIndex]) ? safeIndexes[localIndex] : localIndex,
+        topic,
+      })
+    );
+
+    return {
+      questions: normalizedQuestions,
+      imagePrompt:
+        sanitizeString(parsedResponse?.imagePrompt) ||
+        buildSharedFallbackImagePrompt({
+          topic,
+          questions: normalizedQuestions,
+          imageType: safeImageType,
+        }),
+      diagramType:
+        sanitizeString(parsedResponse?.diagramType).toLowerCase() &&
+        VALID_IMAGE_QUESTION_TYPES.includes(sanitizeString(parsedResponse?.diagramType).toLowerCase())
+          ? sanitizeString(parsedResponse.diagramType).toLowerCase()
+          : safeImageType,
+    };
+  } catch (error) {
+    console.warn('Falling back to local shared image-based question group:', error?.message || error);
+    return fallbackGroup;
+  }
+};
+
+const attachImageBasedQuestions = async ({
+  questions,
+  imageConfig,
+  topic,
+  difficulty,
+  uploadedContent,
+  examTitle,
+  examDescription,
+}) => {
+  const safeQuestions = Array.isArray(questions) ? [...questions] : [];
+  if (!safeQuestions.length || !imageConfig?.enabled || imageConfig.count <= 0) {
+    return safeQuestions.map((question, index) => ({ ...question, order: index + 1 }));
+  }
+
+  const candidateIndexes = shuffleArray(
+    Array.from({ length: safeQuestions.length }, (_, index) => index)
+  );
+  const desiredImageQuestionCount = Math.min(imageConfig.count, safeQuestions.length);
+  if (!candidateIndexes.length || desiredImageQuestionCount <= 0) {
+    return safeQuestions.map((question, index) => ({ ...question, order: index + 1 }));
+  }
+
+  const enhancedQuestions = [...safeQuestions];
+  let successfulImageQuestions = 0;
+  const selectedIndexes = candidateIndexes
+    .slice(0, desiredImageQuestionCount)
+    .sort((left, right) => left - right);
+  const imageQuestionGroups = chunkArray(
+    selectedIndexes,
+    Math.max(1, imageConfig.questionsPerImage || DEFAULT_IMAGE_QUESTIONS_PER_IMAGE)
+  );
+
+  for (
+    let start = 0;
+    start < imageQuestionGroups.length && successfulImageQuestions < desiredImageQuestionCount;
+    start += MAX_PARALLEL_IMAGE_VARIANTS
+  ) {
+    const batchGroups = imageQuestionGroups.slice(start, start + MAX_PARALLEL_IMAGE_VARIANTS);
+
+    const batchResults = await Promise.all(
+      batchGroups.map(async (groupIndexes) => {
+        const baseQuestions = groupIndexes.map((questionIndex) => enhancedQuestions[questionIndex]);
+        const imageType = pickRandomImageType(imageConfig.imageTypes);
+        const groupResult = await generateImageBasedQuestionGroup({
+          questions: baseQuestions,
+          indexes: groupIndexes,
+          topic,
+          difficulty,
+          uploadedContent,
+          examTitle,
+          examDescription,
+          imageType,
+        });
+        const imageFields = await createGeneratedQuestionImage({
+          questionId: `ai-question-group-${Date.now()}-${groupIndexes[0] + 1}`,
+          questionText: groupResult.questions.map((question) => sanitizeString(question.questionText)).join(' '),
+          diagramType: groupResult.diagramType || imageType,
+          imagePrompt: groupResult.imagePrompt,
+          fileStem: `ai-${groupResult.diagramType || imageType}`,
+        });
+        const hasImageAsset = Boolean(
+          sanitizeString(
+            imageFields.imageUrl ||
+            imageFields.image_path ||
+            imageFields.imageBase64 ||
+            imageFields.image_base64 ||
+            imageFields.image
+          )
+        );
+
+        return {
+          groupIndexes,
+          hasImageAsset,
+          originalQuestions: baseQuestions,
+          nextQuestions: groupIndexes.map((questionIndex, localIndex) => ({
+            ...enhancedQuestions[questionIndex],
+            ...(groupResult.questions[localIndex] || {}),
+            ...imageFields,
+            isImageBased: Boolean(
+              sanitizeString(
+                imageFields.imageUrl ||
+                imageFields.image_path ||
+                imageFields.generatedImage ||
+                imageFields.imageBase64 ||
+                imageFields.image
+              )
+            ),
+            aiImageType: groupResult.diagramType || imageType,
+          })),
+        };
+      })
+    );
+
+    batchResults.forEach(({ groupIndexes, nextQuestions, hasImageAsset, originalQuestions }) => {
+      groupIndexes.forEach((questionIndex, localIndex) => {
+        if (hasImageAsset && successfulImageQuestions < desiredImageQuestionCount) {
+          enhancedQuestions[questionIndex] = nextQuestions[localIndex];
+          successfulImageQuestions += 1;
+          return;
+        }
+
+        enhancedQuestions[questionIndex] = {
+          ...originalQuestions[localIndex],
+          isImageBased: false,
+        };
+      });
+    });
+  }
+
+  return enhancedQuestions.map((question, index) => ({ ...question, order: index + 1 }));
 };
 
 const extractQuestionsFallback = ({ content, structuredRows }) => {
@@ -1082,18 +2267,55 @@ const extractQuestionsFallback = ({ content, structuredRows }) => {
   }));
 };
 
-const generateFallbackQuestions = (params) => {
+const generateFallbackQuestions = async (params) => {
   const {
     topic,
     count,
     questionTypes = ['MULTIPLE_CHOICE'],
+    scenarioQuestionTypes = ['PARAGRAPH'],
     questionTypeDistribution,
+    difficulty,
+    uploadedContent,
+    examTitle,
+    examDescription,
+    enableImageQuestions = false,
+    imageQuestionCount = 0,
+    imageQuestionRatio = 0,
+    imageQuestionPerCount = 5,
+    imageQuestionsPerImage = DEFAULT_IMAGE_QUESTIONS_PER_IMAGE,
+    questionsPerParagraph = DEFAULT_PARAGRAPH_QUESTIONS_PER_PARAGRAPH,
+    imageQuestionMode = 'percentage',
+    imageQuestionTypes = [],
   } = params || {};
 
   const safeCount = Math.max(1, parseCount(count, 5));
-  const safeQuestionTypes = Array.isArray(questionTypes) && questionTypes.length
-    ? questionTypes
-    : ['MULTIPLE_CHOICE'];
+  const imageConfig = normalizeImageQuestionConfig({
+    enableImageQuestions,
+    imageQuestionCount,
+    imageQuestionRatio,
+    imageQuestionPerCount,
+    imageQuestionsPerImage,
+    imageQuestionMode,
+    imageQuestionTypes,
+    count: safeCount,
+  });
+  const normalizedTypes = normalizeRequestedQuestionTypes(questionTypes);
+  const effectiveImageConfig =
+    normalizedTypes.length === 0 && imageConfig.enabled
+      ? {
+          ...imageConfig,
+          enabled: true,
+          count: safeCount,
+          ratioPercent: 100,
+          perCount: 1,
+        }
+      : imageConfig;
+  const safeQuestionTypes = (() => {
+    if (normalizedTypes.length > 0) {
+      return normalizedTypes;
+    }
+    return ['MULTIPLE_CHOICE'];
+  })();
   const typeDistribution = buildQuestionTypeDistribution({
     questionTypes: safeQuestionTypes,
     questionTypeDistribution,
@@ -1113,11 +2335,35 @@ const generateFallbackQuestions = (params) => {
     }
   });
 
-  return enforceQuestionDistribution({
+  const distributedQuestions = enforceQuestionDistribution({
     questions,
     typeDistribution,
     count: safeCount,
     topic,
+  });
+  const paragraphEnhancedQuestions = await enhanceParagraphScenarioQuestions({
+    questions: distributedQuestions,
+    questionsPerParagraph: normalizeQuestionsPerParagraph(
+      questionsPerParagraph,
+      DEFAULT_PARAGRAPH_QUESTIONS_PER_PARAGRAPH,
+      safeCount
+    ),
+    scenarioQuestionTypes,
+    topic,
+    difficulty,
+    uploadedContent,
+    examTitle,
+    examDescription,
+  });
+
+  return attachImageBasedQuestions({
+    questions: paragraphEnhancedQuestions,
+    imageConfig: effectiveImageConfig,
+    topic,
+    difficulty,
+    uploadedContent,
+    examTitle,
+    examDescription,
   });
 };
 

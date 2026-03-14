@@ -1,0 +1,198 @@
+import { hasCodingConfiguration } from './codingQuestions.js';
+
+const STORAGE_QUESTION_TYPES = [
+  'MULTIPLE_CHOICE',
+  'MULTIPLE_OPTIONS',
+  'TRUE_FALSE',
+  'SHORT_ANSWER',
+  'PARAGRAPH',
+  'NUMBER',
+  'CODING',
+];
+
+const QUESTION_FORMATS = ['MCQ', 'IMAGE', 'PARAGRAPH', 'SCENARIO', 'TRUE_FALSE', 'CODING'];
+
+const SCENARIO_HINT_REGEX =
+  /\b(case study|scenario|situation|context|caselet|read the following|consider the following|based on the passage|based on the scenario)\b/i;
+
+const normalizeString = (value) => {
+  if (value === undefined || value === null) return '';
+  return String(value).trim();
+};
+
+const normalizeUpper = (value) => normalizeString(value).toUpperCase();
+const normalizeFormatAlias = (value) => {
+  const normalized = normalizeUpper(value);
+  if (normalized === 'IMAGE_BASED') return 'IMAGE';
+  return normalized;
+};
+
+const hasImagePayload = (payload = {}) =>
+  [
+    payload.imageUrl,
+    payload.image_path,
+    payload.imageBase64,
+    payload.image_base64,
+    payload.generatedImage,
+    payload.generated_image,
+    payload.image,
+  ].some((value) => normalizeString(value));
+
+const hasContextPayload = (payload = {}) =>
+  Boolean(
+    normalizeString(payload.passage) ||
+      normalizeString(payload.paragraphGroupId) ||
+      normalizeString(payload.paragraph_group_id)
+  );
+
+const inferObjectiveTypeFromOptions = (options = [], answer = '') => {
+  const safeOptions = Array.isArray(options)
+    ? options.map((option) => normalizeString(option)).filter(Boolean)
+    : [];
+  const safeAnswer = normalizeString(answer);
+
+  if (safeOptions.length >= 2) {
+    const lowerOptions = safeOptions.map((option) => option.toLowerCase());
+    const isTrueFalse =
+      safeOptions.length === 2 &&
+      lowerOptions.includes('true') &&
+      lowerOptions.includes('false');
+    if (isTrueFalse) {
+      return 'TRUE_FALSE';
+    }
+    return 'MULTIPLE_CHOICE';
+  }
+
+  if (/^(true|false|t|f)$/i.test(safeAnswer)) {
+    return 'TRUE_FALSE';
+  }
+
+  return '';
+};
+
+export const isValidStorageQuestionType = (value) =>
+  STORAGE_QUESTION_TYPES.includes(normalizeUpper(value));
+
+export const isValidQuestionFormat = (value) => {
+  const normalized = normalizeUpper(value);
+  return QUESTION_FORMATS.includes(normalized) || normalized === 'IMAGE_BASED';
+};
+
+export const normalizeQuestionFormat = (payload = {}) => {
+  const explicitFormat = normalizeFormatAlias(
+    payload.questionFormat || payload.question_type
+  );
+  const normalizedType = normalizeUpper(payload.questionType);
+
+  if (normalizedType === 'CODING') {
+    return 'CODING';
+  }
+
+  if (normalizedType === 'IMAGE_BASED') {
+    return 'IMAGE';
+  }
+
+  if (
+    QUESTION_FORMATS.includes(explicitFormat) &&
+    !(explicitFormat === 'CODING' && normalizedType && normalizedType !== 'CODING')
+  ) {
+    return explicitFormat;
+  }
+
+  if (!normalizedType && hasCodingConfiguration(payload)) {
+    return 'CODING';
+  }
+
+  if (hasContextPayload(payload) || normalizedType === 'PARAGRAPH') {
+    const scenarioHintSource = [
+      payload.questionText,
+      payload.question_text,
+      payload.passage,
+      payload.description,
+    ]
+      .map((value) => normalizeString(value))
+      .filter(Boolean)
+      .join(' ');
+
+    return SCENARIO_HINT_REGEX.test(scenarioHintSource) ? 'SCENARIO' : 'PARAGRAPH';
+  }
+
+  if (hasImagePayload(payload)) {
+    return 'IMAGE';
+  }
+
+  if (normalizedType === 'TRUE_FALSE') {
+    return 'TRUE_FALSE';
+  }
+
+  if (['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'MCQ'].includes(normalizedType)) {
+    return 'MCQ';
+  }
+
+  return '';
+};
+
+export const normalizeQuestionTypeForStorage = (payload = {}) => {
+  const normalizedType = normalizeUpper(payload.questionType);
+  const explicitFormat = normalizeFormatAlias(payload.questionFormat || payload.question_type);
+  const normalizedFormat = normalizeQuestionFormat(payload);
+  const inferredObjectiveType = inferObjectiveTypeFromOptions(payload.options, payload.correctAnswer);
+
+  if (STORAGE_QUESTION_TYPES.includes(normalizedType)) {
+    return normalizedType;
+  }
+
+  if (
+    normalizedFormat === 'CODING' ||
+    (!normalizedType && !explicitFormat && hasCodingConfiguration(payload))
+  ) {
+    return 'CODING';
+  }
+
+  if (normalizedType === 'MCQ') {
+    return 'MULTIPLE_CHOICE';
+  }
+
+  if (normalizedType === 'IMAGE' || normalizedType === 'IMAGE_BASED') {
+    return inferredObjectiveType || 'MULTIPLE_CHOICE';
+  }
+
+  if (normalizedType === 'SCENARIO') {
+    return inferredObjectiveType || 'PARAGRAPH';
+  }
+
+  if (normalizedFormat === 'TRUE_FALSE') {
+    return 'TRUE_FALSE';
+  }
+
+  if (normalizedFormat === 'IMAGE') {
+    return inferredObjectiveType || 'MULTIPLE_CHOICE';
+  }
+
+  if (normalizedFormat === 'SCENARIO') {
+    return inferredObjectiveType || 'PARAGRAPH';
+  }
+
+  if (normalizedFormat === 'PARAGRAPH' && inferredObjectiveType) {
+    return inferredObjectiveType;
+  }
+
+  if (inferredObjectiveType) {
+    return inferredObjectiveType;
+  }
+
+  if (hasContextPayload(payload)) {
+    return 'PARAGRAPH';
+  }
+
+  if (/^-?\d+(?:\.\d+)?$/.test(normalizeString(payload.correctAnswer))) {
+    return 'NUMBER';
+  }
+
+  return 'SHORT_ANSWER';
+};
+
+export const questionTypeMetadata = {
+  STORAGE_QUESTION_TYPES,
+  QUESTION_FORMATS,
+};

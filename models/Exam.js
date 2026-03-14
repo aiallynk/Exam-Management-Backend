@@ -19,6 +19,17 @@ const ExamSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+    instructions: {
+      type: String,
+      trim: true,
+      default: '',
+    },
+    examType: {
+      type: String,
+      enum: ['ONLINE', 'OMR'],
+      default: 'ONLINE',
+      index: true,
+    },
     duration: {
       type: Number,
       required: true,
@@ -119,10 +130,50 @@ const ExamSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    totalMarks: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
     candidateCount: {
       type: Number,
       default: 0,
       min: 0,
+    },
+    answerKey: {
+      type: [String],
+      default: [],
+    },
+    markingRules: {
+      totalQuestions: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      optionsPerQuestion: {
+        type: Number,
+        default: 4,
+        min: 2,
+      },
+      marksPerQuestion: {
+        type: Number,
+        default: 1,
+        min: 0,
+      },
+      negativeMarking: {
+        type: Boolean,
+        default: false,
+      },
+      negativeMarks: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+    },
+    omrTemplateImage: {
+      type: String,
+      trim: true,
+      default: '',
     },
   },
   {
@@ -135,7 +186,7 @@ ExamSchema.pre('save', function (next) {
   if (!this.tenantId) {
     return next(new Error('Exam must belong to a tenant'));
   }
-  
+
   next();
 });
 
@@ -159,6 +210,7 @@ ExamSchema.index({ uniqueId: 1 });
 ExamSchema.index({ tenantId: 1, createdAt: -1 });
 ExamSchema.index({ createdBy: 1, createdAt: -1 });
 ExamSchema.index({ tenantId: 1, isActive: 1 });
+ExamSchema.index({ tenantId: 1, examType: 1, createdAt: -1 });
 
 export default mongoose.model('Exam', ExamSchema);
 

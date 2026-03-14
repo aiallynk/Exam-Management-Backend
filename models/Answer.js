@@ -29,6 +29,13 @@ const AnswerSchema = new mongoose.Schema(
     aiEvaluation: {
       type: mongoose.Schema.Types.Mixed,
     },
+    submissionId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Submission',
+    },
+    codingResult: {
+      type: mongoose.Schema.Types.Mixed,
+    },
     needsReview: {
       type: Boolean,
       default: false,

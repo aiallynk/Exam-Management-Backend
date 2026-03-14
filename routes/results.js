@@ -1,12 +1,160 @@
 import express from 'express';
 import ExamAttempt from '../models/ExamAttempt.js';
 import Answer from '../models/Answer.js';
+import Exam from '../models/Exam.js';
 import Question from '../models/Question.js';
+import Submission from '../models/Submission.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { hasExamPermission } from '../middleware/examPermissions.js';
 
 const router = express.Router();
+const PRIVILEGED_ROLES = new Set(['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR']);
+const isResultsReleased = (exam) => {
+  if (!exam) return false;
+  if (exam.showResultsImmediately) return true;
+  if (!exam.resultsReleasedAt) return false;
+  return new Date(exam.resultsReleasedAt) <= new Date();
+};
+
+router.get(
+  '/leaderboard/:examId',
+  requireAuth,
+  requireTenant,
+  enforceTenantBoundaries,
+  async (req, res, next) => {
+    try {
+      const { examId } = req.params;
+      const limit = Math.max(parseInt(req.query.limit || '50', 10) || 50, 1);
+      const isPrivilegedUser = PRIVILEGED_ROLES.has(req.user.role);
+
+      if (!/^[a-fA-F0-9]{24}$/.test(String(examId || ''))) {
+        return res.status(400).json({ error: 'Invalid exam ID.' });
+      }
+
+      const exam = await Exam.findOne({
+        _id: examId,
+        ...req.tenantFilter,
+      }).select('title showResultsImmediately resultsReleasedAt');
+
+      if (!exam) {
+        return res.status(404).json({ error: 'Exam not found.' });
+      }
+
+      if (!isPrivilegedUser) {
+        const hasOwnAttempt = await ExamAttempt.exists({
+          ...req.tenantFilter,
+          examId,
+          userId: req.user._id,
+        });
+        if (!hasOwnAttempt) {
+          return res.status(403).json({ error: 'Forbidden - You can only view leaderboards for your own exams.' });
+        }
+      }
+
+      const attempts = await ExamAttempt.find({
+        ...req.tenantFilter,
+        examId,
+        isCompleted: true,
+        isDisqualified: false,
+      })
+        .populate('userId', 'name email')
+        .select('userId startTime submitTime submittedAt scoreSummary')
+        .lean();
+
+      if (!attempts.length) {
+        return res.json({
+          exam: {
+            _id: exam._id,
+            title: exam.title,
+          },
+          leaderboard: [],
+          totalEntries: 0,
+        });
+      }
+
+      const submissionRows = await Submission.find({
+        examId,
+        attemptId: { $in: attempts.map((attempt) => attempt._id) },
+        isDraft: false,
+      })
+        .select('attemptId executionTimeMs timeTaken')
+        .lean();
+
+      const runtimeByAttempt = new Map();
+      submissionRows.forEach((submission) => {
+        const key = submission.attemptId?.toString();
+        if (!key) return;
+
+        const previous = runtimeByAttempt.get(key) || {
+          executionTimeMs: 0,
+          timeTaken: 0,
+        };
+
+        runtimeByAttempt.set(key, {
+          executionTimeMs: previous.executionTimeMs + Math.max(Number(submission.executionTimeMs) || 0, 0),
+          timeTaken: Math.max(previous.timeTaken, Math.max(Number(submission.timeTaken) || 0, 0)),
+        });
+      });
+
+      const leaderboard = attempts
+        .map((attempt) => {
+          const runtime = runtimeByAttempt.get(attempt._id.toString()) || {};
+          const attemptDurationSeconds = Math.max(
+            Math.floor(
+              ((new Date(attempt.submitTime || attempt.submittedAt || Date.now()).getTime() || Date.now()) -
+                (new Date(attempt.startTime || Date.now()).getTime() || Date.now())) /
+                1000
+            ),
+            0
+          );
+
+          return {
+            attemptId: attempt._id,
+            userId: attempt.userId,
+            score: Number(attempt.scoreSummary?.totalScore) || 0,
+            totalMarks: Number(attempt.scoreSummary?.maxScore) || 0,
+            percentage: Number(attempt.scoreSummary?.percentage) || 0,
+            timeTaken: Number(runtime.timeTaken) || attemptDurationSeconds,
+            executionTimeMs: Number(runtime.executionTimeMs) || 0,
+            submittedAt: attempt.submitTime || attempt.submittedAt || null,
+          };
+        })
+        .sort((left, right) => {
+          if (right.score !== left.score) return right.score - left.score;
+          if (left.executionTimeMs !== right.executionTimeMs) {
+            return left.executionTimeMs - right.executionTimeMs;
+          }
+          if (left.timeTaken !== right.timeTaken) return left.timeTaken - right.timeTaken;
+          return new Date(left.submittedAt || 0).getTime() - new Date(right.submittedAt || 0).getTime();
+        })
+        .map((entry, index) => ({
+          ...entry,
+          rank: index + 1,
+        }));
+
+      const visibleLeaderboard =
+        !isPrivilegedUser && !isResultsReleased(exam)
+          ? leaderboard.filter(
+              (entry) => String(entry.userId?._id || entry.userId) === String(req.user._id)
+            )
+          : leaderboard;
+
+      return res.json({
+        exam: {
+          _id: exam._id,
+          title: exam.title,
+        },
+        leaderboard: visibleLeaderboard.slice(0, limit),
+        totalEntries: !isPrivilegedUser && !isResultsReleased(exam)
+          ? visibleLeaderboard.length
+          : leaderboard.length,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 
 // Get all results (universal: based on VIEW_RESULTS and REVIEW_ANSWERS permissions)
 router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
@@ -23,8 +171,7 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
     const filter = { ...req.tenantFilter };
-    const privilegedRoles = new Set(['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR']);
-    const isPrivilegedUser = privilegedRoles.has(req.user.role);
+    const isPrivilegedUser = PRIVILEGED_ROLES.has(req.user.role);
 
     if (examId) filter.examId = examId;
     if (sessionId) filter.sessionId = sessionId;
@@ -49,12 +196,12 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
     const visibleAttempts = isPrivilegedUser
       ? attempts
       : attempts.filter((attempt) => {
-          const exam = attempt.examId;
-          if (!exam) return false;
-          if (exam.showResultsImmediately) return true;
-          if (!exam.resultsReleasedAt) return false;
-          return new Date(exam.resultsReleasedAt) <= new Date();
-        });
+        const exam = attempt.examId;
+        if (!exam) return false;
+        if (exam.showResultsImmediately) return true;
+        if (!exam.resultsReleasedAt) return false;
+        return new Date(exam.resultsReleasedAt) <= new Date();
+      });
 
     // Calculate scores for each attempt
     const results = await Promise.all(
@@ -68,11 +215,11 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
         // Get total questions for this attempt's question paper
         let totalQuestions = 0;
         let attemptedQuestions = 0;
-        
+
         if (attempt.questionPaperId) {
           const questionPaperId = attempt.questionPaperId._id || attempt.questionPaperId;
           totalQuestions = await Question.countDocuments({ questionPaperId });
-          
+
           // Count attempted questions (questions with non-empty answers)
           attemptedQuestions = await Answer.countDocuments({
             attemptId: attempt._id,
@@ -122,8 +269,8 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
           sectionBreakdown,
           attemptedQuestions,
           totalQuestions,
-          progressPercentage: totalQuestions > 0 
-            ? Math.round((attemptedQuestions / totalQuestions) * 100) 
+          progressPercentage: totalQuestions > 0
+            ? Math.round((attemptedQuestions / totalQuestions) * 100)
             : 0,
         };
       })

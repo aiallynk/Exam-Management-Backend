@@ -31,9 +31,12 @@ export const validateQuestionCSV = (records) => {
       'SHORT_ANSWER',
       'PARAGRAPH',
       'NUMBER',
+      'CODING',
+      'IMAGE_BASED',
     ];
 
-    if (record.questionType && !validTypes.includes(record.questionType)) {
+    const normalizedType = String(record.questionType || '').trim().toUpperCase();
+    if (normalizedType && !validTypes.includes(normalizedType)) {
       errors.push(
         `Row ${index + 2}: Invalid questionType "${record.questionType}"`
       );

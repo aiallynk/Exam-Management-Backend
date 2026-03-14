@@ -13,6 +13,7 @@ import { validatePasswordStrength, generateSecurePassword } from '../utils/passw
 import { auditLog, AUDIT_ACTIONS } from '../middleware/audit.js';
 import { checkTenantLimits } from '../middleware/planLimits.js';
 import { FREE_TRIAL_LIMITS, isTrialRestrictedPlan } from '../config/planLimits.js';
+import { getTenantAnalyticsDashboard } from '../services/analyticsService.js';
 
 const router = express.Router();
 
@@ -378,6 +379,31 @@ router.get('/stats', async (req, res, next) => {
         createdAt: a.createdAt,
       })),
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+router.get('/analytics', async (req, res, next) => {
+  try {
+    const requestedExamId = req.query.examId || req.query.specificExamId || null;
+    const parsedStartDate =
+      typeof req.query.startDate === 'string' && req.query.startDate
+        ? new Date(req.query.startDate)
+        : null;
+
+    const analytics = await getTenantAnalyticsDashboard({
+      tenantId: req.user.tenantId,
+      viewerRole: req.user.role,
+      viewerUserId: req.user._id,
+      examId: requestedExamId,
+      startDate:
+        parsedStartDate && !Number.isNaN(parsedStartDate.getTime())
+          ? parsedStartDate
+          : null,
+    });
+
+    res.json(analytics);
   } catch (error) {
     next(error);
   }

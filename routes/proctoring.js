@@ -121,7 +121,7 @@ router.post(
     try {
       await proctoringService.recordCopyPasteAttempt(
         req.params.attemptId,
-        req.body.action,
+        req.body,
         req.user._id
       );
       res.json({ success: true });
@@ -138,7 +138,7 @@ router.post(
   validateObjectId('attemptId'),
   async (req, res, next) => {
     try {
-      await proctoringService.recordRightClickAttempt(req.params.attemptId, req.user._id);
+      await proctoringService.recordRightClickAttempt(req.params.attemptId, req.body || {}, req.user._id);
       res.json({ success: true });
     } catch (error) {
       next(error);
@@ -155,7 +155,26 @@ router.post(
     try {
       await proctoringService.recordKeyboardShortcut(
         req.params.attemptId,
-        req.body.shortcut,
+        req.body,
+        req.user._id
+      );
+      res.json({ success: true });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Record generic violation (fullscreen exit, custom signals, etc.)
+router.post(
+  '/attempt/:attemptId/violation',
+  requireAuth,
+  validateObjectId('attemptId'),
+  async (req, res, next) => {
+    try {
+      await proctoringService.recordViolationEvent(
+        req.params.attemptId,
+        req.body || {},
         req.user._id
       );
       res.json({ success: true });

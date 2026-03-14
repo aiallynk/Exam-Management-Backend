@@ -29,6 +29,23 @@ import {
 } from '../services/attemptReconciliationService.js';
 import { syncExamCandidateCount } from '../utils/planUsage.js';
 import { getAttemptSectionProgress, startSectionTimer } from '../services/sectionService.js';
+import { ensureQuestionsImageAvailability } from '../services/questionImportImageService.js';
+import {
+  normalizeQuestionCorrectAnswer,
+  sanitizeQuestionOptions,
+} from '../utils/questionOptionSanitizer.js';
+import {
+  evaluateCodingQuestionSubmission,
+  normalizeCodingAnswerForStorage,
+  parseCodingAnswerPayload,
+  resolveCodingAnswerDraft,
+  saveCodingSubmissionRecord,
+} from '../services/codingSubmissionService.js';
+import { normalizeCodingLanguage } from '../utils/codingQuestions.js';
+import {
+  FOCUS_VIOLATION_SUBMISSION_SOURCE,
+  TAB_SWITCH_DISQUALIFY_STATUS,
+} from '../services/proctoringService.js';
 
 const parseArrayAnswer = (value) => {
   if (Array.isArray(value)) {
@@ -89,15 +106,65 @@ const normalizeAnswerForStorage = (questionType, value) => {
     const answers = parseArrayAnswer(value);
     return answers.length ? JSON.stringify(answers) : '';
   }
+  if (questionType === 'CODING') {
+    return normalizeCodingAnswerForStorage(value);
+  }
   if (value === undefined || value === null) {
     return '';
   }
   return String(value);
 };
 
+const normalizeString = (value) => {
+  if (value === undefined || value === null) return '';
+  return String(value).trim();
+};
+
+const normalizeStatusValue = (value) => {
+  if (typeof value !== 'string') return '';
+  return value.trim().toUpperCase();
+};
+
+const isTabSwitchDisqualifiedAttempt = (attempt) =>
+  Boolean(
+    attempt?.isDisqualified &&
+    normalizeStatusValue(attempt?.disqualifyStatus) === TAB_SWITCH_DISQUALIFY_STATUS
+  );
+
+const appendAttemptViolationLog = (attempt, violationType, details = {}) => {
+  const normalizedType = normalizeStatusValue(violationType) || 'OTHER';
+  if (!attempt.proctoringViolations) {
+    attempt.proctoringViolations = [];
+  }
+
+  const recentDuplicate = attempt.proctoringViolations.some((entry) => {
+    const entryType = normalizeStatusValue(entry?.violationType);
+    if (entryType !== normalizedType) {
+      return false;
+    }
+    const timestamp = new Date(entry?.timestamp || 0).getTime();
+    return Number.isFinite(timestamp) && Math.abs(Date.now() - timestamp) < 10000;
+  });
+
+  if (recentDuplicate) {
+    return;
+  }
+
+  attempt.proctoringViolations.push({
+    userId: attempt.userId || null,
+    examId: attempt.examId?._id || attempt.examId || null,
+    timestamp: new Date(),
+    violationType: normalizedType,
+    ...details,
+  });
+};
+
 const parseStoredAnswerValue = (questionType, value) => {
   if (questionType === 'MULTIPLE_OPTIONS') {
     return parseArrayAnswer(value);
+  }
+  if (questionType === 'CODING') {
+    return parseCodingAnswerPayload(value);
   }
   if (value === undefined || value === null) {
     return '';
@@ -223,6 +290,181 @@ const lockAllSectionTimersOnSubmit = (attempt, submitTime) => {
   attempt.sectionStateUpdatedAt = submitTime;
 };
 
+const normalizeCodingSubmissionPayload = (payload = {}) => {
+  const source = Array.isArray(payload?.codingSubmissions)
+    ? payload.codingSubmissions
+    : Array.isArray(payload?.codingAnswers)
+      ? payload.codingAnswers
+      : [];
+
+  const submissionsByQuestionId = new Map();
+
+  source.forEach((entry) => {
+    if (!entry || typeof entry !== 'object') return;
+
+    const questionId = normalizeString(entry.questionId);
+    if (!/^[a-fA-F0-9]{24}$/.test(questionId)) return;
+
+    const language = normalizeCodingLanguage(entry.language) || '';
+    const code = normalizeString(entry.code);
+    const input = normalizeString(entry.input);
+    const output = normalizeString(entry.output);
+    const scoreRaw = Number(entry.score);
+    const score = Number.isFinite(scoreRaw)
+      ? Math.min(Math.max(Math.round(scoreRaw), 0), 100)
+      : 0;
+    const total = toNonNegativeInt(entry.total, 0);
+    const passed = toNonNegativeInt(entry.passed, 0);
+    const failed =
+      total > 0 ? Math.max(total - passed, 0) : toNonNegativeInt(entry.failed, 0);
+    const plagiarism =
+      entry.plagiarism && typeof entry.plagiarism === 'object'
+        ? {
+          flagged: Boolean(entry.plagiarism.flagged),
+          similarity: Math.min(
+            Math.max(Number(entry.plagiarism.similarity) || 0, 0),
+            100
+          ),
+        }
+        : null;
+
+    submissionsByQuestionId.set(questionId, {
+      questionId,
+      language,
+      code,
+      input,
+      output,
+      score,
+      total,
+      passed,
+      failed,
+      plagiarism,
+    });
+  });
+
+  return submissionsByQuestionId;
+};
+
+const scheduleDeferredCodingEvaluation = ({
+  pendingEvaluations = [],
+  attemptId,
+  userId,
+  examId,
+  attemptStartedAt,
+} = {}) => {
+  if (!pendingEvaluations.length || !attemptId || !userId || !examId) return;
+
+  setImmediate(async () => {
+    try {
+      const answerUpdates = [];
+
+      for (const evaluationRequest of pendingEvaluations) {
+        try {
+          const evaluation = await evaluateCodingQuestionSubmission({
+            question: evaluationRequest.question,
+            code: evaluationRequest.code,
+            language: evaluationRequest.language,
+            input: evaluationRequest.input,
+          });
+
+          const submissionRecord = await saveCodingSubmissionRecord({
+            attemptId,
+            userId,
+            examId,
+            questionId: evaluationRequest.question._id,
+            code: evaluationRequest.code,
+            language: evaluationRequest.language,
+            evaluation,
+            attemptStartedAt,
+          });
+
+          answerUpdates.push({
+            updateOne: {
+              filter: {
+                attemptId,
+                questionId: evaluationRequest.question._id,
+              },
+              update: {
+                $set: {
+                  isCorrect: evaluation.failed === 0 && evaluation.total > 0,
+                  pointsEarned: evaluation.pointsEarned,
+                  aiEvaluation: {
+                    type: 'CODING',
+                    score: evaluation.score,
+                    passed: evaluation.passed,
+                    failed: evaluation.failed,
+                    submissionId: submissionRecord._id,
+                    plagiarism: submissionRecord?.plagiarism || {
+                      flagged: false,
+                      similarity: 0,
+                    },
+                  },
+                  codingResult: evaluation.result,
+                  submissionId: submissionRecord._id,
+                  needsReview: false,
+                },
+              },
+            },
+          });
+        } catch (evaluationError) {
+          console.error(
+            `[CODING_EVAL] Deferred coding evaluation failed for attempt ${attemptId} question ${evaluationRequest?.question?._id}:`,
+            evaluationError
+          );
+          answerUpdates.push({
+            updateOne: {
+              filter: {
+                attemptId,
+                questionId: evaluationRequest.question?._id,
+              },
+              update: {
+                $set: {
+                  needsReview: true,
+                  aiEvaluation: {
+                    type: 'CODING',
+                    error: 'Deferred evaluation failed',
+                    needsReview: true,
+                  },
+                },
+              },
+            },
+          });
+        }
+      }
+
+      if (answerUpdates.length > 0) {
+        await Answer.bulkWrite(answerUpdates, { ordered: false });
+      }
+
+      const gradedAnswers = await Answer.find({ attemptId })
+        .populate('questionId', 'points')
+        .select('pointsEarned questionId');
+      let totalScore = 0;
+      let maxScore = 0;
+
+      gradedAnswers.forEach((answerDoc) => {
+        totalScore += Number(answerDoc.pointsEarned) || 0;
+        maxScore += Number(answerDoc.questionId?.points) || 0;
+      });
+
+      const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
+
+      await ExamAttempt.findByIdAndUpdate(attemptId, {
+        $set: {
+          scoreSummary: {
+            totalScore,
+            maxScore,
+            percentage,
+            computedAt: new Date(),
+          },
+        },
+      });
+    } catch (error) {
+      console.error(`[CODING_EVAL] Deferred coding evaluation pipeline failed for attempt ${attemptId}:`, error);
+    }
+  });
+};
+
 const ADMIN_VIEWER_ROLES = new Set(['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR']);
 
 const isExamResultsReleased = (exam) => {
@@ -241,6 +483,19 @@ const isCertificatesReleased = (exam) => {
 
 const canBypassReleaseWindow = ({ userRole, canReviewAnswers = false }) =>
   ADMIN_VIEWER_ROLES.has(userRole) || Boolean(canReviewAnswers);
+
+const ensureQuestionPaperImagesReady = async ({ questionPaperId, examId }) => {
+  if (!questionPaperId || !examId) return;
+
+  const questions = await Question.find({ questionPaperId }).sort({ order: 1 });
+  if (!questions.length) return;
+
+  await ensureQuestionsImageAvailability({
+    questions,
+    examId,
+    persist: true,
+  });
+};
 
 const router = express.Router();
 
@@ -305,10 +560,10 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
       attemptObj.submittedAt = attemptObj.submittedAt || attemptObj.submitTime || null;
       attemptObj.score = attemptObj.scoreSummary
         ? {
-            totalScore: Number(attemptObj.scoreSummary.totalScore) || 0,
-            maxScore: Number(attemptObj.scoreSummary.maxScore) || 0,
-            percentage: Number(attemptObj.scoreSummary.percentage) || 0,
-          }
+          totalScore: Number(attemptObj.scoreSummary.totalScore) || 0,
+          maxScore: Number(attemptObj.scoreSummary.maxScore) || 0,
+          percentage: Number(attemptObj.scoreSummary.percentage) || 0,
+        }
         : null;
 
       return attemptObj;
@@ -403,7 +658,7 @@ router.post(
       // Verify tenant match: session and exam must belong to same tenant
       const sessionTenantId = session.tenantId;
       const examTenantId = exam.tenantId;
-      
+
       if (sessionTenantId && examTenantId) {
         if (sessionTenantId.toString() !== examTenantId.toString()) {
           return res.status(400).json({ error: 'Session and exam belong to different tenants' });
@@ -464,6 +719,11 @@ router.post(
       if (activeAttempt) {
         await activeAttempt.populate('examId', 'title duration');
         await activeAttempt.populate('sessionId', 'startTime endTime');
+        await ensureQuestionPaperImagesReady({
+          questionPaperId:
+            activeAttempt.questionPaperId?._id || activeAttempt.questionPaperId,
+          examId,
+        });
         return res.json({
           attempt: activeAttempt,
           assignment: {
@@ -484,9 +744,14 @@ router.post(
       const assignedQuestionPaperId =
         assignment.questionPaperId?._id || assignment.questionPaperId;
 
+      await ensureQuestionPaperImagesReady({
+        questionPaperId: assignedQuestionPaperId,
+        examId,
+      });
+
       // Inherit tenant ID from exam
       const examForTenant = await Exam.findById(examId).select('tenantId');
-      
+
       // Create new attempt
       const attempt = new ExamAttempt({
         examId,
@@ -513,7 +778,7 @@ router.post(
       if (req.planLimitContext?.shouldIncrementCandidateCount) {
         await syncExamCandidateCount(examId);
       }
-      
+
       // Check for multiple logins
       const proctoringService = await import('../services/proctoringService.js');
       await proctoringService.logDeviceInfo(attempt._id, attempt.deviceInfo);
@@ -765,6 +1030,515 @@ router.put(
   }
 );
 
+export const submitAttemptHandler = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const attempt = await ExamAttempt.findById(req.params.attemptId)
+      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
+      .populate('sessionId');
+
+    if (!attempt) {
+      return res.status(404).json({ error: 'Attempt not found' });
+    }
+
+    const examId = attempt.examId?._id || attempt.examId;
+
+    // Verify ownership: users can only submit their own attempts (unless they have REVIEW_ANSWERS permission)
+    const canReview = await hasExamPermission(
+      req.user._id,
+      examId,
+      'REVIEW_ANSWERS'
+    );
+    if (!canReview && attempt.userId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: 'Forbidden - You can only submit your own attempts' });
+    }
+
+    const requestedDisqualifyStatus =
+      typeof req.body?.disqualifyStatus === 'string'
+        ? req.body.disqualifyStatus.trim().slice(0, 64)
+        : '';
+    const requestedViolationType =
+      typeof req.body?.violationType === 'string'
+        ? req.body.violationType.trim().slice(0, 64)
+        : '';
+    const shouldFinalizeStrictViolationSubmission =
+      Boolean(attempt.isCompleted) &&
+      attempt.submitMeta?.submissionSource === FOCUS_VIOLATION_SUBMISSION_SOURCE &&
+      attempt.submitMeta?.finalizedAfterViolation !== true;
+
+    if (attempt.isCompleted && !shouldFinalizeStrictViolationSubmission) {
+      await attempt.populate('questionPaperId', 'setName');
+      const canReviewAnswers = await hasExamPermission(
+        req.user._id,
+        examId,
+        'REVIEW_ANSWERS'
+      );
+      const scoringVisibleForTabSwitch =
+        attempt.userId.toString() === req.user._id.toString() &&
+        isTabSwitchDisqualifiedAttempt(attempt);
+      const scoringVisible =
+        canBypassReleaseWindow({
+          userRole: req.user.role,
+          canReviewAnswers,
+        }) || isExamResultsReleased(attempt.examId) || scoringVisibleForTabSwitch;
+      const summary = {
+        totalScore: Number(attempt.scoreSummary?.totalScore) || 0,
+        maxScore: Number(attempt.scoreSummary?.maxScore) || 0,
+        percentage: Number(attempt.scoreSummary?.percentage) || 0,
+      };
+      return res.json({
+        success: true,
+        alreadySubmitted: true,
+        attempt,
+        attemptStatus: 'COMPLETED',
+        submittedAt: attempt.submittedAt || attempt.submitTime || null,
+        score: scoringVisible ? summary : null,
+        resultsAvailable: scoringVisible,
+        message: 'Exam submitted successfully',
+      });
+    }
+
+    const { isDisqualified, disqualifyReason } = req.body;
+    const timerMeta =
+      req.body?.timerMeta && typeof req.body.timerMeta === 'object'
+        ? req.body.timerMeta
+        : null;
+    const codingSubmissionsMap = normalizeCodingSubmissionPayload(req.body);
+    const submittedAnswers =
+      req.body?.answers && typeof req.body.answers === 'object'
+        ? { ...req.body.answers }
+        : {};
+
+    // If coding answers are only provided via codingSubmissions/codingAnswers, backfill answers.
+    for (const [questionId, codingPayload] of codingSubmissionsMap.entries()) {
+      if (Object.prototype.hasOwnProperty.call(submittedAnswers, questionId)) {
+        continue;
+      }
+
+      submittedAnswers[questionId] = {
+        language: codingPayload.language,
+        code: codingPayload.code,
+        input: codingPayload.input,
+        lastSubmission: {
+          score: codingPayload.score,
+          passed: codingPayload.passed,
+          failed: codingPayload.failed,
+          total: codingPayload.total,
+          output: codingPayload.output,
+          plagiarism: codingPayload.plagiarism || {
+            flagged: false,
+            similarity: 0,
+          },
+        },
+      };
+    }
+
+    const resolvedDisqualifyStatus =
+      requestedDisqualifyStatus ||
+      (normalizeStatusValue(requestedViolationType) === 'TAB_SWITCH'
+        ? TAB_SWITCH_DISQUALIFY_STATUS
+        : attempt.disqualifyStatus || '');
+
+    // Sync section state before finalizing to avoid stale section timers.
+    try {
+      await getAttemptSectionProgress(attempt._id);
+    } catch {
+      // Continue submission even if section sync fails; submission lock still applies.
+    }
+
+    const assignedQuestionPaperId =
+      attempt.questionPaperId?._id ||
+      attempt.questionPaperId ||
+      attempt.sessionId?.questionPaperId;
+
+    if (!assignedQuestionPaperId) {
+      return res.status(400).json({ error: 'No question paper assigned for this attempt.' });
+    }
+
+    // Get all questions for this session's question paper
+    const questions = await Question.find({
+      questionPaperId: assignedQuestionPaperId,
+    }).sort({ order: 1 });
+
+    const existingAnswers = await Answer.find({ attemptId: attempt._id }).select(
+      'questionId answerText isCorrect pointsEarned aiEvaluation codingResult submissionId'
+    );
+    const existingAnswerMap = new Map(
+      existingAnswers.map((answerDoc) => [answerDoc.questionId.toString(), answerDoc])
+    );
+
+    const answerWriteOperations = [];
+    const deferredCodingEvaluations = [];
+    let totalScore = 0;
+    let maxScore = 0;
+
+    // Process each question
+    for (const question of questions) {
+      maxScore += question.points;
+      const questionId = question._id.toString();
+      const hasSubmittedAnswer = Object.prototype.hasOwnProperty.call(submittedAnswers, questionId);
+      const existingAnswerDoc = existingAnswerMap.get(questionId);
+      const rawAnswer = hasSubmittedAnswer
+        ? submittedAnswers[questionId]
+        : existingAnswerDoc?.answerText;
+      const studentAnswer = rawAnswer === undefined || rawAnswer === null ? '' : rawAnswer;
+
+      let normalizedAnswerText = normalizeAnswerForStorage(
+        question.questionType,
+        studentAnswer
+      );
+
+      let isCorrect = false;
+      let pointsEarned = 0;
+      let aiEvaluation = null;
+      let codingResult = null;
+      let submissionId = existingAnswerDoc?.submissionId;
+
+      // Auto-grade objective questions
+      if (
+        ['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE', 'NUMBER', 'IMAGE_BASED'].includes(
+          question.questionType
+        )
+      ) {
+        const normalizedOptions = sanitizeQuestionOptions(question.options);
+        if (question.questionType === 'MULTIPLE_OPTIONS') {
+          const expected = normalizeQuestionCorrectAnswer({
+            questionType: question.questionType,
+            correctAnswer: question.correctAnswer,
+            options: normalizedOptions,
+          });
+          const received = normalizeQuestionCorrectAnswer({
+            questionType: question.questionType,
+            correctAnswer: studentAnswer,
+            options: normalizedOptions,
+          });
+          isCorrect = expected.length > 0 && arrayEqualsIgnoreOrder(expected, received);
+          normalizedAnswerText = received.length ? JSON.stringify(received) : '';
+          pointsEarned = isCorrect ? question.points : 0;
+        } else if (question.questionType === 'NUMBER') {
+          isCorrect = String(studentAnswer).trim() === String(question.correctAnswer ?? '').trim();
+          pointsEarned = isCorrect ? question.points : 0;
+        } else {
+          const expected = normalizeQuestionCorrectAnswer({
+            questionType: question.questionType,
+            correctAnswer: question.correctAnswer,
+            options: normalizedOptions,
+          });
+          const received = normalizeQuestionCorrectAnswer({
+            questionType: question.questionType,
+            correctAnswer: studentAnswer,
+            options: normalizedOptions,
+          });
+          normalizedAnswerText = String(received ?? '').trim();
+          isCorrect = String(received).trim() === String(expected).trim();
+          pointsEarned = isCorrect ? question.points : 0;
+        }
+      } else if (['SHORT_ANSWER', 'PARAGRAPH'].includes(question.questionType)) {
+        const hasSubjectiveAnswer = String(studentAnswer).trim().length > 0;
+
+        if (hasSubjectiveAnswer) {
+          // AI evaluation for subjective questions (skip empty answers)
+          try {
+            aiEvaluation = await evaluateAnswer({
+              question: question.questionText,
+              correctAnswer: question.correctAnswer,
+              studentAnswer,
+              questionType: question.questionType,
+              points: question.points,
+            });
+
+            isCorrect = aiEvaluation.isCorrect;
+            pointsEarned = aiEvaluation.pointsEarned;
+          } catch (error) {
+            console.error('AI evaluation error:', error);
+            // Fallback: no points if AI fails
+            pointsEarned = 0;
+            aiEvaluation = {
+              error: 'Evaluation failed',
+              needsReview: true,
+            };
+          }
+        }
+      } else if (question.questionType === 'CODING') {
+        const parsedAnswerPayload = parseCodingAnswerPayload(studentAnswer);
+        const codingDraft = resolveCodingAnswerDraft(studentAnswer, question);
+        const codingPayload = codingSubmissionsMap.get(questionId);
+
+        const language =
+          normalizeCodingLanguage(codingPayload?.language) ||
+          normalizeCodingLanguage(codingDraft.language) ||
+          codingDraft.language;
+        const code = normalizeString(codingPayload?.code) || normalizeString(codingDraft.code);
+        const input = normalizeString(codingPayload?.input) || normalizeString(codingDraft.input);
+
+        normalizedAnswerText = normalizeCodingAnswerForStorage({
+          ...parsedAnswerPayload,
+          language,
+          code,
+          input,
+          drafts:
+            parsedAnswerPayload?.drafts &&
+              typeof parsedAnswerPayload.drafts === 'object' &&
+              !Array.isArray(parsedAnswerPayload.drafts)
+              ? parsedAnswerPayload.drafts
+              : codingDraft.drafts,
+          lastSubmission:
+            codingPayload && (code || codingPayload.total > 0 || codingPayload.score > 0)
+              ? {
+                score: codingPayload.score,
+                passed: codingPayload.passed,
+                failed: codingPayload.failed,
+                total: codingPayload.total,
+                output: codingPayload.output,
+                plagiarism: codingPayload.plagiarism || {
+                  flagged: false,
+                  similarity: 0,
+                },
+              }
+              : parsedAnswerPayload?.lastSubmission,
+        });
+
+        const existingCodingEvaluation =
+          existingAnswerDoc?.aiEvaluation?.type === 'CODING' &&
+            Number.isFinite(Number(existingAnswerDoc?.pointsEarned))
+            ? existingAnswerDoc.aiEvaluation
+            : null;
+        const existingCodingDraft = existingAnswerDoc
+          ? resolveCodingAnswerDraft(existingAnswerDoc.answerText, question)
+          : null;
+        const hasCodeChanges =
+          Boolean(existingCodingDraft) &&
+          (
+            normalizeString(existingCodingDraft.code) !== code ||
+            normalizeString(existingCodingDraft.input) !== input ||
+            normalizeCodingLanguage(existingCodingDraft.language) !== normalizeCodingLanguage(language)
+          );
+
+        if (existingCodingEvaluation && !hasCodeChanges) {
+          isCorrect = Boolean(existingAnswerDoc.isCorrect);
+          pointsEarned = Number(existingAnswerDoc.pointsEarned) || 0;
+          aiEvaluation = existingCodingEvaluation;
+          codingResult = existingAnswerDoc.codingResult || null;
+        } else {
+          const provisionalScoreRaw = Number(
+            codingPayload?.score ?? existingCodingEvaluation?.score
+          );
+          const provisionalScore = Number.isFinite(provisionalScoreRaw)
+            ? Math.min(Math.max(Math.round(provisionalScoreRaw), 0), 100)
+            : 0;
+          const total = toNonNegativeInt(
+            codingPayload?.total ?? existingCodingEvaluation?.total,
+            0
+          );
+          const passed = toNonNegativeInt(
+            codingPayload?.passed ?? existingCodingEvaluation?.passed,
+            0
+          );
+          const failed =
+            total > 0
+              ? Math.max(total - passed, 0)
+              : toNonNegativeInt(
+                codingPayload?.failed ?? existingCodingEvaluation?.failed,
+                0
+              );
+
+          pointsEarned = Number(
+            (((Number(question.points) || 0) * provisionalScore) / 100).toFixed(2)
+          );
+          isCorrect = total > 0 ? failed === 0 : false;
+          aiEvaluation = {
+            type: 'CODING',
+            score: provisionalScore,
+            passed,
+            failed,
+            output: codingPayload?.output || '',
+            pendingEvaluation: Boolean(code),
+            source: existingCodingEvaluation ? 'STALE_REEVALUATION' : 'CLIENT_PAYLOAD',
+            plagiarism: codingPayload?.plagiarism || existingCodingEvaluation?.plagiarism || {
+              flagged: false,
+              similarity: 0,
+            },
+          };
+          codingResult = {
+            total,
+            passed,
+            failed,
+            score: provisionalScore,
+            output: codingPayload?.output || '',
+          };
+        }
+
+        if (code && (!existingCodingEvaluation || hasCodeChanges)) {
+          deferredCodingEvaluations.push({
+            question,
+            language,
+            code,
+            input,
+          });
+        }
+      }
+
+      totalScore += pointsEarned;
+
+      answerWriteOperations.push({
+        updateOne: {
+          filter: {
+            attemptId: attempt._id,
+            questionId: question._id,
+          },
+          update: {
+            $set: {
+              answerText: normalizedAnswerText,
+              isCorrect,
+              pointsEarned,
+              aiEvaluation,
+              codingResult,
+              submissionId: aiEvaluation?.submissionId || submissionId || undefined,
+              needsReview: aiEvaluation?.needsReview || false,
+            },
+            $setOnInsert: {
+              attemptId: attempt._id,
+              questionId: question._id,
+            },
+          },
+          upsert: true,
+        },
+      });
+    }
+
+    if (answerWriteOperations.length > 0) {
+      await Answer.bulkWrite(answerWriteOperations, { ordered: false });
+    }
+
+    const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
+    const existingSubmitMeta =
+      attempt.submitMeta && typeof attempt.submitMeta.toObject === 'function'
+        ? attempt.submitMeta.toObject()
+        : { ...(attempt.submitMeta || {}) };
+    const submitTime = shouldFinalizeStrictViolationSubmission
+      ? new Date(attempt.submitTime || attempt.submittedAt || new Date())
+      : new Date();
+
+    // Update attempt
+    attempt.isCompleted = true;
+    attempt.submitTime = submitTime;
+    attempt.submittedAt = attempt.submittedAt || submitTime;
+    attempt.isDisqualified = Boolean(attempt.isDisqualified || isDisqualified);
+    attempt.disqualifyReason = disqualifyReason || attempt.disqualifyReason || '';
+    attempt.disqualifyStatus = resolvedDisqualifyStatus || attempt.disqualifyStatus || '';
+    attempt.lastActivity = submitTime;
+    attempt.scoreSummary = {
+      totalScore,
+      maxScore,
+      percentage,
+      computedAt: new Date(),
+    };
+
+    lockAllSectionTimersOnSubmit(attempt, submitTime);
+
+    const submittedAtClient =
+      typeof timerMeta?.submittedAtClient === 'string'
+        ? new Date(timerMeta.submittedAtClient)
+        : null;
+    attempt.submitMeta = {
+      submissionSource:
+        shouldFinalizeStrictViolationSubmission
+          ? existingSubmitMeta?.submissionSource || FOCUS_VIOLATION_SUBMISSION_SOURCE
+          : typeof req.body?.submissionSource === 'string'
+            ? req.body.submissionSource.slice(0, 64)
+            : null,
+      violationType:
+        requestedViolationType ||
+        existingSubmitMeta?.violationType ||
+        null,
+      submittedAtClient:
+        submittedAtClient && !Number.isNaN(submittedAtClient.getTime())
+          ? submittedAtClient
+          : existingSubmitMeta?.submittedAtClient || null,
+      totalRemainingSeconds:
+        timerMeta?.totalRemainingSeconds !== undefined
+          ? toNonNegativeInt(timerMeta.totalRemainingSeconds, 0)
+          : existingSubmitMeta?.totalRemainingSeconds ?? null,
+      currentSectionId:
+        typeof timerMeta?.currentSectionId === 'string' &&
+          /^[a-fA-F0-9]{24}$/.test(timerMeta.currentSectionId)
+          ? timerMeta.currentSectionId
+          : existingSubmitMeta?.currentSectionId || null,
+      finalizedAfterViolation:
+        shouldFinalizeStrictViolationSubmission
+          ? true
+          : Boolean(existingSubmitMeta?.finalizedAfterViolation),
+    };
+
+    if (attempt.isDisqualified && requestedViolationType) {
+      appendAttemptViolationLog(attempt, requestedViolationType, {
+        reason: attempt.disqualifyReason || null,
+        disqualifyStatus: attempt.disqualifyStatus || null,
+        submissionSource: attempt.submitMeta?.submissionSource || null,
+      });
+    }
+
+    await attempt.save();
+
+    await attempt.populate('examId', 'title duration showResultsImmediately resultsReleasedAt');
+    await attempt.populate('questionPaperId', 'setName');
+    const canReviewAnswers = await hasExamPermission(
+      req.user._id,
+      examId,
+      'REVIEW_ANSWERS'
+    );
+    const scoringVisible =
+      canBypassReleaseWindow({
+        userRole: req.user.role,
+        canReviewAnswers,
+      }) ||
+      isExamResultsReleased(attempt.examId) ||
+      isTabSwitchDisqualifiedAttempt(attempt);
+    const savedAnswers = scoringVisible ? await Answer.find({ attemptId: attempt._id }) : [];
+    const responseScore = scoringVisible
+      ? {
+        totalScore,
+        maxScore,
+        percentage,
+      }
+      : null;
+    const hasDeferredCodingEvaluation = deferredCodingEvaluations.length > 0;
+
+    res.json({
+      success: true,
+      attempt,
+      attemptStatus: 'COMPLETED',
+      submittedAt: submitTime.toISOString(),
+      score: responseScore,
+      answers: savedAnswers,
+      resultsAvailable: scoringVisible,
+      message: 'Exam submitted successfully',
+      detailMessage: scoringVisible
+        ? 'Attempt submitted successfully.'
+        : 'Attempt submitted successfully. Results are not yet released for candidates.',
+      codingEvaluationPending: hasDeferredCodingEvaluation,
+    });
+
+    // Evaluate coding questions in the background to avoid blocking final exam submission.
+    if (hasDeferredCodingEvaluation) {
+      scheduleDeferredCodingEvaluation({
+        pendingEvaluations: deferredCodingEvaluations,
+        attemptId: attempt._id,
+        userId: req.user._id,
+        examId,
+        attemptStartedAt: attempt.startTime,
+      });
+    }
+  } catch (error) {
+    console.error('Exam submission error:', error);
+    next(error);
+  }
+};
+
 // Submit attempt
 router.post(
   '/:attemptId/submit',
@@ -776,278 +1550,14 @@ router.post(
   })),
   [
     body('answers').optional().isObject().withMessage('Answers must be an object'),
+    body('codingSubmissions').optional().isArray().withMessage('codingSubmissions must be an array'),
+    body('codingAnswers').optional().isArray().withMessage('codingAnswers must be an array'),
     body('timerMeta').optional().isObject().withMessage('timerMeta must be an object'),
     body('submissionSource').optional().isString().withMessage('submissionSource must be a string'),
+    body('disqualifyStatus').optional().isString().withMessage('disqualifyStatus must be a string'),
+    body('violationType').optional().isString().withMessage('violationType must be a string'),
   ],
-  async (req, res, next) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
-
-      const attempt = await ExamAttempt.findById(req.params.attemptId)
-        .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
-        .populate('sessionId');
-
-      if (!attempt) {
-        return res.status(404).json({ error: 'Attempt not found' });
-      }
-
-      // Verify ownership: users can only submit their own attempts (unless they have REVIEW_ANSWERS permission)
-      const canReview = await hasExamPermission(
-        req.user._id,
-        attempt.examId?._id || attempt.examId,
-        'REVIEW_ANSWERS'
-      );
-      if (!canReview && attempt.userId.toString() !== req.user._id.toString()) {
-        return res.status(403).json({ error: 'Forbidden - You can only submit your own attempts' });
-      }
-
-      if (attempt.isCompleted) {
-        await attempt.populate('questionPaperId', 'setName');
-        const canReviewAnswers = await hasExamPermission(
-          req.user._id,
-          attempt.examId?._id || attempt.examId,
-          'REVIEW_ANSWERS'
-        );
-        const scoringVisible =
-          canBypassReleaseWindow({
-            userRole: req.user.role,
-            canReviewAnswers,
-          }) || isExamResultsReleased(attempt.examId);
-        const summary = {
-          totalScore: Number(attempt.scoreSummary?.totalScore) || 0,
-          maxScore: Number(attempt.scoreSummary?.maxScore) || 0,
-          percentage: Number(attempt.scoreSummary?.percentage) || 0,
-        };
-        return res.json({
-          success: true,
-          alreadySubmitted: true,
-          attempt,
-          attemptStatus: 'COMPLETED',
-          submittedAt: attempt.submittedAt || attempt.submitTime || null,
-          score: scoringVisible ? summary : null,
-          resultsAvailable: scoringVisible,
-        });
-      }
-
-      const { isDisqualified, disqualifyReason } = req.body;
-      const timerMeta =
-        req.body?.timerMeta && typeof req.body.timerMeta === 'object'
-          ? req.body.timerMeta
-          : null;
-      const submittedAnswers = req.body?.answers && typeof req.body.answers === 'object'
-        ? req.body.answers
-        : {};
-
-      // Sync section state before finalizing to avoid stale section timers.
-      try {
-        await getAttemptSectionProgress(attempt._id);
-      } catch (sectionError) {
-        // Continue submission even if section sync fails; submission lock still applies.
-      }
-
-      const assignedQuestionPaperId =
-        attempt.questionPaperId?._id ||
-        attempt.questionPaperId ||
-        attempt.sessionId?.questionPaperId;
-
-      if (!assignedQuestionPaperId) {
-        return res.status(400).json({ error: 'No question paper assigned for this attempt.' });
-      }
-
-      // Get all questions for this session's question paper
-      const questions = await Question.find({
-        questionPaperId: assignedQuestionPaperId,
-      }).sort({ order: 1 });
-
-      const existingAnswers = await Answer.find({ attemptId: attempt._id }).select('questionId answerText');
-      const existingAnswerMap = new Map(
-        existingAnswers.map((answerDoc) => [answerDoc.questionId.toString(), answerDoc.answerText])
-      );
-
-      const answerWriteOperations = [];
-      let totalScore = 0;
-      let maxScore = 0;
-
-      // Process each question
-      for (const question of questions) {
-        maxScore += question.points;
-        const questionId = question._id.toString();
-        const hasSubmittedAnswer = Object.prototype.hasOwnProperty.call(submittedAnswers, questionId);
-        const rawAnswer = hasSubmittedAnswer
-          ? submittedAnswers[questionId]
-          : existingAnswerMap.get(questionId);
-        const studentAnswer = rawAnswer === undefined || rawAnswer === null ? '' : rawAnswer;
-
-        let normalizedAnswerText = normalizeAnswerForStorage(
-          question.questionType,
-          studentAnswer
-        );
-
-        let isCorrect = false;
-        let pointsEarned = 0;
-        let aiEvaluation = null;
-
-        // Auto-grade objective questions
-        if (
-          ['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE', 'NUMBER'].includes(
-            question.questionType
-          )
-        ) {
-          if (question.questionType === 'MULTIPLE_OPTIONS') {
-            const expected = parseArrayAnswer(question.correctAnswer);
-            const received = parseArrayAnswer(studentAnswer);
-            isCorrect = expected.length > 0 && arrayEqualsIgnoreOrder(expected, received);
-            normalizedAnswerText = received.length ? JSON.stringify(received) : '';
-            pointsEarned = isCorrect ? question.points : 0;
-          } else if (question.questionType === 'NUMBER') {
-            isCorrect = String(studentAnswer).trim() === String(question.correctAnswer ?? '').trim();
-            pointsEarned = isCorrect ? question.points : 0;
-          } else {
-            isCorrect = String(studentAnswer).trim() === String(question.correctAnswer ?? '').trim();
-            pointsEarned = isCorrect ? question.points : 0;
-          }
-        } else if (['SHORT_ANSWER', 'PARAGRAPH'].includes(question.questionType)) {
-          const hasSubjectiveAnswer = String(studentAnswer).trim().length > 0;
-
-          if (hasSubjectiveAnswer) {
-            // AI evaluation for subjective questions (skip empty answers)
-            try {
-              aiEvaluation = await evaluateAnswer({
-                question: question.questionText,
-                correctAnswer: question.correctAnswer,
-                studentAnswer,
-                questionType: question.questionType,
-                points: question.points,
-              });
-
-              isCorrect = aiEvaluation.isCorrect;
-              pointsEarned = aiEvaluation.pointsEarned;
-            } catch (error) {
-              console.error('AI evaluation error:', error);
-              // Fallback: no points if AI fails
-              pointsEarned = 0;
-              aiEvaluation = {
-                error: 'Evaluation failed',
-                needsReview: true,
-              };
-            }
-          }
-        }
-
-        totalScore += pointsEarned;
-
-        answerWriteOperations.push({
-          updateOne: {
-            filter: {
-              attemptId: attempt._id,
-              questionId: question._id,
-            },
-            update: {
-              $set: {
-                answerText: normalizedAnswerText,
-                isCorrect,
-                pointsEarned,
-                aiEvaluation,
-                needsReview: aiEvaluation?.needsReview || false,
-              },
-              $setOnInsert: {
-                attemptId: attempt._id,
-                questionId: question._id,
-              },
-            },
-            upsert: true,
-          },
-        });
-      }
-
-      if (answerWriteOperations.length > 0) {
-        await Answer.bulkWrite(answerWriteOperations, { ordered: false });
-      }
-
-      const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
-      const submitTime = new Date();
-
-      // Update attempt
-      attempt.isCompleted = true;
-      attempt.submitTime = submitTime;
-      attempt.submittedAt = submitTime;
-      attempt.isDisqualified = isDisqualified || false;
-      attempt.disqualifyReason = disqualifyReason || '';
-      attempt.lastActivity = submitTime;
-      attempt.scoreSummary = {
-        totalScore,
-        maxScore,
-        percentage,
-        computedAt: new Date(),
-      };
-
-      lockAllSectionTimersOnSubmit(attempt, submitTime);
-
-      const submittedAtClient =
-        typeof timerMeta?.submittedAtClient === 'string'
-          ? new Date(timerMeta.submittedAtClient)
-          : null;
-      attempt.submitMeta = {
-        submissionSource:
-          typeof req.body?.submissionSource === 'string'
-            ? req.body.submissionSource.slice(0, 64)
-            : null,
-        submittedAtClient:
-          submittedAtClient && !Number.isNaN(submittedAtClient.getTime())
-            ? submittedAtClient
-            : null,
-        totalRemainingSeconds:
-          timerMeta?.totalRemainingSeconds !== undefined
-            ? toNonNegativeInt(timerMeta.totalRemainingSeconds, 0)
-            : null,
-        currentSectionId:
-          typeof timerMeta?.currentSectionId === 'string' &&
-          /^[a-fA-F0-9]{24}$/.test(timerMeta.currentSectionId)
-            ? timerMeta.currentSectionId
-            : null,
-      };
-
-      await attempt.save();
-
-      await attempt.populate('examId', 'title duration showResultsImmediately resultsReleasedAt');
-      await attempt.populate('questionPaperId', 'setName');
-      const savedAnswers = await Answer.find({ attemptId: attempt._id });
-      const canReviewAnswers = await hasExamPermission(
-        req.user._id,
-        attempt.examId?._id || attempt.examId,
-        'REVIEW_ANSWERS'
-      );
-      const scoringVisible =
-        canBypassReleaseWindow({
-          userRole: req.user.role,
-          canReviewAnswers,
-        }) || isExamResultsReleased(attempt.examId);
-
-      res.json({
-        success: true,
-        attempt,
-        attemptStatus: 'COMPLETED',
-        submittedAt: submitTime.toISOString(),
-        score: scoringVisible
-          ? {
-              totalScore,
-              maxScore,
-              percentage,
-            }
-          : null,
-        answers: scoringVisible ? savedAnswers : [],
-        resultsAvailable: scoringVisible,
-        message: scoringVisible
-          ? 'Attempt submitted successfully.'
-          : 'Attempt submitted successfully. Results are not yet released for candidates.',
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
+  submitAttemptHandler
 );
 
 // Get attempt results
@@ -1084,7 +1594,8 @@ router.get('/:attemptId/results', requireAuth, validateObjectId('attemptId'), as
       isOwnAttempt &&
       !canViewAnyAttempt &&
       attempt.examId &&
-      !isExamResultsReleased(attempt.examId)
+      !isExamResultsReleased(attempt.examId) &&
+      !isTabSwitchDisqualifiedAttempt(attempt)
     ) {
       return res.status(403).json({ error: 'Results are not yet available for this exam.' });
     }
@@ -1226,17 +1737,17 @@ router.get('/:attemptId/certificate', requireAuth, validateObjectId('attemptId')
         isCompleted: attempt.isCompleted,
         questionPaper: attempt.questionPaperId
           ? {
-              _id: attempt.questionPaperId._id,
-            }
+            _id: attempt.questionPaperId._id,
+          }
           : null,
         examId: attempt.examId
           ? {
-              _id: attempt.examId._id,
-              title: attempt.examId.title,
-              showResultsImmediately: attempt.examId.showResultsImmediately,
-              resultsReleasedAt: attempt.examId.resultsReleasedAt,
-              certificatesSentAt: attempt.examId.certificatesSentAt,
-            }
+            _id: attempt.examId._id,
+            title: attempt.examId.title,
+            showResultsImmediately: attempt.examId.showResultsImmediately,
+            resultsReleasedAt: attempt.examId.resultsReleasedAt,
+            certificatesSentAt: attempt.examId.certificatesSentAt,
+          }
           : null,
       },
       user: {
@@ -1485,7 +1996,7 @@ router.post(
       try {
         const { calculateNormalizedScore } = await import('../services/normalizationService.js');
         normalizationResult = await calculateNormalizedScore(attempt._id);
-        
+
         attempt.normalizedScore = normalizationResult.normalizedScore;
         attempt.percentile = normalizationResult.percentile;
         attempt.sessionPercentile = normalizationResult.sessionPercentile;
@@ -1581,7 +2092,7 @@ router.post(
       try {
         const { calculateNormalizedScore } = await import('../services/normalizationService.js');
         normalizationResult = await calculateNormalizedScore(attempt._id);
-        
+
         attempt.normalizedScore = normalizationResult.normalizedScore;
         attempt.percentile = normalizationResult.percentile;
         attempt.sessionPercentile = normalizationResult.sessionPercentile;
@@ -1851,14 +2362,14 @@ router.get(
       const attemptsWithStats = await Promise.all(
         attempts.map(async (attempt) => {
           const attemptObj = attempt.toObject();
-          
+
           // Get total questions for this attempt's question paper
           let totalQuestions = 0;
           if (attempt.questionPaperId) {
             const questionPaperId = attempt.questionPaperId._id || attempt.questionPaperId;
             totalQuestions = await Question.countDocuments({ questionPaperId });
           }
-          
+
           // Count attempted questions (questions with answers)
           const attemptedCount = await Answer.countDocuments({
             attemptId: attempt._id,
@@ -1867,13 +2378,13 @@ router.get(
               { answerText: { $exists: true, $ne: null } }
             ]
           });
-          
+
           attemptObj.attemptedQuestions = attemptedCount;
           attemptObj.totalQuestions = totalQuestions;
-          attemptObj.progressPercentage = totalQuestions > 0 
-            ? Math.round((attemptedCount / totalQuestions) * 100) 
+          attemptObj.progressPercentage = totalQuestions > 0
+            ? Math.round((attemptedCount / totalQuestions) * 100)
             : 0;
-          
+
           return attemptObj;
         })
       );

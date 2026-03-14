@@ -50,6 +50,10 @@ const ExamAttemptSchema = new mongoose.Schema(
         type: String,
         trim: true,
       },
+      violationType: {
+        type: String,
+        trim: true,
+      },
       submittedAtClient: {
         type: Date,
       },
@@ -61,6 +65,10 @@ const ExamAttemptSchema = new mongoose.Schema(
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Section',
       },
+      finalizedAfterViolation: {
+        type: Boolean,
+        default: false,
+      },
     },
     isCompleted: {
       type: Boolean,
@@ -71,6 +79,10 @@ const ExamAttemptSchema = new mongoose.Schema(
       default: false,
     },
     disqualifyReason: {
+      type: String,
+      trim: true,
+    },
+    disqualifyStatus: {
       type: String,
       trim: true,
     },
@@ -191,7 +203,11 @@ const ExamAttemptSchema = new mongoose.Schema(
       default: false,
     },
     suspiciousActivityFlags: {
-      type: [String],
+      type: [mongoose.Schema.Types.Mixed],
+      default: [],
+    },
+    proctoringViolations: {
+      type: [mongoose.Schema.Types.Mixed],
       default: [],
     },
     adminFlags: {

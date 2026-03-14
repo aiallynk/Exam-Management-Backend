@@ -12,6 +12,8 @@ import QuestionPaper from '../models/QuestionPaper.js';
 import Section from '../models/Section.js';
 import Question from '../models/Question.js';
 import { logInfo, logError } from '../utils/logger.js';
+import { sanitizeQuestionOptions } from '../utils/questionOptionSanitizer.js';
+import { ensureQuestionsImageAvailability } from './questionImportImageService.js';
 
 const gzip = promisify(zlib.gzip);
 const gunzip = promisify(zlib.gunzip);
@@ -111,6 +113,12 @@ export const generateExamPackage = async (examId, questionPaperId, userId, expir
     questionPaperId,
   }).sort({ order: 1 });
 
+  await ensureQuestionsImageAvailability({
+    questions,
+    examId,
+    persist: true,
+  });
+
   // Get or increment version FIRST (needed for package data and key derivation)
   // Look at ALL packages (active and inactive) to ensure version increments correctly on regeneration
   const latestPackage = await ExamPackage.findOne({
@@ -148,11 +156,20 @@ export const generateExamPackage = async (examId, questionPaperId, userId, expir
     questions: questions.map(question => ({
       id: question._id.toString(),
       uniqueId: question.uniqueId,
+      question: question.questionText,
       questionText: question.questionText,
+      question_text: question.questionText,
       questionType: question.questionType,
-      options: question.options, // Include options but NOT correct answers
+      options: sanitizeQuestionOptions(question.options), // Include options but NOT correct answers
+      image: question.imageUrl || question.generatedImage || question.imageBase64 || '',
       imageUrl: question.imageUrl,
+      image_path: question.imageUrl || '',
+      imageBase64: question.imageBase64,
+      image_base64: question.imageBase64 || '',
+      generatedImage: question.generatedImage,
+      generated_image: question.generatedImage || '',
       passage: question.passage,
+      paragraphGroupId: question.paragraphGroupId || '',
       points: question.points,
       order: question.order,
       sectionId: question.sectionId?.toString(),

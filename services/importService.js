@@ -9,6 +9,10 @@ import pdfParse from 'pdf-parse';
 import readXlsxFile from 'read-excel-file/node';
 import { parse as parseCsv } from 'csv-parse/sync';
 import path from 'path';
+import {
+  normalizeQuestionCorrectAnswer,
+  sanitizeQuestionOptions,
+} from '../utils/questionOptionSanitizer.js';
 
 const VALID_QUESTION_TYPES = [
   'MULTIPLE_CHOICE',
@@ -110,6 +114,8 @@ const normalizeRow = (row, index) => {
       }
       if (!Array.isArray(normalized.options)) {
         normalized.options = undefined;
+      } else {
+        normalized.options = sanitizeQuestionOptions(normalized.options);
       }
     } catch (e) {
       normalized.options = undefined;
@@ -118,7 +124,14 @@ const normalizeRow = (row, index) => {
   
   // Normalize correctAnswer
   if (normalized.correctAnswer !== undefined && normalized.correctAnswer !== null) {
-    normalized.correctAnswer = String(normalized.correctAnswer).trim();
+    const resolvedAnswer = normalizeQuestionCorrectAnswer({
+      questionType: normalized.questionType,
+      correctAnswer: normalized.correctAnswer,
+      options: normalized.options,
+    });
+    normalized.correctAnswer = Array.isArray(resolvedAnswer)
+      ? JSON.stringify(resolvedAnswer)
+      : String(resolvedAnswer).trim();
   }
   
   // Normalize points

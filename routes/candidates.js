@@ -17,6 +17,7 @@ import bcrypt from 'bcryptjs';
 import { ensureScoreSummary } from '../utils/attemptScores.js';
 import { hasExamPermission } from '../middleware/examPermissions.js';
 import { resolveTenantSnapshot } from '../utils/tenantResolver.js';
+import { TAB_SWITCH_DISQUALIFY_STATUS } from '../services/proctoringService.js';
 
 const router = express.Router();
 
@@ -167,8 +168,11 @@ router.get('/results', requireAuth, async (req, res, next) => {
       const certificatesReleased =
         Boolean(attempt.examId.certificatesSentAt) &&
         new Date(attempt.examId.certificatesSentAt) <= new Date();
+      const disqualifiedByTabSwitch =
+        Boolean(attempt.isDisqualified) &&
+        String(attempt.disqualifyStatus || '').trim().toUpperCase() === TAB_SWITCH_DISQUALIFY_STATUS;
 
-      if (canReviewAnswers || resultsReleased || certificatesReleased) {
+      if (canReviewAnswers || resultsReleased || certificatesReleased || disqualifiedByTabSwitch) {
         filteredAttempts.push(attempt);
       }
     }

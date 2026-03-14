@@ -34,6 +34,8 @@ import analyticsRoutes from './routes/analytics.js';
 import auditLogRoutes from './routes/auditLogs.js';
 import proctoringRoutes from './routes/proctoring.js';
 import examPackageRoutes from './routes/examPackages.js';
+import omrRoutes from './routes/omr.js';
+import compilerRoutes from './routes/compiler.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -62,13 +64,28 @@ app.use(
 );
 // CORS: allow multiple origins (comma-separated), localhost (dev only), and Vercel previews
 const buildCorsOrigin = () => {
+  const normalizeOrigin = (value) => {
+    if (!value || typeof value !== 'string') return '';
+    const trimmed = value.trim().replace(/\/+$/, '');
+    if (!trimmed) return '';
+    try {
+      const parsed = new URL(trimmed);
+      return `${parsed.protocol}//${parsed.host}`.toLowerCase();
+    } catch {
+      return trimmed.toLowerCase();
+    }
+  };
+
   const defaults = [
     'http://localhost:5173',
     'http://127.0.0.1:5173',
     'http://localhost:5174',
     'http://127.0.0.1:5174',
-  ];
-  const configured = (config.corsOrigin || '').split(',').map((s) => s.trim()).filter(Boolean);
+  ].map(normalizeOrigin).filter(Boolean);
+  const configured = (config.corsOrigin || '')
+    .split(',')
+    .map(normalizeOrigin)
+    .filter(Boolean);
   const allowed = Array.from(new Set([...configured, ...defaults]));
   const isDevelopment = config.nodeEnv === 'development';
   
@@ -77,14 +94,15 @@ const buildCorsOrigin = () => {
   
   return (origin, callback) => {
     if (!origin) return callback(null, true); // allow non-browser requests
+    const normalizedOrigin = normalizeOrigin(origin);
     
     // Allow exact matches
-    if (allowed.includes(origin)) return callback(null, true);
+    if (allowed.includes(normalizedOrigin)) return callback(null, true);
     
     // Allow localhost only in development mode and only for specific ports
     if (isDevelopment) {
       try {
-        const url = new URL(origin);
+        const url = new URL(normalizedOrigin);
         const port = url.port ? parseInt(url.port, 10) : (url.protocol === 'https:' ? 443 : 80);
         
         if (
@@ -101,9 +119,17 @@ const buildCorsOrigin = () => {
     // Allow any Vercel preview/production subdomain if a *.vercel.app is configured
     try {
       const allowVercelWildcard = allowed.some((o) => o.endsWith('.vercel.app'));
+      const allowDevTunnelWildcard =
+        isDevelopment && allowed.some((o) => o.endsWith('.devtunnels.ms'));
       if (allowVercelWildcard) {
-        const url = new URL(origin);
+        const url = new URL(normalizedOrigin);
         if (/\.vercel\.app$/.test(url.hostname)) {
+          return callback(null, true);
+        }
+      }
+      if (allowDevTunnelWildcard) {
+        const url = new URL(normalizedOrigin);
+        if (/\.devtunnels\.ms$/.test(url.hostname)) {
           return callback(null, true);
         }
       }
@@ -212,6 +238,9 @@ app.use('/api/analytics', analyticsRoutes);
 app.use('/api/audit-logs', auditLogRoutes);
 app.use('/api/proctoring', proctoringRoutes);
 app.use('/api/exam-packages', examPackageRoutes);
+app.use('/api/omr', omrRoutes);
+app.use('/api/compiler', compilerRoutes);
+app.use('/api/code', compilerRoutes);
 
 // Error handling
 app.use(notFound);
