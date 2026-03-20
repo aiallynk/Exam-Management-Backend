@@ -9,6 +9,11 @@ import ExamAttempt from '../models/ExamAttempt.js';
 const FOCUS_VIOLATION_SUBMISSION_SOURCE = 'STRICT_FOCUS_LOSS_AUTO_SUBMIT';
 const TAB_SWITCH_DISQUALIFY_STATUS = 'DISQUALIFIED_TAB_SWITCH';
 
+const normalizeString = (value) => {
+  if (value === undefined || value === null) return '';
+  return String(value).trim();
+};
+
 const toNonNegativeInt = (value, fallback = 0) => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) return fallback;
@@ -202,13 +207,19 @@ export const logDeviceInfo = async (attemptId, deviceInfo, actorUserId = null) =
   }
   assertAttemptOwnership(attempt, actorUserId);
 
+  const nextIpAddress =
+    normalizeString(deviceInfo?.ipAddress) ||
+    normalizeString(attempt?.deviceInfo?.ipAddress) ||
+    '';
+
   attempt.deviceInfo = {
-    ipAddress: deviceInfo.ipAddress || '',
-    userAgent: deviceInfo.userAgent || '',
-    deviceId: deviceInfo.deviceId || '',
-    screenResolution: deviceInfo.screenResolution || '',
-    timezone: deviceInfo.timezone || '',
-    language: deviceInfo.language || '',
+    ...(attempt.deviceInfo || {}),
+    ipAddress: nextIpAddress,
+    userAgent: normalizeString(deviceInfo?.userAgent) || normalizeString(attempt?.deviceInfo?.userAgent) || '',
+    deviceId: normalizeString(deviceInfo?.deviceId) || normalizeString(attempt?.deviceInfo?.deviceId) || '',
+    screenResolution: normalizeString(deviceInfo?.screenResolution),
+    timezone: normalizeString(deviceInfo?.timezone),
+    language: normalizeString(deviceInfo?.language),
   };
 
   return await attempt.save();

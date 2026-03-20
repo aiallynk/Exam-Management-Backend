@@ -68,12 +68,68 @@ const TenantSchema = new mongoose.Schema(
       enum: ['ACTIVE', 'INACTIVE', 'SUSPENDED'],
       default: 'ACTIVE',
     },
+    subscription: {
+      planType: {
+        type: String,
+        enum: ['free', 'pro', 'ultimate', 'legend'],
+        default: 'free',
+        lowercase: true,
+        trim: true,
+      },
+      status: {
+        type: String,
+        enum: ['ACTIVE', 'EXPIRED', 'SUSPENDED'],
+        default: 'ACTIVE',
+      },
+      startedAt: {
+        type: Date,
+        default: Date.now,
+      },
+      expiresAt: {
+        type: Date,
+        default: null,
+      },
+      usageResetAt: {
+        type: Date,
+        default: null,
+      },
+      customLimits: {
+        maxExamsPerMonth: {
+          type: Number,
+          default: null,
+        },
+        maxAttemptsPerMonth: {
+          type: Number,
+          default: null,
+        },
+        maxAiQuestionsPerMonth: {
+          type: Number,
+          default: null,
+        },
+        maxCandidates: {
+          type: Number,
+          default: null,
+        },
+      },
+      customFeatures: {
+        type: mongoose.Schema.Types.Mixed,
+        default: {},
+      },
+      updatedAt: {
+        type: Date,
+        default: Date.now,
+      },
+    },
     // Limits and quotas
     examLimit: {
       type: Number,
       default: null, // null = unlimited
     },
     aiUsageLimit: {
+      type: Number,
+      default: null, // null = unlimited
+    },
+    attemptLimit: {
       type: Number,
       default: null, // null = unlimited
     },
@@ -117,5 +173,7 @@ TenantSchema.index({ code: 1 });
 TenantSchema.index({ type: 1, status: 1 });
 TenantSchema.index({ status: 1, createdAt: -1 });
 TenantSchema.index({ createdBy: 1 });
+TenantSchema.index({ 'subscription.planType': 1 });
+TenantSchema.index({ 'subscription.status': 1 });
 
 export default mongoose.model('Tenant', TenantSchema);

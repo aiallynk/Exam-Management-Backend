@@ -4,7 +4,11 @@
  */
 
 import { logError } from './logger.js';
+import { resolveTenantSnapshot } from './tenantResolver.js';
 import AuditLog from '../models/AuditLog.js';
+import { emitSystemAlertFromAuditEvent } from '../services/systemAlertService.js';
+
+const EXCLUDED_ACTIONS = new Set(['LOGIN_SUCCESS', 'LOGIN_FAILED', 'LOGOUT']);
 
 /**
  * Audit log entry structure
@@ -24,11 +28,34 @@ export const createAuditLog = (action, details) => {
  */
 export const logAuditEvent = async (action, details = {}) => {
   try {
+    if (EXCLUDED_ACTIONS.has(action)) {
+      return;
+    }
+
+    const resolvedUserName =
+      details.userName || details.user?.name || details.user?.fullName || null;
+    const resolvedUserEmail = details.userEmail || details.email || null;
+    const resolvedTenantId = details.tenantId || null;
+    let resolvedTenantName =
+      details.tenantName || details.tenant?.name || null;
+
+    if (!resolvedTenantName && resolvedTenantId) {
+      try {
+        const tenant = await resolveTenantSnapshot(resolvedTenantId, 'name');
+        resolvedTenantName = tenant?.name || null;
+      } catch (lookupError) {
+        resolvedTenantName = null;
+      }
+    }
+
     const auditEntry = new AuditLog({
       action,
       userId: details.userId || null,
-      userEmail: details.userEmail || null,
+      userEmail: resolvedUserEmail,
+      userName: resolvedUserName,
       userRole: details.userRole || null,
+      tenantId: resolvedTenantId,
+      tenantName: resolvedTenantName,
       resourceType: details.resourceType || null,
       resourceId: details.resourceId || null,
       details: {
@@ -49,6 +76,20 @@ export const logAuditEvent = async (action, details = {}) => {
       // Log error but don't throw - audit logging should not break the main flow
       console.error('[AUDIT ERROR] Failed to save audit log:', error);
       logError(error, { context: 'auditLogger', action, details });
+    });
+
+    // Emit system alert from real audit events (non-blocking).
+    emitSystemAlertFromAuditEvent(action, {
+      ...details,
+      tenantId: resolvedTenantId,
+      tenantName: resolvedTenantName,
+      userEmail: resolvedUserEmail,
+      userName: resolvedUserName,
+    }).catch((error) => {
+      console.error(
+        '[AUDIT ERROR] Failed to emit system alert from audit event:',
+        error?.message || error
+      );
     });
     
     // Also log to console in development
@@ -75,6 +116,7 @@ export const AUDIT_ACTIONS = {
   // User actions
   USER_CREATED: 'USER_CREATED',
   USER_UPDATED: 'USER_UPDATED',
+  USER_ROLE_CHANGED: 'USER_ROLE_CHANGED',
   USER_DELETED: 'USER_DELETED',
   USER_BLOCKED: 'USER_BLOCKED',
   USER_UNBLOCKED: 'USER_UNBLOCKED',
@@ -100,6 +142,7 @@ export const AUDIT_ACTIONS = {
   CERTIFICATE_SENT: 'CERTIFICATE_SENT',
   TENANT_CREATED: 'TENANT_CREATED',
   TENANT_UPDATED: 'TENANT_UPDATED',
+  TENANT_DEACTIVATED: 'TENANT_DEACTIVATED',
   
   // Security events
   LOGIN_SUCCESS: 'LOGIN_SUCCESS',

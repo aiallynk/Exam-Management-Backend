@@ -18,6 +18,24 @@ import readXlsxFile from 'read-excel-file/node';
 import OpenAI from 'openai';
 import config from '../config/env.js';
 import { normalizeQuestionFormat } from '../utils/questionTypes.js';
+import {
+  createTrackedChatCompletion,
+  getAIQuestionCountForTenantByWindow,
+} from '../services/aiTokenUsageService.js';
+import Tenant from '../models/Tenant.js';
+import { getCurrentMonthRange } from '../utils/planUsage.js';
+import {
+  FREE_PLAN_MESSAGES,
+  PLAN_LIMIT_MESSAGES,
+  SUBSCRIPTION_PLAN_TYPES,
+  getSubscriptionPlanDefinition,
+  isFreePlan,
+  isPlanFeatureEnabled,
+} from '../config/planLimits.js';
+import {
+  resolveUserEffectivePlanType,
+  sendPlanRestriction,
+} from '../middleware/planRestrictions.js';
 
 const handleMulterUploadError = (err, req, res, next) => {
   if (!err) {
@@ -68,6 +86,88 @@ const imageUpload = multer({
 });
 
 const router = express.Router();
+const OPENAI_MODEL = config.openaiModel || 'gpt-4o-mini';
+
+const normalizeAiQuestionType = (value) => {
+  const normalized = String(value || '').trim().toUpperCase();
+  if (['MCQ', 'MULTIPLE_CHOICE', 'MULTIPLE CHOICE'].includes(normalized)) {
+    return 'MULTIPLE_CHOICE';
+  }
+  if (['TRUE_FALSE', 'TRUEFALSE'].includes(normalized)) return 'TRUE_FALSE';
+  if (['SHORT_ANSWER', 'SHORTANSWER'].includes(normalized)) return 'SHORT_ANSWER';
+  if (['IMAGE', 'IMAGE_BASED', 'IMAGE-BASED'].includes(normalized)) return 'IMAGE';
+  if (['MULTIPLE_OPTIONS', 'MULTI_SELECT', 'MULTISELECT'].includes(normalized)) {
+    return 'MULTIPLE_OPTIONS';
+  }
+  if (['PARAGRAPH', 'SCENARIO'].includes(normalized)) return normalized;
+  if (['CODING', 'CODE'].includes(normalized)) return 'CODING';
+  if (['NUMBER', 'NUMERIC'].includes(normalized)) return 'NUMBER';
+  return normalized;
+};
+
+const FREE_PLAN_ALLOWED_AI_TYPES = new Set([
+  'MULTIPLE_CHOICE',
+  'TRUE_FALSE',
+  'SHORT_ANSWER',
+]);
+
+const toNonNegativeInt = (value, fallback = 0) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
+};
+
+const resolveFiniteLimit = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.floor(parsed);
+};
+
+const buildAiUsageWindow = (subscription = null) => {
+  const { start, end } = getCurrentMonthRange();
+  const resetAt = subscription?.usageResetAt ? new Date(subscription.usageResetAt) : null;
+  if (resetAt && !Number.isNaN(resetAt.getTime()) && resetAt > start && resetAt < end) {
+    return { start: resetAt, end };
+  }
+  return { start, end };
+};
+
+const resolveTenantAiQuestionLimit = (effectivePlanType, tenant = null) => {
+  const planDefinition = getSubscriptionPlanDefinition(effectivePlanType);
+  const planLimit = resolveFiniteLimit(planDefinition?.limits?.maxAiQuestionsPerMonth);
+  if (planLimit !== null) {
+    return planLimit;
+  }
+
+  const normalizedPlanType = String(effectivePlanType || '').trim().toLowerCase();
+  if (normalizedPlanType === SUBSCRIPTION_PLAN_TYPES.LEGEND) {
+    const customLimits =
+      tenant?.subscription?.customLimits &&
+      typeof tenant.subscription.customLimits === 'object' &&
+      !Array.isArray(tenant.subscription.customLimits)
+        ? tenant.subscription.customLimits
+        : {};
+    if (Object.prototype.hasOwnProperty.call(customLimits, 'maxAiQuestionsPerMonth')) {
+      return resolveFiniteLimit(customLimits.maxAiQuestionsPerMonth);
+    }
+    return resolveFiniteLimit(tenant?.aiUsageLimit);
+  }
+
+  return null;
+};
+
+const buildAiQuestionLimitMessage = (effectivePlanType, limit) => {
+  const baseMessage = isFreePlan(effectivePlanType)
+    ? FREE_PLAN_MESSAGES.AI_QUESTION_LIMIT
+    : PLAN_LIMIT_MESSAGES.AI_QUESTION_LIMIT;
+
+  if (!Number.isFinite(Number(limit))) {
+    return baseMessage;
+  }
+
+  return `${baseMessage} Monthly limit: ${limit} questions.`;
+};
 
 // Generate questions using AI (available to EXAM_CREATOR)
 router.post(
@@ -132,6 +232,12 @@ router.post(
         content: text,
         structuredRows,
         filename: req.file.originalname,
+        tenantId: req.user?.tenantId || null,
+        userId: req.user?._id || null,
+        metadata: {
+          tenantId: req.user?.tenantId || null,
+          userId: req.user?._id || null,
+        },
       });
 
       const imageAttachmentResult = await attachImagesToImportedQuestions({
@@ -228,10 +334,74 @@ router.post(
         imageQuestionMode,
         imageQuestionTypes,
       } = req.body;
+      const effectivePlanType = await resolveUserEffectivePlanType(req.user);
+
+      if (isFreePlan(effectivePlanType)) {
+        const normalizeList = (list) =>
+          Array.isArray(list) ? list.map(normalizeAiQuestionType).filter(Boolean) : [];
+        const normalizedQuestionTypes = normalizeList(questionTypes);
+        const normalizedScenarioTypes = normalizeList(scenarioQuestionTypes);
+        const normalizedImageTypes = normalizeList(imageQuestionTypes);
+        const allTypes = [
+          ...normalizedQuestionTypes,
+          ...normalizedScenarioTypes,
+          ...normalizedImageTypes,
+        ];
+        const disallowed = allTypes.find((type) => !FREE_PLAN_ALLOWED_AI_TYPES.has(type));
+        if (disallowed) {
+          const message =
+            disallowed === 'CODING'
+              ? FREE_PLAN_MESSAGES.CODING_LOCKED
+              : FREE_PLAN_MESSAGES.QUESTION_TYPE_LOCKED;
+          return sendPlanRestriction(res, message);
+        }
+      }
+
+      const tenantId = req.user?.tenantId || null;
+      const requestedQuestionCount = toNonNegativeInt(count, 0);
+      if (tenantId && requestedQuestionCount > 0) {
+        const tenant = await Tenant.findById(tenantId)
+          .select('subscription aiUsageLimit')
+          .lean();
+        const monthlyAiQuestionLimit = resolveTenantAiQuestionLimit(effectivePlanType, tenant);
+
+        if (monthlyAiQuestionLimit !== null) {
+          const usageWindow = buildAiUsageWindow(tenant?.subscription || null);
+          const aiQuestionsUsed = await getAIQuestionCountForTenantByWindow(
+            tenantId,
+            usageWindow.start,
+            usageWindow.end
+          );
+          const wouldUse = aiQuestionsUsed + requestedQuestionCount;
+
+          if (wouldUse > monthlyAiQuestionLimit) {
+            const remaining = Math.max(monthlyAiQuestionLimit - aiQuestionsUsed, 0);
+            return sendPlanRestriction(
+              res,
+              buildAiQuestionLimitMessage(effectivePlanType, monthlyAiQuestionLimit),
+              {
+                usage: {
+                  aiQuestions: {
+                    used: aiQuestionsUsed,
+                    requested: requestedQuestionCount,
+                    remaining,
+                    limit: monthlyAiQuestionLimit,
+                  },
+                  period: {
+                    type: 'month',
+                    start: usageWindow.start,
+                    end: usageWindow.end,
+                  },
+                },
+              }
+            );
+          }
+        }
+      }
 
       // Store tenant metadata for AI generation tracking
       const aiMetadata = {
-        tenantId: req.user.tenantId || null,
+        tenantId,
         inputSource: uploadedContent ? 'DETAILED_CONTENT' : 'TOPIC_ONLY',
         generatedBy: req.user._id,
         generatedAt: new Date(),
@@ -257,6 +427,8 @@ router.post(
         scenarioQuestionTypes: Array.isArray(scenarioQuestionTypes) ? scenarioQuestionTypes : undefined,
         imageQuestionMode,
         imageQuestionTypes: Array.isArray(imageQuestionTypes) ? imageQuestionTypes : [],
+        tenantId,
+        userId: req.user?._id || null,
         metadata: aiMetadata, // Pass metadata to AI service for logging
       });
 
@@ -280,6 +452,11 @@ router.post(
   handleMulterUploadError,
   async (req, res, next) => {
     try {
+      const effectivePlanType = await resolveUserEffectivePlanType(req.user);
+      if (!isPlanFeatureEnabled(effectivePlanType, 'aiGrading')) {
+        return sendPlanRestriction(res, FREE_PLAN_MESSAGES.AI_GRADING_LOCKED);
+      }
+
       if (!req.file) {
         return res.status(400).json({ error: 'No file uploaded' });
       }
@@ -329,26 +506,32 @@ router.post(
         const mimeType = fileExtension === '.png' ? 'image/png' : 'image/jpeg';
         
         try {
-          const response = await client.chat.completions.create({
-            model: 'gpt-4o',
-            messages: [
-              {
-                role: 'user',
-                content: [
-                  {
-                    type: 'text',
-                    text: 'Extract all text content from this image. If this is an answer key or exam paper, extract all questions and their correct answers. Return the text in a structured format.',
-                  },
-                  {
-                    type: 'image_url',
-                    image_url: {
-                      url: `data:${mimeType};base64,${base64Image}`,
+          const response = await createTrackedChatCompletion({
+            client,
+            feature: 'answer_key_generation',
+            tenantId: req.user?.tenantId,
+            userId: req.user?._id,
+            request: {
+              model: OPENAI_MODEL,
+              messages: [
+                {
+                  role: 'user',
+                  content: [
+                    {
+                      type: 'text',
+                      text: 'Extract all text content from this image. If this is an answer key or exam paper, extract all questions and their correct answers. Return the text in a structured format.',
                     },
-                  },
-                ],
-              },
-            ],
-            max_tokens: 4000,
+                    {
+                      type: 'image_url',
+                      image_url: {
+                        url: `data:${mimeType};base64,${base64Image}`,
+                      },
+                    },
+                  ],
+                },
+              ],
+              max_tokens: 4000,
+            },
           });
           
           extractedContent = response.choices[0].message.content || '';
@@ -387,14 +570,20 @@ Format: { "answers": { "q1": { "questionText": "...", "correctAnswer": "...", "p
       const client = new OpenAI({ apiKey: config.openaiApiKey });
 
       try {
-        const completion = await client.chat.completions.create({
-          model: 'gpt-4o-mini',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
-          temperature: 0.1,
-          response_format: { type: 'json_object' },
+        const completion = await createTrackedChatCompletion({
+          client,
+          feature: 'answer_key_generation',
+          tenantId: req.user?.tenantId,
+          userId: req.user?._id,
+          request: {
+            model: OPENAI_MODEL,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            temperature: 0.1,
+            response_format: { type: 'json_object' },
+          },
         });
 
         const responseContent = completion.choices[0].message.content;

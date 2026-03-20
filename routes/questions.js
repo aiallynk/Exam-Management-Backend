@@ -6,6 +6,8 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireRole, requireOwnershipOrAdmin } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { checkQuestionLimit } from '../middleware/planLimits.js';
+import { isFreePlan } from '../config/planLimits.js';
+import { sendPlanRestriction, validateFreePlanQuestionPayload, resolveExamPlanContext } from '../middleware/planRestrictions.js';
 import { body, validationResult } from 'express-validator';
 import { parseCSV, validateQuestionCSV } from '../utils/csv.js';
 import { syncExamQuestionCount } from '../utils/planUsage.js';
@@ -522,6 +524,14 @@ router.post(
         }
       }
 
+      const planContext = await resolveExamPlanContext(exam._id);
+      if (planContext?.planType && isFreePlan(planContext.planType)) {
+        const restrictionError = validateFreePlanQuestionPayload(req.body);
+        if (restrictionError) {
+          return sendPlanRestriction(res, restrictionError);
+        }
+      }
+
       // If sectionId is provided, verify it belongs to the question paper
       if (sectionId) {
         const Section = (await import('../models/Section.js')).default;
@@ -657,6 +667,20 @@ router.put(
       const questionPaper = await QuestionPaper.findById(question.questionPaperId);
       if (questionPaper.examId.toString() !== req.params.examId) {
         return res.status(404).json({ error: 'Question not found for this exam' });
+      }
+
+      const exam = await Exam.findById(questionPaper.examId).select('_id createdBy');
+      if (exam) {
+        const planContext = await resolveExamPlanContext(exam._id);
+        if (planContext?.planType && isFreePlan(planContext.planType)) {
+          const restrictionError = validateFreePlanQuestionPayload({
+            ...question.toObject(),
+            ...req.body,
+          });
+          if (restrictionError) {
+            return sendPlanRestriction(res, restrictionError);
+          }
+        }
       }
 
       const {
@@ -993,11 +1017,26 @@ router.post(
         return res.status(404).json({ error: 'Question paper not found' });
       }
 
+      const exam = await Exam.findById(req.params.examId).select('_id createdBy');
+      let freePlanRestriction = null;
+      if (exam) {
+        const planContext = await resolveExamPlanContext(exam._id);
+        if (planContext?.planType && isFreePlan(planContext.planType)) {
+          freePlanRestriction = true;
+        }
+      }
+
       let createdQuestions = [];
 
       if (importedQuestionsPayload) {
         for (let index = 0; index < importedQuestionsPayload.length; index += 1) {
           const record = importedQuestionsPayload[index] || {};
+          if (freePlanRestriction) {
+            const restrictionError = validateFreePlanQuestionPayload(record);
+            if (restrictionError) {
+              return sendPlanRestriction(res, restrictionError);
+            }
+          }
           const createdQuestion = await createQuestionWithManagedImage({
             examId: req.params.examId,
             questionPaperId,
@@ -1039,6 +1078,12 @@ router.post(
 
         for (let index = 0; index < records.length; index += 1) {
           const record = records[index];
+          if (freePlanRestriction) {
+            const restrictionError = validateFreePlanQuestionPayload(record);
+            if (restrictionError) {
+              return sendPlanRestriction(res, restrictionError);
+            }
+          }
           const createdQuestion = await createQuestionWithManagedImage({
             examId: req.params.examId,
             questionPaperId,

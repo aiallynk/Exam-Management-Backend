@@ -213,6 +213,7 @@ export const ensureExamParticipant = async (userId, examId, examRole, assignedBy
     });
 
     if (participant) {
+      participant.__assigned = false;
       return participant;
     }
 
@@ -231,6 +232,7 @@ export const ensureExamParticipant = async (userId, examId, examRole, assignedBy
         // Creator trying to become candidate - preserve CREATOR but allow attempt if explicitly granted
         // For now, return existing CREATOR participant (they can't attempt unless ATTEMPT_EXAM is explicitly set to true)
         // TODO: Consider allowing multiple roles or explicit permission override
+        existingParticipant.__assigned = false;
         return existingParticipant;
       }
       
@@ -242,8 +244,10 @@ export const ensureExamParticipant = async (userId, examId, examRole, assignedBy
           existingParticipant.assignedBy = assignedBy;
         }
         await existingParticipant.save();
+        existingParticipant.__assigned = true;
         return existingParticipant;
       }
+      existingParticipant.__assigned = false;
       return existingParticipant;
     }
 
@@ -257,6 +261,7 @@ export const ensureExamParticipant = async (userId, examId, examRole, assignedBy
     });
 
     await participant.save();
+    participant.__assigned = true;
     return participant;
   } catch (error) {
     console.error('ensureExamParticipant error:', error);

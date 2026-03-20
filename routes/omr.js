@@ -9,6 +9,7 @@ import { execFile } from 'child_process';
 import util from 'util';
 import { fileURLToPath } from 'url';
 import config from '../config/env.js';
+import { FREE_PLAN_MESSAGES, isPlanFeatureEnabled } from '../config/planLimits.js';
 
 const execFileAsync = util.promisify(execFile);
 
@@ -24,6 +25,11 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { requireTenant } from '../middleware/multiTenant.js';
 import {
+  blockFreePlanByUser,
+  resolveExamPlanContext,
+  resolveUserEffectivePlanType,
+} from '../middleware/planRestrictions.js';
+import {
   normalizeQuestionCorrectAnswer,
   sanitizeQuestionOptionText,
   sanitizeQuestionOptions,
@@ -33,6 +39,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const router = express.Router();
+const blockFreePlanOmr = blockFreePlanByUser(FREE_PLAN_MESSAGES.OMR_LOCKED, 'omr');
 
 const OMR_ALLOWED_ROLES = ['SUPER_ADMIN', 'EXAM_CREATOR', 'TENANT_ADMIN'];
 // Python OMR service removed — GPT-4o-mini Vision handles all image detection.
@@ -326,6 +333,28 @@ const evaluateAnswers = ({ detectedAnswers, answerKey, markingRules }) => {
     invalid_count: invalidCount,
     final_score: Number(finalScore.toFixed(2)),
     negative_marks: negativeMarks,
+  };
+};
+
+const buildAssistedOmrEvaluation = ({
+  detectedAnswers,
+  totalQuestions,
+  optionsPerQuestion = 4,
+}) => {
+  const resolvedDetectedAnswers = Array.from({ length: totalQuestions }, (_unused, index) =>
+    normalizeOption(detectedAnswers?.[index], optionsPerQuestion)
+  );
+  const skippedCount = resolvedDetectedAnswers.filter((value) => value === 'SKIPPED').length;
+  const invalidCount = resolvedDetectedAnswers.filter((value) => value === 'INVALID').length;
+
+  return {
+    detected_answers: resolvedDetectedAnswers,
+    correct_count: 0,
+    wrong_count: 0,
+    skipped_count: skippedCount,
+    invalid_count: invalidCount,
+    final_score: 0,
+    negative_marks: 0,
   };
 };
 
@@ -1066,6 +1095,7 @@ router.post(
   '/extract-id',
   requireAuth,
   requireTenant,
+  blockFreePlanOmr,
   requireRole(...OMR_ALLOWED_ROLES),
   upload.single('file'),
   handleMulterError,
@@ -1205,6 +1235,7 @@ router.get(
   '/template/:examId',
   requireAuth,
   requireTenant,
+  blockFreePlanOmr,
   requireRole(...OMR_ALLOWED_ROLES),
   async (req, res, next) => {
     try {
@@ -1225,6 +1256,7 @@ router.post(
   '/process',
   requireAuth,
   requireTenant,
+  blockFreePlanOmr,
   requireRole(...OMR_ALLOWED_ROLES),
   upload.fields([
     { name: 'file', maxCount: 1 },
@@ -1248,6 +1280,13 @@ router.post(
 
       const exam = await ensureExamAccess(examIdentifier, req.user);
       const evaluationConfig = await resolveExamEvaluationConfig(exam);
+      const examPlanContext = await resolveExamPlanContext(exam._id);
+      const effectivePlanType =
+        examPlanContext?.planType || (await resolveUserEffectivePlanType(req.user));
+      const omrAutoGradingEnabled = isPlanFeatureEnabled(
+        effectivePlanType,
+        'omrAutoGrading'
+      );
       const manualReviewThreshold = resolveManualReviewThreshold(req.body.confidenceThreshold);
       const candidateLookup = await buildCandidateLookup(exam._id, exam.tenantId);
       const savedResults = [];
@@ -1287,11 +1326,17 @@ router.post(
           // ── Evaluate answers first — undetected questions become SKIPPED ──
           // evaluateAnswers() already maps missing entries to SKIPPED via normalizeOption,
           // so partial detection is fine; it will NOT throw due to missing questions.
-          const evaluation = evaluateAnswers({
-            detectedAnswers,
-            answerKey: evaluationConfig.answerKey || [],
-            markingRules: evaluationConfig.markingRules || {},
-          });
+          const evaluation = omrAutoGradingEnabled
+            ? evaluateAnswers({
+              detectedAnswers,
+              answerKey: evaluationConfig.answerKey || [],
+              markingRules: evaluationConfig.markingRules || {},
+            })
+            : buildAssistedOmrEvaluation({
+              detectedAnswers,
+              totalQuestions: evaluationConfig.markingRules?.totalQuestions || 0,
+              optionsPerQuestion: evaluationConfig.markingRules?.optionsPerQuestion || 4,
+            });
 
           const confidenceScore = computeConfidenceScore({
             sheet,
@@ -1328,6 +1373,7 @@ router.post(
 
           // Low confidence from Python service → LOW_CONFIDENCE (not ERROR)
           const manualReviewRequired =
+            !omrAutoGradingEnabled ||
             status === 'LOW_CONFIDENCE' ||
             (status !== 'ERROR' && confidenceScore < manualReviewThreshold);
           if (manualReviewRequired && status !== 'LOW_CONFIDENCE' && status !== 'ERROR') {
@@ -1364,7 +1410,7 @@ router.post(
             omrSheetId,
             detected_answers: evaluation.detected_answers,
             detectedAnswers: evaluation.detected_answers,
-            correct_answers: evaluationConfig.answerKey || [],
+            correct_answers: omrAutoGradingEnabled ? evaluationConfig.answerKey || [] : [],
             total_questions: totalQuestions,
             correct_count: evaluation.correct_count,
             totalCorrect: evaluation.correct_count,
@@ -1428,11 +1474,14 @@ router.post(
       }
 
       return res.json({
-        message: `Processed ${savedResults.length} sheet(s) from ${files.length} file(s).`,
+        message: omrAutoGradingEnabled
+          ? `Processed ${savedResults.length} sheet(s) from ${files.length} file(s).`
+          : `Processed ${savedResults.length} sheet(s) from ${files.length} file(s) in assisted mode. Manual review required.`,
         summary: {
           processed: savedResults.length,
           manualReview: savedResults.filter((result) => result.manualReviewRequired).length,
           errors: savedResults.filter((result) => result.status === 'ERROR').length,
+          mode: omrAutoGradingEnabled ? 'full' : 'assisted',
         },
         results: savedResults,
       });
@@ -1446,6 +1495,7 @@ router.get(
   '/results',
   requireAuth,
   requireTenant,
+  blockFreePlanOmr,
   requireRole(...OMR_ALLOWED_ROLES),
   async (req, res, next) => {
     try {
@@ -1632,6 +1682,7 @@ router.get(
   '/results/:resultId',
   requireAuth,
   requireTenant,
+  blockFreePlanOmr,
   requireRole(...OMR_ALLOWED_ROLES),
   async (req, res, next) => {
     try {
@@ -1667,6 +1718,7 @@ router.get(
   '/results/:resultId/report',
   requireAuth,
   requireTenant,
+  blockFreePlanOmr,
   requireRole(...OMR_ALLOWED_ROLES),
   async (req, res, next) => {
     try {
@@ -1706,6 +1758,7 @@ router.post(
   '/results/:resultId/reprocess',
   requireAuth,
   requireTenant,
+  blockFreePlanOmr,
   requireRole(...OMR_ALLOWED_ROLES),
   async (req, res, next) => {
     try {
@@ -1719,6 +1772,13 @@ router.post(
 
       const exam = await ensureExamAccess(result.exam_id, req.user);
       const evaluationConfig = await resolveExamEvaluationConfig(exam);
+      const examPlanContext = await resolveExamPlanContext(exam._id);
+      const effectivePlanType =
+        examPlanContext?.planType || (await resolveUserEffectivePlanType(req.user));
+      const omrAutoGradingEnabled = isPlanFeatureEnabled(
+        effectivePlanType,
+        'omrAutoGrading'
+      );
       if (!result.source_file) {
         return res.status(400).json({ error: 'No source file available for reprocessing.' });
       }
@@ -1765,11 +1825,17 @@ router.post(
       const qrSheetId = qrPayload?.omrSheetId || qrPayload?.omr_sheet_id || currentSheet.omr_sheet_id;
       const qrPaperCode = qrPayload?.paperCode || qrPayload?.paper_code || currentSheet.paper_code || '';
 
-      const evaluation = evaluateAnswers({
-        detectedAnswers: currentSheet.detected_answers,
-        answerKey: evaluationConfig.answerKey || [],
-        markingRules: evaluationConfig.markingRules || {},
-      });
+      const evaluation = omrAutoGradingEnabled
+        ? evaluateAnswers({
+          detectedAnswers: currentSheet.detected_answers,
+          answerKey: evaluationConfig.answerKey || [],
+          markingRules: evaluationConfig.markingRules || {},
+        })
+        : buildAssistedOmrEvaluation({
+          detectedAnswers: currentSheet.detected_answers,
+          totalQuestions: evaluationConfig.markingRules?.totalQuestions || 0,
+          optionsPerQuestion: evaluationConfig.markingRules?.optionsPerQuestion || 4,
+        });
 
       const confidenceScore = computeConfidenceScore({
         sheet: currentSheet,
@@ -1802,8 +1868,10 @@ router.post(
       if (reprocessError) {
         status = 'ERROR';
       }
-      const manualReviewRequired = status !== 'ERROR' && confidenceScore < manualReviewThreshold;
-      if (manualReviewRequired) {
+      const manualReviewRequired =
+        !omrAutoGradingEnabled ||
+        (status !== 'ERROR' && confidenceScore < manualReviewThreshold);
+      if (manualReviewRequired && status !== 'ERROR') {
         status = 'MANUAL_REVIEW';
       }
 
@@ -1817,7 +1885,7 @@ router.post(
       result.omrSheetId = String(qrSheetId || result.omrSheetId || createOmrSheetId()).trim();
       result.detected_answers = evaluation.detected_answers;
       result.detectedAnswers = evaluation.detected_answers;
-      result.correct_answers = evaluationConfig.answerKey || [];
+      result.correct_answers = omrAutoGradingEnabled ? evaluationConfig.answerKey || [] : [];
       result.total_questions = evaluationConfig.markingRules?.totalQuestions || 0;
       result.correct_count = evaluation.correct_count;
       result.totalCorrect = evaluation.correct_count;
@@ -1861,6 +1929,7 @@ router.delete(
   '/results/:resultId',
   requireAuth,
   requireTenant,
+  blockFreePlanOmr,
   requireRole(...OMR_ALLOWED_ROLES),
   async (req, res, next) => {
     try {

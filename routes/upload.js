@@ -328,7 +328,10 @@ router.post(
         return res.status(400).json({ error: 'No file uploaded' });
       }
 
-      const result = await generateImportPreview(req.file, req.file.originalname);
+      const result = await generateImportPreview(req.file, req.file.originalname, {
+        tenantId: req.user?.tenantId || null,
+        userId: req.user?._id || null,
+      });
       res.json(result);
     } catch (error) {
       next(error);

@@ -86,6 +86,12 @@ const ExamSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    subTenantId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'SubTenant',
+      default: null,
+      index: true,
+    },
     // AI generation metadata
     aiGenerated: {
       type: Boolean,
@@ -175,6 +181,56 @@ const ExamSchema = new mongoose.Schema(
       trim: true,
       default: '',
     },
+    accessControl: {
+      ipWhitelist: {
+        type: [String],
+        default: [],
+      },
+      geoRestrictions: {
+        enabled: {
+          type: Boolean,
+          default: false,
+        },
+        allowedCountries: {
+          type: [String],
+          default: [],
+        },
+        allowedRegions: {
+          type: [String],
+          default: [],
+        },
+        allowUnknownLocation: {
+          type: Boolean,
+          default: true,
+        },
+      },
+      secureBrowser: {
+        enabled: {
+          type: Boolean,
+          default: true,
+        },
+        requireFullscreen: {
+          type: Boolean,
+          default: true,
+        },
+        blockClipboard: {
+          type: Boolean,
+          default: true,
+        },
+        blockRightClick: {
+          type: Boolean,
+          default: true,
+        },
+        blockKeyboardShortcuts: {
+          type: Boolean,
+          default: true,
+        },
+        blockTabSwitch: {
+          type: Boolean,
+          default: true,
+        },
+      },
+    },
   },
   {
     timestamps: true,
@@ -211,6 +267,7 @@ ExamSchema.index({ tenantId: 1, createdAt: -1 });
 ExamSchema.index({ createdBy: 1, createdAt: -1 });
 ExamSchema.index({ tenantId: 1, isActive: 1 });
 ExamSchema.index({ tenantId: 1, examType: 1, createdAt: -1 });
+ExamSchema.index({ tenantId: 1, subTenantId: 1, createdAt: -1 });
 
 export default mongoose.model('Exam', ExamSchema);
 

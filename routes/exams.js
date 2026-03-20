@@ -3,6 +3,7 @@ import Exam from '../models/Exam.js';
 import ExamAttempt from '../models/ExamAttempt.js';
 import Answer from '../models/Answer.js';
 import ExamParticipant from '../models/ExamParticipant.js';
+import SubTenant from '../models/SubTenant.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole, requireOwnershipOrAdmin } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
@@ -11,6 +12,13 @@ import { checkExamCreationLimit } from '../middleware/planLimits.js';
 import { body, validationResult } from 'express-validator';
 import { sanitizePagination } from '../middleware/validation.js';
 import { auditLog, AUDIT_ACTIONS } from '../middleware/audit.js';
+import { logAuditEvent } from '../utils/auditLogger.js';
+import { FREE_PLAN_MESSAGES, isPlanFeatureEnabled } from '../config/planLimits.js';
+import {
+  resolveExamPlanContext,
+  resolveUserEffectivePlanType,
+  sendPlanRestriction,
+} from '../middleware/planRestrictions.js';
 import { submitAttemptHandler } from './attempts.js';
 import {
   loadCertificateTemplate,
@@ -21,6 +29,7 @@ import { ensureScoreSummary } from '../utils/attemptScores.js';
 import { syncUserExamCount } from '../utils/planUsage.js';
 import { ensureQuestionsImageAvailability } from '../services/questionImportImageService.js';
 import { sanitizeQuestionOptions } from '../utils/questionOptionSanitizer.js';
+import { sanitizeExamAccessControlPayload } from '../utils/examSecurity.js';
 
 const router = express.Router();
 const SECTION_BASED_EXAM_TYPE = 'SECTION_BASED';
@@ -28,6 +37,7 @@ const OMR_EXAM_TYPE = 'OMR';
 const ONLINE_EXAM_TYPE = 'ONLINE';
 const MAX_OMR_OPTIONS = 4;
 const OMR_OPTION_LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
+const MONGO_OBJECT_ID_PATTERN = /^[a-fA-F0-9]{24}$/;
 
 const toPositiveInt = (value, fallback = null) => {
   const parsed = Number(value);
@@ -47,6 +57,8 @@ const normalizeExamType = (value) => {
   const normalized = value.trim().toUpperCase();
   return normalized || null;
 };
+
+const isValidObjectId = (value) => MONGO_OBJECT_ID_PATTERN.test(String(value || '').trim());
 
 const sanitizeSectionDurationPayload = (sections) => {
   if (!Array.isArray(sections) || sections.length === 0) {
@@ -932,11 +944,12 @@ router.get('/:examId/preview', requireAuth, requireTenant, enforceTenantBoundari
     }
 
     // Log audit
-    const { logAuditEvent, AUDIT_ACTIONS } = await import('../utils/auditLogger.js');
     await logAuditEvent(AUDIT_ACTIONS.EXAM_PREVIEWED || 'EXAM_PREVIEWED', {
       userId: req.user._id,
       userEmail: req.user.email,
+      userName: req.user.name,
       userRole: req.user.role,
+      tenantId: exam.tenantId || null,
       resourceType: 'Exam',
       resourceId: exam._id,
       ip: req.ip,
@@ -1054,11 +1067,12 @@ router.get('/:examId/audit', requireAuth, requireTenant, enforceTenantBoundaries
     }
 
     // Log audit
-    const { logAuditEvent, AUDIT_ACTIONS } = await import('../utils/auditLogger.js');
     await logAuditEvent(AUDIT_ACTIONS.EXAM_AUDITED || 'EXAM_AUDITED', {
       userId: req.user._id,
       userEmail: req.user.email,
+      userName: req.user.name,
       userRole: req.user.role,
+      tenantId: exam.tenantId || null,
       resourceType: 'Exam',
       resourceId: exam._id,
       ip: req.ip,
@@ -1140,8 +1154,10 @@ router.post(
   requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can create exams
   checkExamCreationLimit,
   auditLog(AUDIT_ACTIONS.EXAM_CREATED, (req, res) => ({
-    examTitle: req.body.title,
-    examId: res.locals.examId, // Will be set after creation
+    resourceType: 'Exam',
+    resourceId: res.locals.examId, // Will be set after creation
+    examTitle: res.locals.examTitle || req.body.title,
+    tenantId: res.locals.tenantId || req.user?.tenantId || null,
   })),
   [
     body('title').trim().notEmpty().withMessage('Title is required'),
@@ -1156,6 +1172,11 @@ router.post(
     body('omrTemplateImage').optional().isString(),
     body('instructions').optional().isString(),
     body('totalMarks').optional().isFloat({ min: 0 }),
+    body('subTenantId')
+      .optional({ nullable: true })
+      .custom((value) => value === null || value === '' || isValidObjectId(value))
+      .withMessage('subTenantId must be a valid id when provided'),
+    body('accessControl').optional().isObject().withMessage('accessControl must be an object'),
   ],
   async (req, res, next) => {
     try {
@@ -1189,8 +1210,13 @@ router.post(
         markingRules,
         omrTemplateImage,
         totalMarks,
+        subTenantId,
+        accessControl,
       } =
         req.body;
+      const effectivePlanType =
+        req.planLimitContext?.planType ||
+        (await resolveUserEffectivePlanType(req.user));
 
       const requestedDuration = toPositiveInt(duration, null);
       const requestedExamType = normalizeExamType(examType);
@@ -1199,6 +1225,10 @@ router.post(
       const sectionBasedRequest =
         !isOmrRequest &&
         (requestedExamType === SECTION_BASED_EXAM_TYPE || sectionPayloadProvided);
+
+      if (!isPlanFeatureEnabled(effectivePlanType, 'omr') && isOmrRequest) {
+        return sendPlanRestriction(res, FREE_PLAN_MESSAGES.OMR_LOCKED);
+      }
 
       if (isOmrRequest && sectionPayloadProvided) {
         return res.status(400).json({
@@ -1245,6 +1275,58 @@ router.post(
         }
       }
 
+      let resolvedSubTenantId = null;
+      if (subTenantId !== undefined && subTenantId !== null && String(subTenantId).trim() !== '') {
+        if (!isPlanFeatureEnabled(effectivePlanType, 'multiTenant')) {
+          return sendPlanRestriction(res, FREE_PLAN_MESSAGES.MULTI_TENANT_LOCKED);
+        }
+
+        if (!req.user?.tenantId) {
+          return res.status(403).json({ error: 'A tenant is required when assigning sub-tenant scope.' });
+        }
+
+        const subTenant = await SubTenant.findOne({
+          _id: subTenantId,
+          tenantId: req.user.tenantId,
+          status: 'ACTIVE',
+        })
+          .select('_id')
+          .lean();
+        if (!subTenant) {
+          return res.status(404).json({ error: 'Sub-tenant not found for this workspace.' });
+        }
+        resolvedSubTenantId = subTenant._id;
+      }
+
+      let sanitizedAccessControl = null;
+      if (accessControl !== undefined) {
+        sanitizedAccessControl = sanitizeExamAccessControlPayload(accessControl);
+
+        const hasIpWhitelistRules = Array.isArray(sanitizedAccessControl.ipWhitelist)
+          && sanitizedAccessControl.ipWhitelist.length > 0;
+        if (hasIpWhitelistRules && !isPlanFeatureEnabled(effectivePlanType, 'ipWhitelist')) {
+          return sendPlanRestriction(res, FREE_PLAN_MESSAGES.IP_WHITELIST_LOCKED);
+        }
+
+        const hasGeoRestrictions = Boolean(
+          sanitizedAccessControl?.geoRestrictions?.enabled &&
+          (
+            sanitizedAccessControl.geoRestrictions.allowedCountries.length > 0 ||
+            sanitizedAccessControl.geoRestrictions.allowedRegions.length > 0
+          )
+        );
+        if (hasGeoRestrictions && !isPlanFeatureEnabled(effectivePlanType, 'geoLocationRestriction')) {
+          return sendPlanRestriction(res, FREE_PLAN_MESSAGES.GEO_LOCKED);
+        }
+
+        if (
+          sanitizedAccessControl?.secureBrowser?.enabled === true &&
+          !isPlanFeatureEnabled(effectivePlanType, 'secureBrowser')
+        ) {
+          return sendPlanRestriction(res, FREE_PLAN_MESSAGES.SECURE_BROWSER_LOCKED);
+        }
+      }
+
       // Set tenant IDs based on user's tenant (Organization OR Institute)
       // SUPER_ADMIN can create exams without tenant (for global use)
       const examData = {
@@ -1265,6 +1347,14 @@ router.post(
         totalMarks: Number.isFinite(Number(totalMarks)) ? Math.max(0, Number(totalMarks)) : 0,
         createdBy: req.user._id,
       };
+
+      if (resolvedSubTenantId) {
+        examData.subTenantId = resolvedSubTenantId;
+      }
+
+      if (sanitizedAccessControl) {
+        examData.accessControl = sanitizedAccessControl;
+      }
 
       if (isOmrRequest) {
         examData.answerKey = safeOmrPayload.answerKey;
@@ -1293,8 +1383,35 @@ router.post(
       // Keep denormalized creator counters in sync for plan enforcement.
       await syncUserExamCount(req.user._id);
 
+      try {
+        const { createRoleNotification } = await import('../services/notificationService.js');
+        const creatorName = req.user.name || req.user.email || 'Exam creator';
+        const basePayload = {
+          title: 'Exam Created',
+          message: `Exam "${exam.title}" was created by ${creatorName}.`,
+          type: 'exam_created',
+          tenantId: exam.tenantId || null,
+          examId: exam._id,
+          createdBy: req.user._id,
+          metadata: {
+            examId: exam._id,
+            examTitle: exam.title,
+          },
+        };
+
+        if (exam.tenantId) {
+          await createRoleNotification({ ...basePayload, roles: ['TENANT_ADMIN'] });
+          await createRoleNotification({ ...basePayload, roles: ['EXAM_CREATOR'] });
+        }
+        await createRoleNotification({ ...basePayload, roles: ['SUPER_ADMIN'] });
+      } catch (notifyError) {
+        console.error('[NOTIFICATIONS] Failed to log exam creation:', notifyError?.message || notifyError);
+      }
+
       // Store exam ID for audit log
       res.locals.examId = exam._id.toString();
+      res.locals.examTitle = exam.title;
+      res.locals.tenantId = exam.tenantId || null;
 
       // Auto-generate packages if exam is active and has valid question paper
       if (exam.isActive && exam.examType !== OMR_EXAM_TYPE) {
@@ -1341,6 +1458,11 @@ router.put(
     body('omrTemplateImage').optional().isString(),
     body('instructions').optional().isString(),
     body('totalMarks').optional().isFloat({ min: 0 }),
+    body('subTenantId')
+      .optional({ nullable: true })
+      .custom((value) => value === null || value === '' || isValidObjectId(value))
+      .withMessage('subTenantId must be a valid id when provided'),
+    body('accessControl').optional().isObject().withMessage('accessControl must be an object'),
   ],
   async (req, res, next) => {
     try {
@@ -1353,6 +1475,30 @@ router.put(
       if (!exam) {
         return res.status(404).json({ error: 'Exam not found' });
       }
+      const examPlanContext = await resolveExamPlanContext(exam._id);
+      const effectivePlanType =
+        examPlanContext?.planType ||
+        req.planLimitContext?.planType ||
+        (await resolveUserEffectivePlanType(req.user));
+
+      const beforeState = {
+        title: exam.title,
+        description: exam.description,
+        instructions: exam.instructions,
+        duration: exam.duration,
+        gracePeriod: exam.gracePeriod,
+        maxAttempts: exam.maxAttempts,
+        isActive: exam.isActive,
+        showResultsImmediately: exam.showResultsImmediately,
+        resultsReleasedAt: exam.resultsReleasedAt,
+        examType: exam.examType,
+        totalMarks: exam.totalMarks,
+        subTenantId: exam.subTenantId ? exam.subTenantId.toString() : null,
+        accessControl:
+          exam.accessControl && typeof exam.accessControl.toObject === 'function'
+            ? exam.accessControl.toObject()
+            : exam.accessControl || null,
+      };
 
       const {
         title,
@@ -1370,6 +1516,8 @@ router.put(
         markingRules,
         omrTemplateImage,
         totalMarks,
+        subTenantId,
+        accessControl,
       } =
         req.body;
 
@@ -1388,10 +1536,69 @@ router.put(
         resolvedExamType !== OMR_EXAM_TYPE &&
         (requestedExamType === SECTION_BASED_EXAM_TYPE || sectionPayloadProvided);
 
+      if (!isPlanFeatureEnabled(effectivePlanType, 'omr') && resolvedExamType === OMR_EXAM_TYPE) {
+        return sendPlanRestriction(res, FREE_PLAN_MESSAGES.OMR_LOCKED);
+      }
+
       if (resolvedExamType === OMR_EXAM_TYPE && sectionPayloadProvided) {
         return res.status(400).json({
           error: 'Sections are not supported for OMR exams.',
         });
+      }
+
+      if (subTenantId !== undefined) {
+        const normalizedSubTenantId = String(subTenantId || '').trim();
+        if (!normalizedSubTenantId) {
+          exam.subTenantId = null;
+        } else {
+          if (!isPlanFeatureEnabled(effectivePlanType, 'multiTenant')) {
+            return sendPlanRestriction(res, FREE_PLAN_MESSAGES.MULTI_TENANT_LOCKED);
+          }
+
+          const subTenant = await SubTenant.findOne({
+            _id: normalizedSubTenantId,
+            tenantId: exam.tenantId,
+            status: 'ACTIVE',
+          })
+            .select('_id')
+            .lean();
+          if (!subTenant) {
+            return res.status(404).json({ error: 'Sub-tenant not found for this workspace.' });
+          }
+          exam.subTenantId = subTenant._id;
+        }
+      }
+
+      if (accessControl !== undefined) {
+        const sanitizedAccessControl = sanitizeExamAccessControlPayload(
+          accessControl,
+          exam.accessControl
+        );
+        const hasIpWhitelistRules = Array.isArray(sanitizedAccessControl.ipWhitelist)
+          && sanitizedAccessControl.ipWhitelist.length > 0;
+        if (hasIpWhitelistRules && !isPlanFeatureEnabled(effectivePlanType, 'ipWhitelist')) {
+          return sendPlanRestriction(res, FREE_PLAN_MESSAGES.IP_WHITELIST_LOCKED);
+        }
+
+        const hasGeoRestrictions = Boolean(
+          sanitizedAccessControl?.geoRestrictions?.enabled &&
+          (
+            sanitizedAccessControl.geoRestrictions.allowedCountries.length > 0 ||
+            sanitizedAccessControl.geoRestrictions.allowedRegions.length > 0
+          )
+        );
+        if (hasGeoRestrictions && !isPlanFeatureEnabled(effectivePlanType, 'geoLocationRestriction')) {
+          return sendPlanRestriction(res, FREE_PLAN_MESSAGES.GEO_LOCKED);
+        }
+
+        if (
+          sanitizedAccessControl?.secureBrowser?.enabled === true &&
+          !isPlanFeatureEnabled(effectivePlanType, 'secureBrowser')
+        ) {
+          return sendPlanRestriction(res, FREE_PLAN_MESSAGES.SECURE_BROWSER_LOCKED);
+        }
+
+        exam.accessControl = sanitizedAccessControl;
       }
 
       let safeOmrPayload = null;
@@ -1477,6 +1684,66 @@ router.put(
       await exam.save();
       await exam.populate('createdBy', 'name email');
 
+      const updatedFields = [];
+      const valueToTime = (value) => {
+        if (!value) return null;
+        const parsed = new Date(value);
+        return Number.isNaN(parsed.getTime()) ? null : parsed.getTime();
+      };
+      const compareField = (field, transform = (value) => value) => {
+        const beforeValue = transform(beforeState[field]);
+        const afterValue = transform(exam[field]);
+        if (beforeValue !== afterValue) {
+          updatedFields.push(field);
+        }
+      };
+      compareField('title');
+      compareField('description');
+      compareField('instructions');
+      compareField('duration');
+      compareField('gracePeriod');
+      compareField('maxAttempts');
+      compareField('isActive');
+      compareField('showResultsImmediately');
+      compareField('resultsReleasedAt', valueToTime);
+      compareField('examType');
+      compareField('totalMarks');
+      compareField('subTenantId', (value) => (value ? String(value) : null));
+
+      const isActiveChanged = beforeState.isActive !== exam.isActive;
+      const action = isActiveChanged
+        ? (exam.isActive ? AUDIT_ACTIONS.EXAM_ENABLED : AUDIT_ACTIONS.EXAM_DISABLED)
+        : AUDIT_ACTIONS.EXAM_UPDATED;
+
+      await logAuditEvent(action, {
+        userId: req.user._id,
+        userEmail: req.user.email,
+        userName: req.user.name,
+        userRole: req.user.role,
+        tenantId: exam.tenantId || null,
+        resourceType: 'Exam',
+        resourceId: exam._id,
+        ip: req.ip,
+        userAgent: req.get('user-agent'),
+        method: req.method,
+        path: req.path,
+        details: {
+          updatedFields,
+          answerKeyUpdated: answerKey !== undefined,
+          markingRulesUpdated: markingRules !== undefined,
+          sectionsUpdated: Array.isArray(sections),
+          omrTemplateImageUpdated: omrTemplateImage !== undefined,
+          accessControlUpdated: accessControl !== undefined,
+          subTenantUpdated: subTenantId !== undefined,
+          before: {
+            isActive: beforeState.isActive,
+          },
+          after: {
+            isActive: exam.isActive,
+          },
+        },
+      });
+
       // Auto-generate packages when exam becomes ready
       // Trigger if: exam is active AND has valid question paper
       // This covers: publish toggle, exam created as active, question papers added later
@@ -1552,8 +1819,11 @@ router.delete(
   requireTenant,
   enforceTenantBoundaries,
   requireOwnershipOrAdmin,
-  auditLog(AUDIT_ACTIONS.EXAM_DELETED, (req) => ({
-    examId: req.params.examId,
+  auditLog(AUDIT_ACTIONS.EXAM_DELETED, (req, res) => ({
+    resourceType: 'Exam',
+    resourceId: res.locals.examId || req.params.examId,
+    examTitle: res.locals.examTitle || null,
+    tenantId: res.locals.tenantId || null,
   })),
   async (req, res, next) => {
     try {
@@ -1561,6 +1831,10 @@ router.delete(
       if (!exam) {
         return res.status(404).json({ error: 'Exam not found' });
       }
+
+      res.locals.examId = exam._id.toString();
+      res.locals.examTitle = exam.title;
+      res.locals.tenantId = exam.tenantId || null;
 
       await Exam.findByIdAndDelete(req.params.examId);
       await syncUserExamCount(exam.createdBy);
@@ -1578,8 +1852,11 @@ router.post(
   requireTenant,
   enforceTenantBoundaries,
   requireOwnershipOrAdmin,
-  auditLog(AUDIT_ACTIONS.EXAM_RESULTS_RELEASED, (req) => ({
-    examId: req.params.examId,
+  auditLog(AUDIT_ACTIONS.EXAM_RESULTS_RELEASED, (req, res) => ({
+    resourceType: 'Exam',
+    resourceId: res.locals.examId || req.params.examId,
+    examTitle: res.locals.examTitle || null,
+    tenantId: res.locals.tenantId || null,
   })),
   async (req, res, next) => {
     try {
@@ -1591,6 +1868,44 @@ router.post(
       exam.resultsReleasedAt = new Date();
       await exam.save();
       await exam.populate('createdBy', 'name email');
+
+      res.locals.examId = exam._id.toString();
+      res.locals.examTitle = exam.title;
+      res.locals.tenantId = exam.tenantId || null;
+
+      try {
+        const { createRoleNotification, createUserNotifications } = await import('../services/notificationService.js');
+        const basePayload = {
+          title: 'Results Published',
+          message: `Results for "${exam.title}" have been published.`,
+          type: 'result_published',
+          tenantId: exam.tenantId || null,
+          examId: exam._id,
+          createdBy: req.user._id,
+          metadata: {
+            examId: exam._id,
+            examTitle: exam.title,
+          },
+        };
+
+        if (exam.tenantId) {
+          await createRoleNotification({ ...basePayload, roles: ['TENANT_ADMIN'] });
+          await createRoleNotification({ ...basePayload, roles: ['EXAM_CREATOR'] });
+        }
+        await createRoleNotification({ ...basePayload, roles: ['SUPER_ADMIN'] });
+
+        const candidateIds = await ExamAttempt.distinct('userId', {
+          examId: exam._id,
+          isCompleted: true,
+        });
+        await createUserNotifications({
+          ...basePayload,
+          roles: ['CANDIDATE'],
+          userIds: candidateIds,
+        });
+      } catch (notifyError) {
+        console.error('[NOTIFICATIONS] Failed to log results release:', notifyError?.message || notifyError);
+      }
 
       res.json({ exam });
     } catch (error) {

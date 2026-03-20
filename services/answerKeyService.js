@@ -130,12 +130,18 @@ const extractAnswersFromRows = (rows) => {
 /**
  * Extract answers from text (PDF/OCR)
  */
-const extractAnswersFromText = async (text) => {
+const extractAnswersFromText = async (text, { tenantId = null, userId = null } = {}) => {
   try {
     // Use AI service to extract structured answers
     const extracted = await extractQuestionsFromContent({
       content: text,
       filename: 'answer_key',
+      tenantId,
+      userId,
+      metadata: {
+        tenantId,
+        userId,
+      },
     });
     
     // Convert extracted questions to answer key format
@@ -237,6 +243,8 @@ export const importAnswerKey = async (examId, questionPaperId, file, source, use
   
   let answers = {};
   let extractedData = null;
+  const exam = await Exam.findById(examId).select('tenantId').lean();
+  const trackingTenantId = exam?.tenantId || null;
   
   try {
     if (['xlsx', 'xls'].includes(fileExtension)) {
@@ -252,7 +260,10 @@ export const importAnswerKey = async (examId, questionPaperId, file, source, use
     } else if (fileExtension === 'pdf') {
       // PDF import
       const text = await parsePDFAnswerKey(fileBuffer);
-      answers = await extractAnswersFromText(text);
+      answers = await extractAnswersFromText(text, {
+        tenantId: trackingTenantId,
+        userId,
+      });
       extractedData = { text, type: 'pdf' };
     } else if (['jpg', 'jpeg', 'png'].includes(fileExtension)) {
       // Image import (OCR via AI service)

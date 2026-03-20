@@ -16,7 +16,20 @@ const AuditLogSchema = new mongoose.Schema(
       type: String,
       index: true,
     },
+    userName: {
+      type: String,
+      index: true,
+    },
     userRole: {
+      type: String,
+      index: true,
+    },
+    tenantId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'Tenant',
+      index: true,
+    },
+    tenantName: {
       type: String,
       index: true,
     },
@@ -61,9 +74,19 @@ const AuditLogSchema = new mongoose.Schema(
 
 // Compound indexes for common queries
 AuditLogSchema.index({ userId: 1, timestamp: -1 });
+AuditLogSchema.index({ tenantId: 1, timestamp: -1 });
 AuditLogSchema.index({ action: 1, timestamp: -1 });
 AuditLogSchema.index({ resourceType: 1, resourceId: 1, timestamp: -1 });
 AuditLogSchema.index({ timestamp: -1 }); // For time-based queries
+
+// Prevent updates to audit logs (immutable once created)
+const blockAuditUpdates = function (next) {
+  next(new Error('Audit logs are immutable once created.'));
+};
+AuditLogSchema.pre('updateOne', blockAuditUpdates);
+AuditLogSchema.pre('updateMany', blockAuditUpdates);
+AuditLogSchema.pre('findOneAndUpdate', blockAuditUpdates);
+AuditLogSchema.pre('replaceOne', blockAuditUpdates);
 
 // TTL index - optionally keep logs for 1 year (can be adjusted)
 // AuditLogSchema.index({ timestamp: 1 }, { expireAfterSeconds: 31536000 });

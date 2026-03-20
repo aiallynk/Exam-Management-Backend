@@ -16,6 +16,7 @@ Copy `env.example` to `.env` and configure:
 - `TOKEN_TTL_MINUTES` / `REFRESH_TTL_DAYS` – Token expiration configuration
 - `CORS_ORIGIN` – Allowed origin for the client application
 - `OPENAI_API_KEY` – (Optional) key for AI-powered features
+- `OPENAI_MODEL` – OpenAI model for chat/vision completions (default `gpt-4o-mini`)
 - `UPLOAD_DIR` – Directory to store uploaded files (defaults to `./uploads`)
 
 ## Deployment

@@ -23,7 +23,9 @@ export const auditLog = (action, getDetails = (req, res) => ({})) => {
       const details = {
         userId: req.user?._id || req.user?.sub || null,
         userEmail: req.user?.email || null,
+        userName: req.user?.name || null,
         userRole: req.user?.role || null,
+        tenantId: req.user?.tenantId || null,
         method: req.method,
         path: req.path,
         ip: req.ip || req.connection?.remoteAddress,

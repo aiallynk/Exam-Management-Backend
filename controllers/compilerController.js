@@ -10,6 +10,12 @@ import {
 } from '../services/codingSubmissionService.js';
 import { resolveJudge0LanguageId, runJudge0Submission } from '../services/judge0Service.js';
 import { extractCodingFields, normalizeCodingLanguage } from '../utils/codingQuestions.js';
+import { resolveCompilerProfileForPlan } from '../config/compilerProfiles.js';
+import {
+  resolveExamPlanContext,
+  resolveQuestionPlanContext,
+  resolveUserEffectivePlanType,
+} from '../middleware/planRestrictions.js';
 
 const normalizeString = (value) => {
   if (value === undefined || value === null) return '';
@@ -38,11 +44,16 @@ export const runCode = async (req, res, next) => {
     let evaluationQuestion = null;
     let executionTimeLimit = timeLimit;
     let executionMemoryLimit = memoryLimit;
+    let effectivePlanType = await resolveUserEffectivePlanType(req.user);
 
     if (questionId) {
       evaluationQuestion = await Question.findById(questionId);
       if (!evaluationQuestion) {
         return res.status(404).json({ error: 'Question not found.' });
+      }
+      const questionPlanContext = await resolveQuestionPlanContext(questionId);
+      if (questionPlanContext?.planType) {
+        effectivePlanType = questionPlanContext.planType;
       }
       if (evaluationQuestion.questionType === 'CODING') {
         const codingFields = extractCodingFields(evaluationQuestion);
@@ -54,6 +65,7 @@ export const runCode = async (req, res, next) => {
         }
       }
     }
+    const compilerProfile = resolveCompilerProfileForPlan(effectivePlanType);
 
     let languageId = null;
     try {
@@ -72,6 +84,7 @@ export const runCode = async (req, res, next) => {
       input,
       timeLimit: executionTimeLimit,
       memoryLimit: executionMemoryLimit,
+      executionProfile: compilerProfile,
     });
 
     return res.json({
@@ -80,6 +93,7 @@ export const runCode = async (req, res, next) => {
       status: execution.status,
       time: execution.time,
       memory: execution.memory,
+      compilerMode: compilerProfile.mode,
     });
   } catch (error) {
     console.error('Compiler error:', error.response?.data || error.message);
@@ -215,12 +229,16 @@ export const submitCode = async (req, res, next) => {
     if (question.questionType !== 'CODING') {
       return res.status(400).json({ error: 'This question is not a coding question.' });
     }
+    const examPlanContext = await resolveExamPlanContext(attempt.examId);
+    const effectivePlanType =
+      examPlanContext?.planType || (await resolveUserEffectivePlanType(req.user));
 
     const evaluation = await evaluateCodingQuestionSubmission({
       question,
       code,
       language,
       input,
+      planType: effectivePlanType || null,
     });
 
     const submission = await saveCodingSubmissionRecord({
@@ -300,6 +318,7 @@ export const submitCode = async (req, res, next) => {
         similarity: 0,
       },
       executionTimeMs: evaluation.executionTimeMs,
+      compilerMode: evaluation.compilerMode || resolveCompilerProfileForPlan(effectivePlanType).mode,
     });
   } catch (error) {
     next(error);

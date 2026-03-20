@@ -48,6 +48,12 @@ See server/env.example for reference.
 // Validate environment variables on module load
 validateEnvVars();
 
+const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
+const resolveOpenAiModel = () => {
+  const configured = String(process.env.OPENAI_MODEL || '').trim();
+  return configured || DEFAULT_OPENAI_MODEL;
+};
+
 const config = {
   port: process.env.PORT || 4000,
   mongodbUri: process.env.MONGODB_URI,
@@ -56,6 +62,7 @@ const config = {
   tokenTtlMinutes: parseInt(process.env.TOKEN_TTL_MINUTES || '15', 10),
   refreshTtlDays: parseInt(process.env.REFRESH_TTL_DAYS || '7', 10),
   openaiApiKey: process.env.OPENAI_API_KEY,
+  openaiModel: resolveOpenAiModel(),
   uploadDir: process.env.UPLOAD_DIR || './uploads',
   corsOrigin:
     process.env.CORS_ORIGIN || 'https://exam-management-frontend-psi.vercel.app',

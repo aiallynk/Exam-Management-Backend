@@ -46,6 +46,13 @@ import {
   FOCUS_VIOLATION_SUBMISSION_SOURCE,
   TAB_SWITCH_DISQUALIFY_STATUS,
 } from '../services/proctoringService.js';
+import {
+  FREE_PLAN_MESSAGES,
+  getSubscriptionPlanDefinition,
+  isPlanFeatureEnabled,
+} from '../config/planLimits.js';
+import { resolveExamPlanContext } from '../middleware/planRestrictions.js';
+import { enforceExamAccessControl } from '../utils/examSecurity.js';
 
 const parseArrayAnswer = (value) => {
   if (Array.isArray(value)) {
@@ -123,6 +130,112 @@ const normalizeString = (value) => {
 const normalizeStatusValue = (value) => {
   if (typeof value !== 'string') return '';
   return value.trim().toUpperCase();
+};
+
+const normalizeIpAddress = (value) => {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+
+  const firstHop = raw.split(',')[0].trim();
+  if (!firstHop) return '';
+
+  const withoutIpv6Wrapper = firstHop.replace(/^\[|\]$/g, '');
+  let normalized = withoutIpv6Wrapper;
+
+  if (normalized.startsWith('::ffff:')) {
+    normalized = normalized.slice(7);
+  }
+
+  // Remove port when IPv4 is represented as 1.2.3.4:5678
+  if (normalized.includes('.') && normalized.includes(':')) {
+    const [host] = normalized.split(':');
+    if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(host)) {
+      normalized = host;
+    }
+  }
+
+  return normalized.toLowerCase();
+};
+
+const getRequestIpAddress = (req) => {
+  const forwardedFor = req?.headers?.['x-forwarded-for'];
+  const forwardedValue = Array.isArray(forwardedFor) ? forwardedFor[0] : forwardedFor;
+  const forwardedIp = String(forwardedValue || '')
+    .split(',')[0]
+    .trim();
+
+  return (
+    forwardedIp ||
+    req?.ip ||
+    req?.connection?.remoteAddress ||
+    req?.socket?.remoteAddress ||
+    ''
+  );
+};
+
+const appendIpLockFlag = (attempt, details = {}) => {
+  if (!attempt) return;
+  if (!attempt.suspiciousActivityFlags) {
+    attempt.suspiciousActivityFlags = [];
+  }
+
+  const now = Date.now();
+  const recentDuplicate = attempt.suspiciousActivityFlags.some((entry) => {
+    const type = normalizeStatusValue(entry?.type || entry?.violationType);
+    if (type !== 'IP_LOCK_VIOLATION') return false;
+    const timestamp = new Date(entry?.timestamp || 0).getTime();
+    return Number.isFinite(timestamp) && Math.abs(now - timestamp) < 10000;
+  });
+
+  if (recentDuplicate) return;
+
+  attempt.suspiciousActivityFlags.push({
+    type: 'IP_LOCK_VIOLATION',
+    timestamp: new Date(),
+    details,
+  });
+  attempt.suspiciousActivity = true;
+};
+
+const enforceAttemptIpLock = async ({ attempt, req, planType }) => {
+  if (!attempt || !planType || !isPlanFeatureEnabled(planType, 'ipLock')) {
+    return { allowed: true };
+  }
+
+  const currentIpRaw = getRequestIpAddress(req);
+  const currentIp = normalizeIpAddress(currentIpRaw);
+  if (!currentIp) {
+    return { allowed: true };
+  }
+
+  const lockedIpRaw = attempt?.deviceInfo?.ipAddress || '';
+  const lockedIp = normalizeIpAddress(lockedIpRaw);
+
+  if (!lockedIp) {
+    attempt.deviceInfo = {
+      ...(attempt.deviceInfo || {}),
+      ipAddress: currentIpRaw || currentIp,
+    };
+    await attempt.save();
+    return { allowed: true };
+  }
+
+  if (lockedIp !== currentIp) {
+    const details = {
+      lockedIp: lockedIpRaw || lockedIp,
+      currentIp: currentIpRaw || currentIp,
+      reason: 'IP lock mismatch detected.',
+    };
+    appendAttemptViolationLog(attempt, 'IP_LOCK_VIOLATION', details);
+    appendIpLockFlag(attempt, details);
+    await attempt.save();
+    return {
+      allowed: false,
+      error: 'IP lock violation detected. Continue this attempt from the original network/IP.',
+    };
+  }
+
+  return { allowed: true };
 };
 
 const isTabSwitchDisqualifiedAttempt = (attempt) =>
@@ -351,6 +464,7 @@ const scheduleDeferredCodingEvaluation = ({
   userId,
   examId,
   attemptStartedAt,
+  planType = null,
 } = {}) => {
   if (!pendingEvaluations.length || !attemptId || !userId || !examId) return;
 
@@ -365,6 +479,7 @@ const scheduleDeferredCodingEvaluation = ({
             code: evaluationRequest.code,
             language: evaluationRequest.language,
             input: evaluationRequest.input,
+            planType,
           });
 
           const submissionRecord = await saveCodingSubmissionRecord({
@@ -610,10 +725,12 @@ router.post(
       }
 
       const { sessionId, examId } = req.body;
+      const effectivePlanType = req.planLimitContext?.planType || null;
+      const planFeatures = getSubscriptionPlanDefinition(effectivePlanType)?.features || {};
 
       // UNIVERSAL: Ensure ExamParticipant exists with CANDIDATE role FIRST
       // This must happen before permission check, so the participant exists when we check permissions
-      await ensureExamParticipant(
+      const participant = await ensureExamParticipant(
         req.user._id,
         examId,
         'CANDIDATE',
@@ -673,6 +790,15 @@ router.post(
         }
       }
 
+      const examAccessControlCheck = enforceExamAccessControl({
+        exam,
+        req,
+        planType: effectivePlanType,
+      });
+      if (!examAccessControlCheck.allowed) {
+        return res.status(403).json({ error: examAccessControlCheck.error });
+      }
+
       if (!session.isActive) {
         return res.status(403).json({ error: 'Session is not active' });
       }
@@ -717,6 +843,15 @@ router.post(
       }).populate('questionPaperId', 'setName');
 
       if (activeAttempt) {
+        const ipLockCheck = await enforceAttemptIpLock({
+          attempt: activeAttempt,
+          req,
+          planType: effectivePlanType,
+        });
+        if (!ipLockCheck.allowed) {
+          return res.status(403).json({ error: ipLockCheck.error });
+        }
+
         await activeAttempt.populate('examId', 'title duration');
         await activeAttempt.populate('sessionId', 'startTime endTime');
         await ensureQuestionPaperImagesReady({
@@ -730,6 +865,16 @@ router.post(
             questionPaperId:
               activeAttempt.questionPaperId?._id || activeAttempt.questionPaperId,
             setName: activeAttempt.questionPaperId?.setName,
+          },
+          planContext: {
+            planType: effectivePlanType,
+            features: planFeatures,
+            security: {
+              secureBrowser:
+                exam?.accessControl?.secureBrowser && typeof exam.accessControl.secureBrowser === 'object'
+                  ? exam.accessControl.secureBrowser
+                  : { enabled: true },
+            },
           },
         });
       }
@@ -768,7 +913,7 @@ router.post(
         tenantId: examForTenant?.tenantId || null,
         // Log device info
         deviceInfo: {
-          ipAddress: req.ip || req.connection?.remoteAddress || '',
+          ipAddress: getRequestIpAddress(req),
           userAgent: req.get('user-agent') || '',
           deviceId: req.body.deviceId || req.headers['x-device-id'] || '',
         },
@@ -779,14 +924,70 @@ router.post(
         await syncExamCandidateCount(examId);
       }
 
-      // Check for multiple logins
-      const proctoringService = await import('../services/proctoringService.js');
-      await proctoringService.logDeviceInfo(attempt._id, attempt.deviceInfo);
-      const multipleLogins = await proctoringService.checkMultipleLogins(req.user._id, examId, attempt.deviceInfo);
-      if (multipleLogins.hasMultipleLogins) {
-        await proctoringService.flagSuspiciousActivity(attempt._id, 'MULTIPLE_LOGINS', {
-          attempts: multipleLogins.attempts,
+      try {
+        const { createRoleNotification, createUserNotification } = await import('../services/notificationService.js');
+        const tenantId = exam?.tenantId || examForTenant?.tenantId || null;
+        const examTitle = exam?.title || attempt.examSnapshot?.title || 'Exam';
+        const candidateName = req.user.name || req.user.email || 'Candidate';
+
+        if (participant?.__assigned) {
+          await createUserNotification({
+            title: 'Exam Assigned',
+            message: `You have been assigned to "${examTitle}".`,
+            type: 'exam_assigned',
+            roles: ['CANDIDATE'],
+            userId: req.user._id,
+            tenantId,
+            examId: examId,
+            sessionId,
+            attemptId: attempt._id,
+            createdBy: req.user._id,
+            metadata: { examId, examTitle },
+          });
+        }
+
+        await createUserNotification({
+          title: 'Exam Started',
+          message: `You started "${examTitle}".`,
+          type: 'exam_started',
+          roles: ['CANDIDATE'],
+          userId: req.user._id,
+          tenantId,
+          examId: examId,
+          sessionId,
+          attemptId: attempt._id,
+          createdBy: req.user._id,
+          metadata: { examId, examTitle },
         });
+
+        if (tenantId) {
+          await createRoleNotification({
+            title: 'Exam Started',
+            message: `${candidateName} started "${examTitle}".`,
+            type: 'session_started',
+            roles: ['TENANT_ADMIN', 'EXAM_CREATOR'],
+            tenantId,
+            examId: examId,
+            sessionId,
+            attemptId: attempt._id,
+            createdBy: req.user._id,
+            metadata: { examId, examTitle, candidateName },
+          });
+        }
+      } catch (notifyError) {
+        console.error('[NOTIFICATIONS] Failed to log exam start:', notifyError?.message || notifyError);
+      }
+
+      if (isPlanFeatureEnabled(req.planLimitContext?.planType, 'proctoring')) {
+        // Check for multiple logins
+        const proctoringService = await import('../services/proctoringService.js');
+        await proctoringService.logDeviceInfo(attempt._id, attempt.deviceInfo);
+        const multipleLogins = await proctoringService.checkMultipleLogins(req.user._id, examId, attempt.deviceInfo);
+        if (multipleLogins.hasMultipleLogins) {
+          await proctoringService.flagSuspiciousActivity(attempt._id, 'MULTIPLE_LOGINS', {
+            attempts: multipleLogins.attempts,
+          });
+        }
       }
       await attempt.populate('examId', 'title duration');
       await attempt.populate('sessionId', 'startTime endTime');
@@ -801,6 +1002,16 @@ router.post(
           questionPaperId: assignedQuestionPaperId,
           setName: assignment.questionPaperId?.setName,
         },
+        planContext: {
+          planType: effectivePlanType,
+          features: planFeatures,
+          security: {
+            secureBrowser:
+              exam?.accessControl?.secureBrowser && typeof exam.accessControl.secureBrowser === 'object'
+                ? exam.accessControl.secureBrowser
+                : { enabled: true },
+          },
+        },
       });
     } catch (error) {
       next(error);
@@ -812,7 +1023,7 @@ router.post(
 router.get('/:attemptId/progress', requireAuth, validateObjectId('attemptId'), async (req, res, next) => {
   try {
     const attempt = await ExamAttempt.findById(req.params.attemptId)
-      .populate('examId', '_id duration gracePeriod')
+      .populate('examId', '_id duration gracePeriod accessControl')
       .populate('sessionId', '_id questionPaperId')
       .populate('questionPaperId', '_id');
 
@@ -827,6 +1038,26 @@ router.get('/:attemptId/progress', requireAuth, validateObjectId('attemptId'), a
     );
     if (!canReview && attempt.userId.toString() !== req.user._id.toString()) {
       return res.status(403).json({ error: 'Forbidden - You can only view your own attempt progress' });
+    }
+
+    if (!canReview) {
+      const planContext = await resolveExamPlanContext(attempt.examId?._id || attempt.examId);
+      const accessControlCheck = enforceExamAccessControl({
+        exam: attempt.examId,
+        req,
+        planType: planContext?.planType || null,
+      });
+      if (!accessControlCheck.allowed) {
+        return res.status(403).json({ error: accessControlCheck.error });
+      }
+      const ipLockCheck = await enforceAttemptIpLock({
+        attempt,
+        req,
+        planType: planContext?.planType || null,
+      });
+      if (!ipLockCheck.allowed) {
+        return res.status(403).json({ error: ipLockCheck.error });
+      }
     }
 
     const assignedQuestionPaperId =
@@ -899,7 +1130,7 @@ router.put(
       }
 
       const attempt = await ExamAttempt.findById(req.params.attemptId)
-        .populate('examId', '_id duration gracePeriod')
+        .populate('examId', '_id duration gracePeriod accessControl')
         .populate('sessionId', '_id questionPaperId')
         .populate('questionPaperId', '_id');
 
@@ -914,6 +1145,26 @@ router.put(
       );
       if (!canReview && attempt.userId.toString() !== req.user._id.toString()) {
         return res.status(403).json({ error: 'Forbidden - You can only update your own attempt progress' });
+      }
+
+      if (!canReview) {
+        const planContext = await resolveExamPlanContext(attempt.examId?._id || attempt.examId);
+        const accessControlCheck = enforceExamAccessControl({
+          exam: attempt.examId,
+          req,
+          planType: planContext?.planType || null,
+        });
+        if (!accessControlCheck.allowed) {
+          return res.status(403).json({ error: accessControlCheck.error });
+        }
+        const ipLockCheck = await enforceAttemptIpLock({
+          attempt,
+          req,
+          planType: planContext?.planType || null,
+        });
+        if (!ipLockCheck.allowed) {
+          return res.status(403).json({ error: ipLockCheck.error });
+        }
       }
 
       if (attempt.isCompleted) {
@@ -1038,7 +1289,7 @@ export const submitAttemptHandler = async (req, res, next) => {
     }
 
     const attempt = await ExamAttempt.findById(req.params.attemptId)
-      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
+      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt accessControl')
       .populate('sessionId');
 
     if (!attempt) {
@@ -1046,6 +1297,22 @@ export const submitAttemptHandler = async (req, res, next) => {
     }
 
     const examId = attempt.examId?._id || attempt.examId;
+    const planContext = await resolveExamPlanContext(examId);
+    const subjectiveAutoGradingEnabled = planContext?.planType
+      ? (
+        isPlanFeatureEnabled(planContext.planType, 'aiGrading') &&
+        isPlanFeatureEnabled(planContext.planType, 'aiSubjectiveAutoGrading')
+      )
+      : true;
+    const rubricScoringEnabled = planContext?.planType
+      ? (
+        isPlanFeatureEnabled(planContext.planType, 'aiGrading') &&
+        isPlanFeatureEnabled(planContext.planType, 'aiRubricScoring')
+      )
+      : false;
+    const codingEnabled = planContext?.planType
+      ? isPlanFeatureEnabled(planContext.planType, 'codingCompiler')
+      : true;
 
     // Verify ownership: users can only submit their own attempts (unless they have REVIEW_ANSWERS permission)
     const canReview = await hasExamPermission(
@@ -1055,6 +1322,26 @@ export const submitAttemptHandler = async (req, res, next) => {
     );
     if (!canReview && attempt.userId.toString() !== req.user._id.toString()) {
       return res.status(403).json({ error: 'Forbidden - You can only submit your own attempts' });
+    }
+
+    if (!canReview && !attempt.isCompleted) {
+      const accessControlCheck = enforceExamAccessControl({
+        exam: attempt.examId,
+        req,
+        planType: planContext?.planType || null,
+      });
+      if (!accessControlCheck.allowed) {
+        return res.status(403).json({ error: accessControlCheck.error });
+      }
+
+      const ipLockCheck = await enforceAttemptIpLock({
+        attempt,
+        req,
+        planType: planContext?.planType || null,
+      });
+      if (!ipLockCheck.allowed) {
+        return res.status(403).json({ error: ipLockCheck.error });
+      }
     }
 
     const requestedDisqualifyStatus =
@@ -1241,29 +1528,70 @@ export const submitAttemptHandler = async (req, res, next) => {
         const hasSubjectiveAnswer = String(studentAnswer).trim().length > 0;
 
         if (hasSubjectiveAnswer) {
-          // AI evaluation for subjective questions (skip empty answers)
-          try {
-            aiEvaluation = await evaluateAnswer({
-              question: question.questionText,
-              correctAnswer: question.correctAnswer,
-              studentAnswer,
-              questionType: question.questionType,
-              points: question.points,
-            });
-
-            isCorrect = aiEvaluation.isCorrect;
-            pointsEarned = aiEvaluation.pointsEarned;
-          } catch (error) {
-            console.error('AI evaluation error:', error);
-            // Fallback: no points if AI fails
+          if (!subjectiveAutoGradingEnabled) {
             pointsEarned = 0;
+            isCorrect = false;
             aiEvaluation = {
-              error: 'Evaluation failed',
               needsReview: true,
+              reason: 'Subjective answers require manual evaluation in the current plan.',
             };
+          } else {
+            // AI evaluation for subjective questions (skip empty answers)
+            try {
+              aiEvaluation = await evaluateAnswer({
+                question: question.questionText,
+                correctAnswer: question.correctAnswer,
+                studentAnswer,
+                questionType: question.questionType,
+                points: question.points,
+                tenantId: attempt?.tenantId || req.user?.tenantId || null,
+                userId: req.user?._id || null,
+                metadata: {
+                  tenantId: attempt?.tenantId || req.user?.tenantId || null,
+                  userId: req.user?._id || null,
+                },
+                rubricScoringEnabled,
+                rubric: rubricScoringEnabled
+                  ? (
+                    question.questionType === 'SHORT_ANSWER'
+                      ? [
+                        { criterion: 'Accuracy', weight: 50, description: 'Correctness of the core answer.' },
+                        { criterion: 'Key Points', weight: 30, description: 'Coverage of expected key points.' },
+                        { criterion: 'Clarity', weight: 20, description: 'Clarity and directness of response.' },
+                      ]
+                      : [
+                        { criterion: 'Accuracy', weight: 40, description: 'Conceptual correctness and factual accuracy.' },
+                        { criterion: 'Completeness', weight: 30, description: 'Coverage of required concepts and details.' },
+                        { criterion: 'Reasoning', weight: 20, description: 'Logical explanation and supporting reasoning.' },
+                        { criterion: 'Clarity', weight: 10, description: 'Structure, language quality, and readability.' },
+                      ]
+                  )
+                  : [],
+              });
+
+              isCorrect = aiEvaluation.isCorrect;
+              pointsEarned = aiEvaluation.pointsEarned;
+            } catch (error) {
+              console.error('AI evaluation error:', error);
+              // Fallback: no points if AI fails
+              pointsEarned = 0;
+              aiEvaluation = {
+                error: 'Evaluation failed',
+                needsReview: true,
+              };
+            }
           }
         }
       } else if (question.questionType === 'CODING') {
+        if (!codingEnabled) {
+          pointsEarned = 0;
+          isCorrect = false;
+          aiEvaluation = {
+            needsReview: true,
+            reason: FREE_PLAN_MESSAGES.CODING_LOCKED,
+          };
+          codingResult = null;
+        } else {
         const parsedAnswerPayload = parseCodingAnswerPayload(studentAnswer);
         const codingDraft = resolveCodingAnswerDraft(studentAnswer, question);
         const codingPayload = codingSubmissionsMap.get(questionId);
@@ -1380,6 +1708,7 @@ export const submitAttemptHandler = async (req, res, next) => {
             input,
           });
         }
+        }
       }
 
       totalScore += pointsEarned;
@@ -1484,6 +1813,42 @@ export const submitAttemptHandler = async (req, res, next) => {
 
     await attempt.save();
 
+    try {
+      const { createRoleNotification, createUserNotification } = await import('../services/notificationService.js');
+      const tenantId = attempt.tenantId || null;
+      const examTitle = attempt.examId?.title || attempt.examSnapshot?.title || 'Exam';
+      const candidateName = req.user.name || req.user.email || 'Candidate';
+
+      await createUserNotification({
+        title: 'Exam Submitted',
+        message: `You submitted "${examTitle}".`,
+        type: 'exam_submitted',
+        roles: ['CANDIDATE'],
+        userId: attempt.userId,
+        tenantId,
+        examId: examId,
+        attemptId: attempt._id,
+        createdBy: req.user._id,
+        metadata: { examId, examTitle },
+      });
+
+      if (tenantId) {
+        await createRoleNotification({
+          title: 'Exam Submitted',
+          message: `${candidateName} submitted "${examTitle}".`,
+          type: 'attempt_submitted',
+          roles: ['TENANT_ADMIN', 'EXAM_CREATOR'],
+          tenantId,
+          examId: examId,
+          attemptId: attempt._id,
+          createdBy: req.user._id,
+          metadata: { examId, examTitle, candidateName },
+        });
+      }
+    } catch (notifyError) {
+      console.error('[NOTIFICATIONS] Failed to log exam submission:', notifyError?.message || notifyError);
+    }
+
     await attempt.populate('examId', 'title duration showResultsImmediately resultsReleasedAt');
     await attempt.populate('questionPaperId', 'setName');
     const canReviewAnswers = await hasExamPermission(
@@ -1531,6 +1896,7 @@ export const submitAttemptHandler = async (req, res, next) => {
         userId: req.user._id,
         examId,
         attemptStartedAt: attempt.startTime,
+        planType: planContext?.planType || null,
       });
     }
   } catch (error) {
@@ -1816,7 +2182,9 @@ router.post(
       await logAuditEvent(AUDIT_ACTIONS.ATTEMPT_RE_ENABLED || 'ATTEMPT_RE_ENABLED', {
         userId: req.user._id,
         userEmail: req.user.email,
+        userName: req.user.name,
         userRole: req.user.role,
+        tenantId: attempt.tenantId || null,
         resourceType: 'ExamAttempt',
         resourceId: attempt._id,
         ip: req.ip,
@@ -1875,7 +2243,9 @@ router.post(
       await logAuditEvent(AUDIT_ACTIONS.ATTEMPT_FLAGGED || 'ATTEMPT_FLAGGED', {
         userId: req.user._id,
         userEmail: req.user.email,
+        userName: req.user.name,
         userRole: req.user.role,
+        tenantId: attempt.tenantId || null,
         resourceType: 'ExamAttempt',
         resourceId: attempt._id,
         ip: req.ip,
@@ -1934,7 +2304,9 @@ router.post(
       await logAuditEvent(AUDIT_ACTIONS.ATTEMPT_NOTE_ADDED || 'ATTEMPT_NOTE_ADDED', {
         userId: req.user._id,
         userEmail: req.user.email,
+        userName: req.user.name,
         userRole: req.user.role,
+        tenantId: attempt.tenantId || null,
         resourceType: 'ExamAttempt',
         resourceId: attempt._id,
         ip: req.ip,
@@ -2012,7 +2384,9 @@ router.post(
       await logAuditEvent(AUDIT_ACTIONS.ATTEMPT_RECALCULATED || 'ATTEMPT_RECALCULATED', {
         userId: req.user._id,
         userEmail: req.user.email,
+        userName: req.user.name,
         userRole: req.user.role,
+        tenantId: attempt.tenantId || null,
         resourceType: 'ExamAttempt',
         resourceId: attempt._id,
         ip: req.ip,
@@ -2108,7 +2482,9 @@ router.post(
       await logAuditEvent(AUDIT_ACTIONS.ATTEMPT_RECALCULATED || 'ATTEMPT_RECALCULATED', {
         userId: req.user._id,
         userEmail: req.user.email,
+        userName: req.user.name,
         userRole: req.user.role,
+        tenantId: attempt.tenantId || null,
         resourceType: 'ExamAttempt',
         resourceId: attempt._id,
         ip: req.ip,
@@ -2498,6 +2874,42 @@ router.post(
           userRole: req.user.role,
           canReviewAnswers,
         }) || isExamResultsReleased(updatedAttempt.examId);
+
+      try {
+        const { createRoleNotification, createUserNotification } = await import('../services/notificationService.js');
+        const tenantId = attempt.tenantId || null;
+        const examTitle = updatedAttempt.examId?.title || attempt.examSnapshot?.title || 'Exam';
+        const candidateName = req.user.name || req.user.email || 'Candidate';
+
+        await createUserNotification({
+          title: 'Exam Submitted',
+          message: `You submitted "${examTitle}".`,
+          type: 'exam_submitted',
+          roles: ['CANDIDATE'],
+          userId: attempt.userId,
+          tenantId,
+          examId: updatedAttempt.examId?._id || updatedAttempt.examId,
+          attemptId: attempt._id,
+          createdBy: req.user._id,
+          metadata: { examTitle },
+        });
+
+        if (tenantId) {
+          await createRoleNotification({
+            title: 'Exam Submitted',
+            message: `${candidateName} submitted "${examTitle}".`,
+            type: 'attempt_submitted',
+            roles: ['TENANT_ADMIN', 'EXAM_CREATOR'],
+            tenantId,
+            examId: updatedAttempt.examId?._id || updatedAttempt.examId,
+            attemptId: attempt._id,
+            createdBy: req.user._id,
+            metadata: { examTitle, candidateName },
+          });
+        }
+      } catch (notifyError) {
+        console.error('[NOTIFICATIONS] Failed to log offline submission:', notifyError?.message || notifyError);
+      }
 
       res.json({
         attempt: updatedAttempt,

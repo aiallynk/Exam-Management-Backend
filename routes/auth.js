@@ -9,7 +9,12 @@ import { addToBlacklist, isBlacklisted } from '../utils/tokenBlacklist.js';
 import { validatePasswordStrength as validatePassword } from '../utils/passwordValidator.js';
 import { auditLogin, auditLogout } from '../middleware/audit.js';
 import { resolveTenantSnapshot } from '../utils/tenantResolver.js';
-import { isTrialRestrictedPlan } from '../config/planLimits.js';
+import {
+  isFreePlan,
+  isTrialRestrictedPlan,
+  resolveSubscriptionStatus,
+  SUBSCRIPTION_STATUSES,
+} from '../config/planLimits.js';
 
 const router = express.Router();
 
@@ -62,10 +67,43 @@ const ensureTrialTenant = async ({ user }) => {
         },
       });
 
-      user.tenantId = tenant._id;
-      await user.save();
+        user.tenantId = tenant._id;
+        await user.save();
 
-      return String(tenant._id);
+        try {
+          const { createRoleNotification, createUserNotification } = await import('../services/notificationService.js');
+          await createRoleNotification({
+            title: 'Tenant Created',
+            message: `Tenant "${tenant.name}" (${tenant.code}) was created via self-signup by ${user.name || user.email}.`,
+            type: 'tenant_created',
+            roles: ['SUPER_ADMIN'],
+            tenantId: tenant._id,
+            createdBy: user._id,
+            metadata: {
+              tenantId: tenant._id,
+              tenantName: tenant.name,
+              tenantCode: tenant.code,
+              source: 'self_signup',
+            },
+          });
+          await createUserNotification({
+            title: 'Workspace Ready',
+            message: `Your tenant workspace "${tenant.name}" is ready. You can start creating exams now.`,
+            type: 'tenant_created',
+            roles: [user.role],
+            tenantId: tenant._id,
+            userId: user._id,
+            createdBy: user._id,
+            metadata: {
+              tenantId: tenant._id,
+              tenantName: tenant.name,
+            },
+          });
+        } catch (notifyError) {
+          console.error('[NOTIFICATIONS] Failed to log self-signup tenant creation:', notifyError?.message || notifyError);
+        }
+
+        return String(tenant._id);
     } catch (error) {
       lastError = error;
       const isDuplicateCodeError = error?.code === 11000;
@@ -81,7 +119,7 @@ const ensureTrialTenant = async ({ user }) => {
 const ensureTrialAdminRole = async (user) => {
   if (!user?._id || !user?.tenantId) return user;
   if (user.role !== 'EXAM_CREATOR') return user;
-  if (!isTrialRestrictedPlan(user.planType)) return user;
+  if (!isTrialRestrictedPlan(user.planType) && !isFreePlan(user.planType)) return user;
 
   const tenant = await Tenant.findById(user.tenantId).select('_id createdBy metadata');
   if (!tenant) return user;
@@ -170,7 +208,8 @@ router.post(
       // - SUPER_ADMIN cannot self-register
       const selectedRole = String(role || 'CANDIDATE').toUpperCase();
       const requestedPlanType = normalizePlanType(planType);
-      const allowTenantAdminSelfSignup = isTrialRestrictedPlan(requestedPlanType);
+      const allowTenantAdminSelfSignup =
+        isTrialRestrictedPlan(requestedPlanType) || isFreePlan(requestedPlanType);
       const validRoles = allowTenantAdminSelfSignup
         ? ['TENANT_ADMIN', 'EXAM_CREATOR', 'CANDIDATE']
         : ['EXAM_CREATOR', 'CANDIDATE'];
@@ -197,7 +236,7 @@ router.post(
         password,
         role: selectedRole,
       };
-      if (isTrialRestrictedPlan(requestedPlanType)) {
+      if (isTrialRestrictedPlan(requestedPlanType) || isFreePlan(requestedPlanType)) {
         userData.planType = requestedPlanType;
       }
 
@@ -206,7 +245,7 @@ router.post(
       await user.save();
 
       // Trial/demo self-signups should receive their own tenant workspace.
-      if (isTrialRestrictedPlan(user.planType) && ['EXAM_CREATOR', 'TENANT_ADMIN'].includes(user.role)) {
+      if ((isTrialRestrictedPlan(user.planType) || isFreePlan(user.planType)) && ['EXAM_CREATOR', 'TENANT_ADMIN'].includes(user.role)) {
         await ensureTrialTenant({ user });
       }
 
@@ -352,6 +391,57 @@ router.post(
         }
       }
       const tenantId = toTenantIdString(user.tenantId);
+      let subscriptionStatus = SUBSCRIPTION_STATUSES.ACTIVE;
+      let subscriptionWarning = '';
+
+      if (tenantId && user.role !== 'SUPER_ADMIN') {
+        try {
+          const tenantSubscription = await Tenant.findById(tenantId).select('subscription').lean();
+          const subscription = tenantSubscription?.subscription || {};
+          subscriptionStatus = resolveSubscriptionStatus(subscription);
+
+          const persistedStatus = String(subscription?.status || '')
+            .trim()
+            .toUpperCase();
+          if (persistedStatus !== subscriptionStatus) {
+            Tenant.updateOne(
+              { _id: tenantId },
+              {
+                $set: {
+                  'subscription.status': subscriptionStatus,
+                  'subscription.updatedAt': new Date(),
+                },
+              }
+            ).catch((syncError) => {
+              if (process.env.NODE_ENV === 'development') {
+                console.error(
+                  '[AUTH][LOGIN] Failed to sync subscription status:',
+                  syncError?.message || syncError
+                );
+              }
+            });
+          }
+
+          if (subscriptionStatus === SUBSCRIPTION_STATUSES.SUSPENDED) {
+            return res.status(403).json({
+              error: 'Tenant subscription is suspended. Contact Super Admin to reactivate access.',
+              subscriptionStatus,
+            });
+          }
+
+          if (subscriptionStatus === SUBSCRIPTION_STATUSES.EXPIRED) {
+            subscriptionWarning =
+              'Subscription expired. Access is restricted under free-plan limits until renewal.';
+          }
+        } catch (subscriptionError) {
+          if (process.env.NODE_ENV === 'development') {
+            console.error(
+              '[AUTH][LOGIN] Subscription status resolution failed:',
+              subscriptionError?.message || subscriptionError
+            );
+          }
+        }
+      }
 
       // Generate tokens with tenant info
       const accessToken = jwt.sign(
@@ -384,6 +474,8 @@ router.post(
           examsCreated: user.examsCreated ?? 0,
           tenantId: tenant?._id || null,
           tenant: tenant || null,
+          subscriptionStatus,
+          subscriptionWarning,
         },
       });
     } catch (error) {

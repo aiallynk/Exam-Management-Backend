@@ -164,6 +164,7 @@ export const runJudge0Submission = async ({
   timeLimit = undefined,
   memoryLimit = undefined,
   memoryLimitKb = undefined,
+  executionProfile = null,
   useConfigLimits = true,
 } = {}) => {
   const sourceCode = normalizeString(code);
@@ -177,25 +178,62 @@ export const runJudge0Submission = async ({
       : await resolveJudge0LanguageId(language);
   const normalizedInput = normalizeString(input);
   const normalizedMemoryLimit = Number(memoryLimit);
+  const profileCpuTimeLimit = Number(executionProfile?.cpuTimeLimitSeconds);
+  const profileWallTimeLimit = Number(executionProfile?.wallTimeLimitSeconds);
+  const profileMemoryLimitKb = Number(executionProfile?.memoryLimitKb);
+  const profileEnableNetwork =
+    typeof executionProfile?.enableNetwork === 'boolean'
+      ? executionProfile.enableNetwork
+      : undefined;
   const hasExplicitMemoryLimit =
     (Number.isFinite(Number(memoryLimitKb)) && Number(memoryLimitKb) > 0) ||
     (Number.isFinite(normalizedMemoryLimit) && normalizedMemoryLimit > 0);
-  const resolvedMemoryLimitKb =
+  const explicitMemoryLimitKb =
     Number.isFinite(Number(memoryLimitKb)) && Number(memoryLimitKb) > 0
       ? Math.floor(Number(memoryLimitKb))
       : Number.isFinite(normalizedMemoryLimit) && normalizedMemoryLimit > 0
         ? normalizedMemoryLimit > 1024
           ? Math.floor(normalizedMemoryLimit)
           : Math.floor(normalizedMemoryLimit * 1024)
-        : Number(config.judge0MemoryLimitKb) || 131072;
-  const resolvedCpuTimeLimit =
+        : null;
+  const fallbackMemoryLimitKb = Number(config.judge0MemoryLimitKb) || 131072;
+  const resolvedMemoryLimitKb = Number.isFinite(explicitMemoryLimitKb) && explicitMemoryLimitKb > 0
+    ? (
+      Number.isFinite(profileMemoryLimitKb) && profileMemoryLimitKb > 0
+        ? Math.max(explicitMemoryLimitKb, Math.floor(profileMemoryLimitKb))
+        : explicitMemoryLimitKb
+    )
+    : Number.isFinite(profileMemoryLimitKb) && profileMemoryLimitKb > 0
+      ? Math.floor(profileMemoryLimitKb)
+      : fallbackMemoryLimitKb;
+  const explicitCpuTimeLimit =
     Number.isFinite(Number(timeLimit)) && Number(timeLimit) > 0
       ? Number(timeLimit)
+      : null;
+  const fallbackCpuTimeLimit = useConfigLimits ? Number(config.judge0CpuTimeLimit) || 2 : undefined;
+  const resolvedCpuTimeLimit = Number.isFinite(explicitCpuTimeLimit) && explicitCpuTimeLimit > 0
+    ? (
+      Number.isFinite(profileCpuTimeLimit) && profileCpuTimeLimit > 0
+        ? Math.max(explicitCpuTimeLimit, profileCpuTimeLimit)
+        : explicitCpuTimeLimit
+    )
+    : Number.isFinite(profileCpuTimeLimit) && profileCpuTimeLimit > 0
+      ? profileCpuTimeLimit
+      : fallbackCpuTimeLimit;
+  const fallbackWallTimeLimit = useConfigLimits ? Number(config.judge0WallTimeLimit) || 5 : undefined;
+  const resolvedWallTimeLimit = Number.isFinite(profileWallTimeLimit) && profileWallTimeLimit > 0
+    ? (
+      Number.isFinite(fallbackWallTimeLimit) && fallbackWallTimeLimit > 0
+        ? Math.max(profileWallTimeLimit, fallbackWallTimeLimit)
+        : profileWallTimeLimit
+    )
+    : fallbackWallTimeLimit;
+  const resolvedEnableNetwork =
+    typeof profileEnableNetwork === 'boolean'
+      ? profileEnableNetwork
       : useConfigLimits
-        ? Number(config.judge0CpuTimeLimit) || 2
+        ? Boolean(config.judge0EnableNetwork)
         : undefined;
-  const resolvedWallTimeLimit = useConfigLimits ? Number(config.judge0WallTimeLimit) || 5 : undefined;
-  const resolvedEnableNetwork = useConfigLimits ? Boolean(config.judge0EnableNetwork) : undefined;
 
   const buildSubmissionPayload = ({
     languageIdOverride = resolvedLanguageId,
@@ -214,7 +252,7 @@ export const runJudge0Submission = async ({
       if (Number.isFinite(resolvedWallTimeLimit) && resolvedWallTimeLimit > 0) {
         payload.wall_time_limit = resolvedWallTimeLimit;
       }
-      if (hasExplicitMemoryLimit || useConfigLimits) {
+      if (hasExplicitMemoryLimit || useConfigLimits || Number.isFinite(profileMemoryLimitKb)) {
         payload.memory_limit = resolvedMemoryLimitKb;
       }
       if (typeof resolvedEnableNetwork === 'boolean') {

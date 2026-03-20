@@ -14,6 +14,10 @@ export const requestTimeout = (timeoutMs = 30000) => {
     const extendedTimeoutRoutes = {
       '/api/exams/generate-questions': 300000, // 5 minutes for AI question generation
       '/api/exams/import-questions': 300000,    // 5 minutes for AI question extraction from files
+      '/api/super-admin/backups': 600000, // 10 minutes for large backup creation
+      '/api/super-admin/backups/restore-upload': 600000, // 10 minutes for upload + restore
+      '/api/admin/system/backup': 600000, // 10 minutes for large backup creation
+      '/api/admin/system/restore': 600000, // 10 minutes for upload + restore
     };
     const extendedTimeoutPatterns = [
       {
@@ -23,6 +27,22 @@ export const requestTimeout = (timeoutMs = 30000) => {
       {
         pattern: /^\/api\/exams\/submit$/,
         timeout: 120000, // 2 minutes for unified exam submit endpoint
+      },
+      {
+        pattern: /^\/api\/super-admin\/backups\/[a-fA-F0-9]{24}\/restore$/,
+        timeout: 600000, // 10 minutes for restore operation
+      },
+      {
+        pattern: /^\/api\/super-admin\/backups\/[a-fA-F0-9]{24}\/download$/,
+        timeout: 600000, // 10 minutes for large backup downloads
+      },
+      {
+        pattern: /^\/api\/admin\/system\/backups\/[a-fA-F0-9]{24}\/restore$/,
+        timeout: 600000, // 10 minutes for restore operation
+      },
+      {
+        pattern: /^\/api\/admin\/system\/backups\/[a-fA-F0-9]{24}\/download$/,
+        timeout: 600000, // 10 minutes for large backup downloads
       },
     ];
 

@@ -8,14 +8,34 @@ import Exam from '../models/Exam.js';
 import ExamAttempt from '../models/ExamAttempt.js';
 import ExamSession from '../models/ExamSession.js';
 import Answer from '../models/Answer.js';
+import SubTenant from '../models/SubTenant.js';
 import SystemConfig from '../models/SystemConfig.js';
 import { validatePasswordStrength, generateSecurePassword } from '../utils/passwordValidator.js';
-import { auditLog, AUDIT_ACTIONS } from '../middleware/audit.js';
+import { AUDIT_ACTIONS } from '../middleware/audit.js';
+import { logAuditEvent } from '../utils/auditLogger.js';
 import { checkTenantLimits } from '../middleware/planLimits.js';
-import { FREE_TRIAL_LIMITS, isTrialRestrictedPlan } from '../config/planLimits.js';
+import {
+  FREE_PLAN_MESSAGES,
+  FREE_TRIAL_LIMITS,
+  getSubscriptionPlanDefinition,
+  isPlanFeatureEnabled,
+  isTrialRestrictedPlan,
+  resolveEffectivePlanType,
+  resolveSubscriptionStatus,
+} from '../config/planLimits.js';
+import {
+  blockFreePlanByUser,
+  resolveUserEffectivePlanType,
+  sendPlanRestriction,
+} from '../middleware/planRestrictions.js';
 import { getTenantAnalyticsDashboard } from '../services/analyticsService.js';
+import { deleteUserAndCleanup } from '../services/userDeletionService.js';
 
 const router = express.Router();
+const requireMultiTenantFeature = blockFreePlanByUser(
+  FREE_PLAN_MESSAGES.MULTI_TENANT_LOCKED,
+  'multiTenant'
+);
 
 // Tenant workspace routes require tenant-scoped admin/creator role and tenantId
 router.use(requireAuth);
@@ -35,6 +55,30 @@ const BULK_IMPORT_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const BULK_IMPORT_ROLE_LIMITS = Object.freeze({
   EXAM_CREATOR: FREE_TRIAL_LIMITS.maxExamCreators,
   CANDIDATE: FREE_TRIAL_LIMITS.maxCandidates,
+});
+
+const BULK_IMPORT_ROLE_QUERY_VALUES = Object.freeze({
+  EXAM_CREATOR: ['EXAM_CREATOR', 'ORG_ADMIN', 'INSTITUTE_ADMIN', 'ADMIN', 'DESIGNER', 'TEACHER'],
+  CANDIDATE: ['CANDIDATE', 'USER', 'STUDENT'],
+});
+const SUB_TENANT_ALLOWED_STATUS = new Set(['ACTIVE', 'INACTIVE']);
+
+const toFiniteLimit = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.floor(parsed);
+};
+
+const buildActorAuditDetails = (req) => ({
+  userId: req.user?._id || null,
+  userEmail: req.user?.email || null,
+  userName: req.user?.name || null,
+  userRole: req.user?.role || null,
+  tenantId: req.user?.tenantId || null,
+  ip: req.ip,
+  userAgent: req.get('user-agent'),
+  method: req.method,
+  path: req.path,
 });
 
 const normalizeBulkHeader = (value) =>
@@ -57,6 +101,13 @@ const toTrimmedString = (value) => {
   return String(value).trim();
 };
 
+const normalizeSubTenantCode = (value = '') =>
+  String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9_-]/g, '')
+    .slice(0, 32);
+
 const normalizeBulkImportRow = (row) => {
   const name = toTrimmedString(getBulkRowValue(row, 'Name'));
   const email = toTrimmedString(getBulkRowValue(row, 'Email')).toLowerCase();
@@ -76,9 +127,63 @@ const ensureTenantAdminBulkAccess = (req, res) => {
   return true;
 };
 
+const ensureTenantAdminAccess = (req, res, message = 'Only tenant admins can access this resource') => {
+  if (req.user.role !== 'TENANT_ADMIN') {
+    res.status(403).json({ error: message });
+    return false;
+  }
+  return true;
+};
+
+const resolveValidatedSubTenantId = async ({
+  tenantId,
+  subTenantId,
+  allowInactive = false,
+} = {}) => {
+  const normalizedSubTenantId = String(subTenantId || '').trim();
+  if (!normalizedSubTenantId) return null;
+
+  if (!/^[a-fA-F0-9]{24}$/.test(normalizedSubTenantId)) {
+    return null;
+  }
+
+  const filter = {
+    _id: normalizedSubTenantId,
+    tenantId,
+  };
+  if (!allowInactive) {
+    filter.status = 'ACTIVE';
+  }
+
+  const subTenant = await SubTenant.findOne(filter).select('_id').lean();
+  return subTenant?._id || null;
+};
+
 const getBulkImportRoleAllowance = async (req) => {
-  const currentActor = await User.findById(req.user._id).select('planType').lean();
-  if (!currentActor || !isTrialRestrictedPlan(currentActor.planType)) {
+  const [currentActor, tenant] = await Promise.all([
+    User.findById(req.user._id).select('planType').lean(),
+    Tenant.findById(req.user.tenantId).select('subscription').lean(),
+  ]);
+
+  const subscription = tenant?.subscription || {};
+  const effectivePlanType = resolveEffectivePlanType(
+    subscription?.planType || currentActor?.planType || null,
+    resolveSubscriptionStatus(subscription)
+  );
+
+  let examCreatorLimit = null;
+  let candidateLimit = null;
+
+  if (isTrialRestrictedPlan(effectivePlanType)) {
+    examCreatorLimit = BULK_IMPORT_ROLE_LIMITS.EXAM_CREATOR;
+    candidateLimit = BULK_IMPORT_ROLE_LIMITS.CANDIDATE;
+  } else {
+    const planLimits = getSubscriptionPlanDefinition(effectivePlanType)?.limits || {};
+    examCreatorLimit = toFiniteLimit(planLimits.maxExamCreators);
+    candidateLimit = toFiniteLimit(planLimits.maxCandidates);
+  }
+
+  if (examCreatorLimit === null && candidateLimit === null) {
     return {
       EXAM_CREATOR: Number.POSITIVE_INFINITY,
       CANDIDATE: Number.POSITIVE_INFINITY,
@@ -88,19 +193,25 @@ const getBulkImportRoleAllowance = async (req) => {
   const [existingCreators, existingCandidates] = await Promise.all([
     User.countDocuments({
       tenantId: req.user.tenantId,
-      role: 'EXAM_CREATOR',
+      role: { $in: BULK_IMPORT_ROLE_QUERY_VALUES.EXAM_CREATOR },
       status: { $ne: 'INACTIVE' },
     }),
     User.countDocuments({
       tenantId: req.user.tenantId,
-      role: 'CANDIDATE',
+      role: { $in: BULK_IMPORT_ROLE_QUERY_VALUES.CANDIDATE },
       status: { $ne: 'INACTIVE' },
     }),
   ]);
 
   return {
-    EXAM_CREATOR: Math.max(0, BULK_IMPORT_ROLE_LIMITS.EXAM_CREATOR - existingCreators),
-    CANDIDATE: Math.max(0, BULK_IMPORT_ROLE_LIMITS.CANDIDATE - existingCandidates),
+    EXAM_CREATOR:
+      examCreatorLimit === null
+        ? Number.POSITIVE_INFINITY
+        : Math.max(0, examCreatorLimit - existingCreators),
+    CANDIDATE:
+      candidateLimit === null
+        ? Number.POSITIVE_INFINITY
+        : Math.max(0, candidateLimit - existingCandidates),
   };
 };
 
@@ -384,8 +495,16 @@ router.get('/stats', async (req, res, next) => {
   }
 });
 
-router.get('/analytics', async (req, res, next) => {
+router.get(
+  '/analytics',
+  blockFreePlanByUser(FREE_PLAN_MESSAGES.ANALYTICS_LOCKED, 'analytics'),
+  async (req, res, next) => {
   try {
+    const effectivePlanType = await resolveUserEffectivePlanType(req.user);
+    const includeAdvancedAnalytics = isPlanFeatureEnabled(
+      effectivePlanType,
+      'advancedAnalytics'
+    );
     const requestedExamId = req.query.examId || req.query.specificExamId || null;
     const parsedStartDate =
       typeof req.query.startDate === 'string' && req.query.startDate
@@ -401,11 +520,353 @@ router.get('/analytics', async (req, res, next) => {
         parsedStartDate && !Number.isNaN(parsedStartDate.getTime())
           ? parsedStartDate
           : null,
+      includeAdvanced: includeAdvancedAnalytics,
     });
 
-    res.json(analytics);
+    res.json({
+      ...analytics,
+      planContext: {
+        planType: effectivePlanType,
+        advancedAnalytics: includeAdvancedAnalytics,
+      },
+    });
   } catch (error) {
     next(error);
+  }
+});
+
+/**
+ * SUB-TENANT (Department) MANAGEMENT
+ */
+
+router.get('/sub-tenants', requireMultiTenantFeature, async (req, res, next) => {
+  if (!ensureTenantAdminAccess(req, res, 'Only tenant admins can manage sub-tenants')) return;
+
+  try {
+    const page = Math.max(1, parseInt(req.query.page || '1', 10));
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit || '20', 10)));
+    const skip = (page - 1) * limit;
+    const statusQuery = String(req.query.status || 'ACTIVE').trim().toUpperCase();
+    const search = String(req.query.search || '').trim();
+
+    const filter = {
+      tenantId: req.user.tenantId,
+    };
+
+    if (statusQuery && statusQuery !== 'ALL') {
+      if (!SUB_TENANT_ALLOWED_STATUS.has(statusQuery)) {
+        return res.status(400).json({ error: 'status must be ACTIVE, INACTIVE, or ALL' });
+      }
+      filter.status = statusQuery;
+    }
+
+    if (search) {
+      filter.$or = [
+        { name: { $regex: search, $options: 'i' } },
+        { code: { $regex: search, $options: 'i' } },
+        { description: { $regex: search, $options: 'i' } },
+      ];
+    }
+
+    const [subTenants, total] = await Promise.all([
+      SubTenant.find(filter)
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      SubTenant.countDocuments(filter),
+    ]);
+
+    const subTenantIds = subTenants.map((item) => item._id);
+    const [userUsage, examUsage] = await Promise.all([
+      subTenantIds.length
+        ? User.aggregate([
+            {
+              $match: {
+                tenantId: req.user.tenantId,
+                subTenantId: { $in: subTenantIds },
+                status: { $ne: 'INACTIVE' },
+              },
+            },
+            {
+              $group: {
+                _id: '$subTenantId',
+                count: { $sum: 1 },
+              },
+            },
+          ])
+        : [],
+      subTenantIds.length
+        ? Exam.aggregate([
+            {
+              $match: {
+                tenantId: req.user.tenantId,
+                subTenantId: { $in: subTenantIds },
+              },
+            },
+            {
+              $group: {
+                _id: '$subTenantId',
+                count: { $sum: 1 },
+              },
+            },
+          ])
+        : [],
+    ]);
+
+    const userCountMap = new Map(
+      userUsage.map((entry) => [String(entry._id), Number(entry.count) || 0])
+    );
+    const examCountMap = new Map(
+      examUsage.map((entry) => [String(entry._id), Number(entry.count) || 0])
+    );
+
+    const normalizedSubTenants = subTenants.map((item) => ({
+      ...item,
+      userCount: userCountMap.get(String(item._id)) || 0,
+      examCount: examCountMap.get(String(item._id)) || 0,
+    }));
+
+    return res.json({
+      subTenants: normalizedSubTenants,
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.max(1, Math.ceil(total / limit)),
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post(
+  '/sub-tenants',
+  requireMultiTenantFeature,
+  [
+    body('name').trim().notEmpty().withMessage('name is required'),
+    body('code').optional().isString().withMessage('code must be a string'),
+    body('description').optional().isString().withMessage('description must be a string'),
+    body('status')
+      .optional()
+      .isIn(['ACTIVE', 'INACTIVE'])
+      .withMessage('status must be ACTIVE or INACTIVE'),
+    body('metadata').optional().isObject().withMessage('metadata must be an object'),
+  ],
+  async (req, res, next) => {
+    if (!ensureTenantAdminAccess(req, res, 'Only tenant admins can manage sub-tenants')) return;
+
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const requestedCode =
+        normalizeSubTenantCode(req.body.code) ||
+        normalizeSubTenantCode(String(req.body.name || '').replace(/\s+/g, '_'));
+      if (!requestedCode) {
+        return res.status(400).json({ error: 'Unable to derive a valid department code.' });
+      }
+
+      const subTenant = await SubTenant.create({
+        tenantId: req.user.tenantId,
+        name: String(req.body.name || '').trim(),
+        code: requestedCode,
+        description: String(req.body.description || '').trim(),
+        status: req.body.status || 'ACTIVE',
+        metadata: req.body.metadata && typeof req.body.metadata === 'object' ? req.body.metadata : {},
+        createdBy: req.user._id,
+      });
+
+      await logAuditEvent(AUDIT_ACTIONS.RESOURCE_CREATED || 'SUB_TENANT_CREATED', {
+        ...buildActorAuditDetails(req),
+        tenantId: req.user.tenantId || null,
+        resourceType: 'SubTenant',
+        resourceId: subTenant._id,
+        details: {
+          subTenantName: subTenant.name,
+          subTenantCode: subTenant.code,
+          status: subTenant.status,
+        },
+      });
+
+      return res.status(201).json({ subTenant });
+    } catch (error) {
+      if (error?.code === 11000) {
+        return res.status(409).json({ error: 'A sub-tenant with this code already exists.' });
+      }
+      return next(error);
+    }
+  }
+);
+
+router.put(
+  '/sub-tenants/:subTenantId',
+  requireMultiTenantFeature,
+  [
+    body('name').optional().trim().notEmpty().withMessage('name cannot be empty'),
+    body('code').optional().isString().withMessage('code must be a string'),
+    body('description').optional().isString().withMessage('description must be a string'),
+    body('status')
+      .optional()
+      .isIn(['ACTIVE', 'INACTIVE'])
+      .withMessage('status must be ACTIVE or INACTIVE'),
+    body('metadata').optional().isObject().withMessage('metadata must be an object'),
+  ],
+  async (req, res, next) => {
+    if (!ensureTenantAdminAccess(req, res, 'Only tenant admins can manage sub-tenants')) return;
+
+    try {
+      if (!/^[a-fA-F0-9]{24}$/.test(String(req.params.subTenantId || '').trim())) {
+        return res.status(400).json({ error: 'Invalid sub-tenant id.' });
+      }
+
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const subTenant = await SubTenant.findOne({
+        _id: req.params.subTenantId,
+        tenantId: req.user.tenantId,
+      });
+      if (!subTenant) {
+        return res.status(404).json({ error: 'Sub-tenant not found.' });
+      }
+
+      const beforeState = {
+        name: subTenant.name,
+        code: subTenant.code,
+        description: subTenant.description,
+        status: subTenant.status,
+      };
+
+      if (req.body.name !== undefined) {
+        subTenant.name = String(req.body.name || '').trim();
+      }
+      if (req.body.code !== undefined) {
+        const normalizedCode = normalizeSubTenantCode(req.body.code);
+        if (!normalizedCode) {
+          return res.status(400).json({ error: 'code must contain alphanumeric characters.' });
+        }
+        subTenant.code = normalizedCode;
+      }
+      if (req.body.description !== undefined) {
+        subTenant.description = String(req.body.description || '').trim();
+      }
+      if (req.body.status !== undefined) {
+        subTenant.status = String(req.body.status).toUpperCase();
+      }
+      if (req.body.metadata !== undefined) {
+        subTenant.metadata =
+          req.body.metadata && typeof req.body.metadata === 'object' ? req.body.metadata : {};
+      }
+
+      await subTenant.save();
+
+      const updatedFields = [];
+      Object.entries({
+        name: subTenant.name,
+        code: subTenant.code,
+        description: subTenant.description,
+        status: subTenant.status,
+      }).forEach(([field, value]) => {
+        if (String(beforeState[field] ?? '') !== String(value ?? '')) {
+          updatedFields.push(field);
+        }
+      });
+
+      await logAuditEvent(AUDIT_ACTIONS.RESOURCE_UPDATED || 'SUB_TENANT_UPDATED', {
+        ...buildActorAuditDetails(req),
+        tenantId: req.user.tenantId || null,
+        resourceType: 'SubTenant',
+        resourceId: subTenant._id,
+        details: {
+          updatedFields,
+          before: beforeState,
+          after: {
+            name: subTenant.name,
+            code: subTenant.code,
+            description: subTenant.description,
+            status: subTenant.status,
+          },
+        },
+      });
+
+      return res.json({ subTenant });
+    } catch (error) {
+      if (error?.code === 11000) {
+        return res.status(409).json({ error: 'A sub-tenant with this code already exists.' });
+      }
+      return next(error);
+    }
+  }
+);
+
+router.delete('/sub-tenants/:subTenantId', requireMultiTenantFeature, async (req, res, next) => {
+  if (!ensureTenantAdminAccess(req, res, 'Only tenant admins can manage sub-tenants')) return;
+
+  try {
+    if (!/^[a-fA-F0-9]{24}$/.test(String(req.params.subTenantId || '').trim())) {
+      return res.status(400).json({ error: 'Invalid sub-tenant id.' });
+    }
+
+    const subTenant = await SubTenant.findOne({
+      _id: req.params.subTenantId,
+      tenantId: req.user.tenantId,
+    });
+    if (!subTenant) {
+      return res.status(404).json({ error: 'Sub-tenant not found.' });
+    }
+
+    subTenant.status = 'INACTIVE';
+    await subTenant.save();
+
+    await Promise.all([
+      User.updateMany(
+        {
+          tenantId: req.user.tenantId,
+          subTenantId: subTenant._id,
+        },
+        {
+          $set: {
+            subTenantId: null,
+          },
+        }
+      ),
+      Exam.updateMany(
+        {
+          tenantId: req.user.tenantId,
+          subTenantId: subTenant._id,
+        },
+        {
+          $set: {
+            subTenantId: null,
+          },
+        }
+      ),
+    ]);
+
+    await logAuditEvent(AUDIT_ACTIONS.RESOURCE_DELETED || 'SUB_TENANT_DEACTIVATED', {
+      ...buildActorAuditDetails(req),
+      tenantId: req.user.tenantId || null,
+      resourceType: 'SubTenant',
+      resourceId: subTenant._id,
+      details: {
+        subTenantName: subTenant.name,
+        subTenantCode: subTenant.code,
+        mode: 'soft_deactivate',
+      },
+    });
+
+    return res.json({
+      message: 'Sub-tenant deactivated successfully.',
+      subTenant,
+    });
+  } catch (error) {
+    return next(error);
   }
 });
 
@@ -416,12 +877,15 @@ router.get('/analytics', async (req, res, next) => {
 // List all users in tenant
 router.get('/users', async (req, res, next) => {
   try {
-    const { page = 1, limit = 20, role, status, search } = req.query;
+    const { page = 1, limit = 20, role, status, search, subTenantId } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
     const filter = { tenantId: req.user.tenantId, role: { $ne: 'SUPER_ADMIN' } };
     if (role) filter.role = role;
     if (status) filter.status = status;
+    if (typeof subTenantId === 'string' && /^[a-fA-F0-9]{24}$/.test(subTenantId.trim())) {
+      filter.subTenantId = subTenantId.trim();
+    }
     if (search) {
       filter.$or = [
         { name: { $regex: search, $options: 'i' } },
@@ -432,6 +896,7 @@ router.get('/users', async (req, res, next) => {
     const [users, total] = await Promise.all([
       User.find(filter)
         .select('-password')
+        .populate('subTenantId', 'name code status')
         .sort({ createdAt: -1 })
         .skip(skip)
         .limit(parseInt(limit)),
@@ -526,6 +991,21 @@ router.post('/users/bulk-import', async (req, res, next) => {
 
         await user.save();
         totalImported += 1;
+
+        logAuditEvent(AUDIT_ACTIONS.USER_CREATED, {
+          ...buildActorAuditDetails(req),
+          tenantId: user.tenantId || req.user.tenantId || null,
+          resourceType: 'User',
+          resourceId: user._id,
+          details: {
+            createdUserName: user.name,
+            createdUserEmail: user.email,
+            createdUserRole: user.role,
+            source: 'bulk_import',
+          },
+        }).catch(err => {
+          console.error('[AUDIT] Failed to log bulk user creation:', err);
+        });
       } catch (error) {
         const isDuplicateEmail = error?.code === 11000;
         if (isDuplicateEmail) {
@@ -561,7 +1041,9 @@ router.get('/users/:userId', async (req, res, next) => {
     const user = await User.findOne({
       _id: req.params.userId,
       tenantId: req.user.tenantId,
-    }).select('-password');
+    })
+      .select('-password')
+      .populate('subTenantId', 'name code status');
 
     if (!user) {
       return res.status(404).json({ error: 'User not found' });
@@ -582,6 +1064,10 @@ router.post(
     body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
     body('role').isIn(['EXAM_CREATOR', 'CANDIDATE']).withMessage('Invalid role. Must be EXAM_CREATOR or CANDIDATE'),
     body('mobile').optional().trim(),
+    body('subTenantId')
+      .optional({ nullable: true })
+      .custom((value) => value === null || value === '' || /^[a-fA-F0-9]{24}$/.test(String(value).trim()))
+      .withMessage('subTenantId must be a valid id when provided'),
   ],
   checkTenantLimits,
   async (req, res, next) => {
@@ -591,12 +1077,35 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { name, email, password, role, mobile } = req.body;
+      const { name, email, password, role, mobile, subTenantId } = req.body;
 
       // Check if user exists
       const existing = await User.findOne({ email });
       if (existing) {
         return res.status(409).json({ error: 'Email already registered' });
+      }
+
+      let resolvedSubTenantId = null;
+      if (subTenantId !== undefined) {
+        const effectivePlanType = await resolveUserEffectivePlanType(req.user);
+        if (
+          subTenantId !== null &&
+          String(subTenantId || '').trim() !== '' &&
+          !isPlanFeatureEnabled(effectivePlanType, 'multiTenant')
+        ) {
+          return sendPlanRestriction(res, FREE_PLAN_MESSAGES.MULTI_TENANT_LOCKED);
+        }
+
+        if (subTenantId !== null && String(subTenantId || '').trim() !== '') {
+          resolvedSubTenantId = await resolveValidatedSubTenantId({
+            tenantId: req.user.tenantId,
+            subTenantId,
+            allowInactive: false,
+          });
+          if (!resolvedSubTenantId) {
+            return res.status(404).json({ error: 'Sub-tenant not found for this workspace.' });
+          }
+        }
       }
 
       const user = new User({
@@ -605,6 +1114,7 @@ router.post(
         password,
         role,
         tenantId: req.user.tenantId, // Automatically assign to tenant admin's tenant
+        subTenantId: resolvedSubTenantId,
         mobile,
         status: 'ACTIVE',
       });
@@ -612,6 +1122,18 @@ router.post(
       await user.save();
       const userObj = user.toObject();
       delete userObj.password;
+
+      await logAuditEvent(AUDIT_ACTIONS.USER_CREATED, {
+        ...buildActorAuditDetails(req),
+        tenantId: user.tenantId || req.user.tenantId || null,
+        resourceType: 'User',
+        resourceId: user._id,
+        details: {
+          createdUserName: user.name,
+          createdUserEmail: user.email,
+          createdUserRole: user.role,
+        },
+      });
 
       res.status(201).json({ user: userObj });
     } catch (error) {
@@ -629,6 +1151,10 @@ router.put(
     body('role').optional().isIn(['EXAM_CREATOR', 'CANDIDATE']),
     body('status').optional().isIn(['ACTIVE', 'INACTIVE', 'SUSPENDED', 'BLOCKED']),
     body('mobile').optional().trim(),
+    body('subTenantId')
+      .optional({ nullable: true })
+      .custom((value) => value === null || value === '' || /^[a-fA-F0-9]{24}$/.test(String(value).trim()))
+      .withMessage('subTenantId must be a valid id when provided'),
   ],
   checkTenantLimits,
   async (req, res, next) => {
@@ -652,7 +1178,17 @@ router.put(
         return res.status(403).json({ error: 'Cannot modify this user' });
       }
 
-      const { name, email, password, role, status, mobile } = req.body;
+      const beforeState = {
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        status: user.status,
+        mobile: user.mobile,
+        tenantId: user.tenantId,
+        subTenantId: user.subTenantId ? String(user.subTenantId) : null,
+      };
+
+      const { name, email, password, role, status, mobile, subTenantId } = req.body;
 
       if (name) user.name = name;
       if (email) {
@@ -666,10 +1202,65 @@ router.put(
       if (role) user.role = role;
       if (status) user.status = status;
       if (mobile !== undefined) user.mobile = mobile;
+      if (subTenantId !== undefined) {
+        const effectivePlanType = await resolveUserEffectivePlanType(req.user);
+        const normalizedSubTenantId = String(subTenantId || '').trim();
+        if (normalizedSubTenantId) {
+          if (!isPlanFeatureEnabled(effectivePlanType, 'multiTenant')) {
+            return sendPlanRestriction(res, FREE_PLAN_MESSAGES.MULTI_TENANT_LOCKED);
+          }
+          const resolvedSubTenantId = await resolveValidatedSubTenantId({
+            tenantId: req.user.tenantId,
+            subTenantId: normalizedSubTenantId,
+            allowInactive: false,
+          });
+          if (!resolvedSubTenantId) {
+            return res.status(404).json({ error: 'Sub-tenant not found for this workspace.' });
+          }
+          user.subTenantId = resolvedSubTenantId;
+        } else {
+          user.subTenantId = null;
+        }
+      }
 
       await user.save();
       const userObj = user.toObject();
       delete userObj.password;
+
+      const updatedFields = [];
+      Object.entries({
+        name: user.name,
+        email: user.email,
+        role: user.role,
+        status: user.status,
+        mobile: user.mobile,
+        tenantId: user.tenantId,
+        subTenantId: user.subTenantId ? String(user.subTenantId) : null,
+      }).forEach(([field, value]) => {
+        const beforeValue = beforeState[field];
+        if (String(beforeValue ?? '') !== String(value ?? '')) {
+          updatedFields.push(field);
+        }
+      });
+
+      const roleChanged = beforeState.role !== user.role;
+      const action = roleChanged ? AUDIT_ACTIONS.USER_ROLE_CHANGED : AUDIT_ACTIONS.USER_UPDATED;
+
+      await logAuditEvent(action, {
+        ...buildActorAuditDetails(req),
+        tenantId: user.tenantId || req.user.tenantId || null,
+        resourceType: 'User',
+        resourceId: user._id,
+        details: {
+          updatedFields,
+          roleChanged,
+          beforeRole: beforeState.role,
+          afterRole: user.role,
+          targetUserName: user.name,
+          targetUserEmail: user.email,
+          targetUserStatus: user.status,
+        },
+      });
 
       res.json({ user: userObj });
     } catch (error) {
@@ -678,7 +1269,7 @@ router.put(
   }
 );
 
-// Delete user (soft delete by setting status to INACTIVE)
+// Delete user (permanent delete)
 router.delete('/users/:userId', async (req, res, next) => {
   try {
     const user = await User.findOne({
@@ -694,10 +1285,25 @@ router.delete('/users/:userId', async (req, res, next) => {
       return res.status(403).json({ error: 'Cannot delete this user' });
     }
 
-    user.status = 'INACTIVE';
-    await user.save();
+    const userObj = user.toObject();
+    delete userObj.password;
 
-    res.json({ message: 'User deactivated successfully', user });
+    await logAuditEvent(AUDIT_ACTIONS.USER_DELETED, {
+      ...buildActorAuditDetails(req),
+      tenantId: user.tenantId || req.user.tenantId || null,
+      resourceType: 'User',
+      resourceId: user._id,
+      details: {
+        deletedUserName: user.name,
+        deletedUserEmail: user.email,
+        deletedUserRole: user.role,
+        deletedUserStatus: user.status,
+      },
+    });
+
+    await deleteUserAndCleanup(user._id);
+
+    res.json({ message: 'User deleted successfully', user: userObj });
   } catch (error) {
     next(error);
   }
@@ -740,6 +1346,19 @@ router.post(
       }
 
       await config.save();
+
+      const action = blocked ? AUDIT_ACTIONS.USER_BLOCKED : AUDIT_ACTIONS.USER_UNBLOCKED;
+      await logAuditEvent(action, {
+        ...buildActorAuditDetails(req),
+        tenantId: user.tenantId || req.user.tenantId || null,
+        resourceType: 'User',
+        resourceId: user._id,
+        details: {
+          blocked,
+          targetUserName: user.name,
+          targetUserEmail: user.email,
+        },
+      });
 
       res.json({
         message: `User ${blocked ? 'blocked' : 'unblocked'} successfully`,
@@ -1065,7 +1684,11 @@ router.put(
 
       // Store before state for audit
       const beforeState = {
+        title: exam.title,
+        description: exam.description,
         isActive: exam.isActive,
+        duration: exam.duration,
+        maxAttempts: exam.maxAttempts,
       };
 
       if (title) exam.title = title;
@@ -1077,28 +1700,36 @@ router.put(
       await exam.save();
       await exam.populate('createdBy', 'name email role');
 
-      // Log audit for enable/disable
-      if (isActive !== undefined && isActive !== beforeState.isActive) {
-        const { logAuditEvent, AUDIT_ACTIONS } = await import('../utils/auditLogger.js');
-        await logAuditEvent(
-          isActive ? AUDIT_ACTIONS.EXAM_ENABLED || 'EXAM_ENABLED' : AUDIT_ACTIONS.EXAM_DISABLED || 'EXAM_DISABLED',
-          {
-            userId: req.user._id,
-            userEmail: req.user.email,
-            userRole: req.user.role,
-            resourceType: 'Exam',
-            resourceId: exam._id,
-            ip: req.ip,
-            userAgent: req.get('user-agent'),
-            method: req.method,
-            path: req.path,
-            details: {
-              before: beforeState,
-              after: { isActive: exam.isActive },
-            },
-          }
-        );
-      }
+      const updatedFields = [];
+      Object.entries({
+        title: exam.title,
+        description: exam.description,
+        isActive: exam.isActive,
+        duration: exam.duration,
+        maxAttempts: exam.maxAttempts,
+      }).forEach(([field, value]) => {
+        const beforeValue = beforeState[field];
+        if (String(beforeValue ?? '') !== String(value ?? '')) {
+          updatedFields.push(field);
+        }
+      });
+
+      const isActiveChanged = isActive !== undefined && isActive !== beforeState.isActive;
+      const action = isActiveChanged
+        ? (exam.isActive ? AUDIT_ACTIONS.EXAM_ENABLED : AUDIT_ACTIONS.EXAM_DISABLED)
+        : AUDIT_ACTIONS.EXAM_UPDATED;
+
+      await logAuditEvent(action, {
+        ...buildActorAuditDetails(req),
+        tenantId: exam.tenantId || req.user.tenantId || null,
+        resourceType: 'Exam',
+        resourceId: exam._id,
+        details: {
+          updatedFields,
+          before: { isActive: beforeState.isActive },
+          after: { isActive: exam.isActive },
+        },
+      });
 
       res.json({ exam });
     } catch (error) {
@@ -1121,6 +1752,19 @@ router.delete('/exams/:examId', async (req, res, next) => {
 
     exam.isActive = false;
     await exam.save();
+
+    await logAuditEvent(AUDIT_ACTIONS.EXAM_DELETED, {
+      ...buildActorAuditDetails(req),
+      tenantId: exam.tenantId || req.user.tenantId || null,
+      resourceType: 'Exam',
+      resourceId: exam._id,
+      details: {
+        examTitle: exam.title,
+        before: { isActive: true },
+        after: { isActive: false },
+        mode: 'soft_delete',
+      },
+    });
 
     res.json({ message: 'Exam deactivated successfully', exam });
   } catch (error) {

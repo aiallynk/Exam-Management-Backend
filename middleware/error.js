@@ -1,11 +1,29 @@
 import config from '../config/env.js';
 import { logError } from '../utils/logger.js';
+import { emitSystemFailureAlert } from '../services/systemAlertService.js';
 
 export const errorHandler = (err, req, res, next) => {
   logError(err, `${req.method} ${req.path}`);
 
   // Standardized error response structure
   const createErrorResponse = (statusCode, error, message, details = null) => {
+    if (statusCode >= 500) {
+      emitSystemFailureAlert({
+        title: 'System API Failure',
+        message: `${error || 'Internal server error'} on ${req.method} ${req.path}`,
+        method: req.method,
+        path: req.path,
+        statusCode,
+        errorMessage: err?.message || message || '',
+        stack: err?.stack || '',
+      }).catch((alertError) => {
+        console.error(
+          '[SYSTEM ALERT] Failed to emit API failure alert:',
+          alertError?.message || alertError
+        );
+      });
+    }
+
     const response = {
       error,
       message,

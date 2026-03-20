@@ -1,6 +1,7 @@
 import Submission from '../models/Submission.js';
 import { runJudge0Submission } from './judge0Service.js';
 import { extractCodingFields, normalizeCodingLanguage } from '../utils/codingQuestions.js';
+import { resolveCompilerProfileForPlan } from '../config/compilerProfiles.js';
 
 const normalizeString = (value) => {
   if (value === undefined || value === null) return '';
@@ -171,6 +172,7 @@ export const evaluateCodingQuestionSubmission = async ({
   code,
   language,
   input = '',
+  planType = null,
 } = {}) => {
   if (!question) {
     throw new Error('Question is required for coding evaluation.');
@@ -196,6 +198,7 @@ export const evaluateCodingQuestionSubmission = async ({
   let hiddenCaseCount = 0;
   let executionTimeMs = 0;
   let maxMemoryKb = 0;
+  const compilerProfile = resolveCompilerProfileForPlan(planType);
 
   for (const [index, testCase] of codingFields.testCases.entries()) {
     const execution = await runJudge0Submission({
@@ -205,6 +208,7 @@ export const evaluateCodingQuestionSubmission = async ({
       expectedOutput: normalizeString(testCase.expectedOutput),
       timeLimit: codingFields.timeLimit,
       memoryLimit: codingFields.memoryLimit,
+      executionProfile: compilerProfile,
     });
 
     const rawOutput = resolveExecutionOutput(execution);
@@ -280,8 +284,10 @@ export const evaluateCodingQuestionSubmission = async ({
       score,
       executionTimeMs,
       maxMemoryKb,
+      compilerMode: compilerProfile.mode,
       testCases: perCaseResults,
     },
+    compilerMode: compilerProfile.mode,
   };
 };
 

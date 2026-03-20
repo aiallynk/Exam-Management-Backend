@@ -11,6 +11,7 @@ import { errorHandler, notFound } from './middleware/error.js';
 import { authRateLimiter, apiRateLimiter, aiRateLimiter, uploadRateLimiter } from './middleware/rateLimiter.js';
 import { csrfProtection } from './middleware/csrf.js';
 import { requestTimeout } from './middleware/timeout.js';
+import { requestContextMiddleware } from './middleware/requestContext.js';
 
 // Import routes
 import authRoutes from './routes/auth.js';
@@ -22,6 +23,7 @@ import attemptRoutes from './routes/attempts.js';
 import resultRoutes from './routes/results.js';
 import candidateRoutes from './routes/candidates.js'; // Universal: renamed from student.js
 import adminRoutes from './routes/admin.js';
+import systemBackupRoutes from './routes/systemBackup.js';
 import uploadRoutes from './routes/upload.js';
 import aiRoutes from './routes/ai.js';
 import superAdminRoutes from './routes/superAdmin.js';
@@ -36,6 +38,9 @@ import proctoringRoutes from './routes/proctoring.js';
 import examPackageRoutes from './routes/examPackages.js';
 import omrRoutes from './routes/omr.js';
 import compilerRoutes from './routes/compiler.js';
+import notificationRoutes from './routes/notifications.js';
+import systemAlertRoutes from './routes/systemAlerts.js';
+import { startSubscriptionExpiryScheduler } from './services/subscriptionLifecycleService.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -149,6 +154,7 @@ app.use(
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(requestTimeout(30000)); // 30 second timeout for all requests
+app.use(requestContextMiddleware);
 app.use(requestLogger);
 
 // Apply CSRF protection to API routes (state-changing requests)
@@ -227,8 +233,11 @@ app.use('/api/exam-sessions', sessionRoutes);
 app.use('/api/exam-attempts', attemptRoutes);
 app.use('/api/results', resultRoutes);
 app.use('/api/candidates', candidateRoutes); // Universal: renamed from /api/student to /api/candidates
+app.use('/api/admin/system', systemBackupRoutes);
+app.use('/api/admin', systemBackupRoutes);
 app.use('/api/admin', adminRoutes);
 app.use('/api/super-admin', superAdminRoutes);
+app.use('/api/super-admin/system-alerts', systemAlertRoutes);
 app.use('/api/tenant-admin', tenantAdminRoutes);
 app.use('/api/languages', languageRoutes);
 app.use('/api/sections', sectionRoutes);
@@ -241,6 +250,7 @@ app.use('/api/exam-packages', examPackageRoutes);
 app.use('/api/omr', omrRoutes);
 app.use('/api/compiler', compilerRoutes);
 app.use('/api/code', compilerRoutes);
+app.use('/api/notifications', notificationRoutes);
 
 // Error handling
 app.use(notFound);
@@ -250,6 +260,7 @@ app.use(errorHandler);
 const startServer = async () => {
   try {
     await connect();
+    startSubscriptionExpiryScheduler();
     app.listen(config.port, () => {
       console.log(`🚀 Server running on http://localhost:${config.port}`);
       console.log(`📊 Environment: ${config.nodeEnv}`);

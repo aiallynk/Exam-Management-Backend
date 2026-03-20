@@ -2,8 +2,23 @@ import express from 'express';
 import { body, validationResult } from 'express-validator';
 import { requireAuth } from '../middleware/auth.js';
 import { autosaveCode, runCode, submitCode } from '../controllers/compilerController.js';
+import { FREE_PLAN_MESSAGES, isPlanFeatureEnabled } from '../config/planLimits.js';
+import {
+  blockFreePlanByAttemptId,
+  blockFreePlanByQuestionId,
+  resolveUserEffectivePlanType,
+  sendPlanRestriction,
+} from '../middleware/planRestrictions.js';
 
 const router = express.Router();
+const blockFreePlanCodingAttempt = blockFreePlanByAttemptId(
+  FREE_PLAN_MESSAGES.CODING_LOCKED,
+  'codingCompiler'
+);
+const blockFreePlanCodingQuestion = blockFreePlanByQuestionId(
+  FREE_PLAN_MESSAGES.CODING_LOCKED,
+  'codingCompiler'
+);
 
 const validateRequest = (req, res, next) => {
   const errors = validationResult(req);
@@ -24,6 +39,7 @@ router.post(
     body('input').optional().isString().withMessage('Input must be a string.'),
   ],
   validateRequest,
+  blockFreePlanCodingAttempt,
   autosaveCode
 );
 
@@ -39,6 +55,18 @@ router.post(
     body('memoryLimit').optional().isNumeric().withMessage('memoryLimit must be numeric.'),
   ],
   validateRequest,
+  blockFreePlanCodingQuestion,
+  async (req, res, next) => {
+    try {
+      const effectivePlanType = await resolveUserEffectivePlanType(req.user);
+      if (!req.body?.questionId && !isPlanFeatureEnabled(effectivePlanType, 'codingCompiler')) {
+        return sendPlanRestriction(res, FREE_PLAN_MESSAGES.CODING_LOCKED);
+      }
+      return next();
+    } catch (error) {
+      return next(error);
+    }
+  },
   runCode
 );
 
@@ -53,6 +81,7 @@ router.post(
     body('input').optional().isString().withMessage('Input must be a string.'),
   ],
   validateRequest,
+  blockFreePlanCodingAttempt,
   submitCode
 );
 

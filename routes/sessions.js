@@ -3,6 +3,7 @@ import ExamSession from '../models/ExamSession.js';
 import Exam from '../models/Exam.js';
 import QuestionPaper from '../models/QuestionPaper.js';
 import Question from '../models/Question.js';
+import SessionAssignment from '../models/SessionAssignment.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
@@ -337,6 +338,139 @@ router.post(
   }
 );
 
+// Update a session (end now / extend end time)
+router.put(
+  '/:sessionId',
+  requireAuth,
+  requireTenant,
+  enforceTenantBoundaries,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
+  async (req, res, next) => {
+    try {
+      const session = await ExamSession.findById(req.params.sessionId);
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Tenant safety guard
+      if (
+        req.user?.tenantId &&
+        session.tenantId &&
+        String(req.user.tenantId) !== String(session.tenantId)
+      ) {
+        return res.status(403).json({ error: 'Forbidden - Session belongs to different tenant' });
+      }
+
+      // Check if user can manage sessions for this exam.
+      const canCreateSession = await hasExamPermission(
+        req.user._id,
+        session.examId,
+        'CREATE_SESSION'
+      );
+      if (!canCreateSession && req.user.role !== 'SUPER_ADMIN' && req.user.role !== 'EXAM_CREATOR') {
+        return res.status(403).json({
+          error: 'You do not have permission to update this session',
+        });
+      }
+
+      const action = String(req.body?.action || '').trim().toLowerCase();
+      const nextEndTimeRaw = req.body?.endTime;
+      const now = new Date();
+
+      if (action === 'end') {
+        session.isActive = false;
+        if (session.endTime > now) {
+          session.endTime = now;
+        }
+      } else if (nextEndTimeRaw) {
+        const nextEndTime = new Date(nextEndTimeRaw);
+        if (Number.isNaN(nextEndTime.getTime())) {
+          return res.status(400).json({ error: 'Valid end time is required' });
+        }
+        if (nextEndTime <= session.startTime) {
+          return res.status(400).json({ error: 'End time must be after start time' });
+        }
+        session.endTime = nextEndTime;
+      } else {
+        return res.status(400).json({
+          error: 'Nothing to update. Provide action="end" or a valid endTime.',
+        });
+      }
+
+      await session.save();
+      await session.populate('examId', 'title duration showResultsImmediately resultsReleasedAt');
+      await session.populate('questionPaperId', 'setName');
+      await session.populate('questionPaperIds', 'setName');
+      await session.populate('createdBy', 'name email');
+
+      res.json({
+        message: action === 'end' ? 'Session ended successfully' : 'Session updated successfully',
+        session,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Delete a session
+router.delete(
+  '/:sessionId',
+  requireAuth,
+  requireTenant,
+  enforceTenantBoundaries,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
+  async (req, res, next) => {
+    try {
+      const session = await ExamSession.findById(req.params.sessionId).select(
+        '_id examId tenantId'
+      );
+      if (!session) {
+        return res.status(404).json({ error: 'Session not found' });
+      }
+
+      // Tenant safety guard
+      if (
+        req.user?.tenantId &&
+        session.tenantId &&
+        String(req.user.tenantId) !== String(session.tenantId)
+      ) {
+        return res.status(403).json({
+          error: 'Forbidden - Session belongs to different tenant',
+        });
+      }
+
+      // Check if user can manage sessions for this exam.
+      const canCreateSession = await hasExamPermission(
+        req.user._id,
+        session.examId,
+        'CREATE_SESSION'
+      );
+      if (
+        !canCreateSession &&
+        req.user.role !== 'SUPER_ADMIN' &&
+        req.user.role !== 'EXAM_CREATOR'
+      ) {
+        return res.status(403).json({
+          error: 'You do not have permission to delete this session',
+        });
+      }
+
+      // Remove per-candidate paper assignments linked to this session.
+      await SessionAssignment.deleteMany({ sessionId: session._id });
+
+      await ExamSession.deleteOne({ _id: session._id });
+
+      res.json({
+        message: 'Session deleted successfully',
+        sessionId: session._id,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 // Validate QR code
 router.get('/validate/:qrCode', requireAuth, async (req, res, next) => {
   try {
@@ -354,10 +488,11 @@ router.get('/validate/:qrCode', requireAuth, async (req, res, next) => {
 
     // UNIVERSAL: Check exam permission and create ExamParticipant if needed
     const canAttempt = await hasExamPermission(req.user._id, session.examId._id, 'ATTEMPT_EXAM');
+    let participant = null;
     if (!canAttempt) {
       // User doesn't have permission yet - create ExamParticipant with CANDIDATE role
       // This happens when user scans QR or enters token
-      await ensureExamParticipant(
+      participant = await ensureExamParticipant(
         req.user._id,
         session.examId._id,
         'CANDIDATE',
@@ -371,6 +506,28 @@ router.get('/validate/:qrCode', requireAuth, async (req, res, next) => {
       session,
       userId: req.user._id,
     });
+
+    if (participant?.__assigned) {
+      try {
+        const { createUserNotification } = await import('../services/notificationService.js');
+        await createUserNotification({
+          title: 'Exam Assigned',
+          message: `You have been assigned to "${session.examId?.title || 'an exam'}".`,
+          type: 'exam_assigned',
+          roles: ['CANDIDATE'],
+          userId: req.user._id,
+          examId: session.examId?._id || session.examId,
+          sessionId: session._id,
+          createdBy: req.user._id,
+          metadata: {
+            examId: session.examId?._id || session.examId,
+            examTitle: session.examId?.title || '',
+          },
+        });
+      } catch (notifyError) {
+        console.error('[NOTIFICATIONS] Failed to log exam assignment:', notifyError?.message || notifyError);
+      }
+    }
 
     res.json({
       valid: true,
@@ -406,10 +563,11 @@ router.get('/manual-token/:token', requireAuth, async (req, res, next) => {
 
     // UNIVERSAL: Check exam permission and create ExamParticipant if needed
     const canAttempt = await hasExamPermission(req.user._id, session.examId._id, 'ATTEMPT_EXAM');
+    let participant = null;
     if (!canAttempt) {
       // User doesn't have permission yet - create ExamParticipant with CANDIDATE role
       // This happens when user scans QR or enters token
-      await ensureExamParticipant(
+      participant = await ensureExamParticipant(
         req.user._id,
         session.examId._id,
         'CANDIDATE',
@@ -423,6 +581,28 @@ router.get('/manual-token/:token', requireAuth, async (req, res, next) => {
       session,
       userId: req.user._id,
     });
+
+    if (participant?.__assigned) {
+      try {
+        const { createUserNotification } = await import('../services/notificationService.js');
+        await createUserNotification({
+          title: 'Exam Assigned',
+          message: `You have been assigned to "${session.examId?.title || 'an exam'}".`,
+          type: 'exam_assigned',
+          roles: ['CANDIDATE'],
+          userId: req.user._id,
+          examId: session.examId?._id || session.examId,
+          sessionId: session._id,
+          createdBy: req.user._id,
+          metadata: {
+            examId: session.examId?._id || session.examId,
+            examTitle: session.examId?.title || '',
+          },
+        });
+      } catch (notifyError) {
+        console.error('[NOTIFICATIONS] Failed to log exam assignment:', notifyError?.message || notifyError);
+      }
+    }
 
     res.json({
       valid: true,

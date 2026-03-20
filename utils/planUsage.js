@@ -12,12 +12,12 @@ const asNonNegativeInt = (value) => {
 
 export const getPlanOwnerUser = async (userId) => {
   if (!userId) return null;
-  return User.findById(userId).select('_id planType examsCreated');
+  return User.findById(userId).select('_id planType examsCreated tenantId role');
 };
 
 export const getExamByIdForPlan = async (examId) => {
   if (!examId) return null;
-  return Exam.findById(examId).select('_id createdBy questionCount candidateCount');
+  return Exam.findById(examId).select('_id createdBy questionCount candidateCount tenantId examType');
 };
 
 export const getExamCountByCreator = async (userId) => {
@@ -96,4 +96,50 @@ export const syncUserExamCount = async (userId) => {
   const count = asNonNegativeInt(await getExamCountByCreator(userId));
   await User.updateOne({ _id: userId }, { $set: { examsCreated: count } });
   return count;
+};
+
+export const getCurrentMonthRange = (referenceDate = new Date()) => {
+  const safeDate =
+    referenceDate instanceof Date && !Number.isNaN(referenceDate.getTime())
+      ? referenceDate
+      : new Date();
+  const start = new Date(safeDate.getFullYear(), safeDate.getMonth(), 1, 0, 0, 0, 0);
+  const end = new Date(safeDate.getFullYear(), safeDate.getMonth() + 1, 1, 0, 0, 0, 0);
+  return { start, end };
+};
+
+export const getExamCountForTenantByMonth = async (tenantId, referenceDate) => {
+  if (!tenantId) return 0;
+  const { start, end } = getCurrentMonthRange(referenceDate);
+  return Exam.countDocuments({
+    tenantId,
+    createdAt: { $gte: start, $lt: end },
+  });
+};
+
+export const getAttemptCountForTenantByMonth = async (tenantId, referenceDate) => {
+  if (!tenantId) return 0;
+  const { start, end } = getCurrentMonthRange(referenceDate);
+  return ExamAttempt.countDocuments({
+    tenantId,
+    createdAt: { $gte: start, $lt: end },
+  });
+};
+
+export const getExamCountForTenantByWindow = async (tenantId, start, end) => {
+  if (!tenantId) return 0;
+  if (!(start instanceof Date) || !(end instanceof Date)) return 0;
+  return Exam.countDocuments({
+    tenantId,
+    createdAt: { $gte: start, $lt: end },
+  });
+};
+
+export const getAttemptCountForTenantByWindow = async (tenantId, start, end) => {
+  if (!tenantId) return 0;
+  if (!(start instanceof Date) || !(end instanceof Date)) return 0;
+  return ExamAttempt.countDocuments({
+    tenantId,
+    createdAt: { $gte: start, $lt: end },
+  });
 };

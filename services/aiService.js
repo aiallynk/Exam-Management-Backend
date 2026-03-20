@@ -1,6 +1,7 @@
 import OpenAI from 'openai';
 import config from '../config/env.js';
 import { createGeneratedQuestionImage } from './questionImportImageService.js';
+import { createTrackedChatCompletion, trackAIUsageEvent } from './aiTokenUsageService.js';
 import {
   normalizeQuestionCorrectAnswer,
   sanitizeQuestionOptions,
@@ -10,6 +11,7 @@ import { extractCodingFields, getSupportedCodingLanguages } from '../utils/codin
 const client = config.openaiApiKey
   ? new OpenAI({ apiKey: config.openaiApiKey })
   : null;
+const OPENAI_MODEL = config.openaiModel || 'gpt-4o-mini';
 
 const VALID_QUESTION_TYPES = [
   'MULTIPLE_CHOICE',
@@ -39,6 +41,40 @@ const sanitizeString = (value) => {
   if (value === undefined || value === null) return '';
   return String(value).trim();
 };
+
+const resolveTrackingContext = ({ tenantId = null, userId = null, metadata = null } = {}) => {
+  const metadataTenantId =
+    metadata?.tenantId || metadata?.tenant_id || metadata?.tenant?._id || null;
+  const metadataUserId =
+    metadata?.userId || metadata?.generatedBy || metadata?.user?._id || null;
+
+  return {
+    tenantId: tenantId || metadataTenantId || null,
+    userId: userId || metadataUserId || null,
+  };
+};
+
+const trackFallbackUsage = async ({
+  feature,
+  tenantId = null,
+  userId = null,
+  errorMessage = '',
+}) =>
+  trackAIUsageEvent({
+    feature,
+    tenantId,
+    userId,
+    model: 'unavailable',
+    usageCount: 1,
+    requestStatus: 'FAILED',
+    errorMessage:
+      errorMessage || 'AI request was handled by local fallback logic.',
+    usage: {
+      prompt_tokens: 0,
+      completion_tokens: 0,
+      total_tokens: 0,
+    },
+  });
 
 const parseMultiAnswer = (value) => {
   if (Array.isArray(value)) {
@@ -824,6 +860,8 @@ const enhanceParagraphScenarioQuestions = async ({
   examTitle,
   examDescription,
   existingQuestions = [],
+  tenantId = null,
+  userId = null,
 }) => {
   const safeQuestions = Array.isArray(questions) ? [...questions] : [];
   const paragraphIndexes = safeQuestions.reduce((indexes, question, index) => {
@@ -883,12 +921,17 @@ const enhanceParagraphScenarioQuestions = async ({
     : '';
 
   try {
-    const completion = await client.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [
-        {
-          role: 'system',
-          content: `You create shared scenario-based exam question groups.
+    const completion = await createTrackedChatCompletion({
+      client,
+      feature: 'question_generation',
+      tenantId,
+      userId,
+      request: {
+        model: OPENAI_MODEL,
+        messages: [
+          {
+            role: 'system',
+            content: `You create shared scenario-based exam question groups.
 
 Return JSON with:
 - groups: an array of exactly ${groupBlueprint.length} scenario groups in the SAME ORDER as the input groups
@@ -917,10 +960,10 @@ Rules:
 - Make the passage analytical, educational, and rich enough to support every question in the group
 - Avoid duplicate or near-duplicate questions
 - Do not include markdown, commentary, or extra fields`,
-        },
-        {
-          role: 'user',
-          content: `Create shared-scenario question groups.
+          },
+          {
+            role: 'user',
+            content: `Create shared-scenario question groups.
 
 Topic: ${sanitizeString(topic)}
 Difficulty: ${sanitizeString(difficulty)}
@@ -932,10 +975,11 @@ Scenario question types to use: ${normalizedScenarioQuestionTypes.join(', ')}
 
 Required scenario groups:
 ${JSON.stringify(groupBlueprint)}`,
-        },
-      ],
-      temperature: 0.7,
-      response_format: { type: 'json_object' },
+          },
+        ],
+        temperature: 0.7,
+        response_format: { type: 'json_object' },
+      },
     });
 
     const responseContent = completion?.choices?.[0]?.message?.content || '{}';
@@ -1044,7 +1088,12 @@ export const generateQuestions = async (params) => {
     questionsPerParagraph = DEFAULT_PARAGRAPH_QUESTIONS_PER_PARAGRAPH,
     imageQuestionMode = 'percentage',
     imageQuestionTypes = [],
+    metadata = null,
+    tenantId = null,
+    userId = null,
   } = params;
+
+  const trackingContext = resolveTrackingContext({ tenantId, userId, metadata });
 
   // Sanitize topic
   topic = String(topic || '').trim().substring(0, 500);
@@ -1105,6 +1154,12 @@ export const generateQuestions = async (params) => {
   // Validate OpenAI API key
   if (!client) {
     console.warn('OpenAI API key not configured, using fallback templates');
+    await trackFallbackUsage({
+      feature: 'question_generation',
+      tenantId: trackingContext.tenantId,
+      userId: trackingContext.userId,
+      errorMessage: 'OpenAI API key not configured.',
+    });
     return generateFallbackQuestions({
       ...params,
       enableImageQuestions: effectiveImageQuestionConfig.enabled,
@@ -1262,14 +1317,21 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
     
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
-        const completion = await client.chat.completions.create({
-          model: 'gpt-4o-mini',
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: userPrompt },
-          ],
-          temperature: temperature,
-          response_format: { type: 'json_object' },
+        const completion = await createTrackedChatCompletion({
+          client,
+          feature: 'question_generation',
+          tenantId: trackingContext.tenantId,
+          userId: trackingContext.userId,
+          questionCount,
+          request: {
+            model: OPENAI_MODEL,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: userPrompt },
+            ],
+            temperature: temperature,
+            response_format: { type: 'json_object' },
+          },
         });
         
         // Success - process response
@@ -1321,6 +1383,8 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
           examTitle,
           examDescription,
           existingQuestions,
+          tenantId: trackingContext.tenantId,
+          userId: trackingContext.userId,
         });
 
         return attachImageBasedQuestions({
@@ -1331,6 +1395,8 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
           uploadedContent,
           examTitle,
           examDescription,
+          tenantId: trackingContext.tenantId,
+          userId: trackingContext.userId,
         });
       } catch (error) {
         lastError = error;
@@ -1386,7 +1452,15 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
 };
 
 export const extractQuestionsFromContent = async (params) => {
-  const { content, filename = 'uploaded document', structuredRows } = params;
+  const {
+    content,
+    filename = 'uploaded document',
+    structuredRows,
+    tenantId = null,
+    userId = null,
+    metadata = null,
+  } = params;
+  const trackingContext = resolveTrackingContext({ tenantId, userId, metadata });
 
   const trimmedContent = sanitizeString(content);
   const normalizedFromRows = Array.isArray(structuredRows)
@@ -1405,6 +1479,12 @@ export const extractQuestionsFromContent = async (params) => {
 
   if (!client) {
     console.warn('OpenAI API key not configured, using fallback question extraction');
+    await trackFallbackUsage({
+      feature: 'question_import',
+      tenantId: trackingContext.tenantId,
+      userId: trackingContext.userId,
+      errorMessage: 'OpenAI API key not configured.',
+    });
     return extractQuestionsFallback({ content: trimmedContent, structuredRows });
   }
 
@@ -1437,14 +1517,20 @@ ${structuredPreview}`);
     userPromptParts.push(`Document content excerpt (${filename}):
 ${limitedContent}`);
 
-    const completion = await client.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPromptParts.join('\n\n') },
-      ],
-      temperature: 0.1,
-      response_format: { type: 'json_object' },
+    const completion = await createTrackedChatCompletion({
+      client,
+      feature: 'question_import',
+      tenantId: trackingContext.tenantId,
+      userId: trackingContext.userId,
+      request: {
+        model: OPENAI_MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPromptParts.join('\n\n') },
+        ],
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+      },
     });
 
     const responseContent = completion.choices[0].message.content;
@@ -1486,9 +1572,27 @@ ${limitedContent}`);
  * Evaluate subjective answers using OpenAI
  */
 export const evaluateAnswer = async (params) => {
-  const { question, correctAnswer, studentAnswer, questionType, points } = params;
+  const {
+    question,
+    correctAnswer,
+    studentAnswer,
+    questionType,
+    points,
+    rubric = [],
+    rubricScoringEnabled = false,
+    tenantId = null,
+    userId = null,
+    metadata = null,
+  } = params;
+  const trackingContext = resolveTrackingContext({ tenantId, userId, metadata });
 
   if (!client) {
+    await trackFallbackUsage({
+      feature: 'evaluation',
+      tenantId: trackingContext.tenantId,
+      userId: trackingContext.userId,
+      errorMessage: 'OpenAI API key not configured.',
+    });
     return evaluateFallbackAnswer(params);
   }
 
@@ -1500,33 +1604,70 @@ export const evaluateAnswer = async (params) => {
     throw new Error('Evaluation only supported for SHORT_ANSWER and PARAGRAPH types');
   }
 
+  const maxPoints = Math.max(Number(points) || 0, 0);
+  const normalizedRubric = (Array.isArray(rubric) ? rubric : [])
+    .map((entry, index) => {
+      const criterion = String(entry?.criterion || entry?.name || '').trim();
+      const weight = Number(entry?.weight ?? entry?.percentage);
+      return {
+        criterion: criterion || `Criterion ${index + 1}`,
+        weight: Number.isFinite(weight) && weight > 0 ? weight : 0,
+        description: String(entry?.description || '').trim(),
+      };
+    })
+    .filter((entry) => entry.weight > 0);
+  const rubricWeightTotal = normalizedRubric.reduce((sum, entry) => sum + entry.weight, 0);
+  const effectiveRubric = rubricScoringEnabled
+    ? (
+      normalizedRubric.length > 0
+        ? normalizedRubric.map((entry) => ({
+          ...entry,
+          weight: Number((((entry.weight / rubricWeightTotal) * 100).toFixed(2))),
+        }))
+        : [
+          { criterion: 'Accuracy', weight: 40, description: 'Conceptual correctness and factual accuracy.' },
+          { criterion: 'Completeness', weight: 30, description: 'Coverage of all required points from the answer key.' },
+          { criterion: 'Reasoning', weight: 20, description: 'Logical explanation and justification quality.' },
+          { criterion: 'Clarity', weight: 10, description: 'Clarity, structure, and communication quality.' },
+        ]
+    )
+    : [];
+
   try {
     const systemPrompt = `You are an expert exam evaluator. Evaluate student answers and provide detailed feedback.
 
 Return a JSON object with:
 - isCorrect: boolean (true if answer is correct or mostly correct)
-- pointsEarned: number (0 to ${points}, based on accuracy)
+- pointsEarned: number (0 to ${maxPoints}, based on accuracy)
 - confidence: number (0 to 1, how confident you are in the evaluation)
 - feedback: string (constructive feedback for the student)
 - needsReview: boolean (true if confidence < 0.8 or answer is ambiguous)
+${rubricScoringEnabled ? '- rubricScores: array of { criterion, weight, score, maxScore, rationale }' : ''}
 
 Be fair and consistent. Award partial credit for partially correct answers.`;
 
     const userPrompt = `Question: ${question}
 Correct Answer: ${correctAnswer || 'N/A'}
 Student Answer: ${studentAnswer}
-Maximum Points: ${points}
+Maximum Points: ${maxPoints}
+${rubricScoringEnabled ? `Rubric (weights in %): ${JSON.stringify(effectiveRubric)}` : ''}
 
 Evaluate this answer and provide your assessment.`;
 
-    const completion = await client.chat.completions.create({
-      model: 'gpt-4o-mini',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      temperature: 0.3,
-      response_format: { type: 'json_object' },
+    const completion = await createTrackedChatCompletion({
+      client,
+      feature: 'evaluation',
+      tenantId: trackingContext.tenantId,
+      userId: trackingContext.userId,
+      request: {
+        model: OPENAI_MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.3,
+        response_format: { type: 'json_object' },
+      },
     });
 
     const responseContent = completion.choices[0].message.content;
@@ -1546,11 +1687,43 @@ Evaluate this answer and provide your assessment.`;
     // Normalize and validate response
     const result = {
       isCorrect: Boolean(evaluation.isCorrect),
-      pointsEarned: Math.min(Math.max(0, Number(evaluation.pointsEarned) || 0), points),
+      pointsEarned: Math.min(Math.max(0, Number(evaluation.pointsEarned) || 0), maxPoints),
       confidence: Math.min(Math.max(0, Number(evaluation.confidence) || 0.5), 1),
       feedback: evaluation.feedback || 'No feedback provided',
       needsReview: Boolean(evaluation.needsReview || (evaluation.confidence < 0.8)),
+      mode: rubricScoringEnabled ? 'rubric' : 'standard',
+      rubric: effectiveRubric,
+      rubricScores: [],
+      rubricTotal: null,
     };
+
+    if (rubricScoringEnabled) {
+      const rubricScoresRaw = Array.isArray(evaluation?.rubricScores) ? evaluation.rubricScores : [];
+      const mappedScores = effectiveRubric.map((rubricEntry) => {
+        const matched = rubricScoresRaw.find((item) =>
+          String(item?.criterion || '').trim().toLowerCase() === rubricEntry.criterion.toLowerCase()
+        ) || {};
+        const maxScore = Number(((maxPoints * rubricEntry.weight) / 100).toFixed(2));
+        const score = Math.min(
+          Math.max(0, Number(matched?.score) || 0),
+          maxScore
+        );
+        return {
+          criterion: rubricEntry.criterion,
+          weight: rubricEntry.weight,
+          score,
+          maxScore,
+          rationale: String(matched?.rationale || '').trim(),
+        };
+      });
+
+      const rubricTotal = Number(
+        mappedScores.reduce((sum, entry) => sum + (Number(entry.score) || 0), 0).toFixed(2)
+      );
+      result.rubricScores = mappedScores;
+      result.rubricTotal = rubricTotal;
+      result.pointsEarned = Math.min(Math.max(0, rubricTotal), maxPoints);
+    }
 
     return result;
   } catch (error) {
@@ -1653,14 +1826,35 @@ const inferQuestionType = (rawType, options, answer, questionText) => {
 };
 
 const normalizeStructuredRow = (row, index) => {
+  const normalizeLookupKey = (value) =>
+    sanitizeString(value)
+      .toLowerCase()
+      .replace(/[^a-z0-9]/g, '');
+
   const loweredKeys = Object.keys(row || {}).reduce((acc, key) => {
-    acc[key.toLowerCase()] = key;
+    const lowerKey = key.toLowerCase();
+    if (!acc[lowerKey]) {
+      acc[lowerKey] = key;
+    }
+    return acc;
+  }, {});
+
+  const normalizedKeys = Object.keys(row || {}).reduce((acc, key) => {
+    const normalizedKey = normalizeLookupKey(key);
+    if (normalizedKey && !acc[normalizedKey]) {
+      acc[normalizedKey] = key;
+    }
     return acc;
   }, {});
 
   const get = (name) => {
-    const key = loweredKeys[name.toLowerCase()];
-    return key ? row[key] : undefined;
+    const loweredLookup = sanitizeString(name).toLowerCase();
+    const loweredKey = loweredKeys[loweredLookup];
+    if (loweredKey) return row[loweredKey];
+
+    const normalizedLookup = normalizeLookupKey(name);
+    const normalizedKey = normalizedKeys[normalizedLookup];
+    return normalizedKey ? row[normalizedKey] : undefined;
   };
 
   const questionText = sanitizeString(
@@ -1677,7 +1871,13 @@ const normalizeStructuredRow = (row, index) => {
   }
 
   const options = collectOptionsFromRow(row);
-  const answer = get('correctAnswer') || get('answer') || get('correct') || get('answers');
+  const answer =
+    get('correctAnswer') ||
+    get('correct_answer') ||
+    get('correct answer') ||
+    get('answer') ||
+    get('correct') ||
+    get('answers');
   const rawType = get('questionType') || get('type') || get('question_type');
   const questionType = inferQuestionType(rawType, options, answer, questionText);
 
@@ -1826,6 +2026,8 @@ const generateImageBasedQuestionVariant = async ({
   examTitle,
   examDescription,
   imageType,
+  tenantId = null,
+  userId = null,
 }) => {
   const fallbackVariant = buildFallbackImageBasedQuestion({
     question,
@@ -1894,14 +2096,20 @@ ${JSON.stringify(baseQuestionPayload)}
 Create one improved image-based variant now.`;
 
   try {
-    const completion = await client.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      temperature: 0.7,
-      response_format: { type: 'json_object' },
+    const completion = await createTrackedChatCompletion({
+      client,
+      feature: 'question_generation',
+      tenantId,
+      userId,
+      request: {
+        model: OPENAI_MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.7,
+        response_format: { type: 'json_object' },
+      },
     });
 
     const responseContent = completion?.choices?.[0]?.message?.content || '{}';
@@ -1957,6 +2165,8 @@ const generateImageBasedQuestionGroup = async ({
   examTitle,
   examDescription,
   imageType,
+  tenantId = null,
+  userId = null,
 }) => {
   const groupQuestions = Array.isArray(questions) ? questions : [];
   const safeIndexes = Array.isArray(indexes) ? indexes : [];
@@ -1972,6 +2182,8 @@ const generateImageBasedQuestionGroup = async ({
       examTitle,
       examDescription,
       imageType: safeImageType,
+      tenantId,
+      userId,
     });
 
     return {
@@ -2062,14 +2274,20 @@ Base questions in required order:
 ${JSON.stringify(baseQuestionPayload)}`;
 
   try {
-    const completion = await client.chat.completions.create({
-      model: 'gpt-4o',
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: userPrompt },
-      ],
-      temperature: 0.7,
-      response_format: { type: 'json_object' },
+    const completion = await createTrackedChatCompletion({
+      client,
+      feature: 'question_generation',
+      tenantId,
+      userId,
+      request: {
+        model: OPENAI_MODEL,
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.7,
+        response_format: { type: 'json_object' },
+      },
     });
 
     const responseContent = completion?.choices?.[0]?.message?.content || '{}';
@@ -2133,6 +2351,8 @@ const attachImageBasedQuestions = async ({
   uploadedContent,
   examTitle,
   examDescription,
+  tenantId = null,
+  userId = null,
 }) => {
   const safeQuestions = Array.isArray(questions) ? [...questions] : [];
   if (!safeQuestions.length || !imageConfig?.enabled || imageConfig.count <= 0) {
@@ -2177,6 +2397,8 @@ const attachImageBasedQuestions = async ({
           examTitle,
           examDescription,
           imageType,
+          tenantId,
+          userId,
         });
         const imageFields = await createGeneratedQuestionImage({
           questionId: `ai-question-group-${Date.now()}-${groupIndexes[0] + 1}`,
@@ -2286,7 +2508,11 @@ const generateFallbackQuestions = async (params) => {
     questionsPerParagraph = DEFAULT_PARAGRAPH_QUESTIONS_PER_PARAGRAPH,
     imageQuestionMode = 'percentage',
     imageQuestionTypes = [],
+    metadata = null,
+    tenantId = null,
+    userId = null,
   } = params || {};
+  const trackingContext = resolveTrackingContext({ tenantId, userId, metadata });
 
   const safeCount = Math.max(1, parseCount(count, 5));
   const imageConfig = normalizeImageQuestionConfig({
@@ -2354,6 +2580,8 @@ const generateFallbackQuestions = async (params) => {
     uploadedContent,
     examTitle,
     examDescription,
+    tenantId: trackingContext.tenantId,
+    userId: trackingContext.userId,
   });
 
   return attachImageBasedQuestions({
@@ -2364,6 +2592,8 @@ const generateFallbackQuestions = async (params) => {
     uploadedContent,
     examTitle,
     examDescription,
+    tenantId: trackingContext.tenantId,
+    userId: trackingContext.userId,
   });
 };
 
@@ -2371,7 +2601,20 @@ const generateFallbackQuestions = async (params) => {
  * Fallback answer evaluation using keyword matching
  */
 const evaluateFallbackAnswer = (params) => {
-  const { correctAnswer, studentAnswer, points } = params;
+  const { correctAnswer, studentAnswer, points, rubricScoringEnabled = false, rubric = [] } = params;
+  const maxPoints = Math.max(Number(points) || 0, 0);
+  const effectiveRubric = rubricScoringEnabled
+    ? (
+      Array.isArray(rubric) && rubric.length > 0
+        ? rubric
+        : [
+          { criterion: 'Accuracy', weight: 40 },
+          { criterion: 'Completeness', weight: 30 },
+          { criterion: 'Reasoning', weight: 20 },
+          { criterion: 'Clarity', weight: 10 },
+        ]
+    )
+    : [];
 
   if (!correctAnswer || !studentAnswer) {
     return {
@@ -2380,6 +2623,10 @@ const evaluateFallbackAnswer = (params) => {
       confidence: 0.5,
       feedback: 'Unable to evaluate - missing reference answer',
       needsReview: true,
+      mode: rubricScoringEnabled ? 'rubric' : 'standard',
+      rubric: effectiveRubric,
+      rubricScores: [],
+      rubricTotal: rubricScoringEnabled ? 0 : null,
     };
   }
 
@@ -2395,10 +2642,9 @@ const evaluateFallbackAnswer = (params) => {
   const similarity = matchingWords.length / Math.max(correctWords.length, 1);
 
   const isCorrect = similarity > 0.6;
-  const pointsEarned = Math.round(points * similarity);
+  const pointsEarned = Math.round(maxPoints * similarity);
   const confidence = Math.min(similarity + 0.2, 1);
-
-  return {
+  const fallbackResult = {
     isCorrect,
     pointsEarned,
     confidence,
@@ -2406,5 +2652,33 @@ const evaluateFallbackAnswer = (params) => {
       ? 'Answer appears to be correct based on keyword matching.'
       : 'Answer may need review. Consider providing more detail.',
     needsReview: confidence < 0.8,
+    mode: rubricScoringEnabled ? 'rubric' : 'standard',
+    rubric: effectiveRubric,
+    rubricScores: [],
+    rubricTotal: rubricScoringEnabled ? pointsEarned : null,
   };
+
+  if (rubricScoringEnabled && effectiveRubric.length > 0) {
+    const normalizedWeights = effectiveRubric
+      .map((item) => ({
+        criterion: String(item?.criterion || item?.name || 'Criterion').trim(),
+        weight: Number(item?.weight) || 0,
+      }))
+      .filter((item) => item.weight > 0);
+    const totalWeight = normalizedWeights.reduce((sum, item) => sum + item.weight, 0) || 100;
+
+    fallbackResult.rubricScores = normalizedWeights.map((item) => {
+      const weightPercent = (item.weight / totalWeight) * 100;
+      const maxScore = Number(((maxPoints * weightPercent) / 100).toFixed(2));
+      return {
+        criterion: item.criterion,
+        weight: Number(weightPercent.toFixed(2)),
+        score: Number((maxScore * similarity).toFixed(2)),
+        maxScore,
+        rationale: 'Fallback rubric score based on keyword overlap similarity.',
+      };
+    });
+  }
+
+  return fallbackResult;
 };

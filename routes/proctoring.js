@@ -2,17 +2,40 @@ import express from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { validateObjectId } from '../middleware/validation.js';
 import * as proctoringService from '../services/proctoringService.js';
+import { trackAIUsageEvent } from '../services/aiTokenUsageService.js';
+import { FREE_PLAN_MESSAGES, isPlanFeatureEnabled } from '../config/planLimits.js';
+import { blockFreePlanByAttemptId, resolveExamPlanContext, sendPlanRestriction } from '../middleware/planRestrictions.js';
 
 const router = express.Router();
+const blockFreePlanProctoring = blockFreePlanByAttemptId(FREE_PLAN_MESSAGES.PROCTORING_LOCKED);
+const ADVANCED_PROCTORING_MESSAGE =
+  'Advanced proctoring controls are available only in higher plans.';
+const blockAdvancedProctoring = blockFreePlanByAttemptId(
+  ADVANCED_PROCTORING_MESSAGE,
+  'advancedProctoring'
+);
+
+const trackProctoringUsage = async (req) => {
+  await trackAIUsageEvent({
+    feature: 'ai_proctoring',
+    tenantId: req.user?.tenantId,
+    userId: req.user?._id,
+    model: 'proctoring-engine',
+    usageCount: 1,
+    requestStatus: 'SUCCESS',
+  });
+};
 
 // Log device info
 router.post(
   '/attempt/:attemptId/device-info',
   requireAuth,
   validateObjectId('attemptId'),
+  blockFreePlanProctoring,
   async (req, res, next) => {
     try {
       await proctoringService.logDeviceInfo(req.params.attemptId, req.body, req.user._id);
+      await trackProctoringUsage(req);
       res.json({ success: true });
     } catch (error) {
       next(error);
@@ -26,11 +49,20 @@ router.get(
   requireAuth,
   async (req, res, next) => {
     try {
+      const examId = req.query.examId || null;
+      if (examId) {
+        const planContext = await resolveExamPlanContext(examId);
+        if (planContext?.planType && !isPlanFeatureEnabled(planContext.planType, 'proctoring')) {
+          return sendPlanRestriction(res, FREE_PLAN_MESSAGES.PROCTORING_LOCKED);
+        }
+      }
+
       const result = await proctoringService.checkMultipleLogins(
         req.user._id,
         req.query.examId,
         req.query
       );
+      await trackProctoringUsage(req);
       res.json(result);
     } catch (error) {
       next(error);
@@ -43,6 +75,7 @@ router.post(
   '/attempt/:attemptId/tab-switch',
   requireAuth,
   validateObjectId('attemptId'),
+  blockFreePlanProctoring,
   async (req, res, next) => {
     try {
       const result = await proctoringService.recordTabSwitch(
@@ -50,6 +83,7 @@ router.post(
         req.user._id,
         req.body || {}
       );
+      await trackProctoringUsage(req);
       res.json({
         success: true,
         autoSubmitted: Boolean(result?.autoSubmitted),
@@ -67,6 +101,8 @@ router.post(
   '/attempt/:attemptId/window-blur',
   requireAuth,
   validateObjectId('attemptId'),
+  blockFreePlanProctoring,
+  blockAdvancedProctoring,
   async (req, res, next) => {
     try {
       const result = await proctoringService.recordWindowBlur(
@@ -74,6 +110,7 @@ router.post(
         req.user._id,
         req.body || {}
       );
+      await trackProctoringUsage(req);
       res.json({
         success: true,
         autoSubmitted: Boolean(result?.autoSubmitted),
@@ -91,6 +128,7 @@ router.post(
   '/attempt/:attemptId/focus-violation',
   requireAuth,
   validateObjectId('attemptId'),
+  blockFreePlanProctoring,
   async (req, res, next) => {
     try {
       const result = await proctoringService.enforceStrictFocusViolation(
@@ -98,6 +136,7 @@ router.post(
         req.body || {},
         req.user._id
       );
+      await trackProctoringUsage(req);
       res.json({
         success: true,
         autoSubmitted: Boolean(result?.autoSubmitted),
@@ -117,6 +156,8 @@ router.post(
   '/attempt/:attemptId/copy-paste',
   requireAuth,
   validateObjectId('attemptId'),
+  blockFreePlanProctoring,
+  blockAdvancedProctoring,
   async (req, res, next) => {
     try {
       await proctoringService.recordCopyPasteAttempt(
@@ -124,6 +165,7 @@ router.post(
         req.body,
         req.user._id
       );
+      await trackProctoringUsage(req);
       res.json({ success: true });
     } catch (error) {
       next(error);
@@ -136,9 +178,12 @@ router.post(
   '/attempt/:attemptId/right-click',
   requireAuth,
   validateObjectId('attemptId'),
+  blockFreePlanProctoring,
+  blockAdvancedProctoring,
   async (req, res, next) => {
     try {
       await proctoringService.recordRightClickAttempt(req.params.attemptId, req.body || {}, req.user._id);
+      await trackProctoringUsage(req);
       res.json({ success: true });
     } catch (error) {
       next(error);
@@ -151,6 +196,8 @@ router.post(
   '/attempt/:attemptId/keyboard-shortcut',
   requireAuth,
   validateObjectId('attemptId'),
+  blockFreePlanProctoring,
+  blockAdvancedProctoring,
   async (req, res, next) => {
     try {
       await proctoringService.recordKeyboardShortcut(
@@ -158,6 +205,7 @@ router.post(
         req.body,
         req.user._id
       );
+      await trackProctoringUsage(req);
       res.json({ success: true });
     } catch (error) {
       next(error);
@@ -170,6 +218,8 @@ router.post(
   '/attempt/:attemptId/violation',
   requireAuth,
   validateObjectId('attemptId'),
+  blockFreePlanProctoring,
+  blockAdvancedProctoring,
   async (req, res, next) => {
     try {
       await proctoringService.recordViolationEvent(
@@ -177,6 +227,7 @@ router.post(
         req.body || {},
         req.user._id
       );
+      await trackProctoringUsage(req);
       res.json({ success: true });
     } catch (error) {
       next(error);
@@ -189,6 +240,7 @@ router.get(
   '/attempt/:attemptId/suspicious-activity',
   requireAuth,
   validateObjectId('attemptId'),
+  blockFreePlanProctoring,
   async (req, res, next) => {
     try {
       const result = await proctoringService.getSuspiciousActivitySummary(

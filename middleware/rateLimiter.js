@@ -56,6 +56,10 @@ export const apiRateLimiter = rateLimit({
   },
   // Skip rate limiting for exams routes and related exam management routes
   skip: (req) => {
+    if (isDevelopmentMode()) {
+      return true;
+    }
+
     const path = req.path || req.originalUrl || '';
     return path.startsWith('/exams') || 
            path.startsWith('/api/exams') ||
@@ -124,4 +128,3 @@ export const noLimitRateLimiter = rateLimit({
   // Skip rate limiting entirely
   skip: () => true,
 });
-

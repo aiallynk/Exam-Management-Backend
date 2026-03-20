@@ -12,6 +12,10 @@ import readXlsxFile from 'read-excel-file/node';
 import { parse as parseCsv } from 'csv-parse/sync';
 import config from '../config/env.js';
 import {
+  createTrackedChatCompletion,
+  createTrackedImageGeneration,
+} from './aiTokenUsageService.js';
+import {
   sanitizeIndexedQuestionOptionText,
   sanitizeQuestionOptions,
 } from '../utils/questionOptionSanitizer.js';
@@ -45,6 +49,7 @@ const AI_PLACEHOLDER_MARKER_LOWER = AI_PLACEHOLDER_MARKER.toLowerCase();
 const openAiImageClient = config.openaiApiKey
   ? new OpenAI({ apiKey: config.openaiApiKey })
   : null;
+const OPENAI_MODEL = config.openaiModel || 'gpt-4o-mini';
 
 let artifactSequence = 0;
 let unzipperModuleCache = null;
@@ -630,25 +635,29 @@ const extractStructuredQuestionWithVision = async ({
   // Stage 1: OCR-like raw text extraction from the block.
   let ocrQuestion = null;
   try {
-    const ocrCompletion = await openAiImageClient.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text:
-                'Read this scanned question block and return only the visible text with original line breaks, including options.',
-            },
-            {
-              type: 'image_url',
-              image_url: { url: payloadImage },
-            },
-          ],
-        },
-      ],
+    const ocrCompletion = await createTrackedChatCompletion({
+      client: openAiImageClient,
+      feature: 'question_import_ocr',
+      request: {
+        model: OPENAI_MODEL,
+        temperature: 0,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text:
+                  'Read this scanned question block and return only the visible text with original line breaks, including options.',
+              },
+              {
+                type: 'image_url',
+                image_url: { url: payloadImage },
+              },
+            ],
+          },
+        ],
+      },
     });
 
     const ocrText = sanitizeString(ocrCompletion?.choices?.[0]?.message?.content || '');
@@ -668,30 +677,34 @@ const extractStructuredQuestionWithVision = async ({
 
   // Stage 2: AI structured fallback if OCR text is weak.
   try {
-    const completion = await openAiImageClient.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.1,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content:
-            'You extract one MCQ question from a scanned exam image. Return JSON with keys: questionText, options (object with A,B,C,D), questionNumber, confidence (0 to 1). Keep text concise and faithful.',
-        },
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: 'Extract the MCQ question and options from this image block.',
-            },
-            {
-              type: 'image_url',
-              image_url: { url: payloadImage },
-            },
-          ],
-        },
-      ],
+    const completion = await createTrackedChatCompletion({
+      client: openAiImageClient,
+      feature: 'question_import_ocr',
+      request: {
+        model: OPENAI_MODEL,
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content:
+              'You extract one MCQ question from a scanned exam image. Return JSON with keys: questionText, options (object with A,B,C,D), questionNumber, confidence (0 to 1). Keep text concise and faithful.',
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: 'Extract the MCQ question and options from this image block.',
+              },
+              {
+                type: 'image_url',
+                image_url: { url: payloadImage },
+              },
+            ],
+          },
+        ],
+      },
     });
 
     const parsed = JSON.parse(completion?.choices?.[0]?.message?.content || '{}');
@@ -1483,14 +1496,18 @@ const generateDiagramArtifact = async ({
   if (openAiImageClient) {
     for (let attempt = 0; attempt < safeRetries; attempt += 1) {
       try {
-        const response = await openAiImageClient.images.generate({
-          model: 'gpt-image-1',
-          prompt: buildDiagramPrompt(diagramType, sanitizeString(questionText).slice(0, 500)),
-          size: '1536x1024',
-          background: 'opaque',
-          output_format: 'png',
-          quality: 'high',
-          n: 1,
+        const response = await createTrackedImageGeneration({
+          client: openAiImageClient,
+          feature: 'question_image_generation',
+          request: {
+            model: 'gpt-image-1',
+            prompt: buildDiagramPrompt(diagramType, sanitizeString(questionText).slice(0, 500)),
+            size: '1536x1024',
+            background: 'opaque',
+            output_format: 'png',
+            quality: 'high',
+            n: 1,
+          },
         });
 
         const responseItem = response?.data?.[0];
@@ -1803,30 +1820,34 @@ const extractQuestionsFromPdfVisionDirect = async ({
 
   try {
     const dataUri = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`;
-    const completion = await openAiImageClient.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0.1,
-      response_format: { type: 'json_object' },
-      messages: [
-        {
-          role: 'system',
-          content:
-            'Extract MCQ questions from scanned exam pages. Return JSON with {"questions":[{questionText, options:{A,B,C,D}, questionNumber}]}. Keep source wording concise.',
-        },
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text: 'Read this scanned PDF and extract all visible MCQ questions with options.',
-            },
-            {
-              type: 'image_url',
-              image_url: { url: dataUri },
-            },
-          ],
-        },
-      ],
+    const completion = await createTrackedChatCompletion({
+      client: openAiImageClient,
+      feature: 'question_import_ocr',
+      request: {
+        model: OPENAI_MODEL,
+        temperature: 0.1,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'system',
+            content:
+              'Extract MCQ questions from scanned exam pages. Return JSON with {"questions":[{questionText, options:{A,B,C,D}, questionNumber}]}. Keep source wording concise.',
+          },
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text: 'Read this scanned PDF and extract all visible MCQ questions with options.',
+              },
+              {
+                type: 'image_url',
+                image_url: { url: dataUri },
+              },
+            ],
+          },
+        ],
+      },
     });
 
     const parsed = JSON.parse(completion?.choices?.[0]?.message?.content || '{}');
@@ -2529,25 +2550,29 @@ export const extractTextFromImageArtifacts = async ({
     if (!dataUri) continue;
 
     try {
-      const response = await openAiImageClient.chat.completions.create({
-        model: 'gpt-4o-mini',
-        temperature: 0,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text:
-                  'Extract all visible exam content exactly from this image. Keep question numbers, options, and line breaks. Return only extracted text.',
-              },
-              {
-                type: 'image_url',
-                image_url: { url: dataUri },
-              },
-            ],
-          },
-        ],
+      const response = await createTrackedChatCompletion({
+        client: openAiImageClient,
+        feature: 'question_import_ocr',
+        request: {
+          model: OPENAI_MODEL,
+          temperature: 0,
+          messages: [
+            {
+              role: 'user',
+              content: [
+                {
+                  type: 'text',
+                  text:
+                    'Extract all visible exam content exactly from this image. Keep question numbers, options, and line breaks. Return only extracted text.',
+                },
+                {
+                  type: 'image_url',
+                  image_url: { url: dataUri },
+                },
+              ],
+            },
+          ],
+        },
       });
 
       const extracted = sanitizeString(response?.choices?.[0]?.message?.content || '');
@@ -2595,25 +2620,29 @@ export const extractTextFromPdfBufferWithVision = async ({
 
   try {
     const dataUri = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`;
-    const response = await openAiImageClient.chat.completions.create({
-      model: 'gpt-4o-mini',
-      temperature: 0,
-      messages: [
-        {
-          role: 'user',
-          content: [
-            {
-              type: 'text',
-              text:
-                'Extract all visible exam text from this PDF. Preserve question numbering, options, and line breaks. Return only extracted text.',
-            },
-            {
-              type: 'image_url',
-              image_url: { url: dataUri },
-            },
-          ],
-        },
-      ],
+    const response = await createTrackedChatCompletion({
+      client: openAiImageClient,
+      feature: 'question_import_ocr',
+      request: {
+        model: OPENAI_MODEL,
+        temperature: 0,
+        messages: [
+          {
+            role: 'user',
+            content: [
+              {
+                type: 'text',
+                text:
+                  'Extract all visible exam text from this PDF. Preserve question numbering, options, and line breaks. Return only extracted text.',
+              },
+              {
+                type: 'image_url',
+                image_url: { url: dataUri },
+              },
+            ],
+          },
+        ],
+      },
     });
 
     return {

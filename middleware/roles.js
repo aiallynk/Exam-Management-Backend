@@ -33,6 +33,9 @@ export const requireRole = (...allowedRoles) => {
   };
 };
 
+// Convenience middleware for SUPER_ADMIN-only routes
+export const superAdminOnly = requireRole('SUPER_ADMIN');
+
 /**
  * Check if user owns the resource or has admin privileges
  * SUPER_ADMIN, TENANT_ADMIN, or EXAM_CREATOR in same tenant

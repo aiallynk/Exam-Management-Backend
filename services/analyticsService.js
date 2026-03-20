@@ -26,6 +26,198 @@ const normalizeId = (value) => {
   return String(value);
 };
 
+const buildScoreBands = (values = []) => {
+  const bands = [
+    { min: 0, max: 20, label: '0-20' },
+    { min: 20, max: 40, label: '20-40' },
+    { min: 40, max: 60, label: '40-60' },
+    { min: 60, max: 80, label: '60-80' },
+    { min: 80, max: 100, label: '80-100' },
+  ];
+
+  return bands.map((band, index) => {
+    const isLastBand = index === bands.length - 1;
+    return {
+      label: band.label,
+      min: band.min,
+      max: band.max,
+      count: values.filter((value) => {
+        if (value < band.min) return false;
+        if (isLastBand) return value <= band.max;
+        return value < band.max;
+      }).length,
+    };
+  });
+};
+
+const buildDailyPerformanceTrend = ({ attempts = [], examLookup = new Map() } = {}) => {
+  const byDate = new Map();
+
+  attempts.forEach((attempt) => {
+    const exam = examLookup.get(normalizeId(attempt.examId));
+    if (!exam) return;
+    const percentage = getAttemptPercentage(attempt);
+    const threshold = Number.isFinite(Number(exam.passingPercentage))
+      ? Number(exam.passingPercentage)
+      : 60;
+    const dateSource = attempt.submitTime || attempt.submittedAt || attempt.createdAt;
+    const date = new Date(dateSource);
+    if (Number.isNaN(date.getTime())) return;
+    const dateKey = date.toISOString().split('T')[0];
+
+    if (!byDate.has(dateKey)) {
+      byDate.set(dateKey, {
+        date: dateKey,
+        attempts: 0,
+        totalScore: 0,
+        passed: 0,
+      });
+    }
+
+    const day = byDate.get(dateKey);
+    day.attempts += 1;
+    day.totalScore += percentage;
+    if (percentage >= threshold) {
+      day.passed += 1;
+    }
+  });
+
+  return [...byDate.values()]
+    .map((day) => ({
+      date: day.date,
+      attempts: day.attempts,
+      averageScore: day.attempts > 0 ? roundMetric(day.totalScore / day.attempts) : 0,
+      passRate: day.attempts > 0 ? roundMetric((day.passed / day.attempts) * 100) : 0,
+    }))
+    .sort((left, right) => new Date(left.date).getTime() - new Date(right.date).getTime());
+};
+
+const buildCandidatePerformanceInsights = ({ attempts = [], examLookup = new Map() } = {}) => {
+  const byCandidate = new Map();
+
+  attempts.forEach((attempt) => {
+    const candidateId = normalizeId(attempt.userId);
+    if (!candidateId) return;
+    const exam = examLookup.get(normalizeId(attempt.examId));
+    if (!exam) return;
+
+    const percentage = getAttemptPercentage(attempt);
+    const threshold = Number.isFinite(Number(exam.passingPercentage))
+      ? Number(exam.passingPercentage)
+      : 60;
+
+    if (!byCandidate.has(candidateId)) {
+      byCandidate.set(candidateId, {
+        userId: candidateId,
+        attempts: 0,
+        passed: 0,
+        totalScore: 0,
+        bestScore: null,
+        lastAttemptAt: null,
+      });
+    }
+
+    const entry = byCandidate.get(candidateId);
+    entry.attempts += 1;
+    entry.totalScore += percentage;
+    entry.bestScore =
+      entry.bestScore === null ? percentage : Math.max(entry.bestScore, percentage);
+    if (percentage >= threshold) {
+      entry.passed += 1;
+    }
+
+    const attemptDate = new Date(attempt.submitTime || attempt.submittedAt || attempt.createdAt || 0);
+    if (!Number.isNaN(attemptDate.getTime())) {
+      const entryDate = entry.lastAttemptAt ? new Date(entry.lastAttemptAt) : null;
+      if (!entryDate || attemptDate > entryDate) {
+        entry.lastAttemptAt = attemptDate.toISOString();
+      }
+    }
+  });
+
+  const candidateRows = [...byCandidate.values()].map((entry) => {
+    const averageScore = entry.attempts > 0 ? entry.totalScore / entry.attempts : 0;
+    const passRate = entry.attempts > 0 ? (entry.passed / entry.attempts) * 100 : 0;
+
+    return {
+      userId: entry.userId,
+      attempts: entry.attempts,
+      averageScore: roundMetric(averageScore),
+      passRate: roundMetric(passRate),
+      bestScore: roundMetric(entry.bestScore || 0),
+      lastAttemptAt: entry.lastAttemptAt,
+    };
+  });
+
+  const topPerformers = [...candidateRows]
+    .sort(
+      (left, right) =>
+        right.averageScore - left.averageScore ||
+        right.passRate - left.passRate ||
+        right.attempts - left.attempts
+    )
+    .slice(0, 10);
+
+  const needsAttention = [...candidateRows]
+    .filter((item) => item.attempts >= 2)
+    .sort(
+      (left, right) =>
+        left.averageScore - right.averageScore ||
+        left.passRate - right.passRate ||
+        right.attempts - left.attempts
+    )
+    .slice(0, 10);
+
+  return {
+    totalCandidates: candidateRows.length,
+    topPerformers,
+    needsAttention,
+  };
+};
+
+const summarizeQuestionDifficulty = (questionStats = []) => {
+  const summary = {
+    total: questionStats.length,
+    easy: 0,
+    medium: 0,
+    hard: 0,
+    unrated: 0,
+  };
+
+  questionStats.forEach((question) => {
+    const difficulty = String(question?.difficulty || '').toUpperCase();
+    if (difficulty === 'EASY') {
+      summary.easy += 1;
+    } else if (difficulty === 'MEDIUM') {
+      summary.medium += 1;
+    } else if (difficulty === 'HARD') {
+      summary.hard += 1;
+    } else {
+      summary.unrated += 1;
+    }
+  });
+
+  return summary;
+};
+
+const buildAdvancedInsights = ({
+  attempts = [],
+  scores = [],
+  percentiles = [],
+  examLookup = new Map(),
+  performance = [],
+  questionStats = [],
+} = {}) => ({
+  scoreDistribution: buildScoreBands(scores),
+  percentileDistribution: buildScoreBands(percentiles),
+  dailyPerformanceTrend: buildDailyPerformanceTrend({ attempts, examLookup }),
+  candidatePerformance: buildCandidatePerformanceInsights({ attempts, examLookup }),
+  examLevelAnalysis: [...(Array.isArray(performance) ? performance : [])].sort(
+    (left, right) => (right.averageScore || 0) - (left.averageScore || 0)
+  ),
+  questionDifficultySummary: summarizeQuestionDifficulty(questionStats),
+});
+
 const buildCompletedAttemptQuery = (examId, questionPaperId = null) => {
   const query = {
     examId,
@@ -432,6 +624,7 @@ export const getTenantAnalyticsDashboard = async ({
   viewerUserId,
   examId = null,
   startDate = null,
+  includeAdvanced = false,
 }) => {
   const examFilter = { tenantId };
   if (viewerRole === 'EXAM_CREATOR') {
@@ -451,7 +644,12 @@ export const getTenantAnalyticsDashboard = async ({
     : '';
 
   if (exams.length === 0) {
-    return buildEmptyDashboardAnalytics({ exams: [], selectedExamId });
+    const emptyResponse = buildEmptyDashboardAnalytics({ exams: [], selectedExamId });
+    if (includeAdvanced) {
+      emptyResponse.advancedInsights = buildAdvancedInsights();
+      emptyResponse.reportsMode = 'advanced';
+    }
+    return emptyResponse;
   }
 
   const attemptFilter = {
@@ -502,6 +700,18 @@ export const getTenantAnalyticsDashboard = async ({
         successRatio: 0,
         difficulty: 'MEDIUM',
       }));
+    }
+
+    if (includeAdvanced) {
+      baseResponse.advancedInsights = buildAdvancedInsights({
+        attempts: [],
+        scores: [],
+        percentiles: [],
+        examLookup,
+        performance: [],
+        questionStats: baseResponse.questionStats,
+      });
+      baseResponse.reportsMode = 'advanced';
     }
 
     return baseResponse;
@@ -638,6 +848,18 @@ export const getTenantAnalyticsDashboard = async ({
       : 'No candidates have attempted your exams yet.',
   };
 
+  if (includeAdvanced) {
+    response.advancedInsights = buildAdvancedInsights({
+      attempts,
+      scores,
+      percentiles,
+      examLookup,
+      performance,
+      questionStats: response.questionStats,
+    });
+    response.reportsMode = 'advanced';
+  }
+
   if (!selectedExamId) {
     return response;
   }
@@ -714,6 +936,18 @@ export const getTenantAnalyticsDashboard = async ({
       difficulty: classifyDifficultyFromSuccessRatio(successRatio),
     };
   });
+
+  if (includeAdvanced) {
+    response.advancedInsights = buildAdvancedInsights({
+      attempts,
+      scores,
+      percentiles,
+      examLookup,
+      performance,
+      questionStats: response.questionStats,
+    });
+    response.reportsMode = 'advanced';
+  }
 
   return response;
 };

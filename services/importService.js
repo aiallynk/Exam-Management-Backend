@@ -342,7 +342,11 @@ export const parseCSVFile = async (fileBuffer, fileName) => {
 /**
  * Parse PDF file
  */
-export const parsePDFFile = async (fileBuffer, fileName) => {
+export const parsePDFFile = async (
+  fileBuffer,
+  fileName,
+  { tenantId = null, userId = null } = {}
+) => {
   try {
     const data = await pdfParse(fileBuffer);
     const text = data.text || '';
@@ -362,6 +366,12 @@ export const parsePDFFile = async (fileBuffer, fileName) => {
         content: text,
         structuredRows: null,
         filename: fileName,
+        tenantId,
+        userId,
+        metadata: {
+          tenantId,
+          userId,
+        },
       });
       
       const questions = Array.isArray(extracted.questions) ? extracted.questions : [];
@@ -430,7 +440,11 @@ export const parseImageFile = async (fileBuffer, fileName) => {
 /**
  * Generate import preview
  */
-export const generateImportPreview = async (file, fileName) => {
+export const generateImportPreview = async (
+  file,
+  fileName,
+  { tenantId = null, userId = null } = {}
+) => {
   const fileExtension = path.extname(fileName || '').toLowerCase();
   const fileBuffer = file.buffer || Buffer.from(file);
   
@@ -439,7 +453,7 @@ export const generateImportPreview = async (file, fileName) => {
   } else if (fileExtension === '.csv') {
     return await parseCSVFile(fileBuffer, fileName);
   } else if (fileExtension === '.pdf') {
-    return await parsePDFFile(fileBuffer, fileName);
+    return await parsePDFFile(fileBuffer, fileName, { tenantId, userId });
   } else if (['.jpg', '.jpeg', '.png'].includes(fileExtension)) {
     return await parseImageFile(fileBuffer, fileName);
   } else {

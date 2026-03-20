@@ -55,6 +55,11 @@ const UserSchema = new mongoose.Schema(
       ref: 'Tenant',
       // Not schema-level required - validated in pre-save hook
     },
+    subTenantId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'SubTenant',
+      default: null,
+    },
     mobile: {
       type: String,
       trim: true,
@@ -67,7 +72,7 @@ const UserSchema = new mongoose.Schema(
     },
     planType: {
       type: String,
-      enum: ['free', 'free_trial', 'demo', 'pro', 'enterprise'],
+      enum: ['free', 'free_trial', 'demo', 'pro', 'ultimate', 'legend', 'business', 'enterprise'],
       default: 'free',
       lowercase: true,
       trim: true,
@@ -86,6 +91,7 @@ const UserSchema = new mongoose.Schema(
 // Indexes for efficient queries
 UserSchema.index({ uniqueId: 1 });
 UserSchema.index({ tenantId: 1, role: 1 });
+UserSchema.index({ tenantId: 1, subTenantId: 1, role: 1 });
 UserSchema.index({ status: 1 });
 UserSchema.index({ planType: 1 });
 
@@ -116,8 +122,8 @@ UserSchema.pre('save', function (next) {
   // TENANT_ADMIN must have a tenantId
   if (this.role === 'TENANT_ADMIN' && !this.tenantId) {
     const planType = String(this.planType || '').toLowerCase();
-    const allowTrialSelfSignup = planType === 'free_trial' || planType === 'demo';
-    if (!allowTrialSelfSignup) {
+    const allowSelfSignup = ['free', 'free_trial', 'demo'].includes(planType);
+    if (!allowSelfSignup) {
       return next(new Error('TENANT_ADMIN must be assigned to a tenant'));
     }
   }
