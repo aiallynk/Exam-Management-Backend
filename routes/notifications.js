@@ -1,5 +1,7 @@
 import express from 'express';
+import mongoose from 'mongoose';
 import Notification from '../models/Notification.js';
+import NotificationSettings from '../models/NotificationSettings.js';
 import { requireAuth } from '../middleware/auth.js';
 
 const router = express.Router();
@@ -7,6 +9,79 @@ const router = express.Router();
 router.use(requireAuth);
 
 const normalizeRole = (role) => String(role || '').trim().toUpperCase();
+const isValidMongoId = (value) => mongoose.Types.ObjectId.isValid(String(value || ''));
+
+const DEFAULT_NOTIFICATION_SETTINGS = Object.freeze({
+  tenant: Object.freeze({
+    userRegistration: true,
+    planAlerts: true,
+    backupStatus: true,
+    systemAlerts: true,
+  }),
+  examCreator: Object.freeze({
+    examCreated: true,
+    candidateSubmission: true,
+    resultPublished: true,
+    aiEvaluationCompleted: true,
+  }),
+  candidate: Object.freeze({
+    examAssigned: true,
+    examReminder: true,
+    resultPublished: true,
+    loginAlerts: true,
+  }),
+});
+
+const cloneDefaultNotificationSettings = () => ({
+  tenant: { ...DEFAULT_NOTIFICATION_SETTINGS.tenant },
+  examCreator: { ...DEFAULT_NOTIFICATION_SETTINGS.examCreator },
+  candidate: { ...DEFAULT_NOTIFICATION_SETTINGS.candidate },
+});
+
+const normalizeNotificationSettingsPayload = (payload) => {
+  const source = payload && typeof payload === 'object' ? payload : {};
+  const normalized = cloneDefaultNotificationSettings();
+
+  Object.keys(normalized).forEach((sectionKey) => {
+    const sectionSource =
+      source[sectionKey] && typeof source[sectionKey] === 'object' ? source[sectionKey] : {};
+    Object.keys(normalized[sectionKey]).forEach((itemKey) => {
+      const incoming = sectionSource[itemKey];
+      if (typeof incoming === 'boolean') {
+        normalized[sectionKey][itemKey] = incoming;
+      }
+    });
+  });
+
+  return normalized;
+};
+
+const resolveTenantIdForSettings = (req, tenantIdInput = null) => {
+  const userRole = normalizeRole(req.user?.role);
+  const userTenantId = req.user?.tenantId ? String(req.user.tenantId) : '';
+  const requestedTenantId = String(tenantIdInput || '').trim();
+
+  if (userRole === 'SUPER_ADMIN') {
+    if (requestedTenantId && isValidMongoId(requestedTenantId)) {
+      return requestedTenantId;
+    }
+    if (userTenantId && isValidMongoId(userTenantId)) {
+      return userTenantId;
+    }
+    return null;
+  }
+
+  if (userRole !== 'TENANT_ADMIN') {
+    return null;
+  }
+
+  return userTenantId && isValidMongoId(userTenantId) ? userTenantId : null;
+};
+
+const buildNotificationSettingsResponse = ({ tenantId, settingsDocument }) => ({
+  tenantId: String(tenantId || ''),
+  notifications: normalizeNotificationSettingsPayload(settingsDocument?.notifications),
+});
 
 const buildAccessFilter = (user) => {
   const role = normalizeRole(user?.role);
@@ -50,6 +125,77 @@ const mapNotification = (notification, userId) => {
     metadata: notification.metadata || null,
   };
 };
+
+router.get('/settings', async (req, res, next) => {
+  try {
+    const tenantId = resolveTenantIdForSettings(req, req.query?.tenantId);
+    if (!tenantId) {
+      return res.status(403).json({
+        error: 'Only Tenant Admin or Super Admin can access notification settings.',
+      });
+    }
+
+    const settings = await NotificationSettings.findOne({ tenantId }).lean();
+    return res.json({
+      success: true,
+      ...buildNotificationSettingsResponse({
+        tenantId,
+        settingsDocument: settings,
+      }),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.put('/settings', async (req, res, next) => {
+  try {
+    const tenantId = resolveTenantIdForSettings(
+      req,
+      req.body?.tenantId || req.query?.tenantId
+    );
+    if (!tenantId) {
+      return res.status(403).json({
+        error: 'Only Tenant Admin or Super Admin can update notification settings.',
+      });
+    }
+
+    if (!req.body || typeof req.body.notifications !== 'object' || Array.isArray(req.body.notifications)) {
+      return res.status(400).json({
+        error: 'notifications payload is required and must be an object.',
+      });
+    }
+
+    const normalizedSettings = normalizeNotificationSettingsPayload(req.body.notifications);
+
+    const updated = await NotificationSettings.findOneAndUpdate(
+      { tenantId },
+      {
+        $set: {
+          notifications: normalizedSettings,
+          updatedBy: req.user?._id || null,
+        },
+        $setOnInsert: {
+          createdBy: req.user?._id || null,
+        },
+      },
+      {
+        new: true,
+        upsert: true,
+      }
+    ).lean();
+
+    return res.json({
+      success: true,
+      ...buildNotificationSettingsResponse({
+        tenantId,
+        settingsDocument: updated,
+      }),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
 
 router.get('/', async (req, res, next) => {
   try {

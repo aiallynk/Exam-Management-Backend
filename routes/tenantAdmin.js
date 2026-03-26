@@ -1,4 +1,5 @@
 import express from 'express';
+import mongoose from 'mongoose';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { body, validationResult } from 'express-validator';
@@ -7,9 +8,12 @@ import User from '../models/User.js';
 import Exam from '../models/Exam.js';
 import ExamAttempt from '../models/ExamAttempt.js';
 import ExamSession from '../models/ExamSession.js';
+import AITokenUsage from '../models/AITokenUsage.js';
 import Answer from '../models/Answer.js';
 import SubTenant from '../models/SubTenant.js';
 import SystemConfig from '../models/SystemConfig.js';
+import TenantFeatureBilling from '../models/TenantFeatureBilling.js';
+import CreditRequest from '../models/CreditRequest.js';
 import { validatePasswordStrength, generateSecurePassword } from '../utils/passwordValidator.js';
 import { AUDIT_ACTIONS } from '../middleware/audit.js';
 import { logAuditEvent } from '../utils/auditLogger.js';
@@ -21,6 +25,7 @@ import {
   isPlanFeatureEnabled,
   isTrialRestrictedPlan,
   resolveEffectivePlanType,
+  resolveSubscriptionPlanType,
   resolveSubscriptionStatus,
 } from '../config/planLimits.js';
 import {
@@ -30,6 +35,25 @@ import {
 } from '../middleware/planRestrictions.js';
 import { getTenantAnalyticsDashboard } from '../services/analyticsService.js';
 import { deleteUserAndCleanup } from '../services/userDeletionService.js';
+import {
+  getTenantAiGradingUsageSnapshot,
+  toAiUsageResponsePayload,
+} from '../services/aiGradingUsageService.js';
+import {
+  CREDIT_REQUEST_STATUSES,
+  CREDIT_REQUEST_TYPES,
+  applyExtraCreditsToPlanLimits,
+  computeExtraUsageCost,
+  normalizeCreditRequestType,
+  normalizeTenantExtraCredits,
+  resolveExtraCreditUnitPrice,
+} from '../utils/creditSystem.js';
+import {
+  getAttemptCountForTenantByWindow,
+  getCurrentMonthRange,
+  getExamCountForTenantByWindow,
+} from '../utils/planUsage.js';
+import { getAIQuestionCountForTenantByWindow } from '../services/aiTokenUsageService.js';
 
 const router = express.Router();
 const requireMultiTenantFeature = blockFreePlanByUser(
@@ -62,11 +86,315 @@ const BULK_IMPORT_ROLE_QUERY_VALUES = Object.freeze({
   CANDIDATE: ['CANDIDATE', 'USER', 'STUDENT'],
 });
 const SUB_TENANT_ALLOWED_STATUS = new Set(['ACTIVE', 'INACTIVE']);
+const FEATURE_BILLING_ALLOWED_PLAN_TYPES = new Set(['legend', 'enterprise']);
+const FEATURE_BILLING_ALLOWED_ROLE = 'TENANT_ADMIN';
+const FEATURE_BILLING_AI_UNIT_PRICE_INR = 0.5;
+const FEATURE_BILLING_UPGRADE_PATH = '/pricing';
+const FEATURE_BILLING_FEATURES = Object.freeze([
+  { key: 'examCreation', label: 'Exam Creation', price: 50 },
+  { key: 'analytics', label: 'Analytics', price: 40 },
+  { key: 'proctoring', label: 'Proctoring', price: 100 },
+]);
+const FEATURE_BILLING_DEFAULT_SELECTION = Object.freeze({
+  examCreation: true,
+  analytics: true,
+  proctoring: false,
+});
+const CREDIT_REQUEST_ALLOWED_TYPES = new Set(Object.values(CREDIT_REQUEST_TYPES));
+const CREDIT_REQUEST_ALLOWED_STATUSES = new Set(Object.values(CREDIT_REQUEST_STATUSES));
+const CREDIT_REQUEST_MAX_AMOUNT = 1000000;
+const CREDIT_REQUEST_TYPE_CONFIG = Object.freeze({
+  [CREDIT_REQUEST_TYPES.AI]: {
+    limitKey: 'maxAiQuestionsPerMonth',
+    extraCreditKey: 'ai',
+    usageLabel: 'AI Questions',
+  },
+  [CREDIT_REQUEST_TYPES.ATTEMPTS]: {
+    limitKey: 'maxAttemptsPerMonth',
+    extraCreditKey: 'attempts',
+    usageLabel: 'Attempts',
+  },
+  [CREDIT_REQUEST_TYPES.EXAMS]: {
+    limitKey: 'maxExamsPerMonth',
+    extraCreditKey: 'exams',
+    usageLabel: 'Exams',
+  },
+});
 
 const toFiniteLimit = (value) => {
   const parsed = Number(value);
   if (!Number.isFinite(parsed) || parsed < 0) return null;
   return Math.floor(parsed);
+};
+
+const normalizeFeatureBillingPlanType = (value) => String(value || '').trim().toLowerCase();
+
+const isFeatureBillingPlanAllowed = (planTypeValue) => {
+  const normalized = normalizeFeatureBillingPlanType(planTypeValue);
+  if (!normalized) return false;
+  if (FEATURE_BILLING_ALLOWED_PLAN_TYPES.has(normalized)) return true;
+  const resolved = resolveSubscriptionPlanType(normalized);
+  return FEATURE_BILLING_ALLOWED_PLAN_TYPES.has(resolved);
+};
+
+const normalizeFeatureBillingSelection = (value) => {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const normalized = { ...FEATURE_BILLING_DEFAULT_SELECTION };
+
+  FEATURE_BILLING_FEATURES.forEach((feature) => {
+    if (typeof source[feature.key] === 'boolean') {
+      normalized[feature.key] = source[feature.key];
+    }
+  });
+
+  return normalized;
+};
+
+const toMoney = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return 0;
+  return Math.round(parsed * 100) / 100;
+};
+
+const resolveTenantPlanLimitsWithoutExtraCredits = (tenant = null, effectivePlanType = null) => {
+  const resolvedPlanType = resolveSubscriptionPlanType(
+    effectivePlanType || tenant?.subscription?.planType || 'free'
+  );
+  const planDefinition = getSubscriptionPlanDefinition(resolvedPlanType);
+  const baseLimits = planDefinition?.limits || {};
+  const customLimits =
+    tenant?.subscription?.customLimits &&
+    typeof tenant.subscription.customLimits === 'object' &&
+    !Array.isArray(tenant.subscription.customLimits)
+      ? tenant.subscription.customLimits
+      : {};
+
+  const resolvePlanLimitWithOverride = (key, legacyValue = null, baseValue = null) => {
+    if (Object.prototype.hasOwnProperty.call(customLimits, key)) {
+      const rawValue = customLimits[key];
+      if (rawValue !== null && rawValue !== undefined && rawValue !== '') {
+        if (Number(rawValue) === -1) return null;
+        return toFiniteLimit(rawValue);
+      }
+    }
+    if (
+      key === 'maxImportFiles' &&
+      Object.prototype.hasOwnProperty.call(customLimits, 'importQuestionsPerMonth')
+    ) {
+      const aliasValue = customLimits.importQuestionsPerMonth;
+      if (aliasValue !== null && aliasValue !== undefined && aliasValue !== '') {
+        if (Number(aliasValue) === -1) return null;
+        return toFiniteLimit(aliasValue);
+      }
+    }
+    const legacy = toFiniteLimit(legacyValue);
+    if (legacy !== null) return legacy;
+    return toFiniteLimit(baseValue);
+  };
+
+  return {
+    maxExamsPerMonth: resolvePlanLimitWithOverride(
+      'maxExamsPerMonth',
+      tenant?.examLimit,
+      baseLimits?.maxExamsPerMonth
+    ),
+    maxAttemptsPerMonth: resolvePlanLimitWithOverride(
+      'maxAttemptsPerMonth',
+      tenant?.attemptLimit,
+      baseLimits?.maxAttemptsPerMonth
+    ),
+    maxAiQuestionsPerMonth: resolvePlanLimitWithOverride(
+      'maxAiQuestionsPerMonth',
+      tenant?.aiUsageLimit,
+      baseLimits?.maxAiQuestionsPerMonth
+    ),
+    maxImportFiles: resolvePlanLimitWithOverride(
+      'maxImportFiles',
+      null,
+      baseLimits?.importQuestionsPerMonth ?? baseLimits?.maxImportFiles
+    ),
+  };
+};
+
+const resolveCreditRequestTypeSummary = async ({
+  type,
+  tenantId,
+  tenant = null,
+  effectivePlanType = null,
+} = {}) => {
+  const normalizedType = normalizeCreditRequestType(type);
+  if (!normalizedType || !CREDIT_REQUEST_TYPE_CONFIG[normalizedType]) {
+    return null;
+  }
+
+  const planLimits = resolveTenantPlanLimitsWithoutExtraCredits(tenant, effectivePlanType);
+  const extraCredits = normalizeTenantExtraCredits(tenant?.extraCredits);
+  const totalLimits = applyExtraCreditsToPlanLimits(planLimits, extraCredits);
+  const config = CREDIT_REQUEST_TYPE_CONFIG[normalizedType];
+  const limitKey = config.limitKey;
+
+  const { start, end } = getCurrentMonthRange();
+  const [usage] = await Promise.all([
+    normalizedType === CREDIT_REQUEST_TYPES.EXAMS
+      ? getExamCountForTenantByWindow(tenantId, start, end)
+      : normalizedType === CREDIT_REQUEST_TYPES.ATTEMPTS
+        ? getAttemptCountForTenantByWindow(tenantId, start, end)
+        : getAIQuestionCountForTenantByWindow(tenantId, start, end),
+  ]);
+
+  const baseLimit = planLimits?.[limitKey] ?? null;
+  const totalLimit = totalLimits?.[limitKey] ?? null;
+  const extraCreditAmount = Number(extraCredits?.[config.extraCreditKey]) || 0;
+  const { extraUsage, unitPrice, extraCost } = computeExtraUsageCost({
+    usage,
+    baseLimit,
+    type: normalizedType,
+  });
+
+  return {
+    type: normalizedType,
+    label: config.usageLabel,
+    usage: Number(usage) || 0,
+    baseLimit,
+    totalLimit,
+    extraCredits: extraCreditAmount,
+    extraUsage,
+    unitPrice,
+    extraCost,
+    monthWindow: {
+      start,
+      end,
+    },
+  };
+};
+
+const toMongoObjectId = (value) => {
+  const raw = String(value || '').trim();
+  if (!/^[a-fA-F0-9]{24}$/.test(raw)) return null;
+  return new mongoose.Types.ObjectId(raw);
+};
+
+const getCurrentIstMonthRange = (referenceDate = new Date()) => {
+  const IST_OFFSET_MINUTES = 330;
+  const offsetMs = IST_OFFSET_MINUTES * 60 * 1000;
+  const safeNow =
+    referenceDate instanceof Date && !Number.isNaN(referenceDate.getTime())
+      ? referenceDate
+      : new Date();
+  const istNow = new Date(safeNow.getTime() + offsetMs);
+
+  const istMonthStart = new Date(
+    Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth(), 1, 0, 0, 0, 0)
+  );
+  const istNextMonthStart = new Date(
+    Date.UTC(istNow.getUTCFullYear(), istNow.getUTCMonth() + 1, 1, 0, 0, 0, 0)
+  );
+
+  return {
+    start: new Date(istMonthStart.getTime() - offsetMs),
+    end: new Date(istNextMonthStart.getTime() - offsetMs),
+  };
+};
+
+const buildFeatureBillingAccessState = (req, tenantPlanType) => {
+  const roleAllowed = req.user?.role === FEATURE_BILLING_ALLOWED_ROLE;
+  const planAllowed = isFeatureBillingPlanAllowed(tenantPlanType || req.user?.planType);
+  return {
+    roleAllowed,
+    planAllowed,
+    allowed: roleAllowed && planAllowed,
+  };
+};
+
+const buildFeatureBillingDeniedPayload = (accessState) => {
+  const roleMessage =
+    'This feature is available only for tenant administrators on LEGEND / ENTERPRISE plans.';
+  const planMessage = 'This feature is available only for LEGEND / ENTERPRISE plans.';
+  return {
+    error: accessState?.planAllowed ? roleMessage : planMessage,
+    allowedPlans: ['LEGEND', 'ENTERPRISE'],
+    upgradePath: FEATURE_BILLING_UPGRADE_PATH,
+  };
+};
+
+const buildFeatureBillingSummary = async ({
+  tenantId,
+  tenantPlanType,
+  selectedFeatures,
+}) => {
+  const normalizedSelection = normalizeFeatureBillingSelection(selectedFeatures);
+  const resolvedPlanType = resolveSubscriptionPlanType(tenantPlanType || '');
+  const effectivePlanType = resolvedPlanType || 'legend';
+  const planDefinition = getSubscriptionPlanDefinition(effectivePlanType);
+  const basePlanPrice = toMoney(planDefinition?.price ?? 0);
+
+  const features = FEATURE_BILLING_FEATURES.map((feature) => ({
+    key: feature.key,
+    label: feature.label,
+    price: feature.price,
+    enabled: Boolean(normalizedSelection[feature.key]),
+  }));
+
+  const selectedFeatureTotal = toMoney(
+    features.reduce(
+      (sum, feature) => sum + (feature.enabled ? Number(feature.price) || 0 : 0),
+      0
+    )
+  );
+
+  const { start, end } = getCurrentIstMonthRange();
+  const tenantObjectId = toMongoObjectId(tenantId);
+  const aiUsagePipeline =
+    tenantObjectId
+      ? [
+          {
+            $match: {
+              tenant_id: tenantObjectId,
+              request_status: 'SUCCESS',
+              created_at: { $gte: start, $lt: end },
+            },
+          },
+          {
+            $group: {
+              _id: null,
+              questionCount: { $sum: { $ifNull: ['$question_count', 0] } },
+              usageCount: { $sum: { $ifNull: ['$usage_count', 0] } },
+            },
+          },
+        ]
+      : [];
+  const [aiUsageAggregate] = aiUsagePipeline.length
+    ? await AITokenUsage.aggregate(aiUsagePipeline)
+    : [];
+
+  const questionCount = Number(aiUsageAggregate?.questionCount) || 0;
+  const usageCount = Number(aiUsageAggregate?.usageCount) || 0;
+  const aiUsedThisMonth = questionCount > 0 ? questionCount : usageCount;
+  const aiUsageCost = toMoney(aiUsedThisMonth * FEATURE_BILLING_AI_UNIT_PRICE_INR);
+
+  const total = toMoney(basePlanPrice + selectedFeatureTotal + aiUsageCost);
+
+  return {
+    planType: String(resolvedPlanType || tenantPlanType || '')
+      .trim()
+      .toUpperCase(),
+    basePlanPrice,
+    features,
+    selectedFeatures: normalizedSelection,
+    aiUsage: {
+      used: aiUsedThisMonth,
+      unitPrice: FEATURE_BILLING_AI_UNIT_PRICE_INR,
+      cost: aiUsageCost,
+      monthWindow: { start, end },
+    },
+    totals: {
+      basePlan: basePlanPrice,
+      features: selectedFeatureTotal,
+      aiUsage: aiUsageCost,
+      total,
+    },
+    currency: 'INR',
+  };
 };
 
 const buildActorAuditDetails = (req) => ({
@@ -442,10 +770,19 @@ router.get('/stats', async (req, res, next) => {
       .lean();
 
     // Get tenant info
-    const tenant = await Tenant.findById(tenantId).select('name code type status');
+    const tenant = await Tenant.findById(tenantId)
+      .select(
+        'name code type status subscription ai_usage_count ai_usage_limit ai_usage_reset_date'
+      )
+      .lean();
+    const aiUsageSnapshot = await getTenantAiGradingUsageSnapshot({
+      tenantId,
+      tenant,
+    });
 
     res.json({
       tenant,
+      ai_usage: toAiUsageResponsePayload(aiUsageSnapshot),
       exams: {
         total: totalExams,
         active: activeExams,
@@ -532,6 +869,390 @@ router.get(
     });
   } catch (error) {
     next(error);
+  }
+});
+
+/**
+ * FEATURE BILLING (LEGEND / ENTERPRISE ONLY)
+ */
+
+router.get('/feature-billing/eligibility', async (req, res, next) => {
+  try {
+    const accessState = buildFeatureBillingAccessState(req, req.user?.subscriptionPlanType);
+    const resolvedPlanType = resolveSubscriptionPlanType(
+      req.user?.subscriptionPlanType || req.user?.planType || ''
+    );
+
+    return res.json({
+      success: true,
+      allowed: accessState.allowed,
+      roleAllowed: accessState.roleAllowed,
+      planAllowed: accessState.planAllowed,
+      planType: String(resolvedPlanType || req.user?.planType || '')
+        .trim()
+        .toUpperCase(),
+      allowedPlans: ['LEGEND', 'ENTERPRISE'],
+      upgradePath: FEATURE_BILLING_UPGRADE_PATH,
+      message: accessState.allowed
+        ? ''
+        : buildFeatureBillingDeniedPayload(accessState).error,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get('/feature-billing', async (req, res, next) => {
+  try {
+    const tenant = await Tenant.findById(req.user.tenantId)
+      .select('name code subscription')
+      .lean();
+
+    if (!tenant) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const tenantPlanType =
+      tenant?.subscription?.planType ||
+      req.user?.subscriptionPlanType ||
+      req.user?.planType ||
+      '';
+    const accessState = buildFeatureBillingAccessState(req, tenantPlanType);
+    if (!accessState.allowed) {
+      return res.status(403).json(buildFeatureBillingDeniedPayload(accessState));
+    }
+
+    const savedSettings = await TenantFeatureBilling.findOne({
+      tenantId: req.user.tenantId,
+    }).lean();
+    const selectedFeatures = normalizeFeatureBillingSelection(savedSettings?.selectedFeatures);
+
+    const summary = await buildFeatureBillingSummary({
+      tenantId: req.user.tenantId,
+      tenantPlanType,
+      selectedFeatures,
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        tenantId: String(req.user.tenantId),
+        tenantName: tenant.name || '',
+        tenantCode: tenant.code || '',
+        ...summary,
+        updatedAt: savedSettings?.updatedAt || savedSettings?.createdAt || null,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.put('/feature-billing', async (req, res, next) => {
+  try {
+    const tenant = await Tenant.findById(req.user.tenantId)
+      .select('name code subscription')
+      .lean();
+
+    if (!tenant) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const tenantPlanType =
+      tenant?.subscription?.planType ||
+      req.user?.subscriptionPlanType ||
+      req.user?.planType ||
+      '';
+    const accessState = buildFeatureBillingAccessState(req, tenantPlanType);
+    if (!accessState.allowed) {
+      return res.status(403).json(buildFeatureBillingDeniedPayload(accessState));
+    }
+
+    const incomingFeatures =
+      req.body?.features && typeof req.body.features === 'object'
+        ? req.body.features
+        : req.body?.selectedFeatures;
+
+    if (!incomingFeatures || typeof incomingFeatures !== 'object' || Array.isArray(incomingFeatures)) {
+      return res.status(400).json({
+        error: 'features payload is required and must be an object.',
+      });
+    }
+
+    const normalizedSelection = normalizeFeatureBillingSelection(incomingFeatures);
+
+    const savedSettings = await TenantFeatureBilling.findOneAndUpdate(
+      { tenantId: req.user.tenantId },
+      {
+        $set: {
+          selectedFeatures: normalizedSelection,
+          updatedBy: req.user?._id || null,
+        },
+        $setOnInsert: {
+          createdBy: req.user?._id || null,
+        },
+      },
+      {
+        new: true,
+        upsert: true,
+      }
+    ).lean();
+
+    const summary = await buildFeatureBillingSummary({
+      tenantId: req.user.tenantId,
+      tenantPlanType,
+      selectedFeatures: savedSettings?.selectedFeatures,
+    });
+
+    return res.json({
+      success: true,
+      data: {
+        tenantId: String(req.user.tenantId),
+        tenantName: tenant.name || '',
+        tenantCode: tenant.code || '',
+        ...summary,
+        updatedAt: savedSettings?.updatedAt || savedSettings?.createdAt || null,
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * CREDIT REQUESTS
+ */
+
+router.get('/credit-requests/overview', async (req, res, next) => {
+  if (!ensureTenantAdminAccess(req, res, 'Only tenant admins can request extra credits')) return;
+
+  try {
+    const tenant = await Tenant.findById(req.user.tenantId)
+      .select('name code subscription examLimit attemptLimit aiUsageLimit extraCredits')
+      .lean();
+
+    if (!tenant) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const subscription = tenant?.subscription || {};
+    const effectivePlanType = resolveEffectivePlanType(
+      subscription?.planType || req.user?.planType || null,
+      resolveSubscriptionStatus(subscription)
+    );
+
+    const [summaries, pendingCount, approvedCount, rejectedCount] = await Promise.all([
+      Promise.all(
+        Object.values(CREDIT_REQUEST_TYPES).map((type) =>
+          resolveCreditRequestTypeSummary({
+            type,
+            tenantId: req.user.tenantId,
+            tenant,
+            effectivePlanType,
+          })
+        )
+      ),
+      CreditRequest.countDocuments({
+        tenantId: req.user.tenantId,
+        status: CREDIT_REQUEST_STATUSES.PENDING,
+      }),
+      CreditRequest.countDocuments({
+        tenantId: req.user.tenantId,
+        status: CREDIT_REQUEST_STATUSES.APPROVED,
+      }),
+      CreditRequest.countDocuments({
+        tenantId: req.user.tenantId,
+        status: CREDIT_REQUEST_STATUSES.REJECTED,
+      }),
+    ]);
+
+    return res.json({
+      success: true,
+      data: {
+        tenantId: String(req.user.tenantId),
+        tenantName: tenant?.name || '',
+        tenantCode: tenant?.code || '',
+        planType: String(effectivePlanType || '').toUpperCase(),
+        summaryByType: summaries.filter(Boolean),
+        totals: {
+          pending: pendingCount,
+          approved: approvedCount,
+          rejected: rejectedCount,
+        },
+        extraCredits: normalizeTenantExtraCredits(tenant?.extraCredits),
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get('/credit-requests', async (req, res, next) => {
+  if (!ensureTenantAdminAccess(req, res, 'Only tenant admins can view credit requests')) return;
+
+  try {
+    const page = Math.max(parseInt(req.query?.page, 10) || 1, 1);
+    const limit = Math.min(100, Math.max(parseInt(req.query?.limit, 10) || 20, 1));
+    const skip = (page - 1) * limit;
+    const statusFilterRaw = String(req.query?.status || 'all')
+      .trim()
+      .toUpperCase();
+    const typeFilter = normalizeCreditRequestType(req.query?.type || '');
+
+    const filter = { tenantId: req.user.tenantId };
+    if (statusFilterRaw !== 'ALL') {
+      if (!CREDIT_REQUEST_ALLOWED_STATUSES.has(statusFilterRaw)) {
+        return res.status(400).json({
+          error: 'status must be ALL, PENDING, APPROVED, or REJECTED',
+        });
+      }
+      filter.status = statusFilterRaw;
+    }
+    if (typeFilter) {
+      filter.type = typeFilter;
+    }
+
+    const [requests, total] = await Promise.all([
+      CreditRequest.find(filter)
+        .populate('requestedBy', 'name email')
+        .populate('reviewedBy', 'name email')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      CreditRequest.countDocuments(filter),
+    ]);
+
+    return res.json({
+      success: true,
+      requests: (Array.isArray(requests) ? requests : []).map((request) => ({
+        id: request?._id ? String(request._id) : null,
+        tenantId: request?.tenantId ? String(request.tenantId) : null,
+        type: request?.type || '',
+        requestedAmount: Number(request?.requestedAmount) || 0,
+        status: request?.status || CREDIT_REQUEST_STATUSES.PENDING,
+        comment: request?.comment || '',
+        reviewNote: request?.reviewNote || '',
+        unitPriceInr: Number(request?.unitPriceInr) || 0,
+        requestedBy: request?.requestedBy
+          ? {
+              id: request.requestedBy?._id ? String(request.requestedBy._id) : null,
+              name: request.requestedBy?.name || '',
+              email: request.requestedBy?.email || '',
+            }
+          : null,
+        reviewedBy: request?.reviewedBy
+          ? {
+              id: request.reviewedBy?._id ? String(request.reviewedBy._id) : null,
+              name: request.reviewedBy?.name || '',
+              email: request.reviewedBy?.email || '',
+            }
+          : null,
+        reviewedAt: request?.reviewedAt || null,
+        createdAt: request?.createdAt || null,
+        updatedAt: request?.updatedAt || null,
+      })),
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.max(1, Math.ceil(total / limit)),
+      },
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post('/credit-requests', async (req, res, next) => {
+  if (!ensureTenantAdminAccess(req, res, 'Only tenant admins can request extra credits')) return;
+
+  try {
+    const type = normalizeCreditRequestType(req.body?.type);
+    const requestedAmount = Number(req.body?.requestedAmount);
+    const comment = String(req.body?.comment || '')
+      .trim()
+      .slice(0, 500);
+
+    if (!type || !CREDIT_REQUEST_ALLOWED_TYPES.has(type)) {
+      return res.status(400).json({
+        error: 'type must be one of AI, ATTEMPTS, or EXAMS',
+      });
+    }
+
+    if (!Number.isFinite(requestedAmount) || requestedAmount <= 0) {
+      return res.status(400).json({
+        error: 'requestedAmount must be a positive number',
+      });
+    }
+
+    if (requestedAmount > CREDIT_REQUEST_MAX_AMOUNT) {
+      return res.status(400).json({
+        error: `requestedAmount must be less than or equal to ${CREDIT_REQUEST_MAX_AMOUNT}`,
+      });
+    }
+
+    const tenant = await Tenant.findById(req.user.tenantId)
+      .select('subscription examLimit attemptLimit aiUsageLimit extraCredits')
+      .lean();
+    if (!tenant) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const subscription = tenant?.subscription || {};
+    const effectivePlanType = resolveEffectivePlanType(
+      subscription?.planType || req.user?.planType || null,
+      resolveSubscriptionStatus(subscription)
+    );
+    const summary = await resolveCreditRequestTypeSummary({
+      type,
+      tenantId: req.user.tenantId,
+      tenant,
+      effectivePlanType,
+    });
+
+    if (!summary) {
+      return res.status(400).json({ error: 'Invalid credit request type' });
+    }
+
+    if (summary.totalLimit === null) {
+      return res.status(400).json({
+        error: 'Current plan has no limit for this usage type, so extra credits are not required.',
+      });
+    }
+
+    if ((Number(summary.usage) || 0) < (Number(summary.totalLimit) || 0)) {
+      return res.status(400).json({
+        error: 'Credits can be requested only after your current limit is exhausted.',
+        usage: summary,
+      });
+    }
+
+    const created = await CreditRequest.create({
+      tenantId: req.user.tenantId,
+      type,
+      requestedAmount: Math.floor(requestedAmount),
+      status: CREDIT_REQUEST_STATUSES.PENDING,
+      requestedBy: req.user._id,
+      comment,
+      unitPriceInr: resolveExtraCreditUnitPrice(type),
+    });
+
+    return res.status(201).json({
+      success: true,
+      request: {
+        id: String(created._id),
+        tenantId: String(created.tenantId),
+        type: created.type,
+        requestedAmount: Number(created.requestedAmount) || 0,
+        status: created.status,
+        comment: created.comment || '',
+        unitPriceInr: Number(created.unitPriceInr) || 0,
+        createdAt: created.createdAt,
+      },
+    });
+  } catch (error) {
+    return next(error);
   }
 });
 

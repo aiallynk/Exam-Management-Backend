@@ -45,6 +45,9 @@ const QuestionSchema = new mongoose.Schema(
         'TRUE_FALSE',
         'SHORT_ANSWER',
         'PARAGRAPH',
+        'ESSAY',
+        'ESSAY_LETTER',
+        'ESSAY_STORY',
         'NUMBER',
         'CODING',
       ],
@@ -52,7 +55,17 @@ const QuestionSchema = new mongoose.Schema(
     },
     questionFormat: {
       type: String,
-      enum: ['MCQ', 'IMAGE', 'PARAGRAPH', 'SCENARIO', 'TRUE_FALSE', 'CODING'],
+      enum: [
+        'MCQ',
+        'IMAGE',
+        'PARAGRAPH',
+        'SCENARIO',
+        'TRUE_FALSE',
+        'ESSAY',
+        'ESSAY_LETTER',
+        'ESSAY_STORY',
+        'CODING',
+      ],
       alias: 'question_type',
     },
     title: {
@@ -62,6 +75,11 @@ const QuestionSchema = new mongoose.Schema(
     description: {
       type: String,
       trim: true,
+    },
+    instructions: {
+      type: String,
+      trim: true,
+      default: '',
     },
     difficulty: {
       type: String,

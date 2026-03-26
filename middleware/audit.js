@@ -8,6 +8,34 @@ import { logAuditEvent, AUDIT_ACTIONS } from '../utils/auditLogger.js';
 // Re-export AUDIT_ACTIONS for convenience
 export { AUDIT_ACTIONS };
 
+const resolveClientIp = (req) => {
+  const forwarded = req.headers?.['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) {
+    return forwarded.split(',')[0].trim();
+  }
+  return req.ip || req.connection?.remoteAddress || req.socket?.remoteAddress || null;
+};
+
+const detectClientDevice = (userAgentValue) => {
+  const userAgent = String(userAgentValue || '').toLowerCase();
+  let browser = 'Unknown';
+
+  if (userAgent.includes('edg/')) browser = 'Edge';
+  else if (userAgent.includes('chrome/')) browser = 'Chrome';
+  else if (userAgent.includes('safari/') && !userAgent.includes('chrome/')) browser = 'Safari';
+  else if (userAgent.includes('firefox/')) browser = 'Firefox';
+  else if (userAgent.includes('opr/') || userAgent.includes('opera/')) browser = 'Opera';
+
+  let device = 'Desktop';
+  if (userAgent.includes('ipad') || userAgent.includes('tablet')) {
+    device = 'Tablet';
+  } else if (userAgent.includes('mobile') || userAgent.includes('android')) {
+    device = 'Mobile';
+  }
+
+  return { browser, device };
+};
+
 /**
  * Audit middleware factory
  * Creates middleware to log specific actions
@@ -28,8 +56,8 @@ export const auditLog = (action, getDetails = (req, res) => ({})) => {
         tenantId: req.user?.tenantId || null,
         method: req.method,
         path: req.path,
-        ip: req.ip || req.connection?.remoteAddress,
-        ipAddress: req.ip || req.connection?.remoteAddress,
+        ip: resolveClientIp(req),
+        ipAddress: resolveClientIp(req),
         userAgent: req.get('user-agent'),
         statusCode: res.statusCode,
         ...getDetails(req, res),
@@ -54,20 +82,68 @@ export const auditLog = (action, getDetails = (req, res) => ({})) => {
  * Audit login attempts (success and failure)
  */
 export const auditLogin = (req, res, next) => {
+  let hasLogged = false;
   const originalJson = res.json;
   res.json = function (data) {
-    const action = res.statusCode === 200 ? AUDIT_ACTIONS.LOGIN_SUCCESS : AUDIT_ACTIONS.LOGIN_FAILED;
+    if (hasLogged) {
+      return originalJson.call(this, data);
+    }
+    hasLogged = true;
+
+    const statusCode = Number(res.statusCode) || 0;
+    const status = statusCode >= 200 && statusCode < 300 ? 'SUCCESS' : 'FAILED';
+    const context =
+      req.auditLoginContext && typeof req.auditLoginContext === 'object'
+        ? req.auditLoginContext
+        : {};
+    const userPayload =
+      data?.user && typeof data.user === 'object'
+        ? data.user
+        : {};
+    const userId =
+      userPayload?._id ||
+      userPayload?.id ||
+      context.userId ||
+      null;
+    const userEmail =
+      userPayload?.email ||
+      context.userEmail ||
+      req.body?.email ||
+      null;
+    const userName = userPayload?.name || context.userName || null;
+    const userRole = userPayload?.role || context.userRole || null;
+    const tenantId =
+      userPayload?.tenantId ||
+      userPayload?.tenant?._id ||
+      context.tenantId ||
+      null;
+    const ipAddress = resolveClientIp(req);
+    const userAgent = req.get('user-agent') || null;
+    const deviceInfo = detectClientDevice(userAgent);
+
     const details = {
-      email: req.body?.email || 'unknown',
-      ip: req.ip || req.connection?.remoteAddress,
-      ipAddress: req.ip || req.connection?.remoteAddress,
-      userAgent: req.get('user-agent'),
-      statusCode: res.statusCode,
-      userId: data?.user?._id || data?.user?.id || null,
+      attemptedEmail: req.body?.email || null,
+      email: userEmail || req.body?.email || 'unknown',
+      userId,
+      userEmail,
+      userName,
+      userRole,
+      tenantId,
+      method: req.method,
+      path: req.path,
+      resourceType: 'User',
+      resourceId: userId || null,
+      status,
+      ip: ipAddress,
+      ipAddress,
+      userAgent,
+      device: deviceInfo.device,
+      browser: deviceInfo.browser,
+      statusCode,
     };
-    
+
     // Call async function but don't await (non-blocking)
-    logAuditEvent(action, details).catch(err => {
+    logAuditEvent(AUDIT_ACTIONS.USER_LOGIN, details).catch(err => {
       console.error('[AUDIT LOGIN ERROR]', err);
     });
     return originalJson.call(this, data);
@@ -79,17 +155,18 @@ export const auditLogin = (req, res, next) => {
 /**
  * Audit logout
  */
-export const auditLogout = auditLog(AUDIT_ACTIONS.LOGOUT);
+export const auditLogout = auditLog(AUDIT_ACTIONS.USER_LOGOUT);
 
 /**
  * Audit unauthorized access attempts
  */
 export const auditUnauthorized = (req, res) => {
+  const ipAddress = resolveClientIp(req);
   logAuditEvent(AUDIT_ACTIONS.UNAUTHORIZED_ACCESS, {
     method: req.method,
     path: req.path,
-    ip: req.ip || req.connection?.remoteAddress,
-    ipAddress: req.ip || req.connection?.remoteAddress,
+    ip: ipAddress,
+    ipAddress,
     userAgent: req.get('user-agent'),
     hasToken: !!req.headers.authorization,
   }).catch(err => {

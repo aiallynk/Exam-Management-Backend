@@ -49,10 +49,17 @@ import {
 import {
   FREE_PLAN_MESSAGES,
   getSubscriptionPlanDefinition,
+  isFreePlan,
   isPlanFeatureEnabled,
 } from '../config/planLimits.js';
 import { resolveExamPlanContext } from '../middleware/planRestrictions.js';
 import { enforceExamAccessControl } from '../utils/examSecurity.js';
+import {
+  AI_GRADING_LIMIT_EXCEEDED_MESSAGE,
+  getTenantAiGradingUsageSnapshot,
+  incrementTenantAiGradingUsage,
+  toAiUsageResponsePayload,
+} from '../services/aiGradingUsageService.js';
 
 const parseArrayAnswer = (value) => {
   if (Array.isArray(value)) {
@@ -106,6 +113,118 @@ const arrayEqualsIgnoreOrder = (a, b) => {
     }
   }
   return true;
+};
+
+const WRITING_QUESTION_TYPES = new Set(['ESSAY', 'ESSAY_LETTER', 'ESSAY_STORY']);
+
+const sendWritingPlanRestriction = (res) =>
+  res.status(403).json({
+    success: false,
+    message: FREE_PLAN_MESSAGES.WRITING_AI_LOCKED,
+  });
+
+const hasWritingQuestionsInPaper = async (questionPaperId) => {
+  if (!questionPaperId) return false;
+  const exists = await Question.exists({
+    questionPaperId,
+    questionType: { $in: Array.from(WRITING_QUESTION_TYPES) },
+  });
+  return Boolean(exists);
+};
+
+const resolveAiGradingProfile = (planType) => {
+  const normalized = String(planType || '').trim().toLowerCase();
+  if (normalized === 'legend') return 'advanced';
+  if (normalized === 'ultimate') return 'enhanced';
+  return 'basic';
+};
+
+const normalizeAiGradingTypeKey = (value) =>
+  String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_')
+    .replace(/[^a-z0-9_]/g, '')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+
+const resolveAiGradingTypeForQuestion = (questionType) => {
+  const normalized = normalizeAiGradingTypeKey(questionType);
+  if (normalized === 'short_answer') return 'short';
+  if (normalized === 'paragraph') return 'paragraph';
+  if (normalized === 'essay') return 'essay';
+  if (normalized === 'essay_letter' || normalized === 'letter_writing') {
+    return 'essay_letter';
+  }
+  if (normalized === 'essay_story' || normalized === 'story_writing') {
+    return 'essay_story';
+  }
+  return '';
+};
+
+const computeMultiSelectScoring = ({
+  question,
+  studentAnswer,
+  examMarkingRules = {},
+}) => {
+  const questionPoints = Number(question?.points) || 0;
+  const normalizedOptions = sanitizeQuestionOptions(question?.options);
+  const expected = normalizeQuestionCorrectAnswer({
+    questionType: 'MULTIPLE_OPTIONS',
+    correctAnswer: question?.correctAnswer,
+    options: normalizedOptions,
+  });
+  const received = normalizeQuestionCorrectAnswer({
+    questionType: 'MULTIPLE_OPTIONS',
+    correctAnswer: studentAnswer,
+    options: normalizedOptions,
+  });
+
+  const expectedSet = new Set(expected.map((item) => String(item).toLowerCase()));
+  const receivedSet = new Set(received.map((item) => String(item).toLowerCase()));
+  const correctSelectionCount = Array.from(receivedSet).filter((item) => expectedSet.has(item)).length;
+  const wrongSelectionCount = Array.from(receivedSet).filter((item) => !expectedSet.has(item)).length;
+  const allCorrect =
+    expected.length > 0 &&
+    wrongSelectionCount === 0 &&
+    correctSelectionCount === expectedSet.size &&
+    receivedSet.size === expectedSet.size;
+
+  const questionScoring =
+    question?.multiSelectScoring &&
+    typeof question.multiSelectScoring === 'object' &&
+    !Array.isArray(question.multiSelectScoring)
+      ? question.multiSelectScoring
+      : {};
+  const partialMarkingEnabled =
+    questionScoring.partialMarking === true ||
+    questionScoring.enablePartialMarking === true ||
+    examMarkingRules?.multiSelectPartialMarking === true;
+  const deductWrongSelections =
+    questionScoring.deductWrongSelections === true ||
+    examMarkingRules?.multiSelectDeductWrongSelections === true;
+  const configuredPenaltyRaw =
+    questionScoring.wrongSelectionPenalty ??
+    examMarkingRules?.multiSelectWrongSelectionPenalty ??
+    (examMarkingRules?.negativeMarking ? examMarkingRules?.negativeMarks : 0);
+  const wrongSelectionPenalty = Number.isFinite(Number(configuredPenaltyRaw))
+    ? Number(configuredPenaltyRaw)
+    : 0;
+
+  let pointsEarned = allCorrect ? questionPoints : 0;
+  if (!allCorrect && partialMarkingEnabled && expectedSet.size > 0) {
+    pointsEarned = (questionPoints * correctSelectionCount) / expectedSet.size;
+    if (deductWrongSelections && wrongSelectionCount > 0 && wrongSelectionPenalty > 0) {
+      pointsEarned -= wrongSelectionCount * wrongSelectionPenalty;
+    }
+    pointsEarned = Number(Math.max(pointsEarned, 0).toFixed(2));
+  }
+
+  return {
+    isCorrect: allCorrect,
+    pointsEarned,
+    normalizedAnswerText: received.length ? JSON.stringify(received) : '',
+  };
 };
 
 const normalizeAnswerForStorage = (questionType, value) => {
@@ -843,6 +962,15 @@ router.post(
       }).populate('questionPaperId', 'setName');
 
       if (activeAttempt) {
+        if (
+          isFreePlan(effectivePlanType) &&
+          await hasWritingQuestionsInPaper(
+            activeAttempt.questionPaperId?._id || activeAttempt.questionPaperId
+          )
+        ) {
+          return sendWritingPlanRestriction(res);
+        }
+
         const ipLockCheck = await enforceAttemptIpLock({
           attempt: activeAttempt,
           req,
@@ -888,6 +1016,13 @@ router.post(
       });
       const assignedQuestionPaperId =
         assignment.questionPaperId?._id || assignment.questionPaperId;
+
+      if (
+        isFreePlan(effectivePlanType) &&
+        await hasWritingQuestionsInPaper(assignedQuestionPaperId)
+      ) {
+        return sendWritingPlanRestriction(res);
+      }
 
       await ensureQuestionPaperImagesReady({
         questionPaperId: assignedQuestionPaperId,
@@ -1069,6 +1204,16 @@ router.get('/:attemptId/progress', requireAuth, validateObjectId('attemptId'), a
       return res.status(400).json({ error: 'No question paper assigned for this attempt.' });
     }
 
+    const getProgressPlanContext = await resolveExamPlanContext(attempt.examId?._id || attempt.examId);
+    if (
+      !canReview &&
+      getProgressPlanContext?.planType &&
+      isFreePlan(getProgressPlanContext.planType) &&
+      await hasWritingQuestionsInPaper(assignedQuestionPaperId)
+    ) {
+      return sendWritingPlanRestriction(res);
+    }
+
     const questions = await Question.find({
       questionPaperId: assignedQuestionPaperId,
     }).select('_id questionType');
@@ -1180,6 +1325,16 @@ router.put(
         return res.status(400).json({ error: 'No question paper assigned for this attempt.' });
       }
 
+      const putProgressPlanContext = await resolveExamPlanContext(attempt.examId?._id || attempt.examId);
+      if (
+        !canReview &&
+        putProgressPlanContext?.planType &&
+        isFreePlan(putProgressPlanContext.planType) &&
+        await hasWritingQuestionsInPaper(assignedQuestionPaperId)
+      ) {
+        return sendWritingPlanRestriction(res);
+      }
+
       let sectionProgress = null;
       if (req.body.currentSectionId) {
         try {
@@ -1289,7 +1444,10 @@ export const submitAttemptHandler = async (req, res, next) => {
     }
 
     const attempt = await ExamAttempt.findById(req.params.attemptId)
-      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt accessControl')
+      .populate(
+        'examId',
+        'title duration showResultsImmediately resultsReleasedAt accessControl markingRules'
+      )
       .populate('sessionId');
 
     if (!attempt) {
@@ -1298,14 +1456,38 @@ export const submitAttemptHandler = async (req, res, next) => {
 
     const examId = attempt.examId?._id || attempt.examId;
     const planContext = await resolveExamPlanContext(examId);
+    const isFreePlanContext = planContext?.planType
+      ? isFreePlan(planContext.planType)
+      : false;
+    const aiGradingProfile = resolveAiGradingProfile(planContext?.planType);
+    const effectivePlanDefinition = getSubscriptionPlanDefinition(
+      planContext?.planType || 'free'
+    );
+    const planAiTypesAllowedRaw =
+      effectivePlanDefinition?.features?.aiTypesAllowed ??
+      effectivePlanDefinition?.features?.ai_types_allowed;
+    const planAiTypeList = Array.isArray(planAiTypesAllowedRaw)
+      ? planAiTypesAllowedRaw
+      : typeof planAiTypesAllowedRaw === 'string'
+        ? planAiTypesAllowedRaw.split(/[,\n;|]/)
+        : [];
+    const planAiTypesAllowed = new Set(
+      planAiTypeList
+        .map((entry) => normalizeAiGradingTypeKey(entry))
+        .filter(Boolean)
+    );
+    const aiTypeRestrictionEnabled =
+      planAiTypesAllowedRaw !== undefined && planAiTypesAllowedRaw !== null;
     const subjectiveAutoGradingEnabled = planContext?.planType
       ? (
+        !isFreePlanContext &&
         isPlanFeatureEnabled(planContext.planType, 'aiGrading') &&
         isPlanFeatureEnabled(planContext.planType, 'aiSubjectiveAutoGrading')
       )
       : true;
     const rubricScoringEnabled = planContext?.planType
       ? (
+        !isFreePlanContext &&
         isPlanFeatureEnabled(planContext.planType, 'aiGrading') &&
         isPlanFeatureEnabled(planContext.planType, 'aiRubricScoring')
       )
@@ -1313,6 +1495,19 @@ export const submitAttemptHandler = async (req, res, next) => {
     const codingEnabled = planContext?.planType
       ? isPlanFeatureEnabled(planContext.planType, 'codingCompiler')
       : true;
+    const aiUsageTenantId = attempt?.tenantId || req.user?.tenantId || null;
+    let aiGradingUsageSnapshot = null;
+    let aiGradingUsageLoaded = false;
+    let aiGradingLimitReached = false;
+    const loadAiGradingUsageSnapshot = async () => {
+      if (!aiUsageTenantId) return null;
+      if (aiGradingUsageLoaded) return aiGradingUsageSnapshot;
+      aiGradingUsageLoaded = true;
+      aiGradingUsageSnapshot = await getTenantAiGradingUsageSnapshot({
+        tenantId: aiUsageTenantId,
+      });
+      return aiGradingUsageSnapshot;
+    };
 
     // Verify ownership: users can only submit their own attempts (unless they have REVIEW_ANSWERS permission)
     const canReview = await hasExamPermission(
@@ -1451,6 +1646,13 @@ export const submitAttemptHandler = async (req, res, next) => {
       questionPaperId: assignedQuestionPaperId,
     }).sort({ order: 1 });
 
+    if (
+      isFreePlanContext &&
+      questions.some((question) => WRITING_QUESTION_TYPES.has(String(question?.questionType || '').toUpperCase()))
+    ) {
+      return sendWritingPlanRestriction(res);
+    }
+
     const existingAnswers = await Answer.find({ attemptId: attempt._id }).select(
       'questionId answerText isCorrect pointsEarned aiEvaluation codingResult submissionId'
     );
@@ -1493,19 +1695,14 @@ export const submitAttemptHandler = async (req, res, next) => {
       ) {
         const normalizedOptions = sanitizeQuestionOptions(question.options);
         if (question.questionType === 'MULTIPLE_OPTIONS') {
-          const expected = normalizeQuestionCorrectAnswer({
-            questionType: question.questionType,
-            correctAnswer: question.correctAnswer,
-            options: normalizedOptions,
+          const multiSelectResult = computeMultiSelectScoring({
+            question,
+            studentAnswer,
+            examMarkingRules: attempt.examId?.markingRules || {},
           });
-          const received = normalizeQuestionCorrectAnswer({
-            questionType: question.questionType,
-            correctAnswer: studentAnswer,
-            options: normalizedOptions,
-          });
-          isCorrect = expected.length > 0 && arrayEqualsIgnoreOrder(expected, received);
-          normalizedAnswerText = received.length ? JSON.stringify(received) : '';
-          pointsEarned = isCorrect ? question.points : 0;
+          isCorrect = multiSelectResult.isCorrect;
+          normalizedAnswerText = multiSelectResult.normalizedAnswerText;
+          pointsEarned = multiSelectResult.pointsEarned;
         } else if (question.questionType === 'NUMBER') {
           isCorrect = String(studentAnswer).trim() === String(question.correctAnswer ?? '').trim();
           pointsEarned = isCorrect ? question.points : 0;
@@ -1524,7 +1721,11 @@ export const submitAttemptHandler = async (req, res, next) => {
           isCorrect = String(received).trim() === String(expected).trim();
           pointsEarned = isCorrect ? question.points : 0;
         }
-      } else if (['SHORT_ANSWER', 'PARAGRAPH'].includes(question.questionType)) {
+      } else if (
+        ['SHORT_ANSWER', 'PARAGRAPH', 'ESSAY', 'ESSAY_LETTER', 'ESSAY_STORY'].includes(
+          question.questionType
+        )
+      ) {
         const hasSubjectiveAnswer = String(studentAnswer).trim().length > 0;
 
         if (hasSubjectiveAnswer) {
@@ -1533,52 +1734,141 @@ export const submitAttemptHandler = async (req, res, next) => {
             isCorrect = false;
             aiEvaluation = {
               needsReview: true,
-              reason: 'Subjective answers require manual evaluation in the current plan.',
+              reason:
+                isFreePlanContext || WRITING_QUESTION_TYPES.has(question.questionType)
+                  ? FREE_PLAN_MESSAGES.WRITING_AI_LOCKED
+                  : 'Subjective answers require manual evaluation in the current plan.',
             };
           } else {
-            // AI evaluation for subjective questions (skip empty answers)
-            try {
-              aiEvaluation = await evaluateAnswer({
-                question: question.questionText,
-                correctAnswer: question.correctAnswer,
-                studentAnswer,
-                questionType: question.questionType,
-                points: question.points,
-                tenantId: attempt?.tenantId || req.user?.tenantId || null,
-                userId: req.user?._id || null,
-                metadata: {
-                  tenantId: attempt?.tenantId || req.user?.tenantId || null,
-                  userId: req.user?._id || null,
-                },
-                rubricScoringEnabled,
-                rubric: rubricScoringEnabled
-                  ? (
-                    question.questionType === 'SHORT_ANSWER'
-                      ? [
-                        { criterion: 'Accuracy', weight: 50, description: 'Correctness of the core answer.' },
-                        { criterion: 'Key Points', weight: 30, description: 'Coverage of expected key points.' },
-                        { criterion: 'Clarity', weight: 20, description: 'Clarity and directness of response.' },
-                      ]
-                      : [
-                        { criterion: 'Accuracy', weight: 40, description: 'Conceptual correctness and factual accuracy.' },
-                        { criterion: 'Completeness', weight: 30, description: 'Coverage of required concepts and details.' },
-                        { criterion: 'Reasoning', weight: 20, description: 'Logical explanation and supporting reasoning.' },
-                        { criterion: 'Clarity', weight: 10, description: 'Structure, language quality, and readability.' },
-                      ]
-                  )
-                  : [],
-              });
+            const aiTypeKey = resolveAiGradingTypeForQuestion(question.questionType);
+            const aiTypeAllowed =
+              !aiTypeRestrictionEnabled || (aiTypeKey && planAiTypesAllowed.has(aiTypeKey));
 
-              isCorrect = aiEvaluation.isCorrect;
-              pointsEarned = aiEvaluation.pointsEarned;
-            } catch (error) {
-              console.error('AI evaluation error:', error);
-              // Fallback: no points if AI fails
+            if (!aiTypeAllowed) {
               pointsEarned = 0;
+              isCorrect = false;
               aiEvaluation = {
-                error: 'Evaluation failed',
                 needsReview: true,
+                reason:
+                  'AI grading is not enabled for this answer type in your current plan settings.',
               };
+            } else {
+              const usageSnapshot = await loadAiGradingUsageSnapshot();
+              const aiLimitReached =
+                usageSnapshot &&
+                usageSnapshot.unlimited !== true &&
+                Number(usageSnapshot.remaining) <= 0;
+              if (usageSnapshot && !usageSnapshot.allowed) {
+                if (aiLimitReached) {
+                  aiGradingLimitReached = true;
+                }
+                pointsEarned = 0;
+                isCorrect = false;
+                aiEvaluation = {
+                  needsReview: true,
+                  reason: usageSnapshot.message || AI_GRADING_LIMIT_EXCEEDED_MESSAGE,
+                };
+              } else {
+                // AI evaluation for subjective questions (skip empty answers)
+                try {
+                  aiEvaluation = await evaluateAnswer({
+                    question: question.questionText,
+                    correctAnswer: question.correctAnswer,
+                    studentAnswer,
+                    questionType: question.questionType,
+                    points: question.points,
+                    tenantId: attempt?.tenantId || req.user?.tenantId || null,
+                    userId: req.user?._id || null,
+                    metadata: {
+                      tenantId: attempt?.tenantId || req.user?.tenantId || null,
+                      userId: req.user?._id || null,
+                    },
+                    gradingProfile: aiGradingProfile,
+                    rubricScoringEnabled,
+                    rubric: rubricScoringEnabled
+                      ? (
+                        question.questionType === 'SHORT_ANSWER'
+                          ? [
+                            { criterion: 'Accuracy', weight: 50, description: 'Correctness of the core answer.' },
+                            { criterion: 'Key Points', weight: 30, description: 'Coverage of expected key points.' },
+                            { criterion: 'Clarity', weight: 20, description: 'Clarity and directness of response.' },
+                          ]
+                          : WRITING_QUESTION_TYPES.has(question.questionType)
+                            ? [
+                              {
+                                criterion: 'Structure',
+                                weight: 25,
+                                description:
+                                  question.questionType === 'ESSAY_LETTER'
+                                    ? 'Letter format/organization and proper sections.'
+                                    : 'Clear opening, development, and closure.',
+                              },
+                              {
+                                criterion: 'Content Depth',
+                                weight: 30,
+                                description:
+                                  question.questionType === 'ESSAY_STORY'
+                                    ? 'Depth of narrative detail and originality.'
+                                    : 'Coverage and development of relevant ideas.',
+                              },
+                              {
+                                criterion: 'Coherence',
+                                weight: 25,
+                                description:
+                                  question.questionType === 'ESSAY_STORY'
+                                    ? 'Narrative flow, continuity, and readability.'
+                                    : 'Logical flow, connected arguments, and clarity.',
+                              },
+                              {
+                                criterion: 'Language Quality',
+                                weight: 20,
+                                description:
+                                  question.questionType === 'ESSAY_LETTER'
+                                    ? 'Appropriate tone, grammar, and readability for letter writing.'
+                                    : 'Grammar, readability, and expression quality.',
+                              },
+                            ]
+                            : [
+                            { criterion: 'Accuracy', weight: 40, description: 'Conceptual correctness and factual accuracy.' },
+                            { criterion: 'Completeness', weight: 30, description: 'Coverage of required concepts and details.' },
+                            { criterion: 'Reasoning', weight: 20, description: 'Logical explanation and supporting reasoning.' },
+                            { criterion: 'Clarity', weight: 10, description: 'Structure, language quality, and readability.' },
+                            ]
+                      )
+                      : [],
+                  });
+
+                  if (
+                    aiUsageTenantId &&
+                    String(aiEvaluation?.provider || '').toLowerCase() === 'openai'
+                  ) {
+                    const usageIncrement = await incrementTenantAiGradingUsage({
+                      tenantId: aiUsageTenantId,
+                    });
+                    if (usageIncrement?.usage) {
+                      aiGradingUsageSnapshot = usageIncrement.usage;
+                      aiGradingUsageLoaded = true;
+                      if (
+                        usageIncrement.usage.unlimited !== true &&
+                        Number(usageIncrement.usage.remaining) <= 0
+                      ) {
+                        aiGradingLimitReached = true;
+                      }
+                    }
+                  }
+
+                  isCorrect = aiEvaluation.isCorrect;
+                  pointsEarned = aiEvaluation.pointsEarned;
+                } catch (error) {
+                  console.error('AI evaluation error:', error);
+                  // Fallback: no points if AI fails
+                  pointsEarned = 0;
+                  aiEvaluation = {
+                    error: 'Evaluation failed',
+                    needsReview: true,
+                  };
+                }
+              }
             }
           }
         }
@@ -1872,6 +2162,9 @@ export const submitAttemptHandler = async (req, res, next) => {
       }
       : null;
     const hasDeferredCodingEvaluation = deferredCodingEvaluations.length > 0;
+    const aiUsagePayload = aiGradingUsageSnapshot
+      ? toAiUsageResponsePayload(aiGradingUsageSnapshot)
+      : null;
 
     res.json({
       success: true,
@@ -1886,6 +2179,10 @@ export const submitAttemptHandler = async (req, res, next) => {
         ? 'Attempt submitted successfully.'
         : 'Attempt submitted successfully. Results are not yet released for candidates.',
       codingEvaluationPending: hasDeferredCodingEvaluation,
+      ai_usage: aiUsagePayload,
+      ai_usage_message: aiGradingLimitReached
+        ? AI_GRADING_LIMIT_EXCEEDED_MESSAGE
+        : null,
     });
 
     // Evaluate coding questions in the background to avoid blocking final exam submission.
@@ -2835,6 +3132,15 @@ router.post(
 
       if (attempt.isCompleted) {
         return res.status(400).json({ error: 'Attempt already submitted' });
+      }
+
+      const planContext = await resolveExamPlanContext(attempt.examId);
+      if (
+        planContext?.planType &&
+        isFreePlan(planContext.planType) &&
+        await hasWritingQuestionsInPaper(attempt.questionPaperId)
+      ) {
+        return sendWritingPlanRestriction(res);
       }
 
       // Prepare attempt data for reconciliation

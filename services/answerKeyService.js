@@ -146,8 +146,13 @@ const extractAnswersFromText = async (text, { tenantId = null, userId = null } =
     
     // Convert extracted questions to answer key format
     const answers = {};
-    if (Array.isArray(extracted.questions)) {
-      extracted.questions.forEach((q, index) => {
+    const extractedQuestions = Array.isArray(extracted)
+      ? extracted
+      : Array.isArray(extracted?.questions)
+        ? extracted.questions
+        : [];
+    if (extractedQuestions.length) {
+      extractedQuestions.forEach((q, index) => {
         if (q.correctAnswer) {
           answers[`q${index + 1}`] = {
             correctAnswer: q.correctAnswer,

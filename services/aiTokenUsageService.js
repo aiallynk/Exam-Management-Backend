@@ -435,3 +435,106 @@ export const getAIQuestionCountForTenantByWindow = async (tenantId, start, end) 
     return 0;
   }
 };
+
+const normalizeFeatureList = (features = []) => {
+  if (!Array.isArray(features)) return [];
+  return features
+    .map((feature) => normalizeFeature(feature))
+    .filter(Boolean);
+};
+
+const aggregateUsageCountForTenantByWindow = async ({
+  tenantId,
+  start,
+  end,
+  features = [],
+  requestStatus = 'SUCCESS',
+  field = 'usage_count',
+}) => {
+  const resolvedTenantId = toObjectIdOrNull(tenantId);
+  if (!resolvedTenantId) return 0;
+  if (!(start instanceof Date) || Number.isNaN(start.getTime())) return 0;
+  if (!(end instanceof Date) || Number.isNaN(end.getTime())) return 0;
+
+  const normalizedFeatures = normalizeFeatureList(features);
+  if (!normalizedFeatures.length) return 0;
+
+  const normalizedField = String(field || 'usage_count').trim();
+  const safeField =
+    ['usage_count', 'question_count', 'tokens_used', 'total_tokens', 'events'].includes(
+      normalizedField
+    )
+      ? normalizedField
+      : 'usage_count';
+  const safeStatus = normalizeRequestStatus(requestStatus);
+
+  const totalUsageExpression =
+    safeField === 'events'
+      ? 1
+      : {
+          $ifNull: [`$${safeField}`, 0],
+        };
+
+  const aggregation = await AITokenUsage.aggregate([
+    {
+      $match: {
+        tenant_id: resolvedTenantId,
+        feature: { $in: normalizedFeatures },
+        request_status: safeStatus,
+        created_at: { $gte: start, $lt: end },
+      },
+    },
+    {
+      $group: {
+        _id: null,
+        totalUsage: {
+          $sum: totalUsageExpression,
+        },
+      },
+    },
+  ]);
+
+  return asNonNegativeInteger(aggregation?.[0]?.totalUsage);
+};
+
+export const getAIUsageCountForTenantByWindow = async (
+  tenantId,
+  start,
+  end,
+  {
+    features = [],
+    fallbackFeatures = [],
+    requestStatus = 'SUCCESS',
+    field = 'usage_count',
+  } = {}
+) => {
+  try {
+    const usage = await aggregateUsageCountForTenantByWindow({
+      tenantId,
+      start,
+      end,
+      features,
+      requestStatus,
+      field,
+    });
+
+    if (usage > 0 || !Array.isArray(fallbackFeatures) || fallbackFeatures.length === 0) {
+      return usage;
+    }
+
+    return aggregateUsageCountForTenantByWindow({
+      tenantId,
+      start,
+      end,
+      features: fallbackFeatures,
+      requestStatus,
+      field,
+    });
+  } catch (error) {
+    console.warn(
+      '[ai-token-usage] failed to read tenant usage count:',
+      error?.message || error
+    );
+    return 0;
+  }
+};

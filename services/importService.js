@@ -17,9 +17,13 @@ import {
 const VALID_QUESTION_TYPES = [
   'MULTIPLE_CHOICE',
   'MULTIPLE_OPTIONS',
+  'MULTI_SELECT_MCQ',
   'TRUE_FALSE',
   'SHORT_ANSWER',
   'PARAGRAPH',
+  'ESSAY',
+  'ESSAY_LETTER',
+  'ESSAY_STORY',
   'NUMBER',
 ];
 
@@ -373,8 +377,12 @@ export const parsePDFFile = async (
           userId,
         },
       });
-      
-      const questions = Array.isArray(extracted.questions) ? extracted.questions : [];
+
+      const questions = Array.isArray(extracted)
+        ? extracted
+        : Array.isArray(extracted?.questions)
+          ? extracted.questions
+          : [];
       
       // Validate extracted questions
       const preview = questions.map((q, index) => {

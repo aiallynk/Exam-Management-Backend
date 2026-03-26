@@ -23,6 +23,10 @@ import {
   getExamCountForTenantByWindow,
   getAttemptCountForTenantByWindow,
 } from '../utils/planUsage.js';
+import {
+  applyExtraCreditsToPlanLimits,
+  resolveCreditTypeByLimitType,
+} from '../utils/creditSystem.js';
 
 const USER_ROLE_LIMITS = Object.freeze({
   EXAM_CREATOR: FREE_TRIAL_LIMITS.maxExamCreators,
@@ -111,7 +115,7 @@ const resolveTenantSubscriptionContext = async (tenantId, fallbackPlanType) => {
   }
 
   const tenant = await Tenant.findById(tenantId)
-    .select('subscription examLimit attemptLimit aiUsageLimit')
+    .select('subscription examLimit attemptLimit aiUsageLimit extraCredits')
     .lean();
   const subscription = tenant?.subscription || null;
   const subscriptionStatus = resolveSubscriptionStatus(subscription || {});
@@ -135,9 +139,37 @@ const buildUsageWindow = (subscription = null) => {
   return { start, end };
 };
 
-const resolvePlanLimitWithOverride = ({ customLimits, key, legacyValue, baseValue }) => {
-  if (hasOwn(customLimits, key)) {
-    return resolveFinitePlanLimit(customLimits[key]);
+const resolvePlanLimitWithOverride = ({
+  customLimits,
+  key,
+  legacyValue,
+  baseValue,
+  aliasKeys = [],
+}) => {
+  const resolveCustomLimitOverride = (targetKey) => {
+    if (!hasOwn(customLimits, targetKey)) return undefined;
+    const rawValue = customLimits[targetKey];
+    if (rawValue === null || rawValue === undefined || rawValue === '') {
+      return undefined;
+    }
+    if (Number(rawValue) === -1) {
+      return null;
+    }
+    return resolveFinitePlanLimit(rawValue);
+  };
+
+  const directOverride = resolveCustomLimitOverride(key);
+  if (directOverride !== undefined) {
+    return directOverride;
+  }
+
+  if (Array.isArray(aliasKeys)) {
+    for (const aliasKey of aliasKeys) {
+      const aliasOverride = resolveCustomLimitOverride(aliasKey);
+      if (aliasOverride !== undefined) {
+        return aliasOverride;
+      }
+    }
   }
   const legacyLimit = resolveFinitePlanLimit(legacyValue);
   if (legacyLimit !== null) {
@@ -153,7 +185,7 @@ const resolvePlanLimits = (planType, tenant = null) => {
   const subscription = tenant?.subscription || {};
   const customLimits = normalizeOptionalObject(subscription.customLimits);
 
-  return {
+  const limits = {
     ...baseLimits,
     maxExamsPerMonth: resolvePlanLimitWithOverride({
       customLimits,
@@ -173,6 +205,19 @@ const resolvePlanLimits = (planType, tenant = null) => {
       legacyValue: tenant?.aiUsageLimit,
       baseValue: baseLimits?.maxAiQuestionsPerMonth,
     }),
+    maxImportFiles: resolvePlanLimitWithOverride({
+      customLimits,
+      key: 'maxImportFiles',
+      aliasKeys: ['importQuestionsPerMonth'],
+      legacyValue: null,
+      baseValue: baseLimits?.maxImportFiles,
+    }),
+    maxQuestionsPerExam: resolvePlanLimitWithOverride({
+      customLimits,
+      key: 'maxQuestionsPerExam',
+      legacyValue: null,
+      baseValue: baseLimits?.maxQuestionsPerExam,
+    }),
     maxCandidates: resolvePlanLimitWithOverride({
       customLimits,
       key: 'maxCandidates',
@@ -180,6 +225,8 @@ const resolvePlanLimits = (planType, tenant = null) => {
       baseValue: baseLimits?.maxCandidates,
     }),
   };
+
+  return applyExtraCreditsToPlanLimits(limits, tenant?.extraCredits);
 };
 
 const buildUsagePayload = (
@@ -251,10 +298,22 @@ const sendLimitResponse = (
     limitType: alertContext?.limitType || 'general',
   });
 
+  const requestCreditType = resolveCreditTypeByLimitType(alertContext?.limitType);
+  const currentUserRole = String(alertContext?.req?.user?.role || '').trim().toUpperCase();
+  const canRequestCredits = currentUserRole === 'TENANT_ADMIN' && Boolean(requestCreditType);
+
   return res.status(403).json({
     message,
     showUpgradeModal: true,
     usage,
+    ...(canRequestCredits
+      ? {
+          requestCredits: {
+            enabled: true,
+            type: requestCreditType,
+          },
+        }
+      : {}),
     ...extra,
   });
 };
@@ -550,9 +609,13 @@ export const checkQuestionLimit = async (req, res, next) => {
       req.planLimitContext?.questionsToAdd ?? req.body?.questionsToAdd,
       1
     );
-    const maxQuestionsPerExam = isTrialRestrictedPlan(effectivePlanType)
-      ? FREE_TRIAL_LIMITS.maxQuestions
-      : resolveFinitePlanLimit(planLimits?.maxQuestionsPerExam);
+    const configuredMaxQuestionsPerExam = resolveFinitePlanLimit(planLimits?.maxQuestionsPerExam);
+    const maxQuestionsPerExam =
+      configuredMaxQuestionsPerExam !== null
+        ? configuredMaxQuestionsPerExam
+        : isTrialRestrictedPlan(effectivePlanType)
+          ? FREE_TRIAL_LIMITS.maxQuestions
+          : null;
 
     if (maxQuestionsPerExam !== null && questionCount + questionsToAdd > maxQuestionsPerExam) {
       const questionLimitMessage = isTrialRestrictedPlan(effectivePlanType)

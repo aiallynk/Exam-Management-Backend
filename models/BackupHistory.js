@@ -14,6 +14,12 @@ const BackupHistorySchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    trigger_type: {
+      type: String,
+      enum: ['MANUAL', 'AUTO'],
+      default: 'MANUAL',
+      index: true,
+    },
     company_id: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Tenant',
@@ -78,5 +84,6 @@ const BackupHistorySchema = new mongoose.Schema(
 
 BackupHistorySchema.index({ type: 1, created_at: -1 });
 BackupHistorySchema.index({ company_id: 1, created_at: -1 });
+BackupHistorySchema.index({ trigger_type: 1, company_id: 1, created_at: -1 });
 
 export default mongoose.model('BackupHistory', BackupHistorySchema);

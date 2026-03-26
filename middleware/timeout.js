@@ -14,6 +14,7 @@ export const requestTimeout = (timeoutMs = 30000) => {
     const extendedTimeoutRoutes = {
       '/api/exams/generate-questions': 300000, // 5 minutes for AI question generation
       '/api/exams/import-questions': 300000,    // 5 minutes for AI question extraction from files
+      '/api/omr/extract-id': 90000, // 90 seconds for OCR-based identity extraction
       '/api/super-admin/backups': 600000, // 10 minutes for large backup creation
       '/api/super-admin/backups/restore-upload': 600000, // 10 minutes for upload + restore
       '/api/admin/system/backup': 600000, // 10 minutes for large backup creation

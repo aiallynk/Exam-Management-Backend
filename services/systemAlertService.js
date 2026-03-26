@@ -14,6 +14,11 @@ import {
   resolveSubscriptionStatus,
 } from '../config/planLimits.js';
 import { getCurrentMonthRange } from '../utils/planUsage.js';
+import {
+  buildAlertUserLabel,
+  resolveAlertUserEmail,
+  resolveAlertUserName,
+} from '../utils/alertActorLabel.js';
 
 const VALID_SEVERITIES = new Set(SYSTEM_ALERT_SEVERITIES);
 const VALID_CATEGORIES = new Set(SYSTEM_ALERT_CATEGORIES);
@@ -371,12 +376,10 @@ const humanizeAction = (action) =>
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (char) => char.toUpperCase());
 
-const resolveActorLabel = (details = {}) =>
-  toTrimmedString(
-    details.userName ||
-      details.userEmail ||
-      (details.userId ? `User ${details.userId}` : 'System')
-  );
+const resolveActorLabel = (details = {}) => {
+  const normalizedUserId = normalizeEntityId(details.userId);
+  return buildAlertUserLabel(details, normalizedUserId ? `User ${normalizedUserId}` : 'System');
+};
 
 const resolveEntityLabel = (details = {}) => {
   const resourceType = toTrimmedString(details.resourceType || details.entityType);
@@ -433,6 +436,8 @@ export const emitSystemAlertFromAuditEvent = async (action, details = {}) => {
     const message = buildAuditMessage(normalizedAction, details);
     const entityType = toTrimmedString(details.resourceType || details.entityType || category);
     const entityId = normalizeEntityId(details.resourceId || details.entityId);
+    const actorUserName = resolveAlertUserName(details);
+    const actorUserEmail = resolveAlertUserEmail(details);
 
     return await createSystemAlert({
       title,
@@ -446,6 +451,8 @@ export const emitSystemAlertFromAuditEvent = async (action, details = {}) => {
       metadata: {
         action: normalizedAction,
         actor_user_id: normalizeEntityId(details.userId),
+        actor_user_name: actorUserName,
+        actor_user_email: actorUserEmail,
         actor_role: toTrimmedString(details.userRole),
         tenant_id: normalizeEntityId(details.tenantId),
         method: toTrimmedString(details.method),

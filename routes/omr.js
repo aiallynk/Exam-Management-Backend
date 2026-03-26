@@ -59,6 +59,26 @@ const SUPPORTED_PDF_EXTENSIONS = new Set(['.pdf']);
 const SUPPORTED_EXTENSIONS = new Set([...SUPPORTED_IMAGE_EXTENSIONS, ...SUPPORTED_PDF_EXTENSIONS]);
 const LETTERS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
 const CANDIDATE_LIKE_ROLES = ['CANDIDATE', 'STUDENT', 'USER'];
+const EXAM_CODE_MIN_LENGTH = 4;
+const EXAM_CODE_MAX_LENGTH = 32;
+const EXAM_CODE_NUMERIC_MIN_LENGTH = 5;
+const EXAM_CODE_NUMERIC_MAX_LENGTH = 8;
+const ROLL_NUMBER_LIKE_MIN_LENGTH = 10;
+const OMR_DEBUG_LOGS =
+  process.env.NODE_ENV !== 'production' ||
+  String(process.env.OMR_DEBUG || '').toLowerCase() === 'true';
+
+const omrDebugLog = (...args) => {
+  if (OMR_DEBUG_LOGS) {
+    console.log(...args);
+  }
+};
+
+const omrDebugWarn = (...args) => {
+  if (OMR_DEBUG_LOGS) {
+    console.warn(...args);
+  }
+};
 
 
 const uploadDir = path.join(__dirname, '..', config.uploadDir, 'omr');
@@ -281,6 +301,299 @@ const parseQrPayload = (value) => {
     }
   }
   return null;
+};
+
+const formatStrictExamCodeCandidate = (value = '') => {
+  const upper = String(value || '').trim().toUpperCase();
+  if (!upper) return '';
+
+  const exact = upper.match(/EXAM[-\s:_]*([A-Z0-9]{4})[-\s:_]*([A-Z0-9]{4})/i);
+  const exactTail = `${exact?.[1] || ''}${exact?.[2] || ''}`;
+  if (exact?.[1] && exact?.[2] && /\d/.test(exactTail)) {
+    return `EXAM-${exact[1].toUpperCase()}-${exact[2].toUpperCase()}`;
+  }
+
+  const compact = upper.replace(/[^A-Z0-9]/g, '');
+  const prefixed = compact.match(/EXAM([A-Z0-9]{4})([A-Z0-9]{4})/i);
+  const prefixedTail = `${prefixed?.[1] || ''}${prefixed?.[2] || ''}`;
+  if (prefixed?.[1] && prefixed?.[2] && /\d/.test(prefixedTail)) {
+    return `EXAM-${prefixed[1].toUpperCase()}-${prefixed[2].toUpperCase()}`;
+  }
+
+  return '';
+};
+
+const normalizeDetectedExamCodeCandidate = (value = '') => {
+  const normalized = normalizeExamIdentifier(value);
+  if (!normalized) return '';
+
+  const strict = formatStrictExamCodeCandidate(normalized);
+  if (strict) {
+    return strict;
+  }
+
+  const cleaned = normalized.replace(/[^A-Z0-9-]/g, '');
+  if (!cleaned) return '';
+
+  const compact = cleaned.replace(/-/g, '');
+  const embeddedExam = compact.match(/EXAM([A-Z0-9]{4})([A-Z0-9]{4})/i);
+  if (embeddedExam?.[1] && embeddedExam?.[2]) {
+    return `EXAM-${embeddedExam[1].toUpperCase()}-${embeddedExam[2].toUpperCase()}`;
+  }
+
+  const prefixed = compact.match(/(?:EXAMCODE|EXAMID|CODE)(EXAM[A-Z0-9]{8}|[A-Z0-9]{4,})/i);
+  if (prefixed?.[1]) {
+    const prefixedStrict = formatStrictExamCodeCandidate(prefixed[1]);
+    if (prefixedStrict) {
+      return prefixedStrict;
+    }
+    return String(prefixed[1]).toUpperCase();
+  }
+
+  return cleaned;
+};
+
+const sanitizeExamCodeToken = (value = '') =>
+  String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, '');
+
+const isValidExamCodeToken = (value = '', rollNumber = '') => {
+  const token = sanitizeExamCodeToken(value);
+  if (!token) return false;
+  if (token.length < EXAM_CODE_MIN_LENGTH || token.length > EXAM_CODE_MAX_LENGTH) return false;
+
+  const normalizedRoll = String(rollNumber || '').replace(/\D/g, '');
+  if (normalizedRoll && token === normalizedRoll) return false;
+
+  if (/^\d+$/.test(token)) {
+    if (token.length >= ROLL_NUMBER_LIKE_MIN_LENGTH) return false;
+    if (token.length < EXAM_CODE_NUMERIC_MIN_LENGTH) return false;
+    if (token.length > EXAM_CODE_NUMERIC_MAX_LENGTH) return false;
+  }
+
+  return true;
+};
+
+const sanitizeExamCodeComparable = (value = '') =>
+  normalizeExamIdentifier(value).replace(/[^A-Z0-9]/g, '');
+
+const OCR_CONFUSION_GROUPS = [
+  new Set(['0', 'O', 'Q', 'D']),
+  new Set(['1', 'I', 'L', 'T']),
+  new Set(['2', 'Z']),
+  new Set(['5', 'S']),
+  new Set(['6', 'G']),
+  new Set(['8', 'B']),
+];
+
+const areOcrEquivalentChars = (left = '', right = '') => {
+  if (!left || !right) return false;
+  const a = String(left).toUpperCase();
+  const b = String(right).toUpperCase();
+  if (a === b) return true;
+  return OCR_CONFUSION_GROUPS.some((group) => group.has(a) && group.has(b));
+};
+
+const getWeightedEditDistance = (left = '', right = '') => {
+  const a = String(left);
+  const b = String(right);
+  const rows = b.length + 1;
+  const cols = a.length + 1;
+  const matrix = Array.from({ length: rows }, () => Array(cols).fill(0));
+
+  for (let j = 0; j < cols; j += 1) matrix[0][j] = j;
+  for (let i = 0; i < rows; i += 1) matrix[i][0] = i;
+
+  for (let i = 1; i < rows; i += 1) {
+    for (let j = 1; j < cols; j += 1) {
+      const substitutionCost = areOcrEquivalentChars(b[i - 1], a[j - 1])
+        ? (b[i - 1] === a[j - 1] ? 0 : 0.25)
+        : 1;
+      matrix[i][j] = Math.min(
+        matrix[i - 1][j] + 1,
+        matrix[i][j - 1] + 1,
+        matrix[i - 1][j - 1] + substitutionCost
+      );
+    }
+  }
+
+  return matrix[rows - 1][cols - 1];
+};
+
+const buildExamCodeTokenCandidates = (candidates = []) => {
+  const expanded = new Set();
+  for (const raw of candidates) {
+    const normalized = normalizeExamIdentifier(raw);
+    if (!normalized) continue;
+    expanded.add(normalized);
+    expanded.add(normalized.replace(/[^A-Z0-9]/g, ''));
+    expanded.add(normalized.replace(/(?:EXAMCODE|EXAMID|EXAM|CODE)/g, ''));
+
+    const chunks = normalized.match(/[A-Z0-9]{4,}/g) || [];
+    for (const chunk of chunks) {
+      expanded.add(chunk);
+    }
+  }
+  return Array.from(expanded).filter((token) => token && token.length >= 3);
+};
+
+const resolveExamByOcrTokenMatching = async ({ candidates = [], user = null }) => {
+  if (!user?.tenantId) return null;
+
+  const normalizedTokens = buildExamCodeTokenCandidates(candidates);
+  if (!normalizedTokens.length) return null;
+
+  const tenantExamDocs = await Exam.find({
+    tenantId: user.tenantId,
+    examType: 'OMR',
+  })
+    .select('_id uniqueId')
+    .lean();
+
+  let best = null;
+  let secondBest = null;
+
+  for (const examDoc of tenantExamDocs) {
+    const examCodeRaw = String(examDoc?.uniqueId || '').trim();
+    const examCodeComparable = sanitizeExamCodeComparable(examCodeRaw);
+    if (!examCodeComparable) continue;
+
+    for (const token of normalizedTokens) {
+      const tokenComparable = sanitizeExamCodeComparable(token);
+      if (!tokenComparable) continue;
+
+      const distance = getWeightedEditDistance(tokenComparable, examCodeComparable);
+      const normalizedDistance = distance / Math.max(1, examCodeComparable.length);
+      const score = 1 - normalizedDistance;
+
+      const candidateScore = {
+        examId: String(examDoc._id || ''),
+        examCode: examCodeRaw,
+        token,
+        distance,
+        score,
+      };
+
+      if (!best || candidateScore.score > best.score) {
+        secondBest = best;
+        best = candidateScore;
+      } else if (!secondBest || candidateScore.score > secondBest.score) {
+        secondBest = candidateScore;
+      }
+    }
+  }
+
+  if (!best) return null;
+
+  const hasSafeMargin = !secondBest || (best.score - secondBest.score) >= 0.06;
+  const accepted = best.score >= 0.72 && best.distance <= 2.25 && hasSafeMargin;
+  if (!accepted) return null;
+
+  return best.examCode || null;
+};
+
+const extractDetectedExamCodeCandidates = (payload = {}, options = {}) => {
+  const qrPayload = parseQrPayload(payload?.qr_data || payload?.qrPayload || null);
+  const rollNumber = String(
+    options?.rollNumber || payload?.roll_number || payload?.rollNumber || ''
+  ).trim();
+  const debugEntries = Array.isArray(payload?.meta?.exam_code_debug?.entries)
+    ? payload.meta.exam_code_debug.entries
+    : [];
+  const rawCandidates = [
+    payload?.exam_code,
+    payload?.examCode,
+    payload?.exam_id,
+    payload?.examId,
+    payload?.detected_exam_code,
+    payload?.meta?.exam_code,
+    payload?.meta?.examCode,
+    payload?.meta?.exam_code_candidates,
+    payload?.meta?.examCodeCandidates,
+    payload?.meta?.exam_code_debug?.candidates,
+    payload?.meta?.examCodeDebug?.candidates,
+    debugEntries.map((entry) => entry?.raw_text),
+    debugEntries.map((entry) => entry?.candidates),
+    qrPayload?.examCode,
+    qrPayload?.exam_code,
+    qrPayload?.examId,
+    qrPayload?.exam_id,
+  ];
+
+  const flattened = [];
+  const pushCandidate = (rawValue) => {
+    if (Array.isArray(rawValue)) {
+      rawValue.forEach(pushCandidate);
+      return;
+    }
+    flattened.push(rawValue);
+  };
+
+  for (const rawValue of rawCandidates) {
+    pushCandidate(rawValue);
+  }
+
+  const seen = new Set();
+  for (const rawValue of flattened) {
+    const candidate = normalizeDetectedExamCodeCandidate(rawValue);
+    if (!candidate) continue;
+    if (!isValidExamCodeToken(candidate, rollNumber)) continue;
+    seen.add(candidate);
+  }
+
+  return Array.from(seen);
+};
+
+const resolveDetectedExamCode = async ({
+  pythonResult = {},
+  user = null,
+  rollNumber = '',
+}) => {
+  const candidates = extractDetectedExamCodeCandidates(pythonResult, { rollNumber });
+  if (!candidates.length) return null;
+
+  const debugInfo = {
+    detectedBubbles: Number(pythonResult?.meta?.detected_bubbles || 0),
+    extractedDigits: candidates
+      .map((value) => String(value).replace(/\D/g, ''))
+      .join('|')
+      .replace(/\|+/g, '|')
+      .replace(/^\||\|$/g, ''),
+    candidates,
+    finalExamCode: null,
+  };
+
+  for (const candidate of candidates) {
+    try {
+      const exam = await resolveExamByIdentifier(candidate, user);
+      if (exam) {
+        debugInfo.finalExamCode = String(exam.uniqueId || exam._id || '').trim() || null;
+        omrDebugLog('[OMR][extract-id][exam-code]', debugInfo);
+        return debugInfo.finalExamCode;
+      }
+    } catch {
+      // Best-effort only; continue trying remaining candidates.
+    }
+  }
+
+  const fuzzyResolved = await resolveExamByOcrTokenMatching({ candidates, user });
+  debugInfo.finalExamCode = fuzzyResolved || null;
+  debugInfo.matchType = fuzzyResolved ? 'resolved_exam' : null;
+  const strictDetectedCode = candidates.find((candidate) =>
+    /^EXAM-[A-Z0-9]{4}-[A-Z0-9]{4}$/i.test(candidate)
+  );
+  if (pythonResult?.meta?.exam_code_debug) {
+    debugInfo.examCodeDebug = pythonResult.meta.exam_code_debug;
+  }
+  if (!debugInfo.finalExamCode && strictDetectedCode) {
+    debugInfo.finalExamCode = strictDetectedCode;
+    debugInfo.matchType = 'ocr_text';
+  }
+  omrDebugLog('[OMR][extract-id][exam-code]', debugInfo);
+
+  return debugInfo.finalExamCode || null;
 };
 
 const evaluateAnswers = ({ detectedAnswers, answerKey, markingRules }) => {
@@ -619,29 +932,463 @@ const resolveUploadedFiles = (req) => {
   });
 };
 
-const buildAnswerComparison = ({ detectedAnswers = [], correctAnswers = [], totalQuestions = 0 }) => {
-  const count = Math.max(totalQuestions, detectedAnswers.length, correctAnswers.length);
+const resolveAnswerValueByQuestion = (answers, questionNumber, index) => {
+  if (Array.isArray(answers)) {
+    return answers[index];
+  }
+
+  if (!answers || typeof answers !== 'object') {
+    return undefined;
+  }
+
+  const questionKey = String(questionNumber);
+  const zeroBasedKey = String(index);
+  const candidateKeys = [
+    questionKey,
+    `Q${questionKey}`,
+    `q${questionKey}`,
+    zeroBasedKey,
+    `Q${zeroBasedKey}`,
+    `q${zeroBasedKey}`,
+  ];
+
+  for (const key of candidateKeys) {
+    if (Object.prototype.hasOwnProperty.call(answers, key)) {
+      return answers[key];
+    }
+  }
+
+  return undefined;
+};
+
+const normalizeComparedAnswer = ({
+  value,
+  optionsPerQuestion = 4,
+  treatMissingAsEmpty = false,
+}) => {
+  const raw = Array.isArray(value) && value.length === 1 ? value[0] : value;
+
+  if (raw === undefined || raw === null) {
+    return treatMissingAsEmpty ? '' : 'SKIPPED';
+  }
+
+  if (typeof raw === 'string' && raw.trim() === '') {
+    return treatMissingAsEmpty ? '' : 'SKIPPED';
+  }
+
+  const normalized = normalizeOption(raw, optionsPerQuestion);
+  if (treatMissingAsEmpty && normalized === 'SKIPPED') {
+    return '';
+  }
+
+  return String(normalized || '').trim().toUpperCase();
+};
+
+const buildAnswerComparison = ({
+  detectedAnswers = [],
+  correctAnswers = [],
+  totalQuestions = 0,
+  optionsPerQuestion = 4,
+}) => {
+  const detectedCount = Array.isArray(detectedAnswers)
+    ? detectedAnswers.length
+    : (detectedAnswers && typeof detectedAnswers === 'object'
+      ? Object.keys(detectedAnswers).length
+      : 0);
+  const correctCount = Array.isArray(correctAnswers)
+    ? correctAnswers.length
+    : (correctAnswers && typeof correctAnswers === 'object'
+      ? Object.keys(correctAnswers).length
+      : 0);
+  const count = Math.max(totalQuestions, detectedCount, correctCount);
 
   return Array.from({ length: count }, (_unused, index) => {
-    const detected = normalizeOption(detectedAnswers[index], 4);
-    const correct = normalizeOption(correctAnswers[index], 4);
+    const questionNumber = index + 1;
+    const detectedRaw = resolveAnswerValueByQuestion(detectedAnswers, questionNumber, index);
+    const correctRaw = resolveAnswerValueByQuestion(correctAnswers, questionNumber, index);
+    const detected = normalizeComparedAnswer({
+      value: detectedRaw,
+      optionsPerQuestion,
+      treatMissingAsEmpty: false,
+    });
+    const correct = normalizeComparedAnswer({
+      value: correctRaw,
+      optionsPerQuestion,
+      treatMissingAsEmpty: true,
+    });
+
+    if (!correct) {
+      omrDebugWarn(`[OMR][answer-compare] Missing answer key for Q${questionNumber}`);
+    }
+
+    omrDebugLog('[OMR][answer-compare]', {
+      qn: questionNumber,
+      detected: detected || null,
+      correct: correct || null,
+    });
 
     let status = 'WRONG';
-    if (detected === 'SKIPPED') {
-      status = 'UNATTEMPTED';
+    if (!detected || detected === 'SKIPPED') {
+      status = 'SKIPPED';
     } else if (detected === 'INVALID') {
-      status = 'MULTIPLE';
-    } else if (detected === correct) {
+      status = 'INVALID';
+    } else if (correct && detected === correct) {
       status = 'CORRECT';
     }
 
     return {
-      questionNumber: index + 1,
+      questionNumber,
       detected,
       correct,
       status,
     };
   });
+};
+
+const buildQuestionAnswerKeyMap = ({
+  answers = [],
+  totalQuestions = 0,
+  optionsPerQuestion = 4,
+}) => {
+  const count = Math.max(
+    totalQuestions,
+    Array.isArray(answers)
+      ? answers.length
+      : (answers && typeof answers === 'object' ? Object.keys(answers).length : 0)
+  );
+  const answerKey = {};
+
+  for (let index = 0; index < count; index += 1) {
+    const questionNumber = index + 1;
+    const normalized = normalizeComparedAnswer({
+      value: resolveAnswerValueByQuestion(answers, questionNumber, index),
+      optionsPerQuestion,
+      treatMissingAsEmpty: true,
+    });
+    if (normalized) {
+      answerKey[String(questionNumber)] = normalized;
+    }
+  }
+
+  return answerKey;
+};
+
+const normalizeAnswerKeyArray = ({
+  answers = [],
+  totalQuestions = 0,
+  optionsPerQuestion = 4,
+}) => {
+  const count = Math.max(
+    totalQuestions,
+    Array.isArray(answers)
+      ? answers.length
+      : (answers && typeof answers === 'object' ? Object.keys(answers).length : 0)
+  );
+
+  return Array.from({ length: count }, (_unused, index) =>
+    normalizeComparedAnswer({
+      value: resolveAnswerValueByQuestion(answers, index + 1, index),
+      optionsPerQuestion,
+      treatMissingAsEmpty: true,
+    })
+  );
+};
+
+const pickAnswerSource = (...sources) => {
+  for (const source of sources) {
+    if (Array.isArray(source) && source.length > 0) {
+      return source;
+    }
+    if (source && typeof source === 'object' && Object.keys(source).length > 0) {
+      return source;
+    }
+  }
+
+  return (
+    sources.find(
+      (source) =>
+        Array.isArray(source) || (source && typeof source === 'object')
+    ) || []
+  );
+};
+
+const buildStoredMarkingRules = ({ result, optionsPerQuestion = 4 }) => {
+  const totalQuestions = toPositiveInt(result?.total_questions, 0) || 0;
+  const marksPerQuestion = Number(result?.exam_id?.markingRules?.marksPerQuestion || 1);
+  const negativeMarking = Boolean(result?.exam_id?.markingRules?.negativeMarking);
+
+  return {
+    totalQuestions,
+    optionsPerQuestion,
+    marksPerQuestion: Number.isFinite(marksPerQuestion) ? marksPerQuestion : 1,
+    negativeMarking,
+    negativeMarks: negativeMarking
+      ? Number(result?.exam_id?.markingRules?.negativeMarks || 0)
+      : 0,
+  };
+};
+
+const resolveDerivedExamAnswerKey = async ({
+  examIdentifier,
+  user,
+  cache = null,
+  fallbackOptionsPerQuestion = 4,
+}) => {
+  const cacheKey = String(examIdentifier || '').trim();
+  if (!cacheKey) return null;
+
+  const loadDerivedAnswerKey = async () => {
+    const exam = await ensureExamAccess(examIdentifier, user);
+    const evaluationConfig = await resolveExamEvaluationConfig(exam);
+    const optionsPerQuestion =
+      toPositiveInt(evaluationConfig?.markingRules?.optionsPerQuestion, fallbackOptionsPerQuestion) ||
+      fallbackOptionsPerQuestion;
+
+    return {
+      answerKey: normalizeAnswerKeyArray({
+        answers: evaluationConfig?.answerKey || [],
+        totalQuestions: toPositiveInt(evaluationConfig?.markingRules?.totalQuestions, 0) || 0,
+        optionsPerQuestion,
+      }),
+      markingRules: {
+        totalQuestions: toPositiveInt(evaluationConfig?.markingRules?.totalQuestions, 0) || 0,
+        optionsPerQuestion,
+        marksPerQuestion: Number(evaluationConfig?.markingRules?.marksPerQuestion || 1),
+        negativeMarking: Boolean(evaluationConfig?.markingRules?.negativeMarking),
+        negativeMarks: Boolean(evaluationConfig?.markingRules?.negativeMarking)
+          ? Number(evaluationConfig?.markingRules?.negativeMarks || 0)
+          : 0,
+      },
+    };
+  };
+
+  if (!cache) {
+    return loadDerivedAnswerKey();
+  }
+
+  if (!cache.has(cacheKey)) {
+    cache.set(cacheKey, loadDerivedAnswerKey());
+  }
+
+  return cache.get(cacheKey);
+};
+
+const resolveResultAnswerKey = async ({ result, user, cache = null }) => {
+  const totalQuestions = toPositiveInt(result?.total_questions, 0) || 0;
+  const storedOptionsPerQuestion =
+    toPositiveInt(result?.exam_id?.markingRules?.optionsPerQuestion, 4) || 4;
+  const storedAnswerSource = pickAnswerSource(
+    result?.correct_answers,
+    result?.correctAnswers
+  );
+  const storedAnswerKey = normalizeAnswerKeyArray({
+    answers: storedAnswerSource,
+    totalQuestions,
+    optionsPerQuestion: storedOptionsPerQuestion,
+  });
+  const storedMarkingRules = buildStoredMarkingRules({
+    result,
+    optionsPerQuestion: storedOptionsPerQuestion,
+  });
+  const missingStoredEntries =
+    !storedAnswerKey.some(Boolean) ||
+    (totalQuestions > 0 && storedAnswerKey.some((value) => !value));
+
+  if (!missingStoredEntries) {
+    return {
+      answerKey: storedAnswerKey,
+      optionsPerQuestion: storedOptionsPerQuestion,
+      markingRules: storedMarkingRules,
+    };
+  }
+
+  const examIdentifier = result?.exam_id?._id || result?.exam_id || result?.examId;
+  if (!examIdentifier) {
+    return {
+      answerKey: storedAnswerKey,
+      optionsPerQuestion: storedOptionsPerQuestion,
+      markingRules: storedMarkingRules,
+    };
+  }
+
+  try {
+    const derived = await resolveDerivedExamAnswerKey({
+      examIdentifier,
+      user,
+      cache,
+      fallbackOptionsPerQuestion: storedOptionsPerQuestion,
+    });
+    const derivedOptionsPerQuestion =
+      toPositiveInt(derived?.markingRules?.optionsPerQuestion, storedOptionsPerQuestion) ||
+      storedOptionsPerQuestion;
+    const derivedAnswerKey = normalizeAnswerKeyArray({
+      answers: derived?.answerKey || [],
+      totalQuestions: Math.max(
+        totalQuestions,
+        toPositiveInt(derived?.markingRules?.totalQuestions, 0) || 0
+      ),
+      optionsPerQuestion: derivedOptionsPerQuestion,
+    });
+    const mergedCount = Math.max(totalQuestions, storedAnswerKey.length, derivedAnswerKey.length);
+    const mergedAnswerKey = Array.from({ length: mergedCount }, (_unused, index) =>
+      storedAnswerKey[index] || derivedAnswerKey[index] || ''
+    );
+
+    return {
+      answerKey: mergedAnswerKey,
+      optionsPerQuestion: derivedOptionsPerQuestion,
+      markingRules: {
+        ...buildStoredMarkingRules({
+          result,
+          optionsPerQuestion: derivedOptionsPerQuestion,
+        }),
+        ...(derived?.markingRules || {}),
+        totalQuestions: Math.max(
+          totalQuestions,
+          toPositiveInt(derived?.markingRules?.totalQuestions, 0) || 0,
+          mergedAnswerKey.length
+        ),
+        optionsPerQuestion: derivedOptionsPerQuestion,
+      },
+    };
+  } catch (error) {
+    omrDebugWarn(
+      '[OMR][answer-compare] Failed to resolve fallback answer key:',
+      error?.message || error
+    );
+    return {
+      answerKey: storedAnswerKey,
+      optionsPerQuestion: storedOptionsPerQuestion,
+      markingRules: storedMarkingRules,
+    };
+  }
+};
+
+const summarizeAnswerComparison = ({
+  answerComparison = [],
+  markingRules = {},
+  currentStatus = 'PROCESSED',
+}) => {
+  let correctCount = 0;
+  let wrongCount = 0;
+  let skippedCount = 0;
+  let invalidCount = 0;
+
+  for (const row of answerComparison) {
+    const rowStatus = String(row?.status || '').trim().toUpperCase();
+    if (rowStatus === 'CORRECT') {
+      correctCount += 1;
+      continue;
+    }
+    if (rowStatus === 'SKIPPED') {
+      skippedCount += 1;
+      continue;
+    }
+    if (rowStatus === 'INVALID') {
+      invalidCount += 1;
+      continue;
+    }
+    if (rowStatus === 'WRONG') {
+      wrongCount += 1;
+    }
+  }
+
+  const marksPerQuestion = Number(markingRules?.marksPerQuestion || 1);
+  const negativeMarking = Boolean(markingRules?.negativeMarking);
+  const negativeMarks = negativeMarking ? Number(markingRules?.negativeMarks || 0) : 0;
+  const finalScore = Number(
+    (
+      correctCount * (Number.isFinite(marksPerQuestion) ? marksPerQuestion : 1) -
+      wrongCount * (Number.isFinite(negativeMarks) ? negativeMarks : 0)
+    ).toFixed(2)
+  );
+  const comparedCount = correctCount + wrongCount + skippedCount + invalidCount;
+  const status = String(currentStatus || 'PROCESSED').trim().toUpperCase() || 'PROCESSED';
+
+  omrDebugLog('[OMR][result-summary]', {
+    correctCount,
+    wrongCount,
+    unattempted: skippedCount,
+    invalidCount,
+    finalScore,
+    status,
+  });
+
+  return {
+    correct_count: correctCount,
+    wrong_count: wrongCount,
+    skipped_count: skippedCount,
+    invalid_count: invalidCount,
+    final_score: finalScore,
+    status,
+    compared_count: comparedCount,
+  };
+};
+
+const applyComputedEvaluationSummary = ({
+  result,
+  answerComparison = [],
+  answerKey = {},
+  markingRules = {},
+}) => {
+  const hasAnswerKey = Boolean(answerKey && Object.keys(answerKey).length > 0);
+  if (!Array.isArray(answerComparison) || !answerComparison.length || !hasAnswerKey) {
+    return result;
+  }
+
+  const summary = summarizeAnswerComparison({
+    answerComparison,
+    markingRules,
+    currentStatus: result?.status || 'PROCESSED',
+  });
+  const storedCorrect = Number(result?.totalCorrect ?? result?.correct_count ?? 0);
+  const storedWrong = Number(result?.totalWrong ?? result?.wrong_count ?? 0);
+  const storedSkipped = Number(result?.totalUnattempted ?? result?.skipped_count ?? 0);
+  const storedInvalid = Number(result?.invalid_count ?? 0);
+  const storedScore = Number(result?.score ?? result?.final_score ?? 0);
+  const needsRepair =
+    storedCorrect !== summary.correct_count ||
+    storedWrong !== summary.wrong_count ||
+    storedSkipped !== summary.skipped_count ||
+    storedInvalid !== summary.invalid_count ||
+    storedScore !== summary.final_score;
+  const originalStatus =
+    String(result?.status || 'PROCESSED').trim().toUpperCase() || 'PROCESSED';
+  const nextStatus =
+    hasAnswerKey &&
+    summary.compared_count > 0 &&
+    originalStatus === 'MANUAL_REVIEW' &&
+    needsRepair
+      ? 'PROCESSED'
+      : originalStatus;
+  const nextManualReviewRequired =
+    hasAnswerKey &&
+    summary.compared_count > 0 &&
+    originalStatus === 'MANUAL_REVIEW' &&
+    needsRepair
+      ? false
+      : Boolean(result?.manualReviewRequired);
+  const totalQuestions = Math.max(
+    toPositiveInt(result?.total_questions, 0) || 0,
+    answerComparison.length,
+    Object.keys(answerKey).length
+  );
+
+  return {
+    ...result,
+    total_questions: totalQuestions,
+    correct_count: summary.correct_count,
+    totalCorrect: summary.correct_count,
+    wrong_count: summary.wrong_count,
+    totalWrong: summary.wrong_count,
+    skipped_count: summary.skipped_count,
+    totalUnattempted: summary.skipped_count,
+    invalid_count: summary.invalid_count,
+    final_score: summary.final_score,
+    score: summary.final_score,
+    status: nextStatus,
+    manualReviewRequired: nextManualReviewRequired,
+  };
 };
 
 const addCandidateKeysToLookup = (lookupMap, user) => {
@@ -746,6 +1493,46 @@ const resolveCandidateByRoll = async ({ tenantId, candidateRoll = '' }) => {
     .lean();
 
   return candidate || null;
+};
+
+const resolveExamCodeFromRollFallback = async ({ tenantId, candidateRoll = '' }) => {
+  if (!tenantId) return null;
+  const rollToken = String(candidateRoll || '').trim();
+  if (!rollToken || ['INVALID', 'INCOMPLETE'].includes(rollToken.toUpperCase())) return null;
+
+  const candidate = await resolveCandidateByRoll({
+    tenantId,
+    candidateRoll: rollToken,
+  });
+  if (!candidate?._id) return null;
+
+  const participations = await ExamParticipant.find({
+    userId: candidate._id,
+    examRole: 'CANDIDATE',
+  })
+    .populate('examId', '_id uniqueId tenantId examType updatedAt createdAt')
+    .lean();
+
+  const examEntries = (participations || [])
+    .map((row) => row?.examId)
+    .filter((exam) =>
+      exam &&
+      String(exam?.tenantId || '') === String(tenantId) &&
+      String(exam?.examType || '').toUpperCase() === 'OMR'
+    );
+
+  const uniqueCodes = new Set(
+    examEntries
+      .map((exam) => String(exam?.uniqueId || exam?._id || '').trim())
+      .filter(Boolean)
+  );
+
+  // Only auto-resolve if the candidate is linked to exactly one OMR exam in this tenant.
+  if (uniqueCodes.size === 1) {
+    return Array.from(uniqueCodes)[0] || null;
+  }
+
+  return null;
 };
 
 const escapeRegex = (value = '') => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -1101,7 +1888,7 @@ router.post(
   handleMulterError,
   async (req, res, next) => {
     const file = req.file;
-    console.log(`[OMR][extract-id] Received request for file: ${file?.originalname}`);
+    omrDebugLog(`[OMR][extract-id] Received request for file: ${file?.originalname}`);
 
     // Cleanup helper — remove temp file after response
     const cleanup = async () => {
@@ -1127,7 +1914,7 @@ router.post(
         const { stdout } = await execFileAsync(
           pythonExecutable,
           [omrScriptPath, file.path, '--id-only'],
-          { timeout: 30000 }
+          { timeout: 60000 }
         );
         pythonResult = JSON.parse(String(stdout || '').trim() || '{}');
       } catch (extractError) {
@@ -1147,6 +1934,17 @@ router.post(
         fallbackRoll ||
         (rollStatus && rollStatus !== 'OK' ? rollStatus : null);
       let candidateName = sanitizeCandidateName(pythonResult?.candidate_name, rollNumber) || null;
+      let detectedExamCode = await resolveDetectedExamCode({
+        pythonResult,
+        user: req.user,
+        rollNumber: rollNumber || '',
+      });
+      if (!detectedExamCode && rollNumber) {
+        detectedExamCode = await resolveExamCodeFromRollFallback({
+          tenantId: req.user.tenantId,
+          candidateRoll: rollNumber,
+        });
+      }
 
       // If name is not extracted from sheet, try resolving by detected roll in current tenant.
       if (!candidateName && rollNumber && !['INVALID', 'INCOMPLETE'].includes(String(rollNumber).toUpperCase())) {
@@ -1159,9 +1957,10 @@ router.post(
 
       await cleanup();
       return res.json({
-        examCode: null,
+        examCode: detectedExamCode || null,
         rollNumber: rollNumber || null,
         candidateName,
+        meta: pythonResult?.meta && typeof pythonResult.meta === 'object' ? pythonResult.meta : null,
       });
     } catch (error) {
       await cleanup();
@@ -1268,7 +2067,7 @@ router.post(
       const examIdentifier = String(
         req.body.exam_code || req.body.examCode || req.body.examId || ''
       ).trim();
-      console.log(`[OMR][process] Received request for exam identifier: "${examIdentifier}"`);
+      omrDebugLog(`[OMR][process] Received request for exam identifier: "${examIdentifier}"`);
       if (!examIdentifier) {
         return res.status(400).json({ error: 'exam_code is required.' });
       }
@@ -1290,13 +2089,16 @@ router.post(
       const manualReviewThreshold = resolveManualReviewThreshold(req.body.confidenceThreshold);
       const candidateLookup = await buildCandidateLookup(exam._id, exam.tenantId);
       const savedResults = [];
+      let failedFilesCount = 0;
+      let firstFailureMessage = '';
 
       for (const file of files) {
+        try {
         const ext = path.extname(file.originalname || '').toLowerCase();
         if (file.size > MAX_SINGLE_SHEET_BYTES) {
-          return res.status(400).json({
-            error: `File "${file.originalname}" exceeds 5MB. Each sheet file must be 5MB or smaller.`,
-          });
+          throw new Error(
+            `File "${file.originalname}" exceeds 5MB. Each sheet file must be 5MB or smaller.`
+          );
         }
 
         const payload = await callOmrService({
@@ -1465,11 +2267,22 @@ router.post(
 
           savedResults.push(resultDoc);
         }
+        } catch (fileError) {
+          failedFilesCount += 1;
+          if (!firstFailureMessage) {
+            firstFailureMessage =
+              fileError?.message || `Failed to process "${file?.originalname || 'sheet'}".`;
+          }
+          console.error(
+            `[OMR][process] Failed to process file "${file?.originalname || 'unknown'}":`,
+            fileError?.message || fileError
+          );
+        }
       }
 
       if (!savedResults.length) {
         return res.status(400).json({
-          error: 'No OMR sheets were detected in the uploaded file(s).',
+          error: firstFailureMessage || 'No OMR sheets were detected in the uploaded file(s).',
         });
       }
 
@@ -1480,7 +2293,7 @@ router.post(
         summary: {
           processed: savedResults.length,
           manualReview: savedResults.filter((result) => result.manualReviewRequired).length,
-          errors: savedResults.filter((result) => result.status === 'ERROR').length,
+          errors: savedResults.filter((result) => result.status === 'ERROR').length + failedFilesCount,
           mode: omrAutoGradingEnabled ? 'full' : 'assisted',
         },
         results: savedResults,
@@ -1591,7 +2404,7 @@ router.get(
 
       const [results, total] = await Promise.all([
         OMRResult.find(filter)
-          .populate('exam_id', 'title examType uniqueId')
+          .populate('exam_id', 'title examType uniqueId markingRules')
           .populate('candidate_id', 'name email uniqueId')
           .sort({ processed_at: -1 })
           .skip(skip)
@@ -1613,8 +2426,9 @@ router.get(
       const tenantCandidateLookup = hasMissingCandidateNames
         ? await buildTenantCandidateLookup(req.user.tenantId)
         : null;
+      const answerKeyCache = new Map();
 
-      const normalizedResults = results.map((result = {}) => {
+      const normalizedResults = await Promise.all(results.map(async (result = {}) => {
         const normalizedExamCode = String(
           result.exam_code || result?.exam_id?.uniqueId || result?.examId?.uniqueId || ''
         ).trim();
@@ -1643,8 +2457,29 @@ router.get(
         const normalizedConfidence = Number(
           result.confidence ?? result.confidenceScore ?? 0
         );
-
-        return {
+        const resolvedAnswerKey = await resolveResultAnswerKey({
+          result,
+          user: req.user,
+          cache: answerKeyCache,
+        });
+        const answerKey = buildQuestionAnswerKeyMap({
+          answers: resolvedAnswerKey.answerKey,
+          totalQuestions:
+            toPositiveInt(result.total_questions, 0) || resolvedAnswerKey.answerKey.length || 0,
+          optionsPerQuestion: resolvedAnswerKey.optionsPerQuestion,
+        });
+        const detectedAnswers = pickAnswerSource(
+          result.detected_answers,
+          result.detectedAnswers
+        );
+        const answerComparison = buildAnswerComparison({
+          detectedAnswers,
+          correctAnswers: resolvedAnswerKey.answerKey,
+          totalQuestions:
+            toPositiveInt(result.total_questions, 0) || resolvedAnswerKey.answerKey.length || 0,
+          optionsPerQuestion: resolvedAnswerKey.optionsPerQuestion,
+        });
+        const normalizedResult = {
           ...result,
           candidate_id:
             (hasPopulatedCandidateName ? result?.candidate_id : null) ||
@@ -1660,8 +2495,17 @@ router.get(
           student_roll_no: normalizedRoll,
           student_name: normalizedName,
           confidence: Number.isFinite(normalizedConfidence) ? normalizedConfidence : 0,
+          correct_answers: resolvedAnswerKey.answerKey,
+          correctAnswers: resolvedAnswerKey.answerKey,
         };
-      });
+
+        return applyComputedEvaluationSummary({
+          result: normalizedResult,
+          answerComparison,
+          answerKey,
+          markingRules: resolvedAnswerKey.markingRules,
+        });
+      }));
 
       return res.json({
         results: normalizedResults,
@@ -1698,14 +2542,45 @@ router.get(
         return res.status(404).json({ error: 'OMR result not found.' });
       }
 
+      const resolvedAnswerKey = await resolveResultAnswerKey({
+        result,
+        user: req.user,
+      });
+      const answerKey = buildQuestionAnswerKeyMap({
+        answers: resolvedAnswerKey.answerKey,
+        totalQuestions:
+          toPositiveInt(result.total_questions, 0) || resolvedAnswerKey.answerKey.length || 0,
+        optionsPerQuestion: resolvedAnswerKey.optionsPerQuestion,
+      });
+      const resultWithResolvedAnswerKey = {
+        ...result,
+        correct_answers: resolvedAnswerKey.answerKey,
+        correctAnswers: resolvedAnswerKey.answerKey,
+      };
+      const detectedAnswers = pickAnswerSource(
+        resultWithResolvedAnswerKey.detected_answers,
+        resultWithResolvedAnswerKey.detectedAnswers
+      );
+
       const answerComparison = buildAnswerComparison({
-        detectedAnswers: result.detected_answers || [],
-        correctAnswers: result.correct_answers || [],
-        totalQuestions: result.total_questions || 0,
+        detectedAnswers,
+        correctAnswers: resultWithResolvedAnswerKey.correct_answers || [],
+        totalQuestions:
+          toPositiveInt(resultWithResolvedAnswerKey.total_questions, 0) ||
+          resolvedAnswerKey.answerKey.length ||
+          0,
+        optionsPerQuestion: resolvedAnswerKey.optionsPerQuestion,
+      });
+      const summarizedResult = applyComputedEvaluationSummary({
+        result: resultWithResolvedAnswerKey,
+        answerComparison,
+        answerKey,
+        markingRules: resolvedAnswerKey.markingRules,
       });
 
       return res.json({
-        result,
+        result: summarizedResult,
+        answerKey,
         answerComparison,
       });
     } catch (error) {
@@ -1726,7 +2601,7 @@ router.get(
         _id: req.params.resultId,
         tenant_id: req.user.tenantId,
       })
-        .populate('exam_id', 'title uniqueId examType')
+        .populate('exam_id', 'title uniqueId examType markingRules')
         .populate('candidate_id', 'name email uniqueId')
         .lean();
 
@@ -1734,16 +2609,47 @@ router.get(
         return res.status(404).json({ error: 'OMR result not found.' });
       }
 
+      const resolvedAnswerKey = await resolveResultAnswerKey({
+        result,
+        user: req.user,
+      });
+      const answerKey = buildQuestionAnswerKeyMap({
+        answers: resolvedAnswerKey.answerKey,
+        totalQuestions:
+          toPositiveInt(result.total_questions, 0) || resolvedAnswerKey.answerKey.length || 0,
+        optionsPerQuestion: resolvedAnswerKey.optionsPerQuestion,
+      });
+      const resultWithResolvedAnswerKey = {
+        ...result,
+        correct_answers: resolvedAnswerKey.answerKey,
+        correctAnswers: resolvedAnswerKey.answerKey,
+      };
+      const detectedAnswers = pickAnswerSource(
+        resultWithResolvedAnswerKey.detected_answers,
+        resultWithResolvedAnswerKey.detectedAnswers
+      );
+
       const answerComparison = buildAnswerComparison({
-        detectedAnswers: result.detected_answers || [],
-        correctAnswers: result.correct_answers || [],
-        totalQuestions: result.total_questions || 0,
+        detectedAnswers,
+        correctAnswers: resultWithResolvedAnswerKey.correct_answers || [],
+        totalQuestions:
+          toPositiveInt(resultWithResolvedAnswerKey.total_questions, 0) ||
+          resolvedAnswerKey.answerKey.length ||
+          0,
+        optionsPerQuestion: resolvedAnswerKey.optionsPerQuestion,
+      });
+      const summarizedResult = applyComputedEvaluationSummary({
+        result: resultWithResolvedAnswerKey,
+        answerComparison,
+        answerKey,
+        markingRules: resolvedAnswerKey.markingRules,
       });
 
       return res.json({
         report: {
           exam: result.exam_id || null,
-          result,
+          result: summarizedResult,
+          answerKey,
           answerComparison,
           generatedAt: new Date().toISOString(),
         },

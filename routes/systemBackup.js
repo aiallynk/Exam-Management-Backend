@@ -52,6 +52,24 @@ const backupUpload = multer({
 });
 
 const isValidMongoId = (value) => /^[a-fA-F0-9]{24}$/.test(String(value || ''));
+const IST_TIMEZONE = 'Asia/Kolkata';
+const IST_DATE_TIME_FORMATTER = new Intl.DateTimeFormat('en-IN', {
+  timeZone: IST_TIMEZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hour12: false,
+});
+
+const toIstDateTimeString = (value) => {
+  if (!value) return '';
+  const parsed = value instanceof Date ? value : new Date(value);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return `${IST_DATE_TIME_FORMATTER.format(parsed)} IST`;
+};
 
 const normalizeBackupType = (value) => {
   const raw = String(value || '').trim();
@@ -72,12 +90,18 @@ const toFormattedBackupRecord = (record) => {
   const createdBy = record?.created_by || null;
   const restoredBy = record?.restored_by || null;
   const normalizedType = record?.type === 'company' ? 'specific_company' : record?.type;
+  const triggerType =
+    String(record?.trigger_type || '').trim().toUpperCase() === 'AUTO'
+      ? 'AUTO'
+      : 'MANUAL';
   const resolvedPath =
     record?.storage_url_path || record?.storage_path || record?.file_path || '';
   return {
     id: record?._id || null,
     backup_name: record?.backup_name || '',
     type: normalizedType || '',
+    trigger_type: triggerType,
+    backup_type: triggerType,
     company_id: company?._id || company || null,
     company_name: company?.name || null,
     company_code: company?.code || null,
@@ -87,21 +111,20 @@ const toFormattedBackupRecord = (record) => {
     file_path: resolvedPath,
     status: record?.status || '',
     created_by: createdBy?._id || createdBy || null,
-    created_by_name: createdBy?.name || null,
+    created_by_name: triggerType === 'AUTO' ? 'System' : createdBy?.name || null,
     created_by_email: createdBy?.email || null,
     restored_by: restoredBy?._id || restoredBy || null,
     restored_by_name: restoredBy?.name || null,
     restored_by_email: restoredBy?.email || null,
     restored_at: record?.restored_at || null,
+    restored_at_ist: toIstDateTimeString(record?.restored_at),
     created_at: record?.created_at || null,
+    created_at_ist: toIstDateTimeString(record?.created_at),
     updated_at: record?.updated_at || null,
     error_message: record?.error_message || '',
     source_backup_id: record?.source_backup_id || null,
   };
 };
-
-router.use(requireAuth);
-router.use(superAdminOnly);
 
 const handleCreateBackup = async (req, res, next) => {
   try {
@@ -160,19 +183,19 @@ const handleCreateBackup = async (req, res, next) => {
  * POST /api/admin/system/backup
  * Create a full system, specific company, or tenant-wide backup batch.
  */
-router.post('/backup', handleCreateBackup);
+router.post('/backup', requireAuth, superAdminOnly, handleCreateBackup);
 
 /**
  * POST /api/admin/system/backups/create
  * Alias for creating backups (kept for frontend/client compatibility).
  */
-router.post('/backups/create', handleCreateBackup);
+router.post('/backups/create', requireAuth, superAdminOnly, handleCreateBackup);
 
 /**
  * GET /api/admin/system/backups
  * List backup history.
  */
-router.get('/backups', async (req, res, next) => {
+router.get('/backups', requireAuth, superAdminOnly, async (req, res, next) => {
   try {
     const type = normalizeBackupType(req.query?.type);
     const companyId = resolveCompanyId(req.query);
@@ -182,6 +205,10 @@ router.get('/backups', async (req, res, next) => {
       type: type || undefined,
       companyId: companyId || undefined,
       status: req.query?.status,
+      triggerType: req.query?.trigger_type || req.query?.backup_type,
+      startDate: req.query?.startDate || req.query?.fromDate,
+      endDate: req.query?.endDate || req.query?.toDate,
+      search: req.query?.search || req.query?.q,
     });
 
     const backups = (history.items || []).map((entry) => toFormattedBackupRecord(entry));
@@ -202,7 +229,7 @@ router.get('/backups', async (req, res, next) => {
  * GET /api/admin/system/backups/:backupId/download
  * Download a backup ZIP.
  */
-router.get('/backups/:backupId/download', async (req, res, next) => {
+router.get('/backups/:backupId/download', requireAuth, superAdminOnly, async (req, res, next) => {
   try {
     const { backupId } = req.params;
     if (!isValidMongoId(backupId)) {
@@ -235,7 +262,7 @@ router.get('/backups/:backupId/download', async (req, res, next) => {
  * POST /api/admin/system/backups/:backupId/restore
  * Restore a backup from history.
  */
-router.post('/backups/:backupId/restore', async (req, res, next) => {
+router.post('/backups/:backupId/restore', requireAuth, superAdminOnly, async (req, res, next) => {
   try {
     const { backupId } = req.params;
     if (!isValidMongoId(backupId)) {
@@ -267,7 +294,7 @@ router.post('/backups/:backupId/restore', async (req, res, next) => {
  * POST /api/admin/system/restore
  * Restore a backup from uploaded ZIP file.
  */
-router.post('/restore', backupUpload.single('backup_file'), async (req, res, next) => {
+router.post('/restore', requireAuth, superAdminOnly, backupUpload.single('backup_file'), async (req, res, next) => {
   const uploadedFilePath = req.file?.path;
 
   try {
@@ -312,7 +339,7 @@ router.post('/restore', backupUpload.single('backup_file'), async (req, res, nex
  * DELETE /api/admin/system/backups/:backupId
  * Delete a backup and its file.
  */
-router.delete('/backups/:backupId', async (req, res, next) => {
+router.delete('/backups/:backupId', requireAuth, superAdminOnly, async (req, res, next) => {
   try {
     const { backupId } = req.params;
     if (!isValidMongoId(backupId)) {

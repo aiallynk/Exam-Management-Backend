@@ -78,7 +78,7 @@ const TenantSchema = new mongoose.Schema(
       },
       status: {
         type: String,
-        enum: ['ACTIVE', 'EXPIRED', 'SUSPENDED'],
+        enum: ['ACTIVE', 'EXPIRED', 'SUSPENDED', 'CANCELLED'],
         default: 'ACTIVE',
       },
       startedAt: {
@@ -103,6 +103,14 @@ const TenantSchema = new mongoose.Schema(
           default: null,
         },
         maxAiQuestionsPerMonth: {
+          type: Number,
+          default: null,
+        },
+        maxAiGradingsPerMonth: {
+          type: Number,
+          default: null,
+        },
+        maxImportFiles: {
           type: Number,
           default: null,
         },
@@ -136,6 +144,40 @@ const TenantSchema = new mongoose.Schema(
     currentAiUsage: {
       type: Number,
       default: 0,
+    },
+    ai_usage_count: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    ai_usage_limit: {
+      type: Number,
+      default: null,
+    },
+    ai_usage_reset_date: {
+      type: Date,
+      default: null,
+    },
+    extraCredits: {
+      ai: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      attempts: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      exams: {
+        type: Number,
+        default: 0,
+        min: 0,
+      },
+      updatedAt: {
+        type: Date,
+        default: null,
+      },
     },
     metadata: {
       type: mongoose.Schema.Types.Mixed,

@@ -18,11 +18,35 @@ export const SUBSCRIPTION_PLAN_TYPES = Object.freeze({
   LEGEND: PLAN_TYPES.LEGEND,
 });
 
+export const SUBSCRIPTION_GLOBAL_LIMIT_KEYS = Object.freeze({
+  AI_QUESTIONS_PER_MONTH: 'aiQuestionsPerMonth',
+  MAX_IMPORT_FILES: 'maxImportFiles',
+});
+
+const DEFAULT_SUBSCRIPTION_GLOBAL_LIMITS = Object.freeze({
+  [SUBSCRIPTION_GLOBAL_LIMIT_KEYS.AI_QUESTIONS_PER_MONTH]: 10,
+  [SUBSCRIPTION_GLOBAL_LIMIT_KEYS.MAX_IMPORT_FILES]: 2,
+});
+
 export const SUBSCRIPTION_STATUSES = Object.freeze({
   ACTIVE: 'ACTIVE',
   EXPIRED: 'EXPIRED',
   SUSPENDED: 'SUSPENDED',
+  CANCELLED: 'CANCELLED',
 });
+
+export const SUBSCRIPTION_STATUS_MESSAGES = Object.freeze({
+  [SUBSCRIPTION_STATUSES.EXPIRED]:
+    'Your subscription has expired. Please renew to continue.',
+  [SUBSCRIPTION_STATUSES.SUSPENDED]:
+    'Your account is temporarily suspended. Contact support or wait for activation.',
+  [SUBSCRIPTION_STATUSES.CANCELLED]: 'Your subscription has been cancelled.',
+});
+
+const READ_ONLY_HTTP_METHODS = new Set(['GET', 'HEAD', 'OPTIONS']);
+
+export const isReadOnlyHttpMethod = (method) =>
+  READ_ONLY_HTTP_METHODS.has(String(method || '').trim().toUpperCase());
 
 export const normalizePlanType = (value) => String(value || '').trim().toLowerCase();
 
@@ -54,6 +78,8 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       maxExamsPerMonth: 5,
       maxAttemptsPerMonth: 10,
       maxAiQuestionsPerMonth: 10,
+      maxAiGradingsPerMonth: 0,
+      maxImportFiles: 2,
       maxUsers: 10,
       maxExamCreators: null,
       maxCandidates: null,
@@ -68,6 +94,7 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       analytics: false,
       advancedAnalytics: false,
       aiGrading: false,
+      aiTypesAllowed: [],
       aiSubjectiveAutoGrading: false,
       aiRubricScoring: false,
       aiQuestionGen: true,
@@ -82,7 +109,7 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       proctoringLevel: 'none',
       omrMode: 'none',
       aiGradingMode: 'objective_only',
-      questionTypes: ['MCQ', 'TRUE_FALSE', 'SHORT_ANSWER'],
+      questionTypes: ['MCQ', 'TRUE_FALSE', 'SHORT_ANSWER', 'MULTIPLE_OPTIONS'],
       reports: 'basic',
     },
   },
@@ -94,6 +121,8 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       maxExamsPerMonth: 50,
       maxAttemptsPerMonth: 500,
       maxAiQuestionsPerMonth: 100,
+      maxAiGradingsPerMonth: 100,
+      maxImportFiles: 15,
       maxUsers: 500,
       maxExamCreators: 10,
       maxCandidates: 150,
@@ -108,7 +137,8 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       analytics: true,
       advancedAnalytics: false,
       aiGrading: true,
-      aiSubjectiveAutoGrading: false,
+      aiTypesAllowed: ['short', 'paragraph', 'essay', 'essay_letter', 'essay_story'],
+      aiSubjectiveAutoGrading: true,
       aiRubricScoring: false,
       aiQuestionGen: true,
       imageQuestions: true,
@@ -121,8 +151,19 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       codingCompilerMode: 'basic',
       proctoringLevel: 'basic',
       omrMode: 'assisted',
-      aiGradingMode: 'objective_only',
-      questionTypes: ['MCQ', 'TRUE_FALSE', 'SHORT_ANSWER', 'PARAGRAPH', 'IMAGE', 'CODING'],
+      aiGradingMode: 'basic',
+      questionTypes: [
+        'MCQ',
+        'TRUE_FALSE',
+        'SHORT_ANSWER',
+        'PARAGRAPH',
+        'IMAGE',
+        'CODING',
+        'MULTIPLE_OPTIONS',
+        'ESSAY',
+        'ESSAY_LETTER',
+        'ESSAY_STORY',
+      ],
       reports: 'detailed',
     },
   },
@@ -134,6 +175,8 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       maxExamsPerMonth: 250,
       maxAttemptsPerMonth: 1000,
       maxAiQuestionsPerMonth: 500,
+      maxAiGradingsPerMonth: 1000,
+      maxImportFiles: 50,
       maxUsers: 5000,
       maxExamCreators: null,
       maxCandidates: null,
@@ -148,6 +191,7 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       analytics: true,
       advancedAnalytics: true,
       aiGrading: true,
+      aiTypesAllowed: ['short', 'paragraph', 'essay', 'essay_letter', 'essay_story'],
       aiSubjectiveAutoGrading: true,
       aiRubricScoring: true,
       aiQuestionGen: true,
@@ -161,12 +205,15 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       codingCompilerMode: 'advanced',
       proctoringLevel: 'advanced',
       omrMode: 'full',
-      aiGradingMode: 'full',
+      aiGradingMode: 'enhanced',
       questionTypes: [
         'MCQ',
         'TRUE_FALSE',
         'SHORT_ANSWER',
         'PARAGRAPH',
+        'ESSAY',
+        'ESSAY_LETTER',
+        'ESSAY_STORY',
         'IMAGE',
         'CODING',
         'MULTIPLE_OPTIONS',
@@ -184,6 +231,8 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       maxExamsPerMonth: null,
       maxAttemptsPerMonth: null,
       maxAiQuestionsPerMonth: null,
+      maxAiGradingsPerMonth: null,
+      maxImportFiles: null,
       maxUsers: null,
       maxExamCreators: null,
       maxCandidates: null,
@@ -198,6 +247,7 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       analytics: true,
       advancedAnalytics: true,
       aiGrading: true,
+      aiTypesAllowed: ['short', 'paragraph', 'essay', 'essay_letter', 'essay_story'],
       aiSubjectiveAutoGrading: true,
       aiRubricScoring: true,
       aiQuestionGen: true,
@@ -211,12 +261,15 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       codingCompilerMode: 'advanced',
       proctoringLevel: 'advanced',
       omrMode: 'full',
-      aiGradingMode: 'full',
+      aiGradingMode: 'advanced',
       questionTypes: [
         'MCQ',
         'TRUE_FALSE',
         'SHORT_ANSWER',
         'PARAGRAPH',
+        'ESSAY',
+        'ESSAY_LETTER',
+        'ESSAY_STORY',
         'IMAGE',
         'CODING',
         'MULTIPLE_OPTIONS',
@@ -233,15 +286,273 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
   },
 });
 
+const isPlainObject = (value) => value && typeof value === 'object' && !Array.isArray(value);
+
+const cloneJsonValue = (value) => {
+  if (value === undefined) return undefined;
+  return JSON.parse(JSON.stringify(value));
+};
+
+const runtimeSubscriptionPlanOverrides = {};
+const runtimeSubscriptionGlobalLimits = {
+  ...DEFAULT_SUBSCRIPTION_GLOBAL_LIMITS,
+};
+
+const parseNonNegativeLimitOrNull = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.floor(parsed);
+};
+
+const GLOBAL_LIMIT_TO_PLAN_LIMIT_KEY = Object.freeze({
+  [SUBSCRIPTION_GLOBAL_LIMIT_KEYS.AI_QUESTIONS_PER_MONTH]: 'maxAiQuestionsPerMonth',
+  [SUBSCRIPTION_GLOBAL_LIMIT_KEYS.MAX_IMPORT_FILES]: 'maxImportFiles',
+});
+
+const normalizeGlobalLimitAlias = (key) => {
+  const normalized = String(key || '').trim();
+  if (!normalized) return '';
+  if (normalized === SUBSCRIPTION_GLOBAL_LIMIT_KEYS.AI_QUESTIONS_PER_MONTH) {
+    return SUBSCRIPTION_GLOBAL_LIMIT_KEYS.AI_QUESTIONS_PER_MONTH;
+  }
+  if (
+    normalized === 'maxAiQuestionsPerMonth' ||
+    normalized === 'aiQuestionLimit' ||
+    normalized === 'maxAiQuestions'
+  ) {
+    return SUBSCRIPTION_GLOBAL_LIMIT_KEYS.AI_QUESTIONS_PER_MONTH;
+  }
+  if (
+    normalized === SUBSCRIPTION_GLOBAL_LIMIT_KEYS.MAX_IMPORT_FILES ||
+    normalized === 'importFileLimit' ||
+    normalized === 'importQuestionsPerMonth' ||
+    normalized === 'maxImportQuestionsPerMonth' ||
+    normalized === 'importQuestionsLimit'
+  ) {
+    return SUBSCRIPTION_GLOBAL_LIMIT_KEYS.MAX_IMPORT_FILES;
+  }
+  return '';
+};
+
+const normalizeGlobalLimits = (input = {}) => {
+  if (!isPlainObject(input)) return {};
+  const normalized = {};
+  Object.entries(input).forEach(([incomingKey, incomingValue]) => {
+    const canonicalKey = normalizeGlobalLimitAlias(incomingKey);
+    if (!canonicalKey) return;
+    normalized[canonicalKey] = parseNonNegativeLimitOrNull(incomingValue);
+  });
+  return normalized;
+};
+
+export const setSubscriptionGlobalLimits = (limits = {}) => {
+  Object.keys(runtimeSubscriptionGlobalLimits).forEach((key) => {
+    delete runtimeSubscriptionGlobalLimits[key];
+  });
+
+  Object.assign(runtimeSubscriptionGlobalLimits, {
+    ...DEFAULT_SUBSCRIPTION_GLOBAL_LIMITS,
+    ...normalizeGlobalLimits(limits),
+  });
+};
+
+export const getSubscriptionGlobalLimits = () =>
+  cloneJsonValue(runtimeSubscriptionGlobalLimits) || {};
+
+export const updateSubscriptionGlobalLimits = (patch = {}) => {
+  if (!isPlainObject(patch)) {
+    return getSubscriptionGlobalLimits();
+  }
+
+  const normalizedPatch = normalizeGlobalLimits(patch);
+  Object.assign(runtimeSubscriptionGlobalLimits, normalizedPatch);
+  return getSubscriptionGlobalLimits();
+};
+
+const normalizePlanOverrideEntry = (planType, entry = {}) => {
+  const basePlan = SUBSCRIPTION_PLANS[planType];
+  if (!basePlan || !isPlainObject(entry)) return {};
+
+  const normalized = {};
+
+  if (typeof entry.label === 'string' && entry.label.trim()) {
+    normalized.label = entry.label.trim();
+  }
+
+  if (entry.price !== undefined && entry.price !== null && entry.price !== '') {
+    const parsedPrice = Number(entry.price);
+    if (Number.isFinite(parsedPrice) && parsedPrice >= 0) {
+      normalized.price = Number(parsedPrice.toFixed(2));
+    }
+  }
+
+  if (isPlainObject(entry.limits)) {
+    const allowedLimitKeys = Object.keys(basePlan.limits || {});
+    const normalizedLimits = {};
+
+    allowedLimitKeys.forEach((limitKey) => {
+      if (!Object.prototype.hasOwnProperty.call(entry.limits, limitKey)) return;
+      const incomingValue = entry.limits[limitKey];
+
+      if (incomingValue === null || incomingValue === undefined || incomingValue === '') {
+        normalizedLimits[limitKey] = null;
+        return;
+      }
+
+      const parsed = Number(incomingValue);
+      if (!Number.isFinite(parsed) || parsed < 0) return;
+      normalizedLimits[limitKey] = Math.floor(parsed);
+    });
+
+    if (Object.keys(normalizedLimits).length > 0) {
+      normalized.limits = normalizedLimits;
+    }
+  }
+
+  if (isPlainObject(entry.features)) {
+    normalized.features = cloneJsonValue(entry.features);
+  }
+
+  if (isPlainObject(entry.overrides)) {
+    const normalizedOverrides = normalizeGlobalLimits(entry.overrides);
+    if (Object.keys(normalizedOverrides).length > 0) {
+      normalized.overrides = normalizedOverrides;
+    }
+  }
+
+  return normalized;
+};
+
+export const setSubscriptionPlanOverrides = (overrides = {}) => {
+  Object.keys(runtimeSubscriptionPlanOverrides).forEach((planType) => {
+    delete runtimeSubscriptionPlanOverrides[planType];
+  });
+
+  if (!isPlainObject(overrides)) return;
+
+  Object.entries(overrides).forEach(([planTypeKey, overrideEntry]) => {
+    const planType = resolveSubscriptionPlanType(planTypeKey);
+    if (!SUBSCRIPTION_PLANS[planType]) return;
+
+    const normalized = normalizePlanOverrideEntry(planType, overrideEntry);
+    if (Object.keys(normalized).length === 0) return;
+    runtimeSubscriptionPlanOverrides[planType] = normalized;
+  });
+};
+
+export const getSubscriptionPlanOverrides = () => cloneJsonValue(runtimeSubscriptionPlanOverrides) || {};
+
+export const updateSubscriptionPlanOverride = (planType, patch = {}) => {
+  const resolvedPlanType = resolveSubscriptionPlanType(planType);
+  if (!SUBSCRIPTION_PLANS[resolvedPlanType]) {
+    return null;
+  }
+
+  const previous = isPlainObject(runtimeSubscriptionPlanOverrides[resolvedPlanType])
+    ? runtimeSubscriptionPlanOverrides[resolvedPlanType]
+    : {};
+  const normalizedPatch = normalizePlanOverrideEntry(resolvedPlanType, patch);
+
+  const nextOverride = {
+    ...previous,
+    ...normalizedPatch,
+    limits: isPlainObject(normalizedPatch.limits)
+      ? {
+          ...(isPlainObject(previous.limits) ? previous.limits : {}),
+          ...normalizedPatch.limits,
+        }
+      : previous.limits,
+    features: isPlainObject(normalizedPatch.features)
+      ? {
+          ...(isPlainObject(previous.features) ? previous.features : {}),
+          ...normalizedPatch.features,
+        }
+      : previous.features,
+    overrides: isPlainObject(normalizedPatch.overrides)
+      ? {
+          ...(isPlainObject(previous.overrides) ? previous.overrides : {}),
+          ...normalizedPatch.overrides,
+        }
+      : previous.overrides,
+  };
+
+  runtimeSubscriptionPlanOverrides[resolvedPlanType] = nextOverride;
+  return cloneJsonValue(nextOverride);
+};
+
 export const getSubscriptionPlanDefinition = (planType) => {
   const resolved = resolveSubscriptionPlanType(planType);
-  return SUBSCRIPTION_PLANS[resolved] || SUBSCRIPTION_PLANS[SUBSCRIPTION_PLAN_TYPES.FREE];
+  const basePlan = SUBSCRIPTION_PLANS[resolved] || SUBSCRIPTION_PLANS[SUBSCRIPTION_PLAN_TYPES.FREE];
+  const override = runtimeSubscriptionPlanOverrides[resolved];
+  const overrideLimits = isPlainObject(override?.limits) ? override.limits : {};
+  const overrideFeatures = isPlainObject(override?.features) ? override.features : {};
+  const overrideGlobalLimits = isPlainObject(override?.overrides) ? override.overrides : {};
+  const globalLimits = getSubscriptionGlobalLimits();
+
+  const resolvePlanLimitWithGlobalOverride = (limitKey) => {
+    const globalLimitKey = Object.entries(GLOBAL_LIMIT_TO_PLAN_LIMIT_KEY).find(
+      ([, mappedLimitKey]) => mappedLimitKey === limitKey
+    )?.[0];
+
+    if (!globalLimitKey) {
+      return Object.prototype.hasOwnProperty.call(overrideLimits, limitKey)
+        ? overrideLimits[limitKey]
+        : basePlan?.limits?.[limitKey];
+    }
+
+    if (Object.prototype.hasOwnProperty.call(overrideGlobalLimits, globalLimitKey)) {
+      const overrideValue = overrideGlobalLimits[globalLimitKey];
+      if (overrideValue === null) {
+        return Object.prototype.hasOwnProperty.call(globalLimits, globalLimitKey)
+          ? globalLimits[globalLimitKey]
+          : basePlan?.limits?.[limitKey];
+      }
+      return parseNonNegativeLimitOrNull(overrideValue);
+    }
+
+    if (Object.prototype.hasOwnProperty.call(overrideLimits, limitKey)) {
+      return overrideLimits[limitKey];
+    }
+
+    return basePlan?.limits?.[limitKey];
+  };
+
+  const resolvedLimits = {
+    ...(basePlan.limits || {}),
+    ...overrideLimits,
+  };
+
+  Object.values(SUBSCRIPTION_GLOBAL_LIMIT_KEYS).forEach((globalLimitKey) => {
+    const mappedLimitKey = GLOBAL_LIMIT_TO_PLAN_LIMIT_KEY[globalLimitKey];
+    if (!mappedLimitKey) return;
+    resolvedLimits[mappedLimitKey] = resolvePlanLimitWithGlobalOverride(mappedLimitKey);
+  });
+
+  return {
+    ...basePlan,
+    label: typeof override?.label === 'string' && override.label.trim()
+      ? override.label.trim()
+      : basePlan.label,
+    price: Number.isFinite(Number(override?.price)) && Number(override?.price) >= 0
+      ? Number(override.price)
+      : basePlan.price,
+    limits: resolvedLimits,
+    features: {
+      ...(basePlan.features || {}),
+      ...overrideFeatures,
+    },
+    overrides: cloneJsonValue(overrideGlobalLimits),
+  };
 };
 
 export const resolveSubscriptionStatus = (subscription = {}, now = new Date()) => {
   const rawStatus = String(subscription.status || '')
     .trim()
     .toUpperCase() || SUBSCRIPTION_STATUSES.ACTIVE;
+  if (rawStatus === SUBSCRIPTION_STATUSES.CANCELLED) {
+    return SUBSCRIPTION_STATUSES.CANCELLED;
+  }
   if (rawStatus === SUBSCRIPTION_STATUSES.SUSPENDED) {
     return SUBSCRIPTION_STATUSES.SUSPENDED;
   }
@@ -257,7 +568,8 @@ export const resolveSubscriptionStatus = (subscription = {}, now = new Date()) =
 export const resolveEffectivePlanType = (planType, subscriptionStatus) => {
   if (
     subscriptionStatus === SUBSCRIPTION_STATUSES.EXPIRED ||
-    subscriptionStatus === SUBSCRIPTION_STATUSES.SUSPENDED
+    subscriptionStatus === SUBSCRIPTION_STATUSES.SUSPENDED ||
+    subscriptionStatus === SUBSCRIPTION_STATUSES.CANCELLED
   ) {
     return SUBSCRIPTION_PLAN_TYPES.FREE;
   }
@@ -291,11 +603,12 @@ export const FREE_PLAN_MESSAGES = Object.freeze({
   AI_QUESTION_LIMIT:
     'Free plan monthly AI question generation limit reached. Upgrade to generate more AI questions.',
   CODING_LOCKED: 'Coding questions are available only in higher plans.',
-  QUESTION_TYPE_LOCKED: 'Free plan supports only MCQ, True/False, and Short Answer questions.',
+  QUESTION_TYPE_LOCKED: 'Free plan supports only MCQ, Multi Select, True/False, and Short Answer questions.',
+  WRITING_AI_LOCKED: 'Upgrade your plan to use writing questions with AI grading',
   OMR_LOCKED: 'OMR evaluation is available only in higher plans.',
   PROCTORING_LOCKED: 'Online proctoring is available only in higher plans.',
   ANALYTICS_LOCKED: 'Advanced analytics are available only in higher plans.',
-  AI_GRADING_LOCKED: 'Automated grading is available only in higher plans.',
+  AI_GRADING_LOCKED: 'Upgrade your plan to use AI grading',
   IP_WHITELIST_LOCKED: 'IP whitelisting is available only in higher plans.',
   GEO_LOCKED: 'Geo-location restrictions are available only in higher plans.',
   SECURE_BROWSER_LOCKED: 'Secure browser controls are available only in higher plans.',

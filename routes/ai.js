@@ -21,21 +21,29 @@ import { normalizeQuestionFormat } from '../utils/questionTypes.js';
 import {
   createTrackedChatCompletion,
   getAIQuestionCountForTenantByWindow,
+  getAIUsageCountForTenantByWindow,
+  trackAIUsageEvent,
 } from '../services/aiTokenUsageService.js';
 import Tenant from '../models/Tenant.js';
-import { getCurrentMonthRange } from '../utils/planUsage.js';
+import { getCurrentMonthRange, getQuestionCountForExam } from '../utils/planUsage.js';
 import {
   FREE_PLAN_MESSAGES,
+  FREE_TRIAL_LIMITS,
   PLAN_LIMIT_MESSAGES,
-  SUBSCRIPTION_PLAN_TYPES,
   getSubscriptionPlanDefinition,
   isFreePlan,
+  isTrialRestrictedPlan,
   isPlanFeatureEnabled,
 } from '../config/planLimits.js';
 import {
   resolveUserEffectivePlanType,
   sendPlanRestriction,
 } from '../middleware/planRestrictions.js';
+import {
+  CREDIT_REQUEST_TYPES,
+  normalizeTenantExtraCredits,
+} from '../utils/creditSystem.js';
+import Exam from '../models/Exam.js';
 
 const handleMulterUploadError = (err, req, res, next) => {
   if (!err) {
@@ -96,10 +104,22 @@ const normalizeAiQuestionType = (value) => {
   if (['TRUE_FALSE', 'TRUEFALSE'].includes(normalized)) return 'TRUE_FALSE';
   if (['SHORT_ANSWER', 'SHORTANSWER'].includes(normalized)) return 'SHORT_ANSWER';
   if (['IMAGE', 'IMAGE_BASED', 'IMAGE-BASED'].includes(normalized)) return 'IMAGE';
+  if (['MULTI_SELECT_MCQ', 'MULTI_SELECT MCQ'].includes(normalized)) {
+    return 'MULTIPLE_OPTIONS';
+  }
   if (['MULTIPLE_OPTIONS', 'MULTI_SELECT', 'MULTISELECT'].includes(normalized)) {
     return 'MULTIPLE_OPTIONS';
   }
   if (['PARAGRAPH', 'SCENARIO'].includes(normalized)) return normalized;
+  if (['ESSAY', 'LONG_ANSWER', 'LONGANSWER', 'DESCRIPTIVE'].includes(normalized)) {
+    return 'ESSAY';
+  }
+  if (['ESSAY_LETTER', 'LETTER_WRITING', 'LETTER'].includes(normalized)) {
+    return 'ESSAY_LETTER';
+  }
+  if (['ESSAY_STORY', 'STORY_WRITING', 'STORY'].includes(normalized)) {
+    return 'ESSAY_STORY';
+  }
   if (['CODING', 'CODE'].includes(normalized)) return 'CODING';
   if (['NUMBER', 'NUMERIC'].includes(normalized)) return 'NUMBER';
   return normalized;
@@ -107,9 +127,13 @@ const normalizeAiQuestionType = (value) => {
 
 const FREE_PLAN_ALLOWED_AI_TYPES = new Set([
   'MULTIPLE_CHOICE',
+  'MULTIPLE_OPTIONS',
   'TRUE_FALSE',
   'SHORT_ANSWER',
 ]);
+const FREE_PLAN_AI_TYPE_LOCKED_MESSAGE =
+  'Free plan AI question generation supports only MCQ, Multi Select, True/False, and Short Answer question types.';
+const WRITING_AI_TYPES = new Set(['ESSAY', 'ESSAY_LETTER', 'ESSAY_STORY']);
 
 const toNonNegativeInt = (value, fallback = 0) => {
   const parsed = Number(value);
@@ -124,6 +148,61 @@ const resolveFiniteLimit = (value) => {
   return Math.floor(parsed);
 };
 
+const parseOptionalNonNegativeInt = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.floor(parsed);
+};
+
+const IMPORT_PLACEHOLDER_ROW_HINT_REGEX =
+  /\b(?:ocr review required|manual review required|scanned question block|scanned pdf page|imported scanned question)\b/i;
+const IMPORT_HEADER_HINT_REGEX = /\b(?:quiz|name|date|section)\b/i;
+const IMPORT_NUMBER_MARKER_REGEX =
+  /(?:^|\s)(?:q(?:uestion)?\s*)?\d{1,3}\s*[\).:\-]\s+/gi;
+
+const normalizeImportTextValue = (value) =>
+  String(value ?? '')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const extractStructuredRowText = (row = {}) =>
+  normalizeImportTextValue(
+    row?.questionText ||
+      row?.question ||
+      row?.prompt ||
+      row?.title ||
+      row?.text ||
+      ''
+  );
+
+const countNumberedQuestionMarkers = (value) => {
+  const normalized = normalizeImportTextValue(value);
+  if (!normalized) return 0;
+  const matches = normalized.match(IMPORT_NUMBER_MARKER_REGEX);
+  return Array.isArray(matches) ? matches.length : 0;
+};
+
+const shouldPreferNumberedTextOverSingleStructuredRow = ({
+  text,
+  structuredRows,
+}) => {
+  const safeRows = Array.isArray(structuredRows) ? structuredRows : [];
+  if (safeRows.length !== 1) return false;
+
+  const rowText = extractStructuredRowText(safeRows[0]);
+  if (!rowText) return false;
+
+  const combinedText = normalizeImportTextValue(`${text || ''} ${rowText}`);
+  const markerCount = countNumberedQuestionMarkers(combinedText);
+  if (markerCount < 2) return false;
+
+  const hasHeaderHint = IMPORT_HEADER_HINT_REGEX.test(combinedText);
+  const hasMcqHint = /(?:^|\s)A[\).:\-]\s+\S+/i.test(combinedText);
+  const hasTrueFalseHint = /\btrue\s*\/\s*false\b/i.test(combinedText);
+  return hasHeaderHint || hasMcqHint || hasTrueFalseHint;
+};
+
 const buildAiUsageWindow = (subscription = null) => {
   const { start, end } = getCurrentMonthRange();
   const resetAt = subscription?.usageResetAt ? new Date(subscription.usageResetAt) : null;
@@ -135,26 +214,99 @@ const buildAiUsageWindow = (subscription = null) => {
 
 const resolveTenantAiQuestionLimit = (effectivePlanType, tenant = null) => {
   const planDefinition = getSubscriptionPlanDefinition(effectivePlanType);
+  const normalizedExtraCredits = normalizeTenantExtraCredits(tenant?.extraCredits);
+  const customLimits =
+    tenant?.subscription?.customLimits &&
+    typeof tenant.subscription.customLimits === 'object' &&
+    !Array.isArray(tenant.subscription.customLimits)
+      ? tenant.subscription.customLimits
+      : {};
+  const hasCustomAiLimit = Object.prototype.hasOwnProperty.call(
+    customLimits,
+    'maxAiQuestionsPerMonth'
+  );
+  const customLimit = hasCustomAiLimit
+    ? resolveFiniteLimit(customLimits.maxAiQuestionsPerMonth)
+    : null;
+  const legacyLimit = resolveFiniteLimit(tenant?.aiUsageLimit);
   const planLimit = resolveFiniteLimit(planDefinition?.limits?.maxAiQuestionsPerMonth);
+
+  let resolvedLimit = null;
+  if (hasCustomAiLimit && customLimit !== null) {
+    resolvedLimit = customLimit;
+  } else if (legacyLimit !== null) {
+    resolvedLimit = legacyLimit;
+  } else {
+    resolvedLimit = planLimit;
+  }
+
+  if (resolvedLimit === null) return null;
+  return resolvedLimit + normalizedExtraCredits.ai;
+};
+
+const resolveTenantImportFileLimit = (effectivePlanType, tenant = null) => {
+  const planDefinition = getSubscriptionPlanDefinition(effectivePlanType);
+  const customLimits =
+    tenant?.subscription?.customLimits &&
+    typeof tenant.subscription.customLimits === 'object' &&
+    !Array.isArray(tenant.subscription.customLimits)
+      ? tenant.subscription.customLimits
+      : {};
+  const hasCustomImportQuestionLimit = Object.prototype.hasOwnProperty.call(
+    customLimits,
+    'importQuestionsPerMonth'
+  );
+  const hasCustomImportFileLimit = Object.prototype.hasOwnProperty.call(
+    customLimits,
+    'maxImportFiles'
+  );
+  const customLimit = hasCustomImportQuestionLimit
+    ? resolveFiniteLimit(customLimits.importQuestionsPerMonth)
+    : hasCustomImportFileLimit
+      ? resolveFiniteLimit(customLimits.maxImportFiles)
+      : null;
+  const planLimit = resolveFiniteLimit(
+    planDefinition?.limits?.importQuestionsPerMonth ??
+      planDefinition?.limits?.maxImportFiles
+  );
+
+  if (hasCustomImportQuestionLimit || hasCustomImportFileLimit) {
+    return customLimit;
+  }
+
+  return planLimit;
+};
+
+const resolveTenantMaxQuestionsPerExam = (effectivePlanType, tenant = null) => {
+  const planDefinition = getSubscriptionPlanDefinition(effectivePlanType);
+  const customLimits =
+    tenant?.subscription?.customLimits &&
+    typeof tenant.subscription.customLimits === 'object' &&
+    !Array.isArray(tenant.subscription.customLimits)
+      ? tenant.subscription.customLimits
+      : {};
+  const hasCustomQuestionLimit = Object.prototype.hasOwnProperty.call(
+    customLimits,
+    'maxQuestionsPerExam'
+  );
+  const customLimit = hasCustomQuestionLimit
+    ? resolveFiniteLimit(customLimits.maxQuestionsPerExam)
+    : null;
+  const planLimit = resolveFiniteLimit(planDefinition?.limits?.maxQuestionsPerExam);
+
+  if (hasCustomQuestionLimit) {
+    return customLimit;
+  }
+
   if (planLimit !== null) {
     return planLimit;
   }
 
-  const normalizedPlanType = String(effectivePlanType || '').trim().toLowerCase();
-  if (normalizedPlanType === SUBSCRIPTION_PLAN_TYPES.LEGEND) {
-    const customLimits =
-      tenant?.subscription?.customLimits &&
-      typeof tenant.subscription.customLimits === 'object' &&
-      !Array.isArray(tenant.subscription.customLimits)
-        ? tenant.subscription.customLimits
-        : {};
-    if (Object.prototype.hasOwnProperty.call(customLimits, 'maxAiQuestionsPerMonth')) {
-      return resolveFiniteLimit(customLimits.maxAiQuestionsPerMonth);
-    }
-    return resolveFiniteLimit(tenant?.aiUsageLimit);
+  if (isTrialRestrictedPlan(effectivePlanType)) {
+    return resolveFiniteLimit(FREE_TRIAL_LIMITS.maxQuestions);
   }
 
-  return null;
+  return planLimit;
 };
 
 const buildAiQuestionLimitMessage = (effectivePlanType, limit) => {
@@ -169,6 +321,253 @@ const buildAiQuestionLimitMessage = (effectivePlanType, limit) => {
   return `${baseMessage} Monthly limit: ${limit} questions.`;
 };
 
+const buildImportFileLimitMessage = (limit) => {
+  if (!Number.isFinite(Number(limit))) {
+    return 'Monthly import limit reached. Upgrade your plan to continue.';
+  }
+
+  return `Monthly import limit reached. Your plan allows ${limit} file${Number(limit) === 1 ? '' : 's'} this month. Upgrade to increase limit.`;
+};
+
+const buildExamQuestionLimitMessage = (limit) => {
+  if (!Number.isFinite(Number(limit))) {
+    return PLAN_LIMIT_MESSAGES.QUESTION_LIMIT;
+  }
+  return `${PLAN_LIMIT_MESSAGES.QUESTION_LIMIT} Per exam limit: ${limit} questions.`;
+};
+
+const buildExamQuestionPartialImportWarning = ({
+  allowedCount = 0,
+  detectedCount = 0,
+  maxQuestionsPerExam = null,
+}) => {
+  const safeAllowed = Math.max(0, Number(allowedCount) || 0);
+  const safeDetected = Math.max(0, Number(detectedCount) || 0);
+  if (!safeAllowed || safeAllowed >= safeDetected) return '';
+  if (!Number.isFinite(Number(maxQuestionsPerExam))) {
+    return `Only ${safeAllowed} question${safeAllowed === 1 ? '' : 's'} imported due to exam question limit.`;
+  }
+  return `Only ${safeAllowed} question${safeAllowed === 1 ? '' : 's'} imported due to exam question limit (${maxQuestionsPerExam} max per exam).`;
+};
+
+const IMPORT_GENERIC_FAILURE_MESSAGE = 'Import failed. No questions were added.';
+const IMPORT_EMPTY_RESULT_MESSAGE = 'No valid questions found in file';
+const IMPORT_INVALID_FILE_MESSAGE = 'Invalid file format';
+
+const normalizeImportFailureMessage = (rawMessage) => {
+  const message = String(rawMessage || '').trim();
+  if (!message) {
+    return IMPORT_GENERIC_FAILURE_MESSAGE;
+  }
+
+  const normalized = message.toLowerCase();
+  if (
+    normalized.includes('unsupported file type') ||
+    normalized.includes('invalid file type') ||
+    normalized.includes('invalid file format') ||
+    normalized.includes('no file uploaded')
+  ) {
+    return IMPORT_INVALID_FILE_MESSAGE;
+  }
+
+  if (
+    normalized.includes('no extractable content') ||
+    normalized.includes('no questions extracted') ||
+    normalized.includes('no questions detected')
+  ) {
+    return IMPORT_EMPTY_RESULT_MESSAGE;
+  }
+
+  return message;
+};
+
+const buildImportFailurePayload = (rawMessage, extra = {}) => {
+  const message = normalizeImportFailureMessage(rawMessage);
+  return {
+    success: false,
+    importedCount: 0,
+    message,
+    error: message,
+    ...extra,
+  };
+};
+
+const buildImportSuccessPayload = ({
+  questions = [],
+  detectedCount = null,
+  importReport = {},
+  importLimitPerMonth = null,
+  updatedImportUsage = null,
+  remainingImports = null,
+  examQuestionCount = null,
+  maxQuestionsPerExam = null,
+  partialImportWarning = '',
+} = {}) => {
+  const importedCount = Array.isArray(questions) ? questions.length : 0;
+  const normalizedDetectedCount = Number.isFinite(Number(detectedCount))
+    ? Math.max(importedCount, Math.floor(Number(detectedCount)))
+    : importedCount;
+  const warning = String(partialImportWarning || '').trim();
+  const message =
+    importedCount > 0
+      ? `Successfully imported ${importedCount} question${importedCount === 1 ? '' : 's'}.`
+      : IMPORT_EMPTY_RESULT_MESSAGE;
+
+  return {
+    success: true,
+    importedCount,
+    detectedCount: normalizedDetectedCount,
+    message,
+    questions: Array.isArray(questions) ? questions : [],
+    importReport: importReport || {},
+    warning,
+    partialImportWarning: warning || null,
+    warnings: warning ? [warning] : [],
+    importLimitPerMonth,
+    updatedImportUsage,
+    remainingImports,
+    importUsed: updatedImportUsage,
+    importLimit: importLimitPerMonth,
+    examQuestionCount,
+    maxQuestionsPerExam,
+    // Backward compatibility aliases
+    importUsedThisMonth: updatedImportUsage,
+    importFilesUsed: updatedImportUsage,
+    importFilesRemaining: remainingImports,
+    importQuestionsUsed: updatedImportUsage,
+    importQuestionsRemaining: remainingImports,
+  };
+};
+
+const resolveTenantAiUsageSummary = async ({ tenantId, effectivePlanType }) => {
+  if (!tenantId) {
+    return {
+      aiQuestionsLimit: null,
+      aiQuestionsUsed: 0,
+      aiQuestionsRemaining: null,
+      importQuestionsLimit: null,
+      importQuestionsUsed: 0,
+      importQuestionsRemaining: null,
+      importFilesLimit: null,
+      importFilesUsed: 0,
+      importFilesRemaining: null,
+      period: null,
+    };
+  }
+
+  const tenant = await Tenant.findById(tenantId)
+    .select('subscription aiUsageLimit extraCredits')
+    .lean();
+  const usageWindow = buildAiUsageWindow(tenant?.subscription || null);
+  const aiQuestionsUsed = await getAIQuestionCountForTenantByWindow(
+    tenantId,
+    usageWindow.start,
+    usageWindow.end
+  );
+  const importFilesUsed = await getAIUsageCountForTenantByWindow(
+    tenantId,
+    usageWindow.start,
+    usageWindow.end,
+    {
+      features: ['question_import_file'],
+      requestStatus: 'SUCCESS',
+      field: 'events',
+    }
+  );
+  const aiQuestionsLimit = resolveTenantAiQuestionLimit(effectivePlanType, tenant);
+  const importQuestionsLimit = resolveTenantImportFileLimit(effectivePlanType, tenant);
+  const maxQuestionsPerExam = resolveTenantMaxQuestionsPerExam(effectivePlanType, tenant);
+  const aiQuestionsRemaining =
+    aiQuestionsLimit === null
+      ? null
+      : Math.max((Number(aiQuestionsLimit) || 0) - (Number(aiQuestionsUsed) || 0), 0);
+  const importFilesRemaining =
+    importQuestionsLimit === null
+      ? null
+      : Math.max(
+          (Number(importQuestionsLimit) || 0) - (Number(importFilesUsed) || 0),
+          0
+        );
+
+  return {
+    aiQuestionsLimit,
+    aiQuestionsUsed,
+    aiQuestionsRemaining,
+    aiQuestionsPerMonth: aiQuestionsLimit,
+    importQuestionsLimit,
+    importQuestionsUsed: importFilesUsed,
+    importQuestionsRemaining: importFilesRemaining,
+    importLimitPerMonth: importQuestionsLimit,
+    importUsedThisMonth: importFilesUsed,
+    // Backward-compatibility aliases for older frontend/API consumers.
+    importFilesLimit: importQuestionsLimit,
+    importFilesUsed: importFilesUsed,
+    importFilesRemaining: importFilesRemaining,
+    maxQuestionsPerExam,
+    period: {
+      type: 'month',
+      start: usageWindow.start,
+      end: usageWindow.end,
+    },
+  };
+};
+
+router.get(
+  '/usage-summary',
+  requireAuth,
+  requireTenant,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
+  async (req, res, next) => {
+    try {
+      const effectivePlanType = await resolveUserEffectivePlanType(req.user);
+      const usageSummary = await resolveTenantAiUsageSummary({
+        tenantId: req.user?.tenantId || null,
+        effectivePlanType,
+      });
+      const requestedExamId = String(req.query?.examId || '').trim();
+      const hasValidRequestedExamId = /^[a-fA-F0-9]{24}$/.test(requestedExamId);
+      let examQuestionCount = null;
+      if (hasValidRequestedExamId) {
+        const scopedExamFilter = { _id: requestedExamId };
+        if (req.user?.tenantId) {
+          scopedExamFilter.tenantId = req.user.tenantId;
+        } else if (req.user?._id) {
+          scopedExamFilter.createdBy = req.user._id;
+        }
+        const scopedExam = await Exam.findOne(scopedExamFilter).select('_id').lean();
+        if (scopedExam?._id) {
+          examQuestionCount = await getQuestionCountForExam(scopedExam._id);
+        }
+      }
+
+      return res.json({
+        planType: String(effectivePlanType || '').trim().toUpperCase(),
+        aiQuestionsLimit: usageSummary.aiQuestionsLimit,
+        aiQuestionsUsed: usageSummary.aiQuestionsUsed,
+        aiQuestionsRemaining: usageSummary.aiQuestionsRemaining,
+        importQuestionsLimit: usageSummary.importQuestionsLimit,
+        importQuestionsUsed: usageSummary.importQuestionsUsed,
+        importQuestionsRemaining: usageSummary.importQuestionsRemaining,
+        importLimitPerMonth: usageSummary.importLimitPerMonth,
+        importUsedThisMonth: usageSummary.importUsedThisMonth,
+        importFilesLimit: usageSummary.importFilesLimit,
+        importFilesUsed: usageSummary.importFilesUsed,
+        importFilesRemaining: usageSummary.importFilesRemaining,
+        importUsed: usageSummary.importQuestionsUsed,
+        importLimit: usageSummary.importQuestionsLimit,
+        remainingImports: usageSummary.importQuestionsRemaining,
+        examQuestionCount,
+        maxQuestionsPerExam: usageSummary.maxQuestionsPerExam,
+        aiQuestionsPerMonth: usageSummary.aiQuestionsPerMonth,
+        period: usageSummary.period,
+        updatedAt: new Date().toISOString(),
+      });
+    } catch (error) {
+      return next(error);
+    }
+  }
+);
+
 // Generate questions using AI (available to EXAM_CREATOR)
 router.post(
   '/import-questions',
@@ -179,14 +578,101 @@ router.post(
   handleMulterUploadError,
   async (req, res, next) => {
     try {
+      const effectivePlanType = await resolveUserEffectivePlanType(req.user);
+      const tenantId = req.user?.tenantId || null;
+      let preImportUsageSummary = null;
+
       if (!req.file) {
-        return res.status(400).json({ error: 'No file uploaded' });
+        return res
+          .status(400)
+          .json(buildImportFailurePayload('No file uploaded. Please upload a valid file.'));
+      }
+
+      if (tenantId) {
+        preImportUsageSummary = await resolveTenantAiUsageSummary({
+          tenantId,
+          effectivePlanType,
+        });
+        const monthlyImportLimit = preImportUsageSummary.importQuestionsLimit;
+        const importFilesUsed = Number(preImportUsageSummary.importQuestionsUsed) || 0;
+
+        if (monthlyImportLimit !== null && importFilesUsed >= monthlyImportLimit) {
+          return sendPlanRestriction(res, buildImportFileLimitMessage(monthlyImportLimit), {
+            code: 'LIMIT_EXCEEDED',
+            usage: {
+              importQuestions: {
+                used: importFilesUsed,
+                requested: 0,
+                remaining: 0,
+                limit: monthlyImportLimit,
+              },
+              // Backward-compatibility alias used by older modal parsers.
+              importFiles: {
+                used: importFilesUsed,
+                requested: 0,
+                remaining: 0,
+                limit: monthlyImportLimit,
+              },
+              period: {
+                type: 'month',
+                start: preImportUsageSummary.period?.start || null,
+                end: preImportUsageSummary.period?.end || null,
+              },
+            },
+          });
+        }
       }
 
       const importData = await parseQuestionImportFile(req.file);
       let { text, structuredRows } = importData;
+
+      const structuredRowCount = Array.isArray(structuredRows)
+        ? structuredRows.length
+        : 0;
+      const placeholderOnlyStructuredRows =
+        structuredRowCount > 0 &&
+        structuredRows.every((row) =>
+          IMPORT_PLACEHOLDER_ROW_HINT_REGEX.test(extractStructuredRowText(row))
+        );
+      const shouldBypassSingleStructuredRow =
+        !placeholderOnlyStructuredRows &&
+        shouldPreferNumberedTextOverSingleStructuredRow({
+          text,
+          structuredRows,
+        });
+
+      if (placeholderOnlyStructuredRows || shouldBypassSingleStructuredRow) {
+        console.log(
+          '[question-import-debug] STRUCTURED ROW FILTER:',
+          {
+            structuredRowCount,
+            placeholderOnlyStructuredRows,
+            shouldBypassSingleStructuredRow,
+          }
+        );
+        structuredRows = [];
+      }
+
+      if (placeholderOnlyStructuredRows) {
+        const normalizedText = normalizeImportTextValue(text);
+        const shouldDiscardText =
+          IMPORT_PLACEHOLDER_ROW_HINT_REGEX.test(normalizedText) &&
+          countNumberedQuestionMarkers(normalizedText) <= 1;
+        if (shouldDiscardText) {
+          text = '';
+        }
+        if (Array.isArray(importData.extractionErrors)) {
+          importData.extractionErrors.push({
+            stage: 'structured-row-filter',
+            message:
+              'Discarded placeholder scanned rows so OCR/text fallback can extract real questions.',
+          });
+        }
+      }
+
       let hasText = typeof text === 'string' && text.trim().length > 0;
-      const hasStructuredRows = Array.isArray(structuredRows) && structuredRows.length > 0;
+      let hasStructuredRows =
+        Array.isArray(structuredRows) && structuredRows.length > 0;
 
       if (!hasText && !hasStructuredRows) {
         if (importData.extension === '.pdf') {
@@ -218,8 +704,7 @@ router.post(
 
       if (!hasText && !hasStructuredRows) {
         return res.status(400).json({
-          error:
-            'No extractable content found in the uploaded file. OCR fallback also could not extract readable text.',
+          ...buildImportFailurePayload(IMPORT_EMPTY_RESULT_MESSAGE),
           importReport: {
             extractionErrors: Array.isArray(importData.extractionErrors)
               ? importData.extractionErrors
@@ -257,30 +742,228 @@ router.post(
         );
       }
 
-      res.json({
-        questions: Array.isArray(imageAttachmentResult?.questions)
-          ? imageAttachmentResult.questions.map((question) => {
-              const questionFormat =
-                normalizeQuestionFormat({
-                  ...question,
-                  questionText: question?.questionText || question?.question_text || '',
-                }) || '';
+      const detectedQuestions = Array.isArray(imageAttachmentResult?.questions)
+        ? imageAttachmentResult.questions
+        : [];
+      const detectedQuestionCount = detectedQuestions.length;
+      let importedQuestions = [...detectedQuestions];
+      let importedQuestionCount = importedQuestions.length;
+      let partialImportWarning = '';
+      const skipUsageTracking =
+        String(req.body?.skipUsageTracking || '').trim().toLowerCase() === 'true';
+      let responseExamQuestionCount = null;
+      let responseMaxQuestionsPerExam = null;
 
-              return {
-                ...question,
-                questionFormat,
-                question_type: questionFormat,
-              };
-            })
-          : [],
-        importReport: imageAttachmentResult?.report || {},
-      });
-    } catch (error) {
-      if (error?.statusCode) {
-        return res.status(error.statusCode).json({ error: error.message });
+      if (tenantId) {
+        const requestedExamId = String(req.body?.examId || '').trim();
+        const hasValidRequestedExamId = /^[a-fA-F0-9]{24}$/.test(requestedExamId);
+        const requestedCurrentQuestionCount = parseOptionalNonNegativeInt(
+          req.body?.currentQuestionCount
+        );
+        let currentQuestionCount = requestedCurrentQuestionCount;
+
+        if (hasValidRequestedExamId) {
+          const scopedExamFilter = { _id: requestedExamId };
+          if (tenantId) {
+            scopedExamFilter.tenantId = tenantId;
+          } else if (req.user?._id) {
+            scopedExamFilter.createdBy = req.user._id;
+          }
+          const scopedExam = await Exam.findOne(scopedExamFilter).select('_id').lean();
+          if (scopedExam?._id) {
+            currentQuestionCount = await getQuestionCountForExam(scopedExam._id);
+          }
+        }
+
+        if (currentQuestionCount !== null) {
+          responseExamQuestionCount =
+            Number(currentQuestionCount || 0) + Number(importedQuestionCount || 0);
+        }
+
+        const tenantForQuestionLimit = await Tenant.findById(tenantId)
+          .select('subscription')
+          .lean();
+        responseMaxQuestionsPerExam = resolveTenantMaxQuestionsPerExam(
+          effectivePlanType,
+          tenantForQuestionLimit
+        );
+
+        if (currentQuestionCount !== null) {
+          const maxQuestionsPerExam = responseMaxQuestionsPerExam;
+          const availableQuestionSlots =
+            maxQuestionsPerExam === null
+              ? null
+              : Math.max(Number(maxQuestionsPerExam || 0) - Number(currentQuestionCount || 0), 0);
+
+          if (
+            maxQuestionsPerExam !== null &&
+            availableQuestionSlots <= 0
+          ) {
+            return sendPlanRestriction(
+              res,
+              buildExamQuestionLimitMessage(maxQuestionsPerExam),
+              {
+                code: 'LIMIT_EXCEEDED',
+                usage: {
+                  questions: {
+                    used: Number(currentQuestionCount || 0),
+                    requested: importedQuestionCount,
+                    remaining: 0,
+                    limit: maxQuestionsPerExam,
+                  },
+                },
+              }
+            );
+          }
+
+          if (
+            maxQuestionsPerExam !== null &&
+            Number(currentQuestionCount || 0) + importedQuestionCount > maxQuestionsPerExam
+          ) {
+            importedQuestions = importedQuestions.slice(0, availableQuestionSlots || 0);
+            importedQuestionCount = importedQuestions.length;
+            partialImportWarning = buildExamQuestionPartialImportWarning({
+              allowedCount: importedQuestionCount,
+              detectedCount: detectedQuestionCount,
+              maxQuestionsPerExam,
+            });
+          }
+
+          responseExamQuestionCount =
+            Number(currentQuestionCount || 0) + Number(importedQuestionCount || 0);
+        }
       }
 
-      next(error);
+      if (tenantId && importedQuestionCount > 0) {
+        const usageSummary = preImportUsageSummary || (await resolveTenantAiUsageSummary({
+          tenantId,
+          effectivePlanType,
+        }));
+        const monthlyImportLimit = usageSummary.importQuestionsLimit;
+
+        if (monthlyImportLimit !== null) {
+          const importFilesUsed = Number(usageSummary.importQuestionsUsed) || 0;
+          const wouldUse = importFilesUsed + 1;
+
+          if (wouldUse > monthlyImportLimit) {
+            const remaining = Math.max(monthlyImportLimit - importFilesUsed, 0);
+            return sendPlanRestriction(res, buildImportFileLimitMessage(monthlyImportLimit), {
+              code: 'LIMIT_EXCEEDED',
+              usage: {
+                importQuestions: {
+                  used: importFilesUsed,
+                  requested: 1,
+                  remaining,
+                  limit: monthlyImportLimit,
+                },
+                // Backward-compatibility alias used by older modal parsers.
+                importFiles: {
+                  used: importFilesUsed,
+                  requested: 1,
+                  remaining,
+                  limit: monthlyImportLimit,
+                },
+                period: {
+                  type: 'month',
+                  start: usageSummary.period?.start || null,
+                  end: usageSummary.period?.end || null,
+                },
+              },
+            });
+          }
+        }
+      }
+
+      let importUsageIncrement = 0;
+      if (tenantId && importedQuestionCount > 0 && !skipUsageTracking) {
+        try {
+          await trackAIUsageEvent({
+            feature: 'question_import_file',
+            tenantId,
+            userId: req.user?._id || null,
+            model: 'upload',
+            usageCount: 1,
+            questionCount: importedQuestionCount,
+            requestStatus: 'SUCCESS',
+            usage: {
+              prompt_tokens: 0,
+              completion_tokens: 0,
+              total_tokens: 0,
+            },
+          });
+          importUsageIncrement = 1;
+        } catch (usageTrackError) {
+          console.warn(
+            '[import-questions] failed to track import file usage:',
+            usageTrackError?.message || usageTrackError
+          );
+        }
+      }
+
+      let updatedImportUsage = null;
+      let remainingImports = null;
+      let importLimitPerMonth = null;
+      if (tenantId) {
+        const usageSummaryForResponse =
+          preImportUsageSummary ||
+          (await resolveTenantAiUsageSummary({
+            tenantId,
+            effectivePlanType,
+          }));
+        const importsUsedBefore = Number(usageSummaryForResponse?.importQuestionsUsed) || 0;
+        importLimitPerMonth = usageSummaryForResponse?.importQuestionsLimit ?? null;
+        updatedImportUsage =
+          importedQuestionCount > 0 ? importsUsedBefore + importUsageIncrement : importsUsedBefore;
+        remainingImports =
+          importLimitPerMonth === null
+            ? null
+            : Math.max((Number(importLimitPerMonth) || 0) - Number(updatedImportUsage || 0), 0);
+      }
+
+      const responseQuestions = Array.isArray(importedQuestions)
+        ? importedQuestions.map((question) => {
+            const questionFormat =
+              normalizeQuestionFormat({
+                ...question,
+                questionText: question?.questionText || question?.question_text || '',
+              }) || '';
+
+            return {
+              ...question,
+              questionFormat,
+              question_type: questionFormat,
+            };
+          })
+        : [];
+
+      console.log('[question-import-debug] DETECTED TOTAL:', detectedQuestionCount);
+      responseQuestions.forEach((question, index) => {
+        console.log(
+          `[question-import-debug] PREVIEW Q${index + 1}: questionType=${question?.questionType || ''} questionFormat=${question?.questionFormat || ''} hasImage=${Boolean(question?.imageUrl || question?.image_path || question?.generatedImage || question?.generated_image)}`
+        );
+      });
+
+      return res.json(
+        buildImportSuccessPayload({
+          questions: responseQuestions,
+          detectedCount: detectedQuestionCount,
+          importReport: imageAttachmentResult?.report || {},
+          importLimitPerMonth,
+          updatedImportUsage,
+          remainingImports,
+          examQuestionCount: responseExamQuestionCount,
+          maxQuestionsPerExam: responseMaxQuestionsPerExam,
+          partialImportWarning,
+        })
+      );
+    } catch (error) {
+      if (error?.statusCode) {
+        return res.status(error.statusCode).json(buildImportFailurePayload(error.message));
+      }
+      console.error('[import-questions] unexpected error:', error);
+      return res
+        .status(500)
+        .json(buildImportFailurePayload(error?.message || IMPORT_GENERIC_FAILURE_MESSAGE));
     }
   }
 );
@@ -293,7 +976,7 @@ router.post(
   requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can generate questions
   [
     body('topic').trim().notEmpty().withMessage('Topic/Domain is required'), // Universal: clarified as Topic/Domain
-    body('count').isInt({ min: 5, max: 50 }).withMessage('Count must be between 5 and 50'),
+    body('count').isInt({ min: 1, max: 50 }).withMessage('Count must be between 1 and 50'),
     body('difficulty').isIn(['easy', 'medium', 'hard', 'ultra_hard']).withMessage('Invalid difficulty'),
     body('questionTypes').isArray().withMessage('Question types must be an array'),
     body('enableImageQuestions').optional().isBoolean().withMessage('enableImageQuestions must be boolean'),
@@ -340,19 +1023,29 @@ router.post(
         const normalizeList = (list) =>
           Array.isArray(list) ? list.map(normalizeAiQuestionType).filter(Boolean) : [];
         const normalizedQuestionTypes = normalizeList(questionTypes);
-        const normalizedScenarioTypes = normalizeList(scenarioQuestionTypes);
-        const normalizedImageTypes = normalizeList(imageQuestionTypes);
+        const includesParagraphType = normalizedQuestionTypes.includes('PARAGRAPH');
+        const normalizedScenarioTypes = includesParagraphType
+          ? normalizeList(scenarioQuestionTypes)
+          : [];
+        const imageGenerationRequested =
+          enableImageQuestions === true || toNonNegativeInt(imageQuestionCount, 0) > 0;
+
+        if (imageGenerationRequested) {
+          return sendPlanRestriction(res, FREE_PLAN_MESSAGES.QUESTION_TYPE_LOCKED);
+        }
+
         const allTypes = [
           ...normalizedQuestionTypes,
           ...normalizedScenarioTypes,
-          ...normalizedImageTypes,
         ];
         const disallowed = allTypes.find((type) => !FREE_PLAN_ALLOWED_AI_TYPES.has(type));
         if (disallowed) {
           const message =
             disallowed === 'CODING'
               ? FREE_PLAN_MESSAGES.CODING_LOCKED
-              : FREE_PLAN_MESSAGES.QUESTION_TYPE_LOCKED;
+              : WRITING_AI_TYPES.has(disallowed)
+                ? FREE_PLAN_MESSAGES.WRITING_AI_LOCKED
+              : FREE_PLAN_AI_TYPE_LOCKED_MESSAGE;
           return sendPlanRestriction(res, message);
         }
       }
@@ -360,18 +1053,14 @@ router.post(
       const tenantId = req.user?.tenantId || null;
       const requestedQuestionCount = toNonNegativeInt(count, 0);
       if (tenantId && requestedQuestionCount > 0) {
-        const tenant = await Tenant.findById(tenantId)
-          .select('subscription aiUsageLimit')
-          .lean();
-        const monthlyAiQuestionLimit = resolveTenantAiQuestionLimit(effectivePlanType, tenant);
+        const usageSummary = await resolveTenantAiUsageSummary({
+          tenantId,
+          effectivePlanType,
+        });
+        const monthlyAiQuestionLimit = usageSummary.aiQuestionsLimit;
 
         if (monthlyAiQuestionLimit !== null) {
-          const usageWindow = buildAiUsageWindow(tenant?.subscription || null);
-          const aiQuestionsUsed = await getAIQuestionCountForTenantByWindow(
-            tenantId,
-            usageWindow.start,
-            usageWindow.end
-          );
+          const aiQuestionsUsed = Number(usageSummary.aiQuestionsUsed) || 0;
           const wouldUse = aiQuestionsUsed + requestedQuestionCount;
 
           if (wouldUse > monthlyAiQuestionLimit) {
@@ -380,6 +1069,7 @@ router.post(
               res,
               buildAiQuestionLimitMessage(effectivePlanType, monthlyAiQuestionLimit),
               {
+                code: 'LIMIT_EXCEEDED',
                 usage: {
                   aiQuestions: {
                     used: aiQuestionsUsed,
@@ -389,10 +1079,18 @@ router.post(
                   },
                   period: {
                     type: 'month',
-                    start: usageWindow.start,
-                    end: usageWindow.end,
+                    start: usageSummary.period?.start || null,
+                    end: usageSummary.period?.end || null,
                   },
                 },
+                ...(String(req.user?.role || '').trim().toUpperCase() === 'TENANT_ADMIN'
+                  ? {
+                      requestCredits: {
+                        enabled: true,
+                        type: CREDIT_REQUEST_TYPES.AI,
+                      },
+                    }
+                  : {}),
               }
             );
           }
@@ -453,8 +1151,11 @@ router.post(
   async (req, res, next) => {
     try {
       const effectivePlanType = await resolveUserEffectivePlanType(req.user);
-      if (!isPlanFeatureEnabled(effectivePlanType, 'aiGrading')) {
-        return sendPlanRestriction(res, FREE_PLAN_MESSAGES.AI_GRADING_LOCKED);
+      if (
+        isFreePlan(effectivePlanType) ||
+        !isPlanFeatureEnabled(effectivePlanType, 'aiGrading')
+      ) {
+        return sendPlanRestriction(res, FREE_PLAN_MESSAGES.WRITING_AI_LOCKED);
       }
 
       if (!req.file) {

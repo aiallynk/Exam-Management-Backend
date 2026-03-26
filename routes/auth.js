@@ -14,6 +14,7 @@ import {
   isTrialRestrictedPlan,
   resolveSubscriptionStatus,
   SUBSCRIPTION_STATUSES,
+  SUBSCRIPTION_STATUS_MESSAGES,
 } from '../config/planLimits.js';
 
 const router = express.Router();
@@ -162,6 +163,42 @@ const verifyPasswordSafely = async (user, candidatePassword) => {
   return false;
 };
 
+const parsePositiveInteger = (value, fallback) => {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  if (Number.isFinite(parsed) && parsed > 0) {
+    return parsed;
+  }
+  return fallback;
+};
+
+const resolveRememberMeFlag = (value) =>
+  value === true || String(value ?? '').trim().toLowerCase() === 'true';
+
+const SHORT_SESSION_REFRESH_TTL_HOURS = parsePositiveInteger(
+  process.env.SESSION_REFRESH_TTL_HOURS,
+  24
+);
+const LONG_SESSION_REFRESH_TTL_DAYS = parsePositiveInteger(
+  process.env.REMEMBER_ME_REFRESH_TTL_DAYS,
+  parsePositiveInteger(config.refreshTtlDays, 7)
+);
+const BLOCK_SUSPENDED_LOGIN =
+  String(process.env.BLOCK_SUSPENDED_LOGIN || 'true')
+    .trim()
+    .toLowerCase() !== 'false';
+
+const setLoginAuditContext = (req, context = {}) => {
+  if (!req || !context || typeof context !== 'object') return;
+  const existing =
+    req.auditLoginContext && typeof req.auditLoginContext === 'object'
+      ? req.auditLoginContext
+      : {};
+  req.auditLoginContext = {
+    ...existing,
+    ...context,
+  };
+};
+
 /**
  * Register - Create new user account
  * 
@@ -298,6 +335,7 @@ router.post(
   [
     body('email').isEmail().normalizeEmail(),
     body('password').notEmpty(),
+    body('rememberMe').optional().isBoolean(),
   ],
   async (req, res, next) => {
     try {
@@ -307,6 +345,8 @@ router.post(
       }
 
       const { email, password } = req.body;
+      const rememberMe = resolveRememberMeFlag(req.body?.rememberMe);
+      setLoginAuditContext(req, { userEmail: email || null });
 
       // Find user
       let user = await User.findOne({ email });
@@ -333,6 +373,14 @@ router.post(
         }
         return res.status(401).json({ error: 'Invalid credentials' });
       }
+
+      setLoginAuditContext(req, {
+        userId: user?._id ? String(user._id) : null,
+        userName: user?.name || null,
+        userEmail: user?.email || email || null,
+        userRole: user?.role || null,
+        tenantId: toTenantIdString(user?.tenantId),
+      });
 
       // Check password
       let isMatch = false;
@@ -376,6 +424,10 @@ router.post(
 
       try {
         await ensureTrialAdminRole(user);
+        setLoginAuditContext(req, {
+          userRole: user?.role || null,
+          tenantId: toTenantIdString(user?.tenantId),
+        });
       } catch (roleError) {
         if (process.env.NODE_ENV === 'development') {
           console.error('[AUTH][LOGIN] Trial role sync failed:', roleError?.message || roleError);
@@ -422,16 +474,31 @@ router.post(
             });
           }
 
-          if (subscriptionStatus === SUBSCRIPTION_STATUSES.SUSPENDED) {
+          if (subscriptionStatus === SUBSCRIPTION_STATUSES.CANCELLED) {
             return res.status(403).json({
-              error: 'Tenant subscription is suspended. Contact Super Admin to reactivate access.',
+              error: SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.CANCELLED],
+              message: SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.CANCELLED],
+              subscriptionStatus,
+            });
+          }
+
+          if (
+            subscriptionStatus === SUBSCRIPTION_STATUSES.SUSPENDED &&
+            BLOCK_SUSPENDED_LOGIN
+          ) {
+            return res.status(403).json({
+              error: SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.SUSPENDED],
+              message: SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.SUSPENDED],
               subscriptionStatus,
             });
           }
 
           if (subscriptionStatus === SUBSCRIPTION_STATUSES.EXPIRED) {
             subscriptionWarning =
-              'Subscription expired. Access is restricted under free-plan limits until renewal.';
+              SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.EXPIRED];
+          } else if (subscriptionStatus === SUBSCRIPTION_STATUSES.SUSPENDED) {
+            subscriptionWarning =
+              SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.SUSPENDED];
           }
         } catch (subscriptionError) {
           if (process.env.NODE_ENV === 'development') {
@@ -456,15 +523,27 @@ router.post(
         { expiresIn: `${config.tokenTtlMinutes}m` }
       );
 
+      const refreshTokenExpiresIn = rememberMe
+        ? `${LONG_SESSION_REFRESH_TTL_DAYS}d`
+        : `${SHORT_SESSION_REFRESH_TTL_HOURS}h`;
       const refreshToken = jwt.sign(
         { sub: user._id },
         config.jwtRefreshSecret,
-        { expiresIn: `${config.refreshTtlDays}d` }
+        { expiresIn: refreshTokenExpiresIn }
       );
+
+      setLoginAuditContext(req, {
+        userId: user?._id ? String(user._id) : null,
+        userName: user?.name || null,
+        userEmail: user?.email || email || null,
+        userRole: user?.role || null,
+        tenantId: toTenantIdString(tenant?._id || tenantId || user?.tenantId),
+      });
 
       res.json({
         accessToken,
         refreshToken,
+        rememberMe,
         user: {
           _id: user._id,
           name: user.name,
@@ -476,6 +555,10 @@ router.post(
           tenant: tenant || null,
           subscriptionStatus,
           subscriptionWarning,
+        },
+        session: {
+          rememberMe,
+          refreshTokenExpiresIn,
         },
       });
     } catch (error) {
@@ -522,6 +605,50 @@ router.post('/refresh', async (req, res, next) => {
         }
       }
       const tenantId = toTenantIdString(user.tenantId);
+      let subscriptionStatus = SUBSCRIPTION_STATUSES.ACTIVE;
+      let subscriptionWarning = '';
+
+      if (tenantId && user.role !== 'SUPER_ADMIN') {
+        try {
+          const tenantSubscription = await Tenant.findById(tenantId).select('subscription').lean();
+          const subscription = tenantSubscription?.subscription || {};
+          subscriptionStatus = resolveSubscriptionStatus(subscription);
+
+          if (subscriptionStatus === SUBSCRIPTION_STATUSES.CANCELLED) {
+            return res.status(403).json({
+              error: SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.CANCELLED],
+              message: SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.CANCELLED],
+              subscriptionStatus,
+            });
+          }
+
+          if (
+            subscriptionStatus === SUBSCRIPTION_STATUSES.SUSPENDED &&
+            BLOCK_SUSPENDED_LOGIN
+          ) {
+            return res.status(403).json({
+              error: SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.SUSPENDED],
+              message: SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.SUSPENDED],
+              subscriptionStatus,
+            });
+          }
+
+          if (subscriptionStatus === SUBSCRIPTION_STATUSES.EXPIRED) {
+            subscriptionWarning =
+              SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.EXPIRED];
+          } else if (subscriptionStatus === SUBSCRIPTION_STATUSES.SUSPENDED) {
+            subscriptionWarning =
+              SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.SUSPENDED];
+          }
+        } catch (subscriptionError) {
+          if (process.env.NODE_ENV === 'development') {
+            console.error(
+              '[AUTH][REFRESH] Subscription status resolution failed:',
+              subscriptionError?.message || subscriptionError
+            );
+          }
+        }
+      }
 
       const accessToken = jwt.sign(
         {
@@ -546,6 +673,8 @@ router.post('/refresh', async (req, res, next) => {
           examsCreated: user.examsCreated ?? 0,
           tenantId: tenant?._id || null,
           tenant: tenant || null,
+          subscriptionStatus,
+          subscriptionWarning,
         },
       });
     } catch (error) {
@@ -576,9 +705,14 @@ router.post('/logout', requireAuth, auditLogout, async (req, res) => {
       try {
         // Verify token to get expiry, then blacklist it
         const decoded = jwt.verify(refreshToken, config.jwtRefreshSecret);
-        // Refresh tokens expire in refreshTtlDays, convert to seconds
-        const expiresInSeconds = config.refreshTtlDays * 24 * 60 * 60;
-        addToBlacklist(refreshToken, expiresInSeconds);
+        const nowInSeconds = Math.floor(Date.now() / 1000);
+        const expiresInSeconds =
+          Number.isFinite(decoded?.exp) && decoded.exp > nowInSeconds
+            ? decoded.exp - nowInSeconds
+            : config.refreshTtlDays * 24 * 60 * 60;
+        if (expiresInSeconds > 0) {
+          addToBlacklist(refreshToken, expiresInSeconds);
+        }
       } catch (error) {
         // If refresh token is invalid, ignore (might already be expired)
         // Still proceed with logout
@@ -611,6 +745,8 @@ router.get('/me', requireAuth, async (req, res, next) => {
         ...userPayload,
         tenantId: tenant?._id || null,
         tenant: tenant || null,
+        subscriptionStatus: req.user?.subscriptionStatus || SUBSCRIPTION_STATUSES.ACTIVE,
+        subscriptionWarning: req.user?.subscriptionWarning || '',
       },
     });
   } catch (error) {

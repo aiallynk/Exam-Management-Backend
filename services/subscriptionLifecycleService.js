@@ -12,7 +12,9 @@ export const syncExpiredSubscriptions = async ({ now = new Date() } = {}) => {
   const result = await Tenant.updateMany(
     {
       'subscription.expiresAt': { $ne: null, $lte: safeNow },
-      'subscription.status': { $ne: SUBSCRIPTION_STATUSES.SUSPENDED },
+      'subscription.status': {
+        $nin: [SUBSCRIPTION_STATUSES.SUSPENDED, SUBSCRIPTION_STATUSES.CANCELLED],
+      },
     },
     {
       $set: {

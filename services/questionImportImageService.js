@@ -2163,6 +2163,17 @@ export const parseQuestionImportFile = async (file) => {
     });
   }
 
+  console.log('[question-import-debug] FILE EXTENSION:', extension);
+  console.log('[question-import-debug] RAW TEXT:', text);
+  console.log(
+    '[question-import-debug] STRUCTURED ROW COUNT:',
+    Array.isArray(structuredRows) ? structuredRows.length : 0
+  );
+  console.log(
+    '[question-import-debug] EXTRACTED IMAGE ARTIFACT COUNT:',
+    Array.isArray(extractedArtifacts) ? extractedArtifacts.length : 0
+  );
+
   return {
     extension,
     text: sanitizeString(text),

@@ -12,6 +12,15 @@ const client = config.openaiApiKey
   ? new OpenAI({ apiKey: config.openaiApiKey })
   : null;
 const OPENAI_MODEL = config.openaiModel || 'gpt-4o-mini';
+const IMPORT_EXTRACTION_MODEL = 'gpt-4o-mini';
+const MAX_IMPORT_AI_CHUNKS = 120;
+const MAX_IMPORT_CHUNK_PREVIEW_LENGTH = 8000;
+const MAX_PARALLEL_IMPORT_CHUNK_REQUESTS = 4;
+const IMPORT_HEADER_LINE_REGEX =
+  /^(?:quiz|name|date|section|instructions?)\b(?:\s*[:\-].*|[\s_]*$)/i;
+const IMPORT_HEADER_BLOCK_HINT_REGEX = /\b(?:quiz|name|date|section)\b/i;
+const IMPORT_NUMBERED_SPLIT_REGEX = /(?=\d+\.\s)/g;
+const IMPORT_TRUE_FALSE_REGEX = /\b(?:true\s*(?:\/|\s+or\s+)\s*false|t\s*\/\s*f)\b/i;
 
 const VALID_QUESTION_TYPES = [
   'MULTIPLE_CHOICE',
@@ -19,9 +28,13 @@ const VALID_QUESTION_TYPES = [
   'TRUE_FALSE',
   'SHORT_ANSWER',
   'PARAGRAPH',
+  'ESSAY',
+  'ESSAY_LETTER',
+  'ESSAY_STORY',
   'NUMBER',
   'CODING',
 ];
+const WRITING_QUESTION_TYPES = new Set(['ESSAY', 'ESSAY_LETTER', 'ESSAY_STORY']);
 
 const IMAGE_BASED_GENERATION_MODES = new Set(['percentage', 'per_count']);
 const VALID_IMAGE_QUESTION_TYPES = ['diagram', 'graph', 'chart', 'object_identification'];
@@ -40,6 +53,48 @@ const DEFAULT_CODING_STARTER_CODE = {
 const sanitizeString = (value) => {
   if (value === undefined || value === null) return '';
   return String(value).trim();
+};
+
+const normalizeQuestionTypeToken = (value) => {
+  const normalized = sanitizeString(value).toUpperCase();
+  if (!normalized) return '';
+  if (['MCQ', 'MULTIPLE CHOICE', 'SINGLE_CHOICE'].includes(normalized)) {
+    return 'MULTIPLE_CHOICE';
+  }
+  if (['MULTI_SELECT_MCQ', 'MULTI_SELECT MCQ'].includes(normalized)) {
+    return 'MULTIPLE_OPTIONS';
+  }
+  if (['MULTI_SELECT', 'MULTISELECT', 'MULTI_CHOICE'].includes(normalized)) {
+    return 'MULTIPLE_OPTIONS';
+  }
+  if (['TRUEFALSE', 'TRUE_FALSE', 'TF', 'TRUE/FALSE'].includes(normalized)) {
+    return 'TRUE_FALSE';
+  }
+  if (['SHORT', 'SHORTANSWER', 'SHORT_ANSWER'].includes(normalized)) {
+    return 'SHORT_ANSWER';
+  }
+  if (['LONG_ANSWER', 'LONGANSWER', 'DESCRIPTIVE', 'ESSAY'].includes(normalized)) {
+    return 'ESSAY';
+  }
+  if (['ESSAY_LETTER', 'LETTER_WRITING', 'LETTER'].includes(normalized)) {
+    return 'ESSAY_LETTER';
+  }
+  if (['ESSAY_STORY', 'STORY_WRITING', 'STORY'].includes(normalized)) {
+    return 'ESSAY_STORY';
+  }
+  if (['IMAGE_BASED', 'IMAGE', 'IMAGE-BASED'].includes(normalized)) {
+    return 'MULTIPLE_CHOICE';
+  }
+  if (['SCENARIO'].includes(normalized)) {
+    return 'PARAGRAPH';
+  }
+  if (['NUMERIC'].includes(normalized)) {
+    return 'NUMBER';
+  }
+  if (['CODE'].includes(normalized)) {
+    return 'CODING';
+  }
+  return normalized;
 };
 
 const resolveTrackingContext = ({ tenantId = null, userId = null, metadata = null } = {}) => {
@@ -108,10 +163,10 @@ const normalizeQuestionObject = (question, index = 0) => {
     return null;
   }
 
-  const rawType = sanitizeString(
+  const rawType = normalizeQuestionTypeToken(
     question.questionType || question.type || question.question_type
-  ).toUpperCase();
-  const resolvedType = rawType === 'IMAGE_BASED' ? 'MULTIPLE_CHOICE' : rawType;
+  );
+  const resolvedType = rawType;
   const questionType = VALID_QUESTION_TYPES.includes(resolvedType) ? resolvedType : 'SHORT_ANSWER';
   const questionText = sanitizeString(
     question.questionText || question.title || question.question || question.text
@@ -242,6 +297,24 @@ const normalizeImageQuestionTypes = (value) => {
   return normalized.length ? normalized : [...DEFAULT_IMAGE_QUESTION_TYPES];
 };
 
+const parseJsonObjectContent = (responseContent) => {
+  if (typeof responseContent !== 'string') return null;
+
+  try {
+    const parsed = JSON.parse(responseContent);
+    return parsed && typeof parsed === 'object' ? parsed : null;
+  } catch {
+    const jsonMatch = responseContent.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
+    if (!jsonMatch) return null;
+    try {
+      const parsed = JSON.parse(jsonMatch[1]);
+      return parsed && typeof parsed === 'object' ? parsed : null;
+    } catch {
+      return null;
+    }
+  }
+};
+
 const normalizeQuestionsPerParagraph = (value, fallback = DEFAULT_PARAGRAPH_QUESTIONS_PER_PARAGRAPH, max = 50) =>
   clampNumber(parseCount(value, fallback), 1, Math.max(1, max));
 
@@ -296,8 +369,7 @@ const normalizeImageQuestionConfig = ({
 
 const normalizeRequestedQuestionTypes = (questionTypes) =>
   (Array.isArray(questionTypes) ? questionTypes : [])
-    .map((type) => sanitizeString(type).toUpperCase())
-    .map((type) => (type === 'IMAGE_BASED' ? 'MULTIPLE_CHOICE' : type))
+    .map((type) => normalizeQuestionTypeToken(type))
     .filter((type, index, items) => VALID_QUESTION_TYPES.includes(type) && items.indexOf(type) === index);
 
 const normalizeScenarioQuestionTypes = (questionTypes) => {
@@ -504,6 +576,50 @@ const buildFallbackQuestionForType = ({ type, index, topic }) => {
     };
   }
 
+  if (safeType === 'ESSAY') {
+    return {
+      questionText: `Write an essay on ${safeTopic}.`,
+      questionType: safeType,
+      options: undefined,
+      correctAnswer: `A well-structured essay covering the core ideas of ${safeTopic}.`,
+      instructions:
+        'Write with a clear introduction, well-developed body paragraphs, and a concise conclusion.',
+      points: 10,
+      order: index + 1,
+      passage: '',
+    };
+  }
+
+  if (safeType === 'ESSAY_LETTER') {
+    return {
+      questionText: `Write a formal letter related to ${safeTopic}.`,
+      questionType: safeType,
+      options: undefined,
+      correctAnswer:
+        'A properly formatted letter with suitable salutation, body, closing, and context-relevant content.',
+      instructions:
+        'Use formal letter format, appropriate tone, and include all required communication details.',
+      points: 10,
+      order: index + 1,
+      passage: '',
+    };
+  }
+
+  if (safeType === 'ESSAY_STORY') {
+    return {
+      questionText: `Write a creative story inspired by ${safeTopic}.`,
+      questionType: safeType,
+      options: undefined,
+      correctAnswer:
+        'An original, coherent story with engaging narrative flow, relevant theme, and meaningful ending.',
+      instructions:
+        'Focus on creativity, coherence, and narrative flow with a clear beginning, middle, and end.',
+      points: 10,
+      order: index + 1,
+      passage: '',
+    };
+  }
+
   if (safeType === 'CODING') {
     return {
       questionText: `Coding challenge ${index + 1}: Solve a ${sanitizeString(topic) || 'programming'} task`,
@@ -633,6 +749,21 @@ const normalizeToRequestedType = ({ question, type, index, topic }) => {
       order: index + 1,
       passage,
     }, passage);
+  }
+
+  if (WRITING_QUESTION_TYPES.has(type)) {
+    const answer = sanitizeString(normalized.correctAnswer) || sanitizeString(fallback.correctAnswer);
+    const instructions = sanitizeString(normalized.instructions) || sanitizeString(fallback.instructions);
+    return attachScenarioContext({
+      questionText,
+      questionType: type,
+      options: undefined,
+      correctAnswer: answer,
+      instructions,
+      points: Number.isFinite(Number(normalized.points)) ? Number(normalized.points) : Math.max(points, 1),
+      order: index + 1,
+      passage: '',
+    });
   }
 
   if (type === 'CODING') {
@@ -955,7 +1086,7 @@ Rules:
 - For MULTIPLE_CHOICE, provide 4 plausible options and make correctAnswer match one option exactly
 - For MULTIPLE_OPTIONS, provide 4 plausible options and return correctAnswer as an array of exact option strings
 - For TRUE_FALSE, use options ["True", "False"] and set correctAnswer to exactly one of those values
-- For SHORT_ANSWER, PARAGRAPH, and NUMBER, do not add unnecessary options
+- For SHORT_ANSWER, PARAGRAPH, ESSAY, ESSAY_LETTER, ESSAY_STORY, and NUMBER, do not add unnecessary options
 - For NUMBER, correctAnswer must be the numeric answer as a string
 - Make the passage analytical, educational, and rich enough to support every question in the group
 - Avoid duplicate or near-duplicate questions
@@ -1271,7 +1402,7 @@ For each question, provide:
 - questionType: MUST be one of ONLY these types: ${questionTypes.join(', ')}. DO NOT use any other types.
 - options: Array of options (for MULTIPLE_CHOICE, MULTIPLE_OPTIONS, TRUE_FALSE). For harder difficulties, make distractors more plausible and challenging.
 - correctAnswer: The correct answer (string) for non-coding questions. Use an empty string for CODING questions.
-- passage: For PARAGRAPH questions, include the supporting passage students must read. Use an empty string for other question types.
+- passage: For PARAGRAPH questions, include the supporting passage students must read. Use an empty string for other question types unless contextual text is explicitly required.
 - title: For CODING questions, provide a short problem title.
 - description: For CODING questions, provide a full problem statement.
 - category: For CODING questions, provide a short category label such as Data Structures or Algorithms.
@@ -1454,7 +1585,6 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
 export const extractQuestionsFromContent = async (params) => {
   const {
     content,
-    filename = 'uploaded document',
     structuredRows,
     tenantId = null,
     userId = null,
@@ -1463,17 +1593,35 @@ export const extractQuestionsFromContent = async (params) => {
   const trackingContext = resolveTrackingContext({ tenantId, userId, metadata });
 
   const trimmedContent = sanitizeString(content);
+  const normalizedContent = normalizeImportTextForParsing(trimmedContent);
+  console.log('[question-import-debug] CLEAN TEXT:', normalizedContent);
   const normalizedFromRows = Array.isArray(structuredRows)
     ? structuredRows
       .map((row, idx) => normalizeStructuredRow(row, idx))
-      .filter(Boolean)
+      .filter((question) => isValidParsedImportQuestion(question))
     : [];
+
+  const parsedFromNumbering = normalizedContent
+    ? extractQuestionsFromNumberedText(normalizedContent)
+    : [];
+
+  if (
+    normalizedFromRows.length &&
+    parsedFromNumbering.length > normalizedFromRows.length &&
+    normalizedFromRows.length <= 1
+  ) {
+    console.log(
+      '[question-import-debug] STRUCTURED ROWS BYPASSED:',
+      `rows=${normalizedFromRows.length} numbered=${parsedFromNumbering.length}`
+    );
+    return parsedFromNumbering;
+  }
 
   if (normalizedFromRows.length) {
     return normalizedFromRows;
   }
 
-  if (!trimmedContent) {
+  if (!normalizedContent) {
     throw new Error('No content provided to extract questions');
   }
 
@@ -1485,86 +1633,72 @@ export const extractQuestionsFromContent = async (params) => {
       userId: trackingContext.userId,
       errorMessage: 'OpenAI API key not configured.',
     });
-    return extractQuestionsFallback({ content: trimmedContent, structuredRows });
+    const localChunkParsed = dedupeQuestionsByText(
+      splitContentIntoQuestionChunks(normalizedContent)
+        .map((chunk, index) =>
+          normalizeSingleChunkQuestion({
+            extracted: null,
+            chunkText: chunk,
+            index,
+          })
+        )
+        .filter(Boolean)
+    );
+
+    if (parsedFromNumbering.length) {
+      return parsedFromNumbering;
+    }
+
+    return localChunkParsed.length
+      ? localChunkParsed
+      : extractQuestionsFallback({ content: normalizedContent, structuredRows });
   }
 
   try {
-    const limitedContent = trimmedContent.length > 12000 ? trimmedContent.slice(0, 12000) : trimmedContent;
-    const structuredPreview = structuredRows && structuredRows.length
-      ? JSON.stringify(structuredRows).slice(0, 6000)
-      : null;
-
-    const systemPrompt = `You are an expert exam curator. Extract well-formed assessment questions from provided materials.
-
-Requirements:
-- Return JSON with a top-level object containing a "questions" array.
-- Each question must include: questionText, questionType, options (array for MULTIPLE_CHOICE, MULTIPLE_OPTIONS, TRUE_FALSE), correctAnswer, and points.
-- Allowed questionType values: ${VALID_QUESTION_TYPES.join(', ')}.
-- For MULTIPLE_OPTIONS, correctAnswer must be an array of the selected option strings (exact text as options).
-- For MULTIPLE_CHOICE and TRUE_FALSE, correctAnswer must be a single string that matches one of the provided options.
-- For NUMBER, correctAnswer must be the numeric solution as a string.
-- For SHORT_ANSWER or PARAGRAPH, correctAnswer should be a concise reference response (string) or empty if unknown.
-- For CODING, include title, description, category, languages, starterCode, testCases, and timeLimit. Use an empty string for correctAnswer.
-- Default points to 1 if not specified in the source.
-- Ignore instructions or metadata that are not actual questions.
-- Do not fabricate questions that are not present in the source content.`;
-
-    const userPromptParts = [];
-    if (structuredPreview) {
-      userPromptParts.push(`Structured table preview extracted from ${filename}:
-${structuredPreview}`);
-    }
-    userPromptParts.push(`Document content excerpt (${filename}):
-${limitedContent}`);
-
-    const completion = await createTrackedChatCompletion({
-      client,
-      feature: 'question_import',
-      tenantId: trackingContext.tenantId,
-      userId: trackingContext.userId,
-      request: {
-        model: OPENAI_MODEL,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPromptParts.join('\n\n') },
-        ],
-        temperature: 0.1,
-        response_format: { type: 'json_object' },
-      },
+    const parsedFromChunks = await extractQuestionsFromChunkedAi({
+      content: normalizedContent,
+      trackingContext,
     });
 
-    const responseContent = completion.choices[0].message.content;
-    let parsed;
-
-    try {
-      parsed = JSON.parse(responseContent);
-    } catch (parseError) {
-      const jsonMatch = responseContent.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
-      if (jsonMatch) {
-        parsed = JSON.parse(jsonMatch[1]);
-      } else {
-        throw new Error('Failed to parse question extraction response');
-      }
+    if (
+      parsedFromNumbering.length > 0 &&
+      parsedFromNumbering.length >= parsedFromChunks.length
+    ) {
+      return parsedFromNumbering;
     }
 
-    const rawQuestions = Array.isArray(parsed)
-      ? parsed
-      : Array.isArray(parsed.questions)
-      ? parsed.questions
-      : [];
+    if (parsedFromChunks.length) {
+      return parsedFromChunks;
+    }
 
-    const normalized = rawQuestions
-      .map((question, idx) => normalizeQuestionObject(question, idx))
-      .filter(Boolean);
+    if (parsedFromNumbering.length) {
+      return parsedFromNumbering;
+    }
 
-    if (!normalized.length) {
+    const localChunkParsed = dedupeQuestionsByText(
+      splitContentIntoQuestionChunks(normalizedContent)
+        .map((chunk, index) =>
+          normalizeSingleChunkQuestion({
+            extracted: null,
+            chunkText: chunk,
+            index,
+          })
+        )
+        .filter(Boolean)
+    );
+
+    if (localChunkParsed.length) {
+      return localChunkParsed;
+    }
+
+    if (!parsedFromChunks.length) {
       throw new Error('No questions extracted by AI');
     }
-
-    return normalized;
   } catch (error) {
     console.error('OpenAI question extraction error:', error);
-    return extractQuestionsFallback({ content: trimmedContent, structuredRows });
+    return parsedFromNumbering.length
+      ? parsedFromNumbering
+      : extractQuestionsFallback({ content: normalizedContent, structuredRows });
   }
 };
 
@@ -1593,15 +1727,35 @@ export const evaluateAnswer = async (params) => {
       userId: trackingContext.userId,
       errorMessage: 'OpenAI API key not configured.',
     });
-    return evaluateFallbackAnswer(params);
+    return {
+      ...evaluateFallbackAnswer(params),
+      provider: 'fallback',
+      fallbackReason: 'OPENAI_API_KEY_MISSING',
+    };
   }
 
   if (!question || !studentAnswer || !questionType) {
     throw new Error('Missing required parameters for answer evaluation');
   }
 
-  if (!['SHORT_ANSWER', 'PARAGRAPH'].includes(questionType)) {
-    throw new Error('Evaluation only supported for SHORT_ANSWER and PARAGRAPH types');
+  const normalizedQuestionType = sanitizeString(questionType).toUpperCase();
+  const evaluationType =
+    ['SHORT_ANSWER', 'SHORTANSWER', 'SHORT'].includes(normalizedQuestionType)
+      ? 'short'
+      : ['PARAGRAPH'].includes(normalizedQuestionType)
+        ? 'paragraph'
+        : ['ESSAY', 'LONG_ANSWER', 'LONGANSWER', 'DESCRIPTIVE'].includes(normalizedQuestionType)
+          ? 'essay'
+          : ['ESSAY_LETTER', 'LETTER_WRITING', 'LETTER'].includes(normalizedQuestionType)
+            ? 'essay_letter'
+            : ['ESSAY_STORY', 'STORY_WRITING', 'STORY'].includes(normalizedQuestionType)
+              ? 'essay_story'
+          : null;
+
+  if (!evaluationType) {
+    throw new Error(
+      'Evaluation only supported for SHORT_ANSWER, PARAGRAPH, ESSAY, ESSAY_LETTER, and ESSAY_STORY types'
+    );
   }
 
   const maxPoints = Math.max(Number(points) || 0, 0);
@@ -1634,25 +1788,74 @@ export const evaluateAnswer = async (params) => {
     : [];
 
   try {
-    const systemPrompt = `You are an expert exam evaluator. Evaluate student answers and provide detailed feedback.
+    const systemPrompt = `You are an expert exam evaluator.
 
-Return a JSON object with:
-- isCorrect: boolean (true if answer is correct or mostly correct)
-- pointsEarned: number (0 to ${maxPoints}, based on accuracy)
-- confidence: number (0 to 1, how confident you are in the evaluation)
-- feedback: string (constructive feedback for the student)
-- needsReview: boolean (true if confidence < 0.8 or answer is ambiguous)
-${rubricScoringEnabled ? '- rubricScores: array of { criterion, weight, score, maxScore, rationale }' : ''}
+Your task is to evaluate a student's answer based on the question, expected answer, and answer type.
 
-Be fair and consistent. Award partial credit for partially correct answers.`;
+EVALUATION RULES:
 
-    const userPrompt = `Question: ${question}
-Correct Answer: ${correctAnswer || 'N/A'}
-Student Answer: ${studentAnswer}
-Maximum Points: ${maxPoints}
-${rubricScoringEnabled ? `Rubric (weights in %): ${JSON.stringify(effectiveRubric)}` : ''}
+1. For SHORT answers:
+- Focus on keyword matching and correctness
+- Ignore grammar/spelling mistakes
+- Be strict with correctness
 
-Evaluate this answer and provide your assessment.`;
+2. For PARAGRAPH answers:
+- Evaluate meaning and completeness
+- Check if key points are covered
+- Allow partial marks
+- Ignore minor grammar mistakes
+
+3. For ESSAY answers:
+- Evaluate:
+  a) Structure (intro, body, conclusion)
+  b) Content depth
+  c) Logical flow
+  d) Relevance to question
+- Give balanced scoring (do NOT be overly strict)
+
+4. For ESSAY_LETTER answers:
+- Evaluate:
+  a) Letter format
+  b) Tone suitability
+  c) Content relevance and completeness
+- Allow partial marks for partially correct format/content
+
+5. For ESSAY_STORY answers:
+- Evaluate:
+  a) Creativity and originality
+  b) Coherence and narrative flow
+  c) Relevance to prompt
+- Give balanced scoring (do NOT be overly strict)
+
+GENERAL RULES:
+- Do NOT hallucinate missing facts
+- If answer is irrelevant -> give low score
+- If partially correct -> give partial marks
+- Keep evaluation consistent
+- Be fair and deterministic
+
+SCORING:
+- Score must be between 0 and Maximum Marks
+- Use full range (avoid always giving mid scores)
+
+OUTPUT FORMAT (STRICT JSON ONLY):
+
+{
+  "score": number,
+  "feedback": "clear and concise feedback",
+  "strengths": ["point1", "point2"],
+  "weaknesses": ["point1", "point2"],
+  "confidence": number
+}
+
+Do not include markdown, code fences, or extra keys.`;
+
+    const userPrompt = `INPUT:
+- Question Type: ${evaluationType}
+- Question: ${question}
+- Expected Answer / Key Points: ${correctAnswer || 'N/A'}
+- Student Answer: ${studentAnswer}
+- Maximum Marks: ${maxPoints}`;
 
     const completion = await createTrackedChatCompletion({
       client,
@@ -1665,70 +1868,85 @@ Evaluate this answer and provide your assessment.`;
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
         ],
-        temperature: 0.3,
+        temperature: 0.1,
         response_format: { type: 'json_object' },
       },
     });
 
     const responseContent = completion.choices[0].message.content;
-    let evaluation;
-
-    try {
-      evaluation = JSON.parse(responseContent);
-    } catch (parseError) {
-      const jsonMatch = responseContent.match(/```(?:json)?\s*(\{[\s\S]*\})\s*```/);
-      if (jsonMatch) {
-        evaluation = JSON.parse(jsonMatch[1]);
-      } else {
-        throw new Error('Failed to parse evaluation response');
-      }
+    const evaluation = parseJsonObjectContent(responseContent);
+    if (!evaluation) {
+      throw new Error('Failed to parse evaluation response');
     }
 
-    // Normalize and validate response
+    const normalizeFeedbackItems = (value, fallback = []) => {
+      const items = Array.isArray(value)
+        ? value.map((item) => sanitizeString(item)).filter(Boolean)
+        : [];
+      return items.length > 0 ? items.slice(0, 5) : fallback;
+    };
+
+    const scoreRaw = Number(evaluation?.score);
+    const score = Number(
+      clampNumber(Number.isFinite(scoreRaw) ? scoreRaw : 0, 0, maxPoints).toFixed(2)
+    );
+    const confidenceRaw = Number(evaluation?.confidence);
+    const confidence = Number(
+      clampNumber(Number.isFinite(confidenceRaw) ? confidenceRaw : 0.5, 0, 1).toFixed(3)
+    );
+    const feedback = sanitizeString(evaluation?.feedback) || 'No feedback provided';
+    const strengths = normalizeFeedbackItems(evaluation?.strengths, [
+      score > 0 ? 'Some alignment with expected answer.' : 'No clear strengths identified.',
+    ]);
+    const weaknesses = normalizeFeedbackItems(evaluation?.weaknesses, [
+      score >= maxPoints
+        ? 'No major weaknesses observed.'
+        : 'Expected key points are missing or underdeveloped.',
+    ]);
+    const correctnessThreshold = evaluationType === 'short' ? 0.85 : 0.6;
+
     const result = {
-      isCorrect: Boolean(evaluation.isCorrect),
-      pointsEarned: Math.min(Math.max(0, Number(evaluation.pointsEarned) || 0), maxPoints),
-      confidence: Math.min(Math.max(0, Number(evaluation.confidence) || 0.5), 1),
-      feedback: evaluation.feedback || 'No feedback provided',
-      needsReview: Boolean(evaluation.needsReview || (evaluation.confidence < 0.8)),
+      score,
+      feedback,
+      strengths,
+      weaknesses,
+      confidence,
+      isCorrect: maxPoints > 0 ? score >= (maxPoints * correctnessThreshold) : score > 0,
+      pointsEarned: score,
+      needsReview: confidence < 0.8,
       mode: rubricScoringEnabled ? 'rubric' : 'standard',
       rubric: effectiveRubric,
       rubricScores: [],
       rubricTotal: null,
+      provider: 'openai',
     };
 
     if (rubricScoringEnabled) {
-      const rubricScoresRaw = Array.isArray(evaluation?.rubricScores) ? evaluation.rubricScores : [];
       const mappedScores = effectiveRubric.map((rubricEntry) => {
-        const matched = rubricScoresRaw.find((item) =>
-          String(item?.criterion || '').trim().toLowerCase() === rubricEntry.criterion.toLowerCase()
-        ) || {};
         const maxScore = Number(((maxPoints * rubricEntry.weight) / 100).toFixed(2));
-        const score = Math.min(
-          Math.max(0, Number(matched?.score) || 0),
-          maxScore
-        );
+        const criterionScore = Number(((score * rubricEntry.weight) / 100).toFixed(2));
         return {
           criterion: rubricEntry.criterion,
           weight: rubricEntry.weight,
-          score,
+          score: Math.min(Math.max(0, criterionScore), maxScore),
           maxScore,
-          rationale: String(matched?.rationale || '').trim(),
+          rationale: feedback,
         };
       });
 
-      const rubricTotal = Number(
-        mappedScores.reduce((sum, entry) => sum + (Number(entry.score) || 0), 0).toFixed(2)
-      );
       result.rubricScores = mappedScores;
-      result.rubricTotal = rubricTotal;
-      result.pointsEarned = Math.min(Math.max(0, rubricTotal), maxPoints);
+      result.rubricTotal = score;
+      result.pointsEarned = score;
     }
 
     return result;
   } catch (error) {
     console.error('OpenAI evaluation error:', error);
-    return evaluateFallbackAnswer(params);
+    return {
+      ...evaluateFallbackAnswer(params),
+      provider: 'fallback',
+      fallbackReason: 'OPENAI_EVALUATION_ERROR',
+    };
   }
 };
 
@@ -1790,13 +2008,21 @@ const collectOptionsFromRow = (row) => {
 };
 
 const inferQuestionType = (rawType, options, answer, questionText) => {
-  const normalizedType = sanitizeString(rawType).toUpperCase();
+  const normalizedType = normalizeQuestionTypeToken(rawType);
   if (VALID_QUESTION_TYPES.includes(normalizedType)) {
     return normalizedType;
   }
 
   const optionCount = options ? options.length : 0;
   const answerList = parseMultiAnswer(answer);
+
+  if (
+    /\b(?:true\s*\/\s*false|true\s+or\s+false|t\s*\/\s*f)\b/i.test(
+      sanitizeString(questionText)
+    )
+  ) {
+    return 'TRUE_FALSE';
+  }
 
   if (optionCount >= 2) {
     const tfOptions = options.every((opt) => ['true', 'false'].includes(opt.toLowerCase()));
@@ -1823,6 +2049,687 @@ const inferQuestionType = (rawType, options, answer, questionText) => {
   }
 
   return 'SHORT_ANSWER';
+};
+
+const normalizeImportLine = (line) =>
+  sanitizeString(String(line || '').replace(/\u00A0/g, ' ').replace(/[ \t]{2,}/g, ' '));
+
+const isImportMetadataLine = (line) => {
+  const normalized = normalizeImportLine(line);
+  if (!normalized) return true;
+  return IMPORT_HEADER_LINE_REGEX.test(normalized);
+};
+
+const normalizeImportTextToSingleLine = (content) =>
+  String(content || '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/\u00A0/g, ' ')
+    .replace(/\n/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const stripLeadingQuestionNumberToken = (value) =>
+  sanitizeString(value).replace(/^\s*(?:q(?:uestion)?\s*)?\d+\s*[\).:\-]\s*/i, '');
+
+const isLikelyImportHeaderBlock = (block) => {
+  const normalized = sanitizeString(block);
+  if (!normalized) return true;
+
+  const headerTokens = ['quiz', 'name', 'date', 'section'];
+  const headerTokenHits = headerTokens.reduce((count, token) => {
+    const tokenRegex = new RegExp(`\\b${token}\\b`, 'i');
+    return tokenRegex.test(normalized) ? count + 1 : count;
+  }, 0);
+
+  const hasHeaderFieldSyntax = /\b(?:name|date|section)\s*[:_]/i.test(normalized);
+  const hasLabeledOptions = /(?:^|\s)[A-D][\).:\-]\s+\S+/i.test(normalized);
+  const hasTrueFalse = IMPORT_TRUE_FALSE_REGEX.test(normalized);
+
+  if (hasHeaderFieldSyntax && !hasLabeledOptions && !hasTrueFalse) {
+    return true;
+  }
+
+  if (headerTokenHits >= 2 && !hasLabeledOptions && !hasTrueFalse) {
+    return true;
+  }
+
+  return false;
+};
+
+const extractLabeledOptionsFromText = (text) => {
+  const normalized = normalizeImportTextToSingleLine(text);
+  if (!normalized) {
+    return [];
+  }
+
+  const optionRegex =
+    /(?:^|\s)([A-D])[\).:\-]\s*(.*?)(?=(?:\s+[A-D][\).:\-]\s*)|(?:\s+(?:answer|ans|correct\s*answer)\s*[:\-])|$)/gis;
+  const optionMap = new Map();
+  let match;
+
+  while ((match = optionRegex.exec(normalized))) {
+    const label = sanitizeString(match[1]).toUpperCase();
+    const value = sanitizeString(match[2]).replace(/\s+/g, ' ');
+    if (!label || !value || optionMap.has(label)) {
+      continue;
+    }
+    optionMap.set(label, value);
+  }
+
+  const ordered = ['A', 'B', 'C', 'D'].map((label) => optionMap.get(label)).filter(Boolean);
+  return sanitizeQuestionOptions(ordered);
+};
+
+const extractRawAnswerFromText = (text) => {
+  const normalized = normalizeImportTextToSingleLine(text);
+  if (!normalized) {
+    return '';
+  }
+
+  const answerMatch = normalized.match(
+    /\b(?:answer|ans|correct\s*answer)\s*[:\-]\s*(.+)$/i
+  );
+  return sanitizeString(answerMatch?.[1] || '');
+};
+
+const buildQuestionTextFromParsedBlock = (blockText) => {
+  const withoutNumber = normalizeImportTextToSingleLine(
+    stripLeadingQuestionNumberToken(blockText)
+  );
+  if (!withoutNumber) {
+    return '';
+  }
+
+  const withoutAnswer = withoutNumber
+    .replace(/\b(?:answer|ans|correct\s*answer)\s*[:\-]\s*.+$/i, '')
+    .trim();
+
+  const optionMatch = withoutAnswer.match(/(?:^|\s)A[\).:\-]\s*/i);
+  const tfMatch = withoutAnswer.match(IMPORT_TRUE_FALSE_REGEX);
+  let splitIndex = withoutAnswer.length;
+
+  if (optionMatch && Number.isInteger(optionMatch.index)) {
+    splitIndex = Math.min(splitIndex, optionMatch.index);
+  }
+
+  if (tfMatch && Number.isInteger(tfMatch.index)) {
+    splitIndex = Math.min(splitIndex, tfMatch.index);
+  }
+
+  return sanitizeString(withoutAnswer.slice(0, splitIndex).replace(/\s+/g, ' '));
+};
+
+const normalizeImportTextForParsing = (content) => {
+  const normalized = normalizeImportTextToSingleLine(content)
+    .replace(/(^|\s)(?:q(?:uestion)?\s*)?(\d+)\)\s+/gi, '$1$2. ')
+    .replace(/(^|\s)(?:q(?:uestion)?\s*)(\d+)\s*[:\-]\s+/gi, '$1$2. ')
+    .replace(/\b(\d+)\)\s*/g, '$1. ')
+    .replace(/\b(\d+)\.(?=\S)/g, '$1. ')
+    .replace(/([A-D])\)(?=\S)/gi, '$1) ')
+    .replace(/([A-D])\.(?=\S)/gi, '$1. ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  return normalized;
+};
+
+const isValidParsedImportQuestion = (question) => {
+  const questionText = sanitizeString(question?.questionText || '');
+  if (questionText.length <= 5) return false;
+  if (isImportMetadataLine(questionText)) return false;
+
+  const questionType = sanitizeString(question?.questionType).toUpperCase();
+  const options = Array.isArray(question?.options) ? sanitizeQuestionOptions(question.options) : [];
+
+  if (['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE'].includes(questionType)) {
+    return options.length >= 2;
+  }
+
+  return true;
+};
+
+const splitNumberedQuestionBlocks = (content) => {
+  const normalizedContent = normalizeImportTextForParsing(content);
+  if (!normalizedContent) {
+    return [];
+  }
+
+  const markerPattern = /(?:^|\s)(?:q(?:uestion)?\s*)?(\d{1,3})\s*[\).:\-]\s+/gi;
+  const markers = Array.from(normalizedContent.matchAll(markerPattern))
+    .map((match) => {
+      const markerIndex =
+        Number.isInteger(match.index) && match.index >= 0
+          ? match.index + Math.max(0, sanitizeString(match[0]).search(/\d/))
+          : -1;
+      const prefix = markerIndex > 0
+        ? normalizedContent.slice(Math.max(0, markerIndex - 16), markerIndex)
+        : '';
+      const precededBySection = /\bsection[\s:._-]*$/i.test(prefix);
+      return {
+        index: markerIndex,
+        number: Number.parseInt(match[1], 10),
+        precededBySection,
+      };
+    })
+    .filter((item) => item.index >= 0 && Number.isFinite(item.number) && !item.precededBySection);
+
+  if (!markers.length) {
+    return [];
+  }
+
+  let selectedMarkers = markers;
+  if (markers.length >= 2) {
+    let bestSequence = [];
+    for (let start = 0; start < markers.length; start += 1) {
+      const sequence = [markers[start]];
+      let expected = markers[start].number + 1;
+      for (let idx = start + 1; idx < markers.length; idx += 1) {
+        if (markers[idx].number === expected) {
+          sequence.push(markers[idx]);
+          expected += 1;
+        }
+      }
+      if (sequence.length > bestSequence.length) {
+        bestSequence = sequence;
+      }
+    }
+    if (bestSequence.length >= 2) {
+      selectedMarkers = bestSequence;
+    }
+  }
+
+  const blocks = selectedMarkers
+    .map((marker, idx) => {
+      const end = idx + 1 < selectedMarkers.length
+        ? selectedMarkers[idx + 1].index
+        : normalizedContent.length;
+      return sanitizeString(normalizedContent.slice(marker.index, end));
+    })
+    .filter(Boolean)
+    .filter((chunk) => /^\d+\s*[\).:\-]\s/.test(chunk))
+    .filter((chunk) => !isLikelyImportHeaderBlock(chunk));
+
+  if (blocks.length >= 2) {
+    return blocks;
+  }
+
+  const directSplitBlocks = normalizedContent
+    .split(IMPORT_NUMBERED_SPLIT_REGEX)
+    .map((chunk) => sanitizeString(chunk))
+    .filter(Boolean)
+    .filter((chunk) => /^\d+\s*[\).:\-]\s/.test(chunk))
+    .filter((chunk) => !isLikelyImportHeaderBlock(chunk));
+
+  if (directSplitBlocks.length > blocks.length) {
+    return directSplitBlocks;
+  }
+
+  return blocks;
+};
+
+const splitContentIntoQuestionChunks = (content) => {
+  const normalizedContent = normalizeImportTextForParsing(content);
+  if (!normalizedContent) {
+    return [];
+  }
+
+  const numberedBlocks = splitNumberedQuestionBlocks(normalizedContent);
+  if (numberedBlocks.length >= 2) {
+    return numberedBlocks;
+  }
+
+  if (numberedBlocks.length === 1) {
+    return numberedBlocks;
+  }
+
+  return [normalizedContent];
+};
+
+const detectImportQuestionType = (text) => {
+  const normalized = normalizeImportTextToSingleLine(text);
+  if (!normalized) return 'UNKNOWN';
+
+  if (extractLabeledOptionsFromText(normalized).length >= 2) return 'MCQ';
+  if (IMPORT_TRUE_FALSE_REGEX.test(normalized)) return 'TRUE_FALSE';
+  return 'DESCRIPTIVE';
+};
+
+const normalizeImportQuestionType = (rawType) => {
+  const normalized = normalizeQuestionTypeToken(rawType);
+  if (!normalized) return '';
+  if (
+    [
+      'MULTIPLE_CHOICE',
+      'MULTIPLE_OPTIONS',
+      'TRUE_FALSE',
+      'SHORT_ANSWER',
+      'PARAGRAPH',
+      'ESSAY',
+      'ESSAY_LETTER',
+      'ESSAY_STORY',
+      'NUMBER',
+      'CODING',
+    ].includes(normalized)
+  ) {
+    return normalized;
+  }
+  return '';
+};
+
+const extractOptionsFromChunkText = (chunkText) => {
+  return extractLabeledOptionsFromText(chunkText);
+};
+
+const normalizeOptionsFromExtraction = (rawOptions, chunkText) => {
+  if (Array.isArray(rawOptions)) {
+    const direct = sanitizeQuestionOptions(rawOptions);
+    if (direct.length >= 2) {
+      return direct;
+    }
+
+    const flattened = rawOptions.map((item) => sanitizeString(item)).filter(Boolean).join(' ');
+    const labeled = extractLabeledOptionsFromText(flattened);
+    if (labeled.length >= 2) {
+      return labeled;
+    }
+
+    return direct;
+  }
+
+  if (rawOptions && typeof rawOptions === 'object') {
+    const orderedKeys = Object.keys(rawOptions)
+      .sort((left, right) => left.localeCompare(right))
+      .filter((key) => /^[a-h]$/i.test(key) || /^\d+$/.test(key));
+    const mapped = orderedKeys
+      .map((key) => sanitizeString(rawOptions[key]))
+      .filter(Boolean);
+    if (mapped.length) {
+      return sanitizeQuestionOptions(mapped);
+    }
+  }
+
+  const asString = sanitizeString(rawOptions);
+  if (asString) {
+    const labeledFromString = extractLabeledOptionsFromText(asString);
+    if (labeledFromString.length >= 2) {
+      return labeledFromString;
+    }
+
+    try {
+      const parsed = JSON.parse(asString);
+      if (Array.isArray(parsed)) {
+        return sanitizeQuestionOptions(parsed);
+      }
+      if (parsed && typeof parsed === 'object') {
+        const normalized = Object.values(parsed)
+          .map((value) => sanitizeString(value))
+          .filter(Boolean);
+        if (normalized.length) {
+          return sanitizeQuestionOptions(normalized);
+        }
+      }
+    } catch {
+      // Ignore parse errors and fallback to delimiters.
+    }
+
+    const delimited = asString
+      .split(/[,;|\n]/)
+      .map((item) => sanitizeString(item))
+      .filter(Boolean);
+    if (delimited.length) {
+      return sanitizeQuestionOptions(delimited);
+    }
+  }
+
+  return extractOptionsFromChunkText(chunkText);
+};
+
+const buildQuestionTextFromChunk = (chunkText) => {
+  return buildQuestionTextFromParsedBlock(chunkText);
+};
+
+const normalizeSingleChunkQuestion = ({ extracted, chunkText, index }) => {
+  const rawExtracted = extracted && typeof extracted === 'object' ? extracted : {};
+  const normalizedChunkText = normalizeImportTextToSingleLine(chunkText);
+  const questionText = sanitizeString(
+    rawExtracted.questionText ||
+      rawExtracted.question ||
+      rawExtracted.question_text ||
+      buildQuestionTextFromChunk(normalizedChunkText)
+  );
+
+  if (!questionText) {
+    return null;
+  }
+
+  let options = normalizeOptionsFromExtraction(rawExtracted.options, normalizedChunkText);
+  const parsedType = normalizeImportQuestionType(
+    rawExtracted.type || rawExtracted.questionType || rawExtracted.question_type
+  );
+  const fallbackType = detectImportQuestionType(normalizedChunkText);
+
+  let questionType = parsedType;
+  if (!questionType) {
+    if (options.length >= 2 || fallbackType === 'MCQ') {
+      questionType = 'MULTIPLE_CHOICE';
+    } else if (fallbackType === 'TRUE_FALSE') {
+      questionType = 'TRUE_FALSE';
+    } else {
+      questionType = 'SHORT_ANSWER';
+    }
+  }
+
+  if (questionType === 'TRUE_FALSE') {
+    options = ['True', 'False'];
+  } else if (!['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS'].includes(questionType)) {
+    options = undefined;
+  }
+
+  console.log('[question-import-debug] BLOCK:', normalizedChunkText);
+  console.log('[question-import-debug] OPTIONS:', options);
+  console.log('[question-import-debug] TYPE:', questionType);
+
+  const normalizedQuestion = normalizeQuestionObject(
+    {
+      questionText,
+      questionType,
+      options,
+      correctAnswer: '',
+      points: 1,
+      order: index,
+      passage: '',
+    },
+    index
+  );
+  if (!isValidParsedImportQuestion(normalizedQuestion)) {
+    return null;
+  }
+
+  return normalizedQuestion;
+};
+
+const dedupeQuestionsByText = (questions = []) => {
+  const seen = new Set();
+  const deduped = [];
+
+  (Array.isArray(questions) ? questions : []).forEach((question) => {
+    const key = sanitizeString(question?.questionText).toLowerCase();
+    if (!key || seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    deduped.push(question);
+  });
+
+  return deduped.map((question, index) => ({ ...question, order: index }));
+};
+
+const parseSingleChunkWithAi = async ({
+  chunk,
+  chunkIndex,
+  trackingContext,
+}) => {
+  const safeChunk = sanitizeString(chunk);
+  if (!safeChunk) {
+    return null;
+  }
+
+  const completion = await createTrackedChatCompletion({
+    client,
+    feature: 'question_import',
+    tenantId: trackingContext.tenantId,
+    userId: trackingContext.userId,
+    request: {
+      model: IMPORT_EXTRACTION_MODEL,
+      messages: [
+        {
+          role: 'system',
+          content: `Extract a single question into structured JSON.
+
+Rules:
+- Identify question type:
+  - If options A/B/C/D are present, set "type" to "MCQ".
+  - If the question contains "True or False", set "type" to "TRUE_FALSE".
+- Extract:
+  - questionText
+  - options (for MCQ or TRUE_FALSE)
+
+Return format:
+{
+  "questionText": "",
+  "type": "MCQ",
+  "options": []
+}`,
+        },
+        {
+          role: 'user',
+          content: safeChunk.length > MAX_IMPORT_CHUNK_PREVIEW_LENGTH
+            ? safeChunk.slice(0, MAX_IMPORT_CHUNK_PREVIEW_LENGTH)
+            : safeChunk,
+        },
+      ],
+      temperature: 0,
+      response_format: { type: 'json_object' },
+    },
+  });
+
+  const parsed = parseJsonObjectContent(completion?.choices?.[0]?.message?.content || '');
+  return normalizeSingleChunkQuestion({
+    extracted: parsed,
+    chunkText: safeChunk,
+    index: chunkIndex,
+  });
+};
+
+const extractQuestionsFromChunkedAi = async ({
+  content,
+  trackingContext,
+}) => {
+  const rawChunks = splitContentIntoQuestionChunks(content)
+    .slice(0, MAX_IMPORT_AI_CHUNKS)
+    .map((chunk) => sanitizeString(chunk))
+    .filter(Boolean);
+
+  if (!rawChunks.length) {
+    return [];
+  }
+
+  const indexedChunks = rawChunks.map((chunk, index) => ({ chunk, index }));
+  const results = [];
+
+  for (const batch of chunkArray(indexedChunks, MAX_PARALLEL_IMPORT_CHUNK_REQUESTS)) {
+    const batchResults = await Promise.all(
+      batch.map(async ({ chunk, index }) => {
+        try {
+          const parsed = await parseSingleChunkWithAi({
+            chunk,
+            chunkIndex: index,
+            trackingContext,
+          });
+          if (parsed?.questionText) {
+            return { index, question: parsed };
+          }
+        } catch {
+          // Skip invalid chunk-level AI responses and fallback locally.
+        }
+
+        const fallbackQuestion = normalizeSingleChunkQuestion({
+          extracted: null,
+          chunkText: chunk,
+          index,
+        });
+        if (!fallbackQuestion?.questionText) {
+          return null;
+        }
+        return { index, question: fallbackQuestion };
+      })
+    );
+
+    results.push(
+      ...batchResults
+        .filter(Boolean)
+        .sort((left, right) => left.index - right.index)
+        .map((item) => item.question)
+    );
+  }
+
+  return dedupeQuestionsByText(results);
+};
+
+const mapAnswerTokenToOption = (token, options) => {
+  const normalizedToken = sanitizeString(token);
+  if (!normalizedToken) {
+    return '';
+  }
+
+  if (/^[A-H]$/i.test(normalizedToken)) {
+    const optionIndex = normalizedToken.toUpperCase().charCodeAt(0) - 65;
+    if (Array.isArray(options) && options[optionIndex]) {
+      return options[optionIndex];
+    }
+  }
+
+  return normalizedToken;
+};
+
+const resolveCorrectAnswerFromRaw = ({ rawAnswer, options, questionType }) => {
+  const normalizedRaw = sanitizeString(rawAnswer);
+  if (!normalizedRaw) {
+    return questionType === 'MULTIPLE_OPTIONS' ? [] : '';
+  }
+
+  if (questionType === 'TRUE_FALSE') {
+    const lowered = normalizedRaw.toLowerCase();
+    const mappedAnswer =
+      lowered === 't' || lowered === 'true'
+        ? 'True'
+        : lowered === 'f' || lowered === 'false'
+          ? 'False'
+          : normalizedRaw;
+
+    return normalizeQuestionCorrectAnswer({
+      questionType,
+      correctAnswer: mappedAnswer,
+      options: ['True', 'False'],
+    });
+  }
+
+  if (questionType === 'MULTIPLE_OPTIONS') {
+    const mappedAnswers = parseMultiAnswer(normalizedRaw)
+      .map((token) => mapAnswerTokenToOption(token, options))
+      .filter(Boolean);
+
+    return normalizeQuestionCorrectAnswer({
+      questionType,
+      correctAnswer: mappedAnswers,
+      options,
+    });
+  }
+
+  if (questionType === 'MULTIPLE_CHOICE') {
+    const mappedAnswer = mapAnswerTokenToOption(normalizedRaw, options);
+    return normalizeQuestionCorrectAnswer({
+      questionType,
+      correctAnswer: mappedAnswer,
+      options,
+    });
+  }
+
+  return normalizeQuestionCorrectAnswer({
+    questionType,
+    correctAnswer: normalizedRaw,
+    options,
+  });
+};
+
+const normalizeParsedQuestionFromBlock = ({ block, index }) => {
+  const withoutNumber = normalizeImportTextToSingleLine(
+    stripLeadingQuestionNumberToken(block)
+  );
+  if (!withoutNumber) {
+    return null;
+  }
+
+  const questionText = buildQuestionTextFromParsedBlock(withoutNumber);
+  if (!questionText) {
+    return null;
+  }
+
+  let options = extractLabeledOptionsFromText(withoutNumber);
+  const rawAnswer = extractRawAnswerFromText(withoutNumber);
+  const fallbackType = detectImportQuestionType(withoutNumber);
+
+  let questionType = 'SHORT_ANSWER';
+  if (options.length >= 2 || fallbackType === 'MCQ') {
+    questionType = 'MULTIPLE_CHOICE';
+  } else if (fallbackType === 'TRUE_FALSE') {
+    questionType = 'TRUE_FALSE';
+  }
+
+  if (questionType === 'TRUE_FALSE') {
+    options = ['True', 'False'];
+  } else if (!['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS'].includes(questionType)) {
+    options = undefined;
+  }
+
+  console.log('[question-import-debug] BLOCK:', block);
+  console.log('[question-import-debug] OPTIONS:', options);
+  console.log('[question-import-debug] TYPE:', questionType);
+
+  const correctAnswer = resolveCorrectAnswerFromRaw({
+    rawAnswer,
+    options,
+    questionType,
+  });
+
+  const normalizedQuestion = normalizeQuestionObject(
+    {
+      questionText,
+      questionType,
+      options,
+      correctAnswer,
+      points: 1,
+      order: index,
+      passage: '',
+    },
+    index
+  );
+  if (!isValidParsedImportQuestion(normalizedQuestion)) {
+    return null;
+  }
+
+  return normalizedQuestion;
+};
+
+const extractQuestionsFromNumberedText = (content) => {
+  const blocks = splitNumberedQuestionBlocks(content);
+  console.log('[question-import-debug] QUESTION BLOCKS:', blocks.length);
+  console.log('[question-import] Total blocks:', blocks.length);
+
+  if (!blocks.length) {
+    console.log('[question-import] Parsed questions:', 0);
+    return [];
+  }
+
+  const parsed = blocks
+    .map((block, idx) => normalizeParsedQuestionFromBlock({ block, index: idx }))
+    .filter(Boolean);
+
+  console.log('[question-import] Parsed questions:', parsed.length);
+  parsed.forEach((question, idx) => {
+    const questionText = sanitizeString(question?.questionText).slice(0, 180);
+    const optionsCount = Array.isArray(question?.options) ? question.options.length : 0;
+    const detectedType = sanitizeString(question?.questionType) || 'UNKNOWN';
+    console.log(
+      `[question-import] Q${idx + 1}: text="${questionText}" options=${optionsCount} type=${detectedType}`
+    );
+  });
+
+  if (parsed.length < 1) {
+    return [];
+  }
+
+  return parsed.map((question, idx) => ({ ...question, order: idx }));
 };
 
 const normalizeStructuredRow = (row, index) => {
@@ -2073,7 +2980,7 @@ Rules:
 - Keep the question academically aligned with the topic and requested difficulty
 - For MULTIPLE_CHOICE and TRUE_FALSE, correctAnswer must be a single option string from options
 - For MULTIPLE_OPTIONS, correctAnswer must be an array of exact option strings
-- For SHORT_ANSWER, PARAGRAPH, NUMBER do not invent options
+- For SHORT_ANSWER, PARAGRAPH, ESSAY, ESSAY_LETTER, ESSAY_STORY, and NUMBER do not invent options
 - Preserve any provided passage/context when the base question includes one
 - imagePrompt must be a concise but specific prompt for generating the educational image
 - diagramType must be one of: ${VALID_IMAGE_QUESTION_TYPES.join(', ')}
@@ -2253,7 +3160,7 @@ Rules:
 - The shared image must be rich enough to support every question in the set
 - For MULTIPLE_CHOICE and TRUE_FALSE, correctAnswer must be one option string from options
 - For MULTIPLE_OPTIONS, correctAnswer must be an array of exact option strings from options
-- For SHORT_ANSWER, PARAGRAPH, NUMBER do not invent unnecessary options
+- For SHORT_ANSWER, PARAGRAPH, ESSAY, ESSAY_LETTER, ESSAY_STORY, and NUMBER do not invent unnecessary options
 - Preserve any provided passage/context when a base question includes one
 - diagramType must be one of: ${VALID_IMAGE_QUESTION_TYPES.join(', ')}
 - Do not mention placeholders, missing images, or test-creator instructions
@@ -2469,6 +3376,11 @@ const extractQuestionsFallback = ({ content, structuredRows }) => {
     }
   }
 
+  const parsedFromNumbering = extractQuestionsFromNumberedText(content);
+  if (parsedFromNumbering.length) {
+    return parsedFromNumbering;
+  }
+
   const blocks = content
     .split(/\n{2,}/)
     .map((block) => sanitizeString(block))
@@ -2618,10 +3530,13 @@ const evaluateFallbackAnswer = (params) => {
 
   if (!correctAnswer || !studentAnswer) {
     return {
+      score: 0,
+      feedback: 'Unable to evaluate - missing reference answer',
+      strengths: [],
+      weaknesses: ['Reference answer or student answer is missing.'],
+      confidence: 0.5,
       isCorrect: false,
       pointsEarned: 0,
-      confidence: 0.5,
-      feedback: 'Unable to evaluate - missing reference answer',
       needsReview: true,
       mode: rubricScoringEnabled ? 'rubric' : 'standard',
       rubric: effectiveRubric,
@@ -2644,13 +3559,21 @@ const evaluateFallbackAnswer = (params) => {
   const isCorrect = similarity > 0.6;
   const pointsEarned = Math.round(maxPoints * similarity);
   const confidence = Math.min(similarity + 0.2, 1);
+  const feedback = isCorrect
+    ? 'Answer appears to be correct based on keyword matching.'
+    : 'Answer may need review. Consider providing more detail.';
   const fallbackResult = {
+    score: pointsEarned,
+    feedback,
+    strengths: isCorrect
+      ? ['Covers key expected terms from the reference answer.']
+      : ['Shows partial overlap with expected keywords.'],
+    weaknesses: isCorrect
+      ? ['Could include clearer explanation for stronger confidence.']
+      : ['Missing important expected keywords and concepts.'],
+    confidence,
     isCorrect,
     pointsEarned,
-    confidence,
-    feedback: isCorrect
-      ? 'Answer appears to be correct based on keyword matching.'
-      : 'Answer may need review. Consider providing more detail.',
     needsReview: confidence < 0.8,
     mode: rubricScoringEnabled ? 'rubric' : 'standard',
     rubric: effectiveRubric,

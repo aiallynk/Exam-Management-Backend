@@ -40,7 +40,9 @@ import omrRoutes from './routes/omr.js';
 import compilerRoutes from './routes/compiler.js';
 import notificationRoutes from './routes/notifications.js';
 import systemAlertRoutes from './routes/systemAlerts.js';
+import publicRoutes from './routes/public.js';
 import { startSubscriptionExpiryScheduler } from './services/subscriptionLifecycleService.js';
+import { startAutoTenantBackupScheduler } from './services/autoBackupSchedulerService.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -216,6 +218,7 @@ app.get('/health', async (req, res) => {
 // API Routes with specific rate limiting
 // Auth routes - strict rate limiting to prevent brute force
 app.use('/api/auth', authRateLimiter, authRoutes);
+app.use('/api/public', publicRoutes);
 
 // Upload routes - strict rate limiting to prevent storage abuse
 app.use('/api/upload', uploadRateLimiter, uploadRoutes);
@@ -256,16 +259,29 @@ app.use('/api/notifications', notificationRoutes);
 app.use(notFound);
 app.use(errorHandler);
 
+const startHttpServer = () =>
+  new Promise((resolve, reject) => {
+    const server = app.listen(config.port, () => {
+      resolve(server);
+    });
+    server.once('error', reject);
+  });
+
 // Start server
 const startServer = async () => {
   try {
     await connect();
+    await startHttpServer();
     startSubscriptionExpiryScheduler();
-    app.listen(config.port, () => {
-      console.log(`🚀 Server running on http://localhost:${config.port}`);
-      console.log(`📊 Environment: ${config.nodeEnv}`);
-    });
+    startAutoTenantBackupScheduler();
+    console.log(`🚀 Server running on http://localhost:${config.port}`);
+    console.log(`📊 Environment: ${config.nodeEnv}`);
   } catch (error) {
+    if (error?.code === 'EADDRINUSE') {
+      console.error(
+        `❌ Port ${config.port} is already in use. Stop the existing process or set a different PORT in .env.`,
+      );
+    }
     console.error('Failed to start server:', error);
     process.exit(1);
   }
@@ -274,4 +290,3 @@ const startServer = async () => {
 startServer();
 
 export default app;
-

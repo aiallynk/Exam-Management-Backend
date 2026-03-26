@@ -224,10 +224,13 @@ const normalizeQuestionTypeKey = (value) => {
   const raw = normalizeAutoAssignText(value).toUpperCase();
   if (!raw) return '';
   if (['MCQ', 'SINGLE_CHOICE', 'MULTIPLE_CHOICE'].includes(raw)) return 'MULTIPLE_CHOICE';
-  if (['MULTI_SELECT', 'MULTIPLE_OPTIONS', 'MULTI_CHOICE'].includes(raw)) return 'MULTIPLE_OPTIONS';
+  if (['MULTI_SELECT', 'MULTIPLE_OPTIONS', 'MULTI_CHOICE', 'MULTI_SELECT_MCQ'].includes(raw)) return 'MULTIPLE_OPTIONS';
   if (['TRUE_FALSE', 'TRUEFALSE', 'TF'].includes(raw)) return 'TRUE_FALSE';
   if (['SHORT', 'SHORT_ANSWER'].includes(raw)) return 'SHORT_ANSWER';
   if (['LONG_ANSWER', 'DESCRIPTIVE', 'PARAGRAPH'].includes(raw)) return 'PARAGRAPH';
+  if (['ESSAY'].includes(raw)) return 'ESSAY';
+  if (['ESSAY_LETTER', 'LETTER_WRITING', 'LETTER'].includes(raw)) return 'ESSAY_LETTER';
+  if (['ESSAY_STORY', 'STORY_WRITING', 'STORY'].includes(raw)) return 'ESSAY_STORY';
   if (['NUMERIC', 'NUMBER'].includes(raw)) return 'NUMBER';
   if (['CODING', 'CODE'].includes(raw)) return 'CODING';
   if (['IMAGE', 'IMAGE_BASED'].includes(raw)) return 'IMAGE_BASED';

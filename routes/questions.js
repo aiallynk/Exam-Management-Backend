@@ -23,6 +23,7 @@ import {
   normalizeQuestionFormat,
   normalizeQuestionTypeForStorage,
 } from '../utils/questionTypes.js';
+import { trackAIUsageEvent } from '../services/aiTokenUsageService.js';
 import {
   extractCodingFields,
   hasCodingConfiguration,
@@ -106,7 +107,10 @@ const resolveQuestionTypeTokenForExamResponse = (question = {}) => {
   ).toUpperCase();
 
   if (normalizedType === 'CODING') return 'coding';
-  if (normalizedType === 'MULTIPLE_OPTIONS') return 'multi_select';
+  if (normalizedType === 'ESSAY') return 'essay';
+  if (normalizedType === 'ESSAY_LETTER') return 'essay_letter';
+  if (normalizedType === 'ESSAY_STORY') return 'essay_story';
+  if (normalizedType === 'MULTIPLE_OPTIONS') return 'multi_select_mcq';
   if (normalizedType === 'TRUE_FALSE') return 'true_false';
   if (normalizedType === 'NUMBER') return 'numeric';
   if (normalizedType === 'SHORT_ANSWER') return 'short_answer';
@@ -184,6 +188,7 @@ const createQuestionWithManagedImage = async ({
   questionText,
   title,
   description,
+  instructions,
   difficulty,
   category,
   questionType,
@@ -280,6 +285,7 @@ const createQuestionWithManagedImage = async ({
     questionText: normalizeString(questionText || normalizedTitle),
     title: normalizedTitle || undefined,
     description: normalizedDescription || undefined,
+    instructions: typeof instructions === 'string' ? instructions.trim() : undefined,
     difficulty: normalizedDifficulty || undefined,
     category: normalizedCategory || undefined,
     questionType: normalizedStorageQuestionType,
@@ -425,15 +431,54 @@ router.post(
   [
     body('questionText').trim().notEmpty().withMessage('Question text is required'),
     body('questionType')
-      .isIn(['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE', 'SHORT_ANSWER', 'PARAGRAPH', 'NUMBER', 'CODING', 'IMAGE_BASED'])
+      .isIn([
+        'MULTIPLE_CHOICE',
+        'MULTIPLE_OPTIONS',
+        'MULTI_SELECT_MCQ',
+        'TRUE_FALSE',
+        'SHORT_ANSWER',
+        'PARAGRAPH',
+        'ESSAY',
+        'ESSAY_LETTER',
+        'ESSAY_STORY',
+        'NUMBER',
+        'CODING',
+        'IMAGE_BASED',
+      ])
       .withMessage('Invalid question type'),
     body('questionFormat')
       .optional({ nullable: true })
-      .isIn(['MCQ', 'IMAGE', 'IMAGE_BASED', 'PARAGRAPH', 'SCENARIO', 'TRUE_FALSE', 'CODING'])
+      .isIn([
+        'MCQ',
+        'MULTIPLE_OPTIONS',
+        'MULTI_SELECT_MCQ',
+        'IMAGE',
+        'IMAGE_BASED',
+        'PARAGRAPH',
+        'SCENARIO',
+        'TRUE_FALSE',
+        'ESSAY',
+        'ESSAY_LETTER',
+        'ESSAY_STORY',
+        'CODING',
+      ])
       .withMessage('Invalid question format'),
     body('question_type')
       .optional({ nullable: true })
-      .isIn(['MCQ', 'IMAGE', 'IMAGE_BASED', 'PARAGRAPH', 'SCENARIO', 'TRUE_FALSE', 'CODING'])
+      .isIn([
+        'MCQ',
+        'MULTIPLE_OPTIONS',
+        'MULTI_SELECT_MCQ',
+        'IMAGE',
+        'IMAGE_BASED',
+        'PARAGRAPH',
+        'SCENARIO',
+        'TRUE_FALSE',
+        'ESSAY',
+        'ESSAY_LETTER',
+        'ESSAY_STORY',
+        'CODING',
+      ])
       .withMessage('Invalid question format'),
     body('questionPaperId').notEmpty().withMessage('Question paper ID is required'),
     body('order').isInt({ min: 0 }).withMessage('Order must be a non-negative integer'),
@@ -446,6 +491,7 @@ router.post(
     body('paragraphGroupId').optional({ nullable: true }).isString().withMessage('paragraphGroupId must be a string'),
     body('title').optional({ nullable: true }).isString().withMessage('Title must be a string'),
     body('description').optional({ nullable: true }).isString().withMessage('Description must be a string'),
+    body('instructions').optional({ nullable: true }).isString().withMessage('Instructions must be a string'),
     body('difficulty').optional({ nullable: true }).isString().withMessage('Difficulty must be a string'),
     body('category').optional({ nullable: true }).isString().withMessage('Category must be a string'),
     body('languages').optional({ nullable: true }).isArray().withMessage('Languages must be an array'),
@@ -465,6 +511,7 @@ router.post(
         questionText,
         title,
         description,
+        instructions,
         difficulty,
         category,
         questionType,
@@ -550,6 +597,7 @@ router.post(
         questionText,
         title,
         description,
+        instructions,
         difficulty,
         category,
         questionType,
@@ -626,14 +674,55 @@ router.put(
   requireOwnershipOrAdmin,
   [
     body('questionText').optional().trim().notEmpty(),
-    body('questionType').optional().isIn(['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE', 'SHORT_ANSWER', 'PARAGRAPH', 'NUMBER', 'CODING', 'IMAGE_BASED']),
+    body('questionType')
+      .optional()
+      .isIn([
+        'MULTIPLE_CHOICE',
+        'MULTIPLE_OPTIONS',
+        'MULTI_SELECT_MCQ',
+        'TRUE_FALSE',
+        'SHORT_ANSWER',
+        'PARAGRAPH',
+        'ESSAY',
+        'ESSAY_LETTER',
+        'ESSAY_STORY',
+        'NUMBER',
+        'CODING',
+        'IMAGE_BASED',
+      ]),
     body('questionFormat')
       .optional({ nullable: true })
-      .isIn(['MCQ', 'IMAGE', 'IMAGE_BASED', 'PARAGRAPH', 'SCENARIO', 'TRUE_FALSE', 'CODING'])
+      .isIn([
+        'MCQ',
+        'MULTIPLE_OPTIONS',
+        'MULTI_SELECT_MCQ',
+        'IMAGE',
+        'IMAGE_BASED',
+        'PARAGRAPH',
+        'SCENARIO',
+        'TRUE_FALSE',
+        'ESSAY',
+        'ESSAY_LETTER',
+        'ESSAY_STORY',
+        'CODING',
+      ])
       .withMessage('Invalid question format'),
     body('question_type')
       .optional({ nullable: true })
-      .isIn(['MCQ', 'IMAGE', 'IMAGE_BASED', 'PARAGRAPH', 'SCENARIO', 'TRUE_FALSE', 'CODING'])
+      .isIn([
+        'MCQ',
+        'MULTIPLE_OPTIONS',
+        'MULTI_SELECT_MCQ',
+        'IMAGE',
+        'IMAGE_BASED',
+        'PARAGRAPH',
+        'SCENARIO',
+        'TRUE_FALSE',
+        'ESSAY',
+        'ESSAY_LETTER',
+        'ESSAY_STORY',
+        'CODING',
+      ])
       .withMessage('Invalid question format'),
     body('imageUrl').optional({ nullable: true }).isString().withMessage('Image URL must be a string'),
     body('image').optional({ nullable: true }).isString().withMessage('Image must be a string'),
@@ -643,6 +732,7 @@ router.put(
     body('paragraphGroupId').optional({ nullable: true }).isString().withMessage('paragraphGroupId must be a string'),
     body('title').optional({ nullable: true }).isString().withMessage('Title must be a string'),
     body('description').optional({ nullable: true }).isString().withMessage('Description must be a string'),
+    body('instructions').optional({ nullable: true }).isString().withMessage('Instructions must be a string'),
     body('difficulty').optional({ nullable: true }).isString().withMessage('Difficulty must be a string'),
     body('category').optional({ nullable: true }).isString().withMessage('Category must be a string'),
     body('languages').optional({ nullable: true }).isArray().withMessage('Languages must be an array'),
@@ -704,6 +794,7 @@ router.put(
         paragraphGroupId,
         title,
         description,
+        instructions,
         difficulty,
         category,
         languages,
@@ -726,6 +817,7 @@ router.put(
       if (questionText) question.questionText = questionText;
       if (title !== undefined) question.title = title;
       if (description !== undefined) question.description = description;
+      if (instructions !== undefined) question.instructions = instructions;
       if (difficulty !== undefined) question.difficulty = difficulty;
       if (category !== undefined) question.category = category;
       if (questionType || questionFormat || question_type) {
@@ -1003,6 +1095,9 @@ router.post(
 
       if ((!csvContent && !importedQuestionsPayload) || !questionPaperId) {
         return res.status(400).json({
+          success: false,
+          importedCount: 0,
+          message: 'Import failed. No questions were added.',
           error: 'Questions or CSV content and question paper ID are required',
         });
       }
@@ -1017,7 +1112,7 @@ router.post(
         return res.status(404).json({ error: 'Question paper not found' });
       }
 
-      const exam = await Exam.findById(req.params.examId).select('_id createdBy');
+      const exam = await Exam.findById(req.params.examId).select('_id createdBy tenantId');
       let freePlanRestriction = null;
       if (exam) {
         const planContext = await resolveExamPlanContext(exam._id);
@@ -1043,6 +1138,7 @@ router.post(
             questionText: record.questionText || record.title,
             title: record.title,
             description: record.description,
+            instructions: record.instructions,
             difficulty: record.difficulty,
             category: record.category,
             questionType: record.questionType,
@@ -1090,6 +1186,7 @@ router.post(
             questionText: record.questionText || record.title,
             title: record.title,
             description: record.description,
+            instructions: record.instructions,
             difficulty: record.difficulty,
             category: record.category,
             questionType: record.questionType,
@@ -1119,8 +1216,51 @@ router.post(
 
       await syncExamQuestionCount(req.params.examId);
 
+      const tenantIdForUsage = exam?.tenantId || req.user?.tenantId || null;
+      if (tenantIdForUsage && createdQuestions.length > 0) {
+        try {
+          await trackAIUsageEvent({
+            feature: 'question_import_file',
+            tenantId: tenantIdForUsage,
+            userId: req.user?._id || null,
+            model: 'upload',
+            usageCount: 1,
+            questionCount: createdQuestions.length,
+            requestStatus: 'SUCCESS',
+            usage: {
+              prompt_tokens: 0,
+              completion_tokens: 0,
+              total_tokens: 0,
+            },
+          });
+        } catch (usageTrackError) {
+          console.warn(
+            '[questions/import] failed to track import usage:',
+            usageTrackError?.message || usageTrackError
+          );
+        }
+      }
+
+      if (!createdQuestions.length) {
+        return res.status(200).json({
+          success: true,
+          importedCount: 0,
+          message: 'No valid questions found in the uploaded file.',
+          questions: [],
+        });
+      }
+
+      console.log('[question-import-debug] TOTAL IMPORTED:', createdQuestions.length);
+      createdQuestions.forEach((question, index) => {
+        console.log(
+          `[question-import-debug] DB Q${index + 1}: questionType=${question?.questionType || ''} questionFormat=${question?.questionFormat || ''}`
+        );
+      });
+
       res.status(201).json({
-        message: `Imported ${createdQuestions.length} questions`,
+        success: true,
+        importedCount: createdQuestions.length,
+        message: `Successfully imported ${createdQuestions.length} question${createdQuestions.length === 1 ? '' : 's'}.`,
         questions: createdQuestions,
       });
     } catch (error) {

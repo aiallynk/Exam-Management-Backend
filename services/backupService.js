@@ -27,6 +27,7 @@ const MATCH_NONE_FILTER = { _id: { $in: [] } };
 const COMPANY_COLLECTION_ORDER = [
   'tenants',
   'users',
+  'subtenants',
   'exams',
   'questionpapers',
   'sections',
@@ -42,7 +43,25 @@ const COMPANY_COLLECTION_ORDER = [
   'ai_token_usage',
   'normalizationconfigs',
   'exampackages',
+  'notifications',
+  'auditlogs',
 ];
+const VALID_TRIGGER_TYPES = ['MANUAL', 'AUTO'];
+const DEFAULT_AUTO_BACKUP_RETRY_ATTEMPTS = 0;
+const DEFAULT_AUTO_BACKUP_RETRY_DELAY_MS = 5000;
+const DEFAULT_AUTO_BACKUP_INTER_TENANT_DELAY_MS = 250;
+const IST_TIMEZONE = 'Asia/Kolkata';
+const MAX_BACKUP_ERROR_MESSAGE_LENGTH = 1000;
+const IST_DATE_PARTS_FORMATTER = new Intl.DateTimeFormat('en-GB', {
+  timeZone: IST_TIMEZONE,
+  year: 'numeric',
+  month: '2-digit',
+  day: '2-digit',
+  hour: '2-digit',
+  minute: '2-digit',
+  second: '2-digit',
+  hourCycle: 'h23',
+});
 
 const pad = (value) => String(value).padStart(2, '0');
 
@@ -53,6 +72,16 @@ const asObjectId = (value) => {
   return new mongoose.Types.ObjectId(String(value));
 };
 
+const normalizeTriggerType = (value) => {
+  const normalized = String(value || 'MANUAL').trim().toUpperCase();
+  return VALID_TRIGGER_TYPES.includes(normalized) ? normalized : 'MANUAL';
+};
+
+const sleep = (delayMs) =>
+  new Promise((resolve) => {
+    setTimeout(resolve, Math.max(Number(delayMs) || 0, 0));
+  });
+
 const sanitizeForFilename = (value) => {
   const raw = String(value || 'company')
     .trim()
@@ -61,20 +90,35 @@ const sanitizeForFilename = (value) => {
   return raw || 'company';
 };
 
+const getIstDateParts = (date = new Date()) => {
+  const safeDate = date instanceof Date && !Number.isNaN(date.getTime()) ? date : new Date();
+  const parts = IST_DATE_PARTS_FORMATTER.formatToParts(safeDate).reduce((accumulator, part) => {
+    if (part.type !== 'literal') {
+      accumulator[part.type] = part.value;
+    }
+    return accumulator;
+  }, {});
+
+  return {
+    year: Number(parts.year) || safeDate.getUTCFullYear(),
+    month: Number(parts.month) || safeDate.getUTCMonth() + 1,
+    day: Number(parts.day) || safeDate.getUTCDate(),
+    hour: Number(parts.hour) || 0,
+    minute: Number(parts.minute) || 0,
+    second: Number(parts.second) || 0,
+  };
+};
+
 const createDateStamp = (date = new Date()) => {
-  const year = date.getFullYear();
-  const month = pad(date.getMonth() + 1);
-  const day = pad(date.getDate());
+  const { year, month, day } = getIstDateParts(date);
   return `${year}_${month}_${day}`;
 };
 
 const createDateTimeStamp = (date = new Date()) => {
-  const year = date.getFullYear();
-  const month = pad(date.getMonth() + 1);
-  const day = pad(date.getDate());
-  const hours = pad(date.getHours());
-  const minutes = pad(date.getMinutes());
-  const seconds = pad(date.getSeconds());
+  const { year, month, day, hour, minute, second } = getIstDateParts(date);
+  const hours = pad(hour);
+  const minutes = pad(minute);
+  const seconds = pad(second);
   return `${year}_${month}_${day}_${hours}_${minutes}_${seconds}`;
 };
 
@@ -88,7 +132,7 @@ const createBackupFilename = ({ scope, historyType, companyName }) => {
 
   if (historyType === 'tenant') {
     const safeName = sanitizeForFilename(companyName);
-    return `tenant_backup_${safeName}_${createMinuteStamp()}.zip`;
+    return `${safeName}_${createMinuteStamp()}.zip`;
   }
 
   if (scope === 'full_system') {
@@ -98,6 +142,26 @@ const createBackupFilename = ({ scope, historyType, companyName }) => {
 
   const safeName = sanitizeForFilename(companyName);
   return `company_backup_${safeName}_${createDateStamp()}.zip`;
+};
+
+const sanitizeErrorMessage = (value) =>
+  String(value || 'Backup operation failed.')
+    .trim()
+    .slice(0, MAX_BACKUP_ERROR_MESSAGE_LENGTH);
+
+const escapeRegex = (value) =>
+  String(value || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const parseDateFilterValue = (value, { endOfDay = false } = {}) => {
+  if (!value) return null;
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) return null;
+  if (endOfDay) {
+    parsed.setHours(23, 59, 59, 999);
+  } else {
+    parsed.setHours(0, 0, 0, 0);
+  }
+  return parsed;
 };
 
 const fileExists = async (targetPath) => {
@@ -294,6 +358,7 @@ const buildCompanyCollectionSpecs = async ({ db, companyId }) => {
   return [
     { collection: 'tenants', filter: { _id: scope.companyId } },
     { collection: 'users', filter: { tenantId: scope.companyId } },
+    { collection: 'subtenants', filter: { tenantId: scope.companyId } },
     { collection: 'exams', filter: { tenantId: scope.companyId } },
     { collection: 'questionpapers', filter: inFilter('examId', scope.examIds) },
     { collection: 'sections', filter: inFilter('questionPaperId', scope.questionPaperIds) },
@@ -334,6 +399,8 @@ const buildCompanyCollectionSpecs = async ({ db, companyId }) => {
         scope.examIds.length ? { examId: { $in: scope.examIds } } : null,
       ]),
     },
+    { collection: 'notifications', filter: { tenantId: scope.companyId } },
+    { collection: 'auditlogs', filter: { tenantId: scope.companyId } },
   ];
 };
 
@@ -360,6 +427,7 @@ const getCollectionSpecsForScope = async ({ db, scope, companyId }) => {
 const createBackupManifest = ({
   scope,
   historyType,
+  triggerType,
   companyId,
   companyName,
   createdBy,
@@ -367,6 +435,7 @@ const createBackupManifest = ({
 }) => ({
   version: '1.0.0',
   type: historyType,
+  trigger_type: triggerType,
   scope_type: scope,
   company_id: companyId ? String(companyId) : null,
   company_name: companyName || null,
@@ -423,6 +492,53 @@ const readManifestFromArchive = async (zipPath) => {
   return normalizeManifest(parsed);
 };
 
+const validateBackupArchiveIntegrity = async ({ zipPath, expectedCollectionFiles = [] }) => {
+  const directory = await unzipper.Open.file(zipPath);
+  const archivePaths = new Set(
+    (Array.isArray(directory?.files) ? directory.files : []).map((entry) => entry?.path).filter(Boolean)
+  );
+  if (!archivePaths.has('metadata.json')) {
+    throw new Error('Backup archive integrity check failed: metadata.json is missing.');
+  }
+
+  const manifest = await readManifestFromArchive(zipPath);
+  const manifestFiles = new Set(
+    (Array.isArray(manifest?.collections) ? manifest.collections : [])
+      .map((entry) => String(entry?.file || '').trim())
+      .filter(Boolean)
+  );
+  const normalizedExpectedFiles = Array.isArray(expectedCollectionFiles)
+    ? expectedCollectionFiles.map((value) => String(value || '').trim()).filter(Boolean)
+    : [];
+  const missingArchiveEntries = normalizedExpectedFiles.filter(
+    (fileName) => !archivePaths.has(fileName)
+  );
+  if (missingArchiveEntries.length > 0) {
+    throw new Error(
+      `Backup archive integrity check failed: missing entries (${missingArchiveEntries.join(', ')}).`
+    );
+  }
+
+  const missingManifestEntries = normalizedExpectedFiles.filter(
+    (fileName) => !manifestFiles.has(fileName)
+  );
+  if (missingManifestEntries.length > 0) {
+    throw new Error(
+      `Backup archive integrity check failed: manifest missing entries (${missingManifestEntries.join(', ')}).`
+    );
+  }
+};
+
+const getFileSizeSafe = async (filePath) => {
+  if (!filePath) return 0;
+  try {
+    const stats = await fs.stat(filePath);
+    return Number(stats?.size) || 0;
+  } catch {
+    return 0;
+  }
+};
+
 const resolveBackupFilePath = (storedPath) => {
   if (!storedPath) return '';
   if (path.isAbsolute(storedPath)) return storedPath;
@@ -435,6 +551,7 @@ export const createBackup = async ({
   createdBy,
   historyType = null,
   sourceBackupId = null,
+  triggerType = 'MANUAL',
 }) => {
   if (!['full_system', 'company'].includes(scope)) {
     throw new Error('Invalid backup scope. Use full_system or company.');
@@ -444,10 +561,15 @@ export const createBackup = async ({
   if (!['full_system', 'company', 'tenant', 'pre_restore'].includes(normalizedHistoryType)) {
     throw new Error('Invalid backup history type.');
   }
+  const normalizedTriggerType = normalizeTriggerType(triggerType);
 
   const normalizedCompanyId = asObjectId(companyId);
   if (scope === 'company' && !normalizedCompanyId) {
     throw new Error('Valid companyId is required for company backups.');
+  }
+  const normalizedCreatedBy = asObjectId(createdBy);
+  if (!normalizedCreatedBy) {
+    throw new Error('Valid createdBy user ID is required for backups.');
   }
 
   await ensureStorageDirectories();
@@ -478,8 +600,33 @@ export const createBackup = async ({
     preferredFilename
   );
   const tempDirectory = path.join(TMP_DIR, `backup_${Date.now()}_${Math.random().toString(16).slice(2)}`);
+  const sourceBackupObjectId = sourceBackupId ? asObjectId(sourceBackupId) : null;
+  let backupHistoryId = null;
+  const resolvedBackupName = path.basename(backupAbsolutePath);
+  const companyRef = scope === 'company' ? normalizedCompanyId : null;
+
+  console.log(
+    `[backup] Starting ${normalizedHistoryType} backup for ${
+      tenant?.name || scope
+    } (${normalizedTriggerType}).`
+  );
 
   try {
+    const inProgressRecord = await BackupHistory.create({
+      backup_name: resolvedBackupName,
+      type: normalizedHistoryType,
+      trigger_type: normalizedTriggerType,
+      company_id: companyRef,
+      file_size: 0,
+      storage_path: backupAbsolutePath,
+      file_path: backupAbsolutePath,
+      status: 'IN_PROGRESS',
+      created_by: normalizedCreatedBy,
+      source_backup_id: sourceBackupObjectId,
+      error_message: '',
+    });
+    backupHistoryId = inProgressRecord?._id ? String(inProgressRecord._id) : null;
+
     await fs.mkdir(tempDirectory, { recursive: true });
     const specs = await getCollectionSpecsForScope({
       db,
@@ -515,9 +662,10 @@ export const createBackup = async ({
     const manifest = createBackupManifest({
       scope,
       historyType: normalizedHistoryType,
+      triggerType: normalizedTriggerType,
       companyId: normalizedCompanyId,
       companyName: tenant?.name || null,
-      createdBy,
+      createdBy: normalizedCreatedBy,
       collections: collectionManifest,
     });
     await fs.writeFile(
@@ -531,60 +679,179 @@ export const createBackup = async ({
       targetZipPath: backupAbsolutePath,
     });
 
-    const stats = await fs.stat(backupAbsolutePath);
-    const backupHistory = await BackupHistory.create({
-      backup_name: path.basename(backupAbsolutePath),
-      type: normalizedHistoryType,
-      company_id: scope === 'company' ? normalizedCompanyId : null,
-      file_size: stats.size,
-      storage_path: backupAbsolutePath,
-      file_path: backupAbsolutePath,
-      status: 'COMPLETED',
-      created_by: asObjectId(createdBy),
-      source_backup_id: sourceBackupId ? asObjectId(sourceBackupId) : null,
+    await validateBackupArchiveIntegrity({
+      zipPath: backupAbsolutePath,
+      expectedCollectionFiles: collectionManifest.map((entry) => entry.file),
     });
 
-    const populated = await BackupHistory.findById(backupHistory._id)
+    const stats = await fs.stat(backupAbsolutePath);
+    if (!backupHistoryId) {
+      throw new Error('Backup history record could not be created.');
+    }
+
+    await BackupHistory.findByIdAndUpdate(backupHistoryId, {
+      $set: {
+        backup_name: resolvedBackupName,
+        file_size: Number(stats?.size) || 0,
+        storage_path: backupAbsolutePath,
+        file_path: backupAbsolutePath,
+        status: 'COMPLETED',
+        error_message: '',
+      },
+    });
+
+    const populated = await BackupHistory.findById(backupHistoryId)
       .populate('company_id', 'name code')
       .populate('created_by', 'name email')
       .lean();
+    if (!populated) {
+      throw new Error('Backup history record not found after backup completion.');
+    }
+
+    console.log(
+      `[backup] Completed ${normalizedHistoryType} backup ${resolvedBackupName} (${stats.size} bytes).`
+    );
 
     return {
       ...populated,
       storage_url_path: toStorageUrlPath(backupAbsolutePath),
     };
   } catch (error) {
+    const errorMessage = sanitizeErrorMessage(error?.message);
+    const sizeOnFailure = await getFileSizeSafe(backupAbsolutePath);
+
+    if (backupHistoryId) {
+      await BackupHistory.findByIdAndUpdate(backupHistoryId, {
+        $set: {
+          status: 'FAILED',
+          error_message: errorMessage,
+          file_size: sizeOnFailure,
+          backup_name: resolvedBackupName,
+          storage_path: backupAbsolutePath,
+          file_path: backupAbsolutePath,
+        },
+      });
+    }
+
+    await safeRemovePath(backupAbsolutePath);
+    console.error(
+      `[backup] Failed ${normalizedHistoryType} backup ${resolvedBackupName}: ${errorMessage}`
+    );
     throw error;
   } finally {
     await safeRemovePath(tempDirectory);
   }
 };
 
-export const createTenantBackupsForAll = async ({ createdBy }) => {
-  const tenants = await Tenant.find({})
+export const createTenantBackupsForAll = async ({
+  createdBy,
+  triggerType = 'MANUAL',
+  tenantFilter = {},
+  shouldSkipTenant = null,
+  retryAttempts = 0,
+  retryDelayMs = 0,
+  interBackupDelayMs = 0,
+}) => {
+  const tenants = await Tenant.find(tenantFilter || {})
     .select('_id name code')
     .sort({ name: 1 })
     .lean();
 
   const created = [];
   const failed = [];
+  const skipped = [];
+  const normalizedRetryAttempts = Math.max(parseInt(retryAttempts, 10) || 0, 0);
+  const normalizedRetryDelayMs = Math.max(parseInt(retryDelayMs, 10) || 0, 0);
+  const normalizedInterBackupDelayMs = Math.max(parseInt(interBackupDelayMs, 10) || 0, 0);
+  const normalizedTriggerType = normalizeTriggerType(triggerType);
 
   for (const tenant of tenants) {
-    try {
-      const backup = await createBackup({
-        scope: 'company',
-        companyId: tenant?._id,
-        createdBy,
-        historyType: 'tenant',
-      });
+    console.log(
+      `[backup] Processing tenant backup for ${tenant?.name || 'Unknown Tenant'} (${String(
+        tenant?._id || ''
+      )}) trigger=${normalizedTriggerType}`
+    );
+
+    if (typeof shouldSkipTenant === 'function') {
+      try {
+        const skipReason = await shouldSkipTenant(tenant);
+        if (skipReason) {
+          console.log(
+            `[backup] Skipping tenant ${tenant?.name || 'Unknown Tenant'}: ${String(skipReason)}`
+          );
+          skipped.push({
+            tenant_id: tenant?._id ? String(tenant._id) : null,
+            tenant_name: tenant?.name || '',
+            tenant_code: tenant?.code || '',
+            status: 'SKIPPED',
+            reason: String(skipReason),
+          });
+          if (normalizedInterBackupDelayMs > 0) {
+            await sleep(normalizedInterBackupDelayMs);
+          }
+          continue;
+        }
+      } catch (error) {
+        failed.push({
+          tenant_id: tenant?._id ? String(tenant._id) : null,
+          tenant_name: tenant?.name || '',
+          tenant_code: tenant?.code || '',
+          status: 'FAILED',
+          error: error?.message || 'Failed to evaluate tenant skip condition.',
+        });
+        if (normalizedInterBackupDelayMs > 0) {
+          await sleep(normalizedInterBackupDelayMs);
+        }
+        continue;
+      }
+    }
+
+    let attempt = 0;
+    let backup = null;
+    let lastError = null;
+
+    while (attempt <= normalizedRetryAttempts) {
+      try {
+        backup = await createBackup({
+          scope: 'company',
+          companyId: tenant?._id,
+          createdBy,
+          historyType: 'tenant',
+          triggerType: normalizedTriggerType,
+        });
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        attempt += 1;
+        if (attempt <= normalizedRetryAttempts && normalizedRetryDelayMs > 0) {
+          await sleep(normalizedRetryDelayMs);
+        }
+      }
+    }
+
+    if (backup) {
+      console.log(
+        `[backup] Tenant backup completed for ${tenant?.name || 'Unknown Tenant'} (${backup?.backup_name || ''})`
+      );
       created.push(backup);
-    } catch (error) {
+    } else {
+      console.error(
+        `[backup] Tenant backup failed for ${tenant?.name || 'Unknown Tenant'}: ${
+          lastError?.message || 'Failed to create backup.'
+        }`
+      );
       failed.push({
         tenant_id: tenant?._id ? String(tenant._id) : null,
         tenant_name: tenant?.name || '',
         tenant_code: tenant?.code || '',
-        error: error?.message || 'Failed to create backup.',
+        status: 'FAILED',
+        error: lastError?.message || 'Failed to create backup.',
       });
+    }
+
+    if (normalizedInterBackupDelayMs > 0) {
+      await sleep(normalizedInterBackupDelayMs);
     }
   }
 
@@ -592,7 +859,48 @@ export const createTenantBackupsForAll = async ({ createdBy }) => {
     total: tenants.length,
     created,
     failed,
+    skipped,
   };
+};
+
+export const createAutoTenantBackupsForActiveTenants = async ({
+  createdBy,
+  dayStartUtc,
+  dayEndUtc,
+  retryAttempts = DEFAULT_AUTO_BACKUP_RETRY_ATTEMPTS,
+  retryDelayMs = DEFAULT_AUTO_BACKUP_RETRY_DELAY_MS,
+  interBackupDelayMs = DEFAULT_AUTO_BACKUP_INTER_TENANT_DELAY_MS,
+}) => {
+  const safeDayStart =
+    dayStartUtc instanceof Date && !Number.isNaN(dayStartUtc.getTime())
+      ? dayStartUtc
+      : new Date(Date.now() - 24 * 60 * 60 * 1000);
+  const safeDayEnd =
+    dayEndUtc instanceof Date && !Number.isNaN(dayEndUtc.getTime())
+      ? dayEndUtc
+      : new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+  return createTenantBackupsForAll({
+    createdBy,
+    triggerType: 'AUTO',
+    tenantFilter: { status: 'ACTIVE' },
+    retryAttempts,
+    retryDelayMs,
+    interBackupDelayMs,
+    shouldSkipTenant: async (tenant) => {
+      const existingBackupForDay = await BackupHistory.exists({
+        type: 'tenant',
+        trigger_type: 'AUTO',
+        company_id: asObjectId(tenant?._id),
+        status: { $in: ['IN_PROGRESS', 'COMPLETED'] },
+        created_at: {
+          $gte: safeDayStart,
+          $lt: safeDayEnd,
+        },
+      });
+      return existingBackupForDay ? 'already_created_for_ist_day' : '';
+    },
+  });
 };
 
 const restoreFromExtractedPayload = async ({
@@ -777,6 +1085,10 @@ export const listBackupHistory = async ({
   type,
   companyId,
   status,
+  triggerType,
+  startDate,
+  endDate,
+  search,
 }) => {
   const normalizedPage = Math.max(parseInt(page, 10) || 1, 1);
   const normalizedLimit = Math.min(Math.max(parseInt(limit, 10) || 20, 1), 100);
@@ -797,6 +1109,28 @@ export const listBackupHistory = async ({
     )
   ) {
     filter.status = String(status).toUpperCase();
+  }
+  const requestedTriggerType = String(triggerType || '').trim().toUpperCase();
+  if (VALID_TRIGGER_TYPES.includes(requestedTriggerType)) {
+    filter.trigger_type = requestedTriggerType;
+  }
+  const normalizedSearch = String(search || '').trim();
+  if (normalizedSearch) {
+    filter.backup_name = {
+      $regex: escapeRegex(normalizedSearch),
+      $options: 'i',
+    };
+  }
+  const parsedStartDate = parseDateFilterValue(startDate, { endOfDay: false });
+  const parsedEndDate = parseDateFilterValue(endDate, { endOfDay: true });
+  if (parsedStartDate || parsedEndDate) {
+    filter.created_at = {};
+    if (parsedStartDate) {
+      filter.created_at.$gte = parsedStartDate;
+    }
+    if (parsedEndDate) {
+      filter.created_at.$lte = parsedEndDate;
+    }
   }
 
   const [items, total] = await Promise.all([

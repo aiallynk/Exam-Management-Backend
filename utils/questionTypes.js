@@ -6,11 +6,24 @@ const STORAGE_QUESTION_TYPES = [
   'TRUE_FALSE',
   'SHORT_ANSWER',
   'PARAGRAPH',
+  'ESSAY',
+  'ESSAY_LETTER',
+  'ESSAY_STORY',
   'NUMBER',
   'CODING',
 ];
 
-const QUESTION_FORMATS = ['MCQ', 'IMAGE', 'PARAGRAPH', 'SCENARIO', 'TRUE_FALSE', 'CODING'];
+const QUESTION_FORMATS = [
+  'MCQ',
+  'IMAGE',
+  'PARAGRAPH',
+  'SCENARIO',
+  'TRUE_FALSE',
+  'ESSAY',
+  'ESSAY_LETTER',
+  'ESSAY_STORY',
+  'CODING',
+];
 
 const SCENARIO_HINT_REGEX =
   /\b(case study|scenario|situation|context|caselet|read the following|consider the following|based on the passage|based on the scenario)\b/i;
@@ -24,7 +37,47 @@ const normalizeUpper = (value) => normalizeString(value).toUpperCase();
 const normalizeFormatAlias = (value) => {
   const normalized = normalizeUpper(value);
   if (normalized === 'IMAGE_BASED') return 'IMAGE';
+  if (['LETTER_WRITING', 'LETTER'].includes(normalized)) return 'ESSAY_LETTER';
+  if (['STORY_WRITING', 'STORY'].includes(normalized)) return 'ESSAY_STORY';
   return normalized;
+};
+
+const normalizeEssayTypeAlias = (value) => {
+  const normalized = normalizeUpper(value);
+  if (!normalized) return '';
+  if (['LETTER_WRITING', 'LETTER', 'ESSAYLETTER'].includes(normalized)) {
+    return 'ESSAY_LETTER';
+  }
+  if (['STORY_WRITING', 'STORY', 'ESSAYSTORY'].includes(normalized)) {
+    return 'ESSAY_STORY';
+  }
+  if (['LONG_ANSWER', 'DESCRIPTIVE'].includes(normalized)) {
+    return 'ESSAY';
+  }
+  return normalized;
+};
+
+const parseStructuredAnswerList = (value) => {
+  if (Array.isArray(value)) {
+    return value.map((item) => normalizeString(item)).filter(Boolean);
+  }
+
+  const normalized = normalizeString(value);
+  if (!normalized) return [];
+
+  try {
+    const parsed = JSON.parse(normalized);
+    if (Array.isArray(parsed)) {
+      return parsed.map((item) => normalizeString(item)).filter(Boolean);
+    }
+  } catch {
+    // Fall through to delimiter split.
+  }
+
+  return normalized
+    .split(/[,;|\n]/)
+    .map((item) => normalizeString(item))
+    .filter(Boolean);
 };
 
 const hasImagePayload = (payload = {}) =>
@@ -50,6 +103,7 @@ const inferObjectiveTypeFromOptions = (options = [], answer = '') => {
     ? options.map((option) => normalizeString(option)).filter(Boolean)
     : [];
   const safeAnswer = normalizeString(answer);
+  const parsedAnswers = parseStructuredAnswerList(answer);
 
   if (safeOptions.length >= 2) {
     const lowerOptions = safeOptions.map((option) => option.toLowerCase());
@@ -60,7 +114,14 @@ const inferObjectiveTypeFromOptions = (options = [], answer = '') => {
     if (isTrueFalse) {
       return 'TRUE_FALSE';
     }
+    if (parsedAnswers.length > 1) {
+      return 'MULTIPLE_OPTIONS';
+    }
     return 'MULTIPLE_CHOICE';
+  }
+
+  if (parsedAnswers.length > 1) {
+    return 'MULTIPLE_OPTIONS';
   }
 
   if (/^(true|false|t|f)$/i.test(safeAnswer)) {
@@ -82,10 +143,14 @@ export const normalizeQuestionFormat = (payload = {}) => {
   const explicitFormat = normalizeFormatAlias(
     payload.questionFormat || payload.question_type
   );
-  const normalizedType = normalizeUpper(payload.questionType);
+  const normalizedType = normalizeEssayTypeAlias(payload.questionType);
 
   if (normalizedType === 'CODING') {
     return 'CODING';
+  }
+
+  if (['ESSAY', 'ESSAY_LETTER', 'ESSAY_STORY'].includes(normalizedType)) {
+    return normalizedType;
   }
 
   if (normalizedType === 'IMAGE_BASED') {
@@ -117,10 +182,6 @@ export const normalizeQuestionFormat = (payload = {}) => {
     return SCENARIO_HINT_REGEX.test(scenarioHintSource) ? 'SCENARIO' : 'PARAGRAPH';
   }
 
-  if (hasImagePayload(payload)) {
-    return 'IMAGE';
-  }
-
   if (normalizedType === 'TRUE_FALSE') {
     return 'TRUE_FALSE';
   }
@@ -129,17 +190,25 @@ export const normalizeQuestionFormat = (payload = {}) => {
     return 'MCQ';
   }
 
+  if (hasImagePayload(payload)) {
+    return 'IMAGE';
+  }
+
   return '';
 };
 
 export const normalizeQuestionTypeForStorage = (payload = {}) => {
-  const normalizedType = normalizeUpper(payload.questionType);
+  const normalizedType = normalizeEssayTypeAlias(payload.questionType);
   const explicitFormat = normalizeFormatAlias(payload.questionFormat || payload.question_type);
   const normalizedFormat = normalizeQuestionFormat(payload);
   const inferredObjectiveType = inferObjectiveTypeFromOptions(payload.options, payload.correctAnswer);
 
   if (STORAGE_QUESTION_TYPES.includes(normalizedType)) {
     return normalizedType;
+  }
+
+  if (['MULTI_SELECT_MCQ', 'MULTI_SELECT', 'MULTISELECT'].includes(normalizedType)) {
+    return 'MULTIPLE_OPTIONS';
   }
 
   if (
@@ -159,6 +228,10 @@ export const normalizeQuestionTypeForStorage = (payload = {}) => {
 
   if (normalizedType === 'SCENARIO') {
     return inferredObjectiveType || 'PARAGRAPH';
+  }
+
+  if (['ESSAY', 'ESSAY_LETTER', 'ESSAY_STORY'].includes(normalizedFormat)) {
+    return normalizedFormat;
   }
 
   if (normalizedFormat === 'TRUE_FALSE') {

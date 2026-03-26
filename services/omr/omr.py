@@ -5,6 +5,7 @@ import re
 import sys
 import traceback
 from dataclasses import dataclass
+from shutil import which
 from typing import Dict, List, Optional, Sequence, Tuple
 
 import cv2
@@ -14,6 +15,11 @@ try:
     import fitz  # type: ignore
 except Exception:
     fitz = None
+
+try:
+    import pytesseract  # type: ignore
+except Exception:
+    pytesseract = None
 
 
 @dataclass
@@ -55,13 +61,62 @@ class OMRScanner:
         self.roll_grid_rel = (0.075, 0.235, 0.490, 0.395)
         # Template-relative candidate-name input box.
         self.candidate_name_rel = (0.075, 0.425, 0.490, 0.455)
+        # Template-relative exam-code text areas.
+        # Prioritize the top-left printed exam-code line on page 1, then keep
+        # broader fallbacks for older headers and continuation pages.
+        self.exam_code_rois_rel = [
+            # Page-1 dedicated exam-code line near the top-left header block.
+            (0.030, 0.096, 0.480, 0.128),
+            # Page-1 slightly wider fallback that still centers the printed code.
+            (0.030, 0.096, 0.600, 0.128),
+            # Page-1 value-biased fallback shifted right toward the code token.
+            (0.100, 0.096, 0.560, 0.128),
+            # Legacy broader header row ("Exam Code: <value> | Exam Date | Paper")
+            (0.040, 0.078, 0.620, 0.136),
+            # Continuation-page header line near right side.
+            (0.685, 0.040, 0.975, 0.074),
+        ]
+        # Tesseract performs better on a wider top-left header strip that still
+        # contains the printed exam-code text.
+        self.exam_code_tesseract_rois_rel = [
+            (0.020, 0.040, 0.550, 0.150),
+            (0.020, 0.020, 0.450, 0.100),
+            (0.020, 0.080, 0.420, 0.140),
+            (0.030, 0.080, 0.600, 0.140),
+        ]
+        # Conservative identity-token guards to prevent roll/exam cross-detection.
+        self.exam_code_min_len = 4
+        self.exam_code_max_len = 24
+        self.exam_code_numeric_min_len = 5
+        self.exam_code_numeric_max_len = 8
+        self.roll_number_like_min_len = 10
         self._ocr_templates = self._build_text_templates()
+        self._last_exam_code_debug: Dict[str, object] = {}
+        self._tesseract_cmd = self._resolve_tesseract_cmd()
+        if pytesseract is not None and self._tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = self._tesseract_cmd
+
+    @staticmethod
+    def _resolve_tesseract_cmd() -> str:
+        """Locate the local Tesseract executable when available."""
+        candidates = [
+            os.environ.get("TESSERACT_CMD", ""),
+            which("tesseract") or "",
+            r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+            r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        ]
+        for candidate in candidates:
+            if candidate and os.path.exists(candidate):
+                return candidate
+        return ""
 
     @staticmethod
     def _find_contours(binary: np.ndarray, mode: int, method: int) -> List[np.ndarray]:
         """OpenCV version-safe contour finder."""
         found = cv2.findContours(binary, mode, method)
         return found[0] if len(found) == 2 else found[1]
+
+
 
     @staticmethod
     def _order_points(pts: np.ndarray) -> np.ndarray:
@@ -865,7 +920,7 @@ class OMRScanner:
         Build lightweight OCR templates for alphanumeric text.
         This avoids external OCR dependencies and works for generated/printed text.
         """
-        charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
+        charset = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-:"
         fonts = [
             cv2.FONT_HERSHEY_SIMPLEX,
             cv2.FONT_HERSHEY_DUPLEX,
@@ -919,6 +974,674 @@ class OMRScanner:
                 best_char = ch
 
         return best_char, best_score
+
+    def _extract_text_from_roi_using_templates(
+        self,
+        gray: np.ndarray,
+        roi_rel: Tuple[float, float, float, float],
+        min_score: float = 0.14,
+    ) -> Tuple[str, float]:
+        """
+        OCR one text line from a relative ROI using internal glyph templates.
+        Returns (best_text, quality_score).
+        """
+        if gray is None or gray.size == 0:
+            return "", 0.0
+
+        h, w = gray.shape
+        x1_rel, y1_rel, x2_rel, y2_rel = roi_rel
+        x0 = max(0, min(w - 1, int(round(w * x1_rel))))
+        y0 = max(0, min(h - 1, int(round(h * y1_rel))))
+        x1 = max(x0 + 1, min(w, int(round(w * x2_rel))))
+        y1 = max(y0 + 1, min(h, int(round(h * y2_rel))))
+        roi = gray[y0:y1, x0:x1]
+        if roi.size == 0:
+            return "", 0.0
+
+        margin_x = max(1, int(roi.shape[1] * 0.008))
+        margin_y = max(1, int(roi.shape[0] * 0.12))
+        if roi.shape[1] <= margin_x * 2 or roi.shape[0] <= margin_y * 2:
+            return "", 0.0
+        text_roi = roi[margin_y : roi.shape[0] - margin_y, margin_x : roi.shape[1] - margin_x]
+        if text_roi.size == 0:
+            return "", 0.0
+
+        # Upscale small header text before thresholding/classification.
+        upsample_factor = 1.35 if min(text_roi.shape[:2]) <= 120 else 1.2
+        text_scaled = cv2.resize(
+            text_roi,
+            None,
+            fx=upsample_factor,
+            fy=upsample_factor,
+            interpolation=cv2.INTER_CUBIC,
+        )
+        text_blur = cv2.GaussianBlur(text_scaled, (3, 3), 0)
+        adaptive_block = int(max(21, (min(text_blur.shape[:2]) * 0.16) // 2 * 2 + 1))
+        adaptive_block = min(adaptive_block, 51)
+        if adaptive_block % 2 == 0:
+            adaptive_block += 1
+
+        adaptive_main = cv2.adaptiveThreshold(
+            text_blur,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            adaptive_block,
+            8,
+        )
+        adaptive_soft = cv2.adaptiveThreshold(
+            text_blur,
+            255,
+            cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+            cv2.THRESH_BINARY_INV,
+            adaptive_block,
+            6,
+        )
+        _, otsu_bin = cv2.threshold(
+            text_blur,
+            0,
+            255,
+            cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU,
+        )
+        variants = [adaptive_main, adaptive_soft, otsu_bin]
+
+        best_text = ""
+        best_quality = 0.0
+        for text_bin in variants:
+            kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+            text_bin = cv2.morphologyEx(text_bin, cv2.MORPH_OPEN, kernel, iterations=1)
+            text_bin = cv2.morphologyEx(text_bin, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+            num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(text_bin, connectivity=8)
+            components: List[Tuple[int, int, int, int, int, np.ndarray]] = []
+            min_component_area = 14 if upsample_factor > 1.0 else 8
+            for idx in range(1, num_labels):
+                x = int(stats[idx, cv2.CC_STAT_LEFT])
+                y = int(stats[idx, cv2.CC_STAT_TOP])
+                bw = int(stats[idx, cv2.CC_STAT_WIDTH])
+                bh = int(stats[idx, cv2.CC_STAT_HEIGHT])
+                area = int(stats[idx, cv2.CC_STAT_AREA])
+
+                if area < min_component_area:
+                    continue
+                if bw < 2 or bh < 5:
+                    continue
+                if bh > int(text_bin.shape[0] * 0.96):
+                    continue
+                components.append((x, y, bw, bh, area, text_bin[y : y + bh, x : x + bw]))
+
+            if not components:
+                continue
+
+            if len(components) > 72:
+                components = sorted(components, key=lambda item: item[4], reverse=True)[:72]
+            components.sort(key=lambda item: item[0])
+            gaps: List[float] = []
+            for idx in range(1, len(components)):
+                prev = components[idx - 1]
+                curr = components[idx]
+                gaps.append(float(curr[0] - (prev[0] + prev[2])))
+
+            median_width = float(np.median([component[2] for component in components]))
+            if gaps:
+                median_gap = float(np.median(gaps))
+                std_gap = float(np.std(gaps))
+                space_gap = max(4.0, median_gap + max(1.5, std_gap * 1.2))
+            else:
+                space_gap = max(4.0, median_width * 0.8)
+
+            chars: List[str] = []
+            scores: List[float] = []
+            prev_right: Optional[int] = None
+            for x, _y, bw, _bh, _area, glyph in components:
+                if prev_right is not None and float(x - prev_right) > space_gap:
+                    chars.append(" ")
+
+                ch, score = self._classify_glyph(glyph)
+                if ch and score >= min_score:
+                    chars.append(ch.upper())
+                    scores.append(score)
+                prev_right = x + bw
+
+            if not chars:
+                continue
+
+            raw_text = re.sub(r"\s+", " ", "".join(chars)).strip()
+            if not raw_text:
+                continue
+
+            avg_score = float(np.mean(scores)) if scores else 0.0
+            alpha_num_count = len(re.sub(r"[^A-Za-z0-9]", "", raw_text))
+            quality = avg_score + min(0.8, alpha_num_count / 20.0)
+
+            if quality > best_quality:
+                best_quality = quality
+                best_text = raw_text
+
+        return best_text, best_quality
+
+    @staticmethod
+    def _normalize_exam_code_text(value: str) -> str:
+        """
+        Normalize OCR text into a likely exam code token.
+        Returns an uppercase exam-code candidate.
+        """
+        upper = re.sub(r"[^A-Za-z0-9 ]+", " ", str(value or "")).upper()
+        upper = re.sub(r"\s+", " ", upper).strip()
+        if not upper:
+            return ""
+
+        strict = OMRScanner._format_strict_exam_code_candidate(upper)
+        if strict:
+            return strict
+
+        compact = upper.replace(" ", "")
+
+        prefixed = re.search(r"(?:EXAMCODE|EXAMID|CODE)(EXAM[A-Z0-9]{8}|[A-Z0-9]{4,})", compact)
+        if prefixed:
+            strict = OMRScanner._format_strict_exam_code_candidate(prefixed.group(1))
+            if strict:
+                return strict
+            return prefixed.group(1)
+
+        exam_code_tail = re.search(r"EXAM\s*CODE\s*(.+)$", upper)
+        if exam_code_tail:
+            strict = OMRScanner._format_strict_exam_code_candidate(exam_code_tail.group(1))
+            if strict:
+                return strict
+            tail = re.sub(r"[^A-Z0-9]", "", exam_code_tail.group(1))
+            if len(tail) >= 4:
+                return tail
+
+        tokens = [token for token in upper.split(" ") if token]
+        filtered = [
+            token
+            for token in tokens
+            if token not in {"EXAM", "CODE", "EXAMCODE", "EXAMID"}
+        ]
+        if not filtered:
+            return ""
+
+        strong = [
+            token
+            for token in filtered
+            if len(token) >= 4 and re.search(r"[A-Z]", token) and re.search(r"\d", token)
+        ]
+        if strong:
+            return max(strong, key=len)
+
+        numeric = [token for token in filtered if token.isdigit() and 5 <= len(token) <= 8]
+        if numeric:
+            return max(numeric, key=len)
+
+        return ""
+
+    @staticmethod
+    def _format_strict_exam_code_candidate(value: str) -> str:
+        """
+        Convert OCR text into the canonical EXAM-XXXX-XXXX shape when present.
+        """
+        upper = str(value or "").upper()
+        if not upper:
+            return ""
+
+        exact = re.search(r"EXAM[-\s:_]*([A-Z0-9]{4})[-\s:_]*([A-Z0-9]{4})", upper)
+        if exact:
+            tail = f"{exact.group(1)}{exact.group(2)}"
+            if re.search(r"\d", tail):
+                return f"EXAM-{exact.group(1)}-{exact.group(2)}"
+
+        compact = re.sub(r"[^A-Z0-9]", "", upper)
+        prefixed = re.search(r"EXAM([A-Z0-9]{4})([A-Z0-9]{4})", compact)
+        if prefixed:
+            tail = f"{prefixed.group(1)}{prefixed.group(2)}"
+            if re.search(r"\d", tail):
+                return f"EXAM-{prefixed.group(1)}-{prefixed.group(2)}"
+
+        return ""
+
+    @staticmethod
+    def _is_object_id_candidate(value: str) -> bool:
+        """Return True when the token looks like a MongoDB ObjectId."""
+        return bool(re.fullmatch(r"[A-F0-9]{24}", str(value or "").upper()))
+
+    def _collect_exam_code_candidates_from_text(
+        self,
+        raw_text: str,
+        detected_roll: str = "",
+    ) -> List[str]:
+        """
+        Build a ranked list of plausible exam-code candidates from OCR text.
+        Keeps conservative filters to avoid generic header/instruction words.
+        """
+        upper = re.sub(r"[^A-Za-z0-9 ]+", " ", str(raw_text or "")).upper()
+        upper = re.sub(r"\s+", " ", upper).strip()
+        if not upper:
+            return []
+
+        compact = upper.replace(" ", "")
+        raw_candidates: List[str] = []
+
+        strict_candidates: List[str] = []
+        for match in re.finditer(r"EXAM[-\s:_]*([A-Z0-9]{4})[-\s:_]*([A-Z0-9]{4})", upper):
+            tail = f"{match.group(1)}{match.group(2)}"
+            if re.search(r"\d", tail):
+                strict_candidates.append(f"EXAM-{match.group(1)}-{match.group(2)}")
+
+        for match in re.finditer(r"EXAM([A-Z0-9]{4})([A-Z0-9]{4})", compact):
+            tail = f"{match.group(1)}{match.group(2)}"
+            if re.search(r"\d", tail):
+                strict_candidates.append(f"EXAM-{match.group(1)}-{match.group(2)}")
+
+        raw_candidates.extend(
+            match.group(0).upper()
+            for match in re.finditer(r"\b[a-fA-F0-9]{24}\b", str(raw_text or ""))
+        )
+
+        prefixed = re.search(r"(?:EXAMCODE|EXAMID|CODE)(EXAM[A-Z0-9]{8}|[A-Z0-9]{4,32})", compact)
+        if prefixed:
+            raw_candidates.append(prefixed.group(1))
+
+        exam_tail = re.search(r"EXAM\s*CODE\s*(.+)$", upper)
+        if exam_tail:
+            strict_tail = self._format_strict_exam_code_candidate(exam_tail.group(1))
+            if strict_tail:
+                strict_candidates.append(strict_tail)
+            tail = re.sub(r"[^A-Z0-9]", "", exam_tail.group(1))
+            if tail:
+                raw_candidates.append(tail)
+
+        raw_candidates.extend(strict_candidates)
+        raw_candidates.extend(re.findall(r"[A-Z0-9]{4,32}", compact))
+        raw_candidates.extend(re.findall(r"[A-Z0-9]{4,24}", upper))
+
+        expanded: List[str] = []
+        for token in raw_candidates:
+            if not token:
+                continue
+            token_compact = re.sub(r"[^A-Z0-9]", "", token.upper())
+            expanded.append(token)
+            if self._format_strict_exam_code_candidate(token) or self._is_object_id_candidate(token_compact):
+                continue
+            if len(token) > 8:
+                max_len = min(12, len(token))
+                for length in range(4, max_len + 1):
+                    expanded.append(token[:length])
+                    expanded.append(token[-length:])
+
+        scored: Dict[str, float] = {}
+        for token in expanded:
+            candidate = self._sanitize_exam_code_candidate(token, detected_roll=detected_roll)
+            if not candidate:
+                continue
+
+            compact_candidate = re.sub(r"[^A-Z0-9]", "", candidate)
+            alpha_count = len(re.findall(r"[A-Z]", compact_candidate))
+            digit_count = len(re.findall(r"\d", compact_candidate))
+            is_strict = bool(re.fullmatch(r"EXAM-[A-Z0-9]{4}-[A-Z0-9]{4}", candidate))
+            is_prefixed = compact_candidate.startswith("EXAM") and len(compact_candidate) == 12
+
+            # Conservative acceptance: mixed alnum, numeric (5-8), or EXAM-prefixed token.
+            if is_strict:
+                score = 4.2
+            elif is_prefixed:
+                score = 3.4
+            elif alpha_count and digit_count:
+                score = 2.8
+            elif digit_count and not alpha_count:
+                score = 1.9
+            elif compact_candidate.startswith("EXAM") and len(compact_candidate) >= 6:
+                score = 1.8
+            else:
+                continue
+
+            score += min(1.0, len(compact_candidate) / 20.0)
+            if compact_candidate.startswith("EXAM"):
+                score += 0.4
+            if re.search(r"\d", compact_candidate):
+                score += 0.25
+            if is_strict:
+                score += 0.3
+
+            previous = scored.get(candidate)
+            if previous is None or score > previous:
+                scored[candidate] = score
+
+        ordered = sorted(scored.items(), key=lambda item: (item[1], len(item[0])), reverse=True)
+        return [candidate for candidate, _score in ordered]
+
+    def _sanitize_exam_code_candidate(
+        self,
+        value: str,
+        detected_roll: str = "",
+    ) -> str:
+        """
+        Keep only plausible exam-code tokens and block roll-number-like values.
+        """
+        candidate_raw = re.sub(r"[^A-Za-z0-9-]", "", str(value or "")).upper()
+        candidate = self._format_strict_exam_code_candidate(candidate_raw) or candidate_raw
+        compact_candidate = re.sub(r"[^A-Z0-9]", "", candidate)
+        if not compact_candidate:
+            return ""
+
+        if self._is_object_id_candidate(compact_candidate):
+            return compact_candidate
+
+        if len(compact_candidate) < self.exam_code_min_len or len(compact_candidate) > self.exam_code_max_len:
+            return ""
+
+        roll_digits = re.sub(r"\D", "", str(detected_roll or ""))
+        if roll_digits and compact_candidate == roll_digits:
+            return ""
+
+        if compact_candidate.isdigit():
+            if len(compact_candidate) >= self.roll_number_like_min_len:
+                return ""
+            if len(compact_candidate) < self.exam_code_numeric_min_len:
+                return ""
+            if len(compact_candidate) > self.exam_code_numeric_max_len:
+                return ""
+        elif (
+            re.search(r"[A-Z]", compact_candidate)
+            and re.search(r"\d", compact_candidate)
+            and not compact_candidate.startswith("EXAM")
+            and len(compact_candidate) < 8
+        ):
+            return ""
+
+        return candidate
+
+    @staticmethod
+    def _extract_exam_code_from_filename(image_path: str) -> str:
+        """Best-effort exam-code fallback from filename."""
+        filename = os.path.basename(image_path)
+        base, _ = os.path.splitext(filename)
+        explicit = re.search(r"(?:exam(?:code|id)?)\s*[-_ ]*([A-Za-z0-9-]{4,})", base, re.IGNORECASE)
+        if not explicit:
+            return ""
+        token = re.sub(r"[^A-Za-z0-9]", "", explicit.group(1)).upper()
+        return token if len(token) >= 4 else ""
+
+    @staticmethod
+    def _crop_relative_roi(
+        gray: np.ndarray,
+        roi_rel: Tuple[float, float, float, float],
+    ) -> np.ndarray:
+        """Crop a relative ROI from a grayscale warped sheet."""
+        if gray is None or gray.size == 0:
+            return np.zeros((0, 0), dtype=np.uint8)
+
+        h, w = gray.shape
+        x1_rel, y1_rel, x2_rel, y2_rel = roi_rel
+        x0 = max(0, min(w - 1, int(round(w * x1_rel))))
+        y0 = max(0, min(h - 1, int(round(h * y1_rel))))
+        x1 = max(x0 + 1, min(w, int(round(w * x2_rel))))
+        y1 = max(y0 + 1, min(h, int(round(h * y2_rel))))
+        return gray[y0:y1, x0:x1]
+
+    def _run_tesseract_on_exam_roi(
+        self,
+        gray: np.ndarray,
+        roi_rel: Tuple[float, float, float, float],
+    ) -> List[Tuple[str, int, str, float]]:
+        """
+        OCR the exam-code header using Tesseract.
+        Returns (variant_name, psm, raw_text, quality_estimate).
+        """
+        if pytesseract is None or not self._tesseract_cmd:
+            return []
+
+        roi = self._crop_relative_roi(gray, roi_rel)
+        if roi.size == 0:
+            return []
+
+        scaled = cv2.resize(roi, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_CUBIC)
+        threshold_value = max(110, min(190, int(np.mean(scaled) * 0.9)))
+        variants = [
+            ("gray", scaled),
+            ("th", cv2.threshold(scaled, threshold_value, 255, cv2.THRESH_BINARY)[1]),
+            ("otsu", cv2.threshold(scaled, 0, 255, cv2.THRESH_BINARY | cv2.THRESH_OTSU)[1]),
+        ]
+
+        results: List[Tuple[str, int, str, float]] = []
+        seen = set()
+        for variant_name, variant in variants:
+            for psm in (6, 7):
+                config = f"--psm {psm} -c preserve_interword_spaces=1"
+                try:
+                    raw_text = pytesseract.image_to_string(
+                        variant,
+                        lang="eng",
+                        config=config,
+                    )
+                except Exception:
+                    continue
+
+                normalized = re.sub(r"\s+", " ", str(raw_text or "")).strip()
+                if not normalized:
+                    continue
+
+                key = (normalized, psm)
+                if key in seen:
+                    continue
+                seen.add(key)
+
+                compact = re.sub(r"[^A-Z0-9]", "", normalized.upper())
+                quality = min(1.8, len(compact) / 12.0)
+                if "EXAM" in compact:
+                    quality += 0.55
+                if "CODE" in compact:
+                    quality += 0.35
+                if re.search(r"[A-Z]", compact) and re.search(r"\d", compact):
+                    quality += 0.20
+
+                results.append((variant_name, psm, normalized, float(quality)))
+
+        return results
+
+    def _score_exam_code_candidate(
+        self,
+        candidate: str,
+        raw_text: str,
+        quality: float,
+        base_index: int,
+        rank: int,
+        engine: str,
+    ) -> float:
+        """Rank one OCR candidate while preferring canonical exam-code outputs."""
+        compact_raw = re.sub(r"[^A-Z0-9]", "", raw_text.upper())
+        compact_candidate = re.sub(r"[^A-Z0-9]", "", candidate)
+        candidate_length = len(compact_candidate)
+        is_strict = bool(re.fullmatch(r"EXAM-[A-Z0-9]{4}-[A-Z0-9]{4}", candidate))
+        is_object_id = bool(re.fullmatch(r"[A-F0-9]{24}", compact_candidate))
+        label_hint = "EXAM" in compact_raw or "CODE" in compact_raw
+
+        candidate_quality = quality + min(0.45, len(candidate) / 18.0)
+        if re.search(r"[A-Z]", candidate) and re.search(r"\d", candidate):
+            candidate_quality += 0.35
+        elif candidate.isdigit():
+            candidate_quality += 0.22
+        if compact_candidate.startswith("EXAM"):
+            candidate_quality += 0.18
+        if is_strict:
+            candidate_quality += 0.90
+        if is_object_id:
+            candidate_quality += 0.80
+        if label_hint:
+            candidate_quality += 0.20
+        if base_index <= 2:
+            candidate_quality += 0.05
+        if engine == "tesseract":
+            candidate_quality += 1.10
+        if not is_strict and not is_object_id and not compact_candidate.startswith("EXAM") and not label_hint:
+            candidate_quality -= 0.80
+        if candidate_length > 12 and not is_object_id:
+            candidate_quality -= min(0.90, (candidate_length - 12) * 0.12)
+        candidate_quality -= min(0.20, rank * 0.04)
+        return float(candidate_quality)
+
+    def _extract_exam_code_from_sheet(
+        self,
+        sheet_image: np.ndarray,
+        detected_roll: str = "",
+    ) -> str:
+        """Template-based OCR for exam-code text printed in the sheet header."""
+        if sheet_image is None or sheet_image.size == 0:
+            return ""
+
+        gray = (
+            cv2.cvtColor(sheet_image, cv2.COLOR_BGR2GRAY)
+            if len(sheet_image.shape) == 3
+            else sheet_image.copy()
+        )
+
+        # Small ROI perturbation improves robustness for slight skew/crop offsets.
+        roi_shifts = [
+            (0.0, 0.0, 1.0, 1.0),
+            (-0.003, 0.0, 1.01, 1.0),
+            (0.003, 0.0, 1.01, 1.0),
+        ]
+
+        best_code = ""
+        best_quality = 0.0
+        all_candidates: List[str] = []
+        debug_entries: List[Dict[str, object]] = []
+
+        # Primary OCR path for exam code: use Tesseract on the top header strip.
+        for base_index, roi_rel in enumerate(self.exam_code_tesseract_rois_rel):
+            tesseract_results = self._run_tesseract_on_exam_roi(gray, roi_rel)
+            for variant_name, psm, raw_text, quality in tesseract_results:
+                normalized_primary = self._sanitize_exam_code_candidate(
+                    self._format_strict_exam_code_candidate(raw_text) or self._normalize_exam_code_text(raw_text),
+                    detected_roll=detected_roll,
+                )
+                candidates = self._collect_exam_code_candidates_from_text(
+                    raw_text,
+                    detected_roll=detected_roll,
+                )
+
+                if normalized_primary and normalized_primary not in candidates:
+                    candidates.insert(0, normalized_primary)
+
+                if candidates:
+                    all_candidates.extend(candidates)
+
+                for rank, candidate in enumerate(candidates):
+                    candidate_quality = self._score_exam_code_candidate(
+                        candidate=candidate,
+                        raw_text=raw_text,
+                        quality=quality,
+                        base_index=base_index,
+                        rank=rank,
+                        engine="tesseract",
+                    )
+                    if candidate_quality > best_quality:
+                        best_quality = candidate_quality
+                        best_code = candidate
+
+                debug_entries.append(
+                    {
+                        "engine": "tesseract",
+                        "roi": [round(float(v), 5) for v in roi_rel],
+                        "variant": variant_name,
+                        "psm": int(psm),
+                        "quality": round(float(quality), 4),
+                        "raw_text": raw_text[:160],
+                        "candidates": candidates[:6],
+                    }
+                )
+
+                strict_match = self._format_strict_exam_code_candidate(raw_text)
+                object_id_candidate = next(
+                    (
+                        candidate
+                        for candidate in candidates
+                        if self._is_object_id_candidate(re.sub(r"[^A-Z0-9]", "", candidate))
+                    ),
+                    "",
+                )
+                if strict_match or object_id_candidate:
+                    final_token = strict_match or object_id_candidate
+                    final_code = self._sanitize_exam_code_candidate(final_token, detected_roll=detected_roll)
+                    self._last_exam_code_debug = {
+                        "selected": final_code,
+                        "candidates": [final_code, *[candidate for candidate in all_candidates if candidate != final_code]][:12],
+                        "entries": debug_entries[:20],
+                    }
+                    return final_code
+
+        for base_index, base_roi in enumerate(self.exam_code_rois_rel):
+            bx1, by1, bx2, by2 = base_roi
+            for shift_x, shift_y, scale_x, scale_y in roi_shifts:
+                cx = (bx1 + bx2) / 2.0 + shift_x
+                cy = (by1 + by2) / 2.0 + shift_y
+                half_w = ((bx2 - bx1) * scale_x) / 2.0
+                half_h = ((by2 - by1) * scale_y) / 2.0
+                roi_rel = (
+                    max(bx1, cx - half_w),
+                    max(by1, cy - half_h),
+                    min(bx2, cx + half_w),
+                    min(by2, cy + half_h),
+                )
+                if roi_rel[2] - roi_rel[0] <= 0.02 or roi_rel[3] - roi_rel[1] <= 0.01:
+                    continue
+
+                raw_text, quality = self._extract_text_from_roi_using_templates(gray, roi_rel, min_score=0.08)
+                normalized_primary = self._sanitize_exam_code_candidate(
+                    self._format_strict_exam_code_candidate(raw_text) or self._normalize_exam_code_text(raw_text),
+                    detected_roll=detected_roll,
+                )
+                candidates = self._collect_exam_code_candidates_from_text(
+                    raw_text,
+                    detected_roll=detected_roll,
+                )
+
+                if normalized_primary and normalized_primary not in candidates:
+                    candidates.insert(0, normalized_primary)
+
+                if candidates:
+                    all_candidates.extend(candidates)
+
+                for rank, candidate in enumerate(candidates):
+                    candidate_quality = self._score_exam_code_candidate(
+                        candidate=candidate,
+                        raw_text=raw_text,
+                        quality=quality,
+                        base_index=base_index,
+                        rank=rank,
+                        engine="template",
+                    )
+                    if candidate_quality > best_quality:
+                        best_quality = candidate_quality
+                        best_code = candidate
+
+                if raw_text:
+                    debug_entries.append(
+                        {
+                            "engine": "template",
+                            "roi": [round(float(v), 5) for v in roi_rel],
+                            "quality": round(float(quality), 4),
+                            "raw_text": raw_text[:120],
+                            "candidates": candidates[:6],
+                        }
+                    )
+
+        # De-duplicate candidates while preserving ranking order.
+        seen_candidates = set()
+        ranked_candidates: List[str] = []
+        for candidate in all_candidates:
+            if candidate in seen_candidates:
+                continue
+            seen_candidates.add(candidate)
+            ranked_candidates.append(candidate)
+
+        final_code = self._sanitize_exam_code_candidate(best_code, detected_roll=detected_roll)
+        self._last_exam_code_debug = {
+            "selected": final_code,
+            "candidates": ranked_candidates[:12],
+            "entries": debug_entries[:20],
+        }
+        return final_code
 
     @staticmethod
     def _normalize_candidate_name_text(value: str) -> str:
@@ -1186,8 +1909,8 @@ class OMRScanner:
         image_path: str,
         binary: np.ndarray,
         sheet_image: Optional[np.ndarray] = None,
-    ) -> Tuple[str, str, str]:
-        """Extract roll number and candidate name with conservative fallbacks."""
+    ) -> Tuple[str, str, str, str]:
+        """Extract roll number, candidate name, and exam code with conservative fallbacks."""
         roll_number, roll_status = self._extract_roll_from_bubble_grid(binary)
         if not roll_number:
             roll_number = self._extract_roll_from_filename(image_path)
@@ -1199,7 +1922,16 @@ class OMRScanner:
             if sheet_image is not None
             else ""
         )
-        return roll_number, roll_status, candidate_name
+        exam_code = (
+            self._extract_exam_code_from_sheet(
+                sheet_image,
+                detected_roll=roll_number,
+            )
+            if sheet_image is not None
+            else ""
+        )
+        exam_code = self._sanitize_exam_code_candidate(exam_code, detected_roll=roll_number)
+        return roll_number, roll_status, candidate_name, exam_code
 
     @staticmethod
     def _is_pdf_path(file_path: str) -> bool:
@@ -1264,7 +1996,7 @@ class OMRScanner:
         )
 
         deskew_angle = self._estimate_deskew_angle(bubbles) if bubbles else 0.0
-        roll_number, roll_status, candidate_name = self._extract_identity_fields(
+        roll_number, roll_status, candidate_name, exam_code = self._extract_identity_fields(
             image_path=source_name,
             binary=binary,
             sheet_image=warped,
@@ -1277,7 +2009,7 @@ class OMRScanner:
         if abs(deskew_angle) >= 2.0:
             rotated = self._rotate_image(warped, deskew_angle)
             _gray_rot, _blurred_rot, binary_rot = self._preprocess_for_bubbles(rotated)
-            roll_rot, status_rot, candidate_name_rot = self._extract_identity_fields(
+            roll_rot, status_rot, candidate_name_rot, exam_code_rot = self._extract_identity_fields(
                 image_path=source_name,
                 binary=binary_rot,
                 sheet_image=rotated,
@@ -1293,17 +2025,24 @@ class OMRScanner:
                 roll_number = roll_rot
                 roll_status = status_rot
                 candidate_name = candidate_name_rot
+                exam_code = exam_code_rot
                 deskew_applied = True
+            elif not exam_code and exam_code_rot:
+                exam_code = exam_code_rot
 
         return {
             "roll_number": roll_number,
             "candidate_name": candidate_name,
+            "exam_code": exam_code,
             "roll_status": roll_status,
             "meta": {
                 "deskew_angle": round(float(deskew_angle), 3),
                 "deskew_applied": deskew_applied,
                 "contour_scale": contour_scale,
                 "binary_shape": [int(chosen_binary.shape[0]), int(chosen_binary.shape[1])],
+                "detected_bubbles": int(len(bubbles)),
+                "exam_code_candidates": list(self._last_exam_code_debug.get("candidates", [])),
+                "exam_code_debug": self._last_exam_code_debug,
             },
         }
 
@@ -1408,7 +2147,7 @@ class OMRScanner:
                 answers_list.append({"question": question_idx, "marked": "SKIPPED"})
                 answers_detected[str(question_idx)] = None
 
-        roll_number, roll_status, candidate_name = self._extract_identity_fields(
+        roll_number, roll_status, candidate_name, exam_code = self._extract_identity_fields(
             image_path=source_name,
             binary=binary,
             sheet_image=identity_sheet_image,
@@ -1420,6 +2159,7 @@ class OMRScanner:
             # Backward-compatible fields used by current Node route.
             "roll_number": roll_number,
             "candidate_name": candidate_name,
+            "exam_code": exam_code,
             "answers_detected": answers_detected,
             "score": 0,
             "total": len(answers_list),
@@ -1436,6 +2176,8 @@ class OMRScanner:
                 "roll_status": roll_status,
                 "page_index": int(page_index),
                 "page_number": int(page_index + 1),
+                "exam_code_candidates": list(self._last_exam_code_debug.get("candidates", [])),
+                "exam_code_debug": self._last_exam_code_debug,
             },
         }
 
@@ -1462,6 +2204,7 @@ class OMRScanner:
                             "answers": [],
                             "roll_number": "",
                             "candidate_name": "",
+                            "exam_code": "",
                             "answers_detected": {},
                             "score": 0,
                             "total": 0,

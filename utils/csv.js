@@ -27,9 +27,13 @@ export const validateQuestionCSV = (records) => {
     const validTypes = [
       'MULTIPLE_CHOICE',
       'MULTIPLE_OPTIONS',
+      'MULTI_SELECT_MCQ',
       'TRUE_FALSE',
       'SHORT_ANSWER',
       'PARAGRAPH',
+      'ESSAY',
+      'ESSAY_LETTER',
+      'ESSAY_STORY',
       'NUMBER',
       'CODING',
       'IMAGE_BASED',

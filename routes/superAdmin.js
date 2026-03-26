@@ -3,6 +3,7 @@ import fsSync from 'node:fs';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
+import mongoose from 'mongoose';
 import multer from 'multer';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
@@ -15,6 +16,7 @@ import Exam from '../models/Exam.js';
 import ExamAttempt from '../models/ExamAttempt.js';
 import ExamSession from '../models/ExamSession.js';
 import AITokenUsage from '../models/AITokenUsage.js';
+import CreditRequest from '../models/CreditRequest.js';
 import AuditLog from '../models/AuditLog.js';
 import BackupHistory from '../models/BackupHistory.js';
 import SystemAlert from '../models/SystemAlert.js';
@@ -43,6 +45,7 @@ import {
   getExamCountForTenantByWindow,
   getAttemptCountForTenantByWindow,
 } from '../utils/planUsage.js';
+import { getAIQuestionCountForTenantByWindow } from '../services/aiTokenUsageService.js';
 import {
   createBackup,
   createTenantBackupsForAll,
@@ -54,6 +57,22 @@ import {
   deleteBackup,
 } from '../services/backupService.js';
 import { emitBackupOperationAlert } from '../services/systemAlertService.js';
+import {
+  getSubscriptionGlobalLimits,
+  getSubscriptionPlanCatalog,
+  persistSubscriptionGlobalLimits,
+  persistSubscriptionPlanOverride,
+} from '../utils/subscriptionPlanCatalog.js';
+import {
+  CREDIT_REQUEST_STATUSES,
+  CREDIT_REQUEST_TYPES,
+  applyExtraCreditsToPlanLimits,
+  computeExtraUsageCost,
+  normalizeCreditRequestType,
+  normalizeTenantExtraCredits,
+  resolveExtraCreditUnitPrice,
+  resolveTenantExtraCreditFieldByType,
+} from '../utils/creditSystem.js';
 
 const router = express.Router();
 
@@ -92,10 +111,31 @@ const toFormattedBackupRecord = (record) => {
   const company = record?.company_id || null;
   const createdBy = record?.created_by || null;
   const restoredBy = record?.restored_by || null;
+  const triggerType =
+    String(record?.trigger_type || '').trim().toUpperCase() === 'AUTO'
+      ? 'AUTO'
+      : 'MANUAL';
+  const toIstDateTimeString = (value) => {
+    if (!value) return '';
+    const parsed = value instanceof Date ? value : new Date(value);
+    if (Number.isNaN(parsed.getTime())) return '';
+    return `${new Intl.DateTimeFormat('en-IN', {
+      timeZone: 'Asia/Kolkata',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }).format(parsed)} IST`;
+  };
   return {
     id: record?._id || null,
     backup_name: record?.backup_name || '',
     type: record?.type || '',
+    trigger_type: triggerType,
+    backup_type: triggerType,
     company_id: company?._id || company || null,
     company_name: company?.name || null,
     company_code: company?.code || null,
@@ -103,13 +143,15 @@ const toFormattedBackupRecord = (record) => {
     storage_path: record?.storage_url_path || record?.storage_path || '',
     status: record?.status || '',
     created_by: createdBy?._id || createdBy || null,
-    created_by_name: createdBy?.name || null,
+    created_by_name: triggerType === 'AUTO' ? 'System' : createdBy?.name || null,
     created_by_email: createdBy?.email || null,
     restored_by: restoredBy?._id || restoredBy || null,
     restored_by_name: restoredBy?.name || null,
     restored_by_email: restoredBy?.email || null,
     restored_at: record?.restored_at || null,
+    restored_at_ist: toIstDateTimeString(record?.restored_at),
     created_at: record?.created_at || null,
+    created_at_ist: toIstDateTimeString(record?.created_at),
     updated_at: record?.updated_at || null,
     error_message: record?.error_message || '',
     source_backup_id: record?.source_backup_id || null,
@@ -142,13 +184,49 @@ const LEGEND_CUSTOM_LIMIT_KEYS = Object.freeze([
   'maxExamsPerMonth',
   'maxAttemptsPerMonth',
   'maxAiQuestionsPerMonth',
+  'maxAiGradingsPerMonth',
+  'maxImportFiles',
+  'importQuestionsPerMonth',
   'maxCandidates',
+]);
+
+const PLAN_LIMIT_EDITABLE_KEYS = Object.freeze([
+  'maxExamsPerMonth',
+  'maxUsers',
+  'maxAttemptsPerMonth',
+  'maxAiQuestionsPerMonth',
+  'maxAiGradingsPerMonth',
+  'maxImportFiles',
+  'importQuestionsPerMonth',
+  'maxExamCreators',
+  'maxCandidates',
+  'maxQuestionsPerExam',
+]);
+
+const AI_TYPES_ALLOWED_ALIASES = Object.freeze({
+  short: 'short',
+  short_answer: 'short',
+  paragraph: 'paragraph',
+  essay: 'essay',
+  essay_letter: 'essay_letter',
+  letter: 'essay_letter',
+  letter_writing: 'essay_letter',
+  essay_story: 'essay_story',
+  story: 'essay_story',
+  story_writing: 'essay_story',
+});
+
+const PLAN_GLOBAL_OVERRIDE_KEYS = Object.freeze([
+  'aiQuestionsPerMonth',
+  'maxImportFiles',
+  'importQuestionsPerMonth',
 ]);
 
 const SUBSCRIPTION_STATUS_VALUES = Object.freeze([
   SUBSCRIPTION_STATUSES.ACTIVE,
   SUBSCRIPTION_STATUSES.EXPIRED,
   SUBSCRIPTION_STATUSES.SUSPENDED,
+  SUBSCRIPTION_STATUSES.CANCELLED,
 ]);
 
 const PLAN_DEFAULT_DURATIONS_DAYS = Object.freeze({
@@ -158,11 +236,21 @@ const PLAN_DEFAULT_DURATIONS_DAYS = Object.freeze({
   [SUBSCRIPTION_PLAN_TYPES.LEGEND]: 365,
 });
 
+const AI_NOT_AVAILABLE_IN_PLAN_MESSAGE = 'AI not available in your plan';
+
 const hasOwn = (target, key) =>
   Boolean(target && typeof target === 'object' && Object.prototype.hasOwnProperty.call(target, key));
 
 const normalizeOptionalObject = (value) =>
   value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+
+const toPlainOptionalObject = (value) => {
+  const normalized = normalizeOptionalObject(value);
+  if (typeof normalized.toObject === 'function') {
+    return normalizeOptionalObject(normalized.toObject());
+  }
+  return { ...normalized };
+};
 
 const parseOptionalLimitValue = (value) => {
   if (value === null || value === undefined || value === '') return null;
@@ -177,14 +265,120 @@ const isValidLimitInput = (value) => {
   return Number.isFinite(parsed) && parsed >= 0;
 };
 
+const normalizeAiTypeKey = (value) => {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_')
+    .replace(/[^a-z0-9_]/g, '')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+  if (!normalized) return '';
+  return AI_TYPES_ALLOWED_ALIASES[normalized] || '';
+};
+
+const normalizeAiTypesAllowedInput = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const source = Array.isArray(value)
+    ? value
+    : typeof value === 'string'
+      ? value.split(/[,\n;|]/)
+      : [];
+  if (source.length === 0) return [];
+
+  return Array.from(
+    new Set(
+      source
+        .map((entry) => normalizeAiTypeKey(entry))
+        .filter(Boolean)
+    )
+  );
+};
+
+const isValidPlanLimitInput = (limitKey, value) => {
+  if (value === null || value === undefined || value === '') return true;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return false;
+  if (parsed >= 0) return true;
+  return (
+    parsed === -1 &&
+    (limitKey === 'maxAiGradingsPerMonth' || limitKey === 'maxAiQuestionsPerMonth')
+  );
+};
+
+const parsePlanLimitInputValue = (limitKey, value) => {
+  if (
+    (limitKey === 'maxAiGradingsPerMonth' || limitKey === 'maxAiQuestionsPerMonth') &&
+    Number(value) === -1
+  ) {
+    return null;
+  }
+  return parseOptionalLimitValue(value);
+};
+
+const resolveAiEnabledFromPlanDefinition = (planDefinition = {}) =>
+  planDefinition?.features?.aiGrading !== false;
+
+const resolveAiTypesAllowedFromPlanDefinition = (planDefinition = {}) => {
+  const rawValue =
+    planDefinition?.features?.aiTypesAllowed ??
+    planDefinition?.features?.ai_types_allowed ??
+    [];
+  const normalized = normalizeAiTypesAllowedInput(rawValue);
+  return Array.isArray(normalized) ? normalized : [];
+};
+
+const resolveAiUsageLimitFromPlanDefinition = (planDefinition = {}) => {
+  const aiGradingLimit = parseOptionalLimitValue(planDefinition?.limits?.maxAiGradingsPerMonth);
+  if (
+    aiGradingLimit !== null ||
+    planDefinition?.limits?.maxAiGradingsPerMonth === null
+  ) {
+    return aiGradingLimit;
+  }
+  return parseOptionalLimitValue(planDefinition?.limits?.maxAiQuestionsPerMonth);
+};
+
+const buildPlanAiSettings = (planDefinition = {}) => {
+  const aiEnabled = resolveAiEnabledFromPlanDefinition(planDefinition);
+  const aiUsageLimit = resolveAiUsageLimitFromPlanDefinition(planDefinition);
+  const aiTypesAllowed = resolveAiTypesAllowedFromPlanDefinition(planDefinition);
+  return {
+    ai_enabled: aiEnabled,
+    ai_usage_limit: aiUsageLimit === null ? -1 : aiUsageLimit,
+    ai_types_allowed: aiTypesAllowed,
+  };
+};
+
 const extractLegendCustomLimits = (input) => {
   const source = normalizeOptionalObject(input);
   const result = {};
-  LEGEND_CUSTOM_LIMIT_KEYS.forEach((key) => {
-    if (hasOwn(source, key)) {
-      result[key] = parseOptionalLimitValue(source[key]);
-    }
-  });
+  if (hasOwn(source, 'maxExamsPerMonth')) {
+    result.maxExamsPerMonth = parseOptionalLimitValue(source.maxExamsPerMonth);
+  }
+  if (hasOwn(source, 'maxAttemptsPerMonth')) {
+    result.maxAttemptsPerMonth = parseOptionalLimitValue(source.maxAttemptsPerMonth);
+  }
+  if (hasOwn(source, 'maxAiQuestionsPerMonth')) {
+    result.maxAiQuestionsPerMonth = parseOptionalLimitValue(source.maxAiQuestionsPerMonth);
+  }
+  if (hasOwn(source, 'maxAiGradingsPerMonth')) {
+    result.maxAiGradingsPerMonth = parsePlanLimitInputValue(
+      'maxAiGradingsPerMonth',
+      source.maxAiGradingsPerMonth
+    );
+  }
+  if (hasOwn(source, 'maxCandidates')) {
+    result.maxCandidates = parseOptionalLimitValue(source.maxCandidates);
+  }
+
+  // Canonicalize import question limit aliases to maxImportFiles for backward compatibility.
+  if (hasOwn(source, 'importQuestionsPerMonth')) {
+    result.maxImportFiles = parseOptionalLimitValue(source.importQuestionsPerMonth);
+  } else if (hasOwn(source, 'maxImportFiles')) {
+    result.maxImportFiles = parseOptionalLimitValue(source.maxImportFiles);
+  }
+
   return result;
 };
 
@@ -196,6 +390,78 @@ const extractFeatureOverrides = (input) => {
     }
     return accumulator;
   }, {});
+};
+
+const PLAN_FEATURE_TOGGLE_DEFINITIONS = Object.freeze([
+  {
+    canonicalKey: 'codingCompiler',
+    aliases: ['codingCompiler'],
+  },
+  {
+    canonicalKey: 'omrAutoGrading',
+    aliases: ['omrAutoGrading', 'omrGrading'],
+  },
+  {
+    canonicalKey: 'aiRubricScoring',
+    aliases: ['aiRubricScoring', 'aiRubric'],
+  },
+  {
+    canonicalKey: 'secureBrowser',
+    aliases: ['secureBrowser'],
+  },
+  {
+    canonicalKey: 'multiTenant',
+    aliases: ['multiTenant'],
+  },
+  {
+    canonicalKey: 'advancedAnalytics',
+    aliases: ['advancedAnalytics', 'analytics'],
+  },
+]);
+
+const PLAN_FEATURE_TOGGLE_ALIAS_TO_CANONICAL = Object.freeze(
+  PLAN_FEATURE_TOGGLE_DEFINITIONS.reduce((accumulator, entry) => {
+    entry.aliases.forEach((aliasKey) => {
+      accumulator[aliasKey] = entry.canonicalKey;
+    });
+    accumulator[entry.canonicalKey] = entry.canonicalKey;
+    return accumulator;
+  }, {})
+);
+
+const PLAN_FEATURE_TOGGLE_CANONICAL_KEYS = Object.freeze(
+  PLAN_FEATURE_TOGGLE_DEFINITIONS.map((entry) => entry.canonicalKey)
+);
+
+const PLAN_FEATURE_TOGGLE_NON_CANONICAL_ALIAS_KEYS = Object.freeze(
+  Array.from(
+    new Set(
+      Object.keys(PLAN_FEATURE_TOGGLE_ALIAS_TO_CANONICAL).filter(
+        (key) => !PLAN_FEATURE_TOGGLE_CANONICAL_KEYS.includes(key)
+      )
+    )
+  )
+);
+
+const extractManagedPlanFeatureValues = (input, sourceLabel) => {
+  const source = normalizeOptionalObject(input);
+  const values = {};
+  const validationErrors = [];
+
+  Object.entries(source).forEach(([rawKey, rawValue]) => {
+    const canonicalKey = PLAN_FEATURE_TOGGLE_ALIAS_TO_CANONICAL[rawKey];
+    if (!canonicalKey) return;
+    if (typeof rawValue !== 'boolean') {
+      validationErrors.push(`${sourceLabel}.${rawKey} must be a boolean`);
+      return;
+    }
+    values[canonicalKey] = Boolean(rawValue);
+  });
+
+  return {
+    values,
+    validationErrors,
+  };
 };
 
 const FEATURE_SOURCE_TYPES = Object.freeze({
@@ -375,7 +641,202 @@ const buildAddonFeatureState = ({ feature, customFeatures }) => {
   };
 };
 
-const buildTenantFeaturePayload = (tenantInput) => {
+const TENANT_LIMIT_USAGE_ROLE_QUERY_VALUES = Object.freeze({
+  exam_creators: ['EXAM_CREATOR', 'ORG_ADMIN', 'INSTITUTE_ADMIN', 'ADMIN', 'DESIGNER', 'TEACHER'],
+  candidates: ['CANDIDATE', 'USER', 'STUDENT'],
+});
+
+const LIMIT_KEY_ALIASES = Object.freeze({
+  exams_limit: 'maxExamsPerMonth',
+  users_limit: 'maxUsers',
+  attempts_limit: 'maxAttemptsPerMonth',
+  ai_questions_limit: 'maxAiQuestionsPerMonth',
+  ai_grading_limit: 'maxAiGradingsPerMonth',
+  import_questions_limit: 'maxImportFiles',
+  import_files_limit: 'maxImportFiles',
+  importquestionspermonth: 'maxImportFiles',
+  import_questions_per_month: 'maxImportFiles',
+  candidates_limit: 'maxCandidates',
+  exam_creators_limit: 'maxExamCreators',
+  questions_per_exam_limit: 'maxQuestionsPerExam',
+});
+
+const FEATURE_KEY_ALIASES = Object.freeze({
+  ai_grading: 'aiGrading',
+  ai_generate: 'aiQuestionGen',
+  ocr_import: 'omr',
+  essay_questions: 'essayQuestions',
+  multi_select_mcq: 'multiSelectMcq',
+});
+
+const normalizeDynamicConfigKey = (value) =>
+  String(value || '')
+    .trim()
+    .replace(/[.\s-]+/g, '_')
+    .replace(/[^A-Za-z0-9_]/g, '')
+    .replace(/_+/g, '_')
+    .replace(/^_+|_+$/g, '');
+
+const normalizeLimitOverrideKey = (key) => {
+  const safeKey = String(key || '').trim();
+  if (!safeKey) return '';
+  const normalizedAlias = normalizeDynamicConfigKey(safeKey).toLowerCase();
+  return LIMIT_KEY_ALIASES[normalizedAlias] || safeKey;
+};
+
+const normalizeFeatureOverrideKey = (key) => {
+  const safeKey = String(key || '').trim();
+  if (!safeKey) return '';
+  const normalizedAlias = normalizeDynamicConfigKey(safeKey).toLowerCase();
+  return FEATURE_KEY_ALIASES[normalizedAlias] || safeKey;
+};
+
+const parseOverrideLimitValue = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  if (parsed === -1) return -1;
+  if (parsed < 0) return null;
+  return Math.floor(parsed);
+};
+
+const toEffectiveLimitValue = (value) => {
+  if (value === null || value === undefined || value === '') return null;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return null;
+  if (parsed === -1) return null;
+  if (parsed < 0) return null;
+  return Math.floor(parsed);
+};
+
+const toFiniteUsageNumber = (value) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return null;
+  return Math.floor(parsed);
+};
+
+const extractActiveCustomLimitOverrides = (input) => {
+  const source = normalizeOptionalObject(input);
+  return Object.entries(source).reduce((accumulator, [rawKey, rawValue]) => {
+    const key = normalizeLimitOverrideKey(rawKey);
+    if (!key) return accumulator;
+
+    const parsedValue = parseOverrideLimitValue(rawValue);
+    if (parsedValue === null) {
+      return accumulator;
+    }
+
+    accumulator[key] = parsedValue;
+    return accumulator;
+  }, {});
+};
+
+const extractActiveCustomFeatureOverrides = (input) => {
+  const source = normalizeOptionalObject(input);
+  return Object.entries(source).reduce((accumulator, [rawKey, rawValue]) => {
+    const key = normalizeFeatureOverrideKey(rawKey);
+    if (!key) return accumulator;
+    if (typeof rawValue !== 'boolean') return accumulator;
+    accumulator[key] = Boolean(rawValue);
+    return accumulator;
+  }, {});
+};
+
+const humanizeDynamicConfigLabel = (key) => {
+  const normalized = String(key || '')
+    .replace(/([a-z0-9])([A-Z])/g, '$1 $2')
+    .replace(/_/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  if (!normalized) return 'Unknown';
+
+  const acronymMap = {
+    ai: 'AI',
+    ocr: 'OCR',
+    mcq: 'MCQ',
+    omr: 'OMR',
+    api: 'API',
+    id: 'ID',
+    ip: 'IP',
+  };
+
+  return normalized
+    .split(' ')
+    .map((segment) => {
+      const lower = segment.toLowerCase();
+      if (acronymMap[lower]) return acronymMap[lower];
+      return `${segment.charAt(0).toUpperCase()}${segment.slice(1)}`;
+    })
+    .join(' ');
+};
+
+const resolveTenantLimitUsageSnapshot = async ({ tenant, limitKeys = [] }) => {
+  const tenantId = tenant?._id || null;
+  if (!tenantId || !Array.isArray(limitKeys) || limitKeys.length === 0) {
+    return {};
+  }
+
+  const keySet = new Set(limitKeys.map((key) => String(key || '').trim()).filter(Boolean));
+  const subscription = normalizeOptionalObject(tenant?.subscription);
+  const usageWindow = buildUsageWindow(subscription);
+
+  const shouldLoadExams = keySet.has('maxExamsPerMonth');
+  const shouldLoadAttempts = keySet.has('maxAttemptsPerMonth');
+  const shouldLoadAiQuestions = keySet.has('maxAiQuestionsPerMonth');
+  const shouldLoadUsers = keySet.has('maxUsers');
+  const shouldLoadExamCreators = keySet.has('maxExamCreators');
+  const shouldLoadCandidates = keySet.has('maxCandidates');
+
+  const [examUsage, attemptUsage, aiQuestionUsage, activeUsers, activeExamCreators, activeCandidates] =
+    await Promise.all([
+      shouldLoadExams
+        ? getExamCountForTenantByWindow(tenantId, usageWindow.start, usageWindow.end)
+        : Promise.resolve(null),
+      shouldLoadAttempts
+        ? getAttemptCountForTenantByWindow(tenantId, usageWindow.start, usageWindow.end)
+        : Promise.resolve(null),
+      shouldLoadAiQuestions
+        ? getAIQuestionCountForTenantByWindow(tenantId, usageWindow.start, usageWindow.end)
+        : Promise.resolve(null),
+      shouldLoadUsers
+        ? User.countDocuments({
+            tenantId,
+            status: 'ACTIVE',
+            role: { $ne: 'SUPER_ADMIN' },
+          })
+        : Promise.resolve(null),
+      shouldLoadExamCreators
+        ? User.countDocuments({
+            tenantId,
+            status: 'ACTIVE',
+            role: { $in: TENANT_LIMIT_USAGE_ROLE_QUERY_VALUES.exam_creators },
+          })
+        : Promise.resolve(null),
+      shouldLoadCandidates
+        ? User.countDocuments({
+            tenantId,
+            status: 'ACTIVE',
+            role: { $in: TENANT_LIMIT_USAGE_ROLE_QUERY_VALUES.candidates },
+          })
+        : Promise.resolve(null),
+    ]);
+
+  const usageSnapshot = {};
+  if (shouldLoadExams) usageSnapshot.maxExamsPerMonth = toFiniteUsageNumber(examUsage);
+  if (shouldLoadAttempts) usageSnapshot.maxAttemptsPerMonth = toFiniteUsageNumber(attemptUsage);
+  if (shouldLoadAiQuestions) usageSnapshot.maxAiQuestionsPerMonth = toFiniteUsageNumber(aiQuestionUsage);
+  if (keySet.has('maxAiGradingsPerMonth')) {
+    usageSnapshot.maxAiGradingsPerMonth = toFiniteUsageNumber(tenant?.ai_usage_count ?? 0);
+  }
+  if (shouldLoadUsers) usageSnapshot.maxUsers = toFiniteUsageNumber(activeUsers);
+  if (shouldLoadExamCreators) usageSnapshot.maxExamCreators = toFiniteUsageNumber(activeExamCreators);
+  if (shouldLoadCandidates) usageSnapshot.maxCandidates = toFiniteUsageNumber(activeCandidates);
+
+  return usageSnapshot;
+};
+
+const buildTenantFeaturePayload = async (tenantInput) => {
   const tenant = tenantInput?.toObject ? tenantInput.toObject() : tenantInput;
   const subscription = normalizeOptionalObject(tenant?.subscription);
   const assignedPlanType = resolveSubscriptionPlanType(
@@ -391,8 +852,89 @@ const buildTenantFeaturePayload = (tenantInput) => {
     baseLimits: basePlanLimits,
   });
   const planFeatures = normalizeOptionalObject(planDefinition?.features);
-  const customLimits = normalizeOptionalObject(subscription.customLimits);
-  const customFeatures = normalizeOptionalObject(subscription.customFeatures);
+  const rawCustomLimits = normalizeOptionalObject(subscription.customLimits);
+  const rawCustomFeatures = normalizeOptionalObject(subscription.customFeatures);
+  const customLimits = extractActiveCustomLimitOverrides(rawCustomLimits);
+  const customFeatures = extractActiveCustomFeatureOverrides(rawCustomFeatures);
+
+  const dynamicLimitKeys = Array.from(
+    new Set([
+      ...Object.keys(normalizeOptionalObject(effectivePlanLimits)).map(normalizeLimitOverrideKey),
+      ...Object.keys(rawCustomLimits).map(normalizeLimitOverrideKey),
+    ].filter(Boolean))
+  ).sort((left, right) => String(left).localeCompare(String(right)));
+
+  const dynamicFeatureKeys = Array.from(
+    new Set([
+      ...Object.entries(planFeatures)
+        .filter(([, value]) => typeof value === 'boolean')
+        .map(([key]) => normalizeFeatureOverrideKey(key)),
+      ...Object.keys(rawCustomFeatures).map(normalizeFeatureOverrideKey),
+    ].filter(Boolean))
+  ).sort((left, right) => String(left).localeCompare(String(right)));
+
+  const limitUsageSnapshot = await resolveTenantLimitUsageSnapshot({
+    tenant,
+    limitKeys: dynamicLimitKeys,
+  });
+
+  const dynamicLimits = dynamicLimitKeys.map((key) => {
+    const hasOverride = hasOwn(customLimits, key);
+    const planValue = toEffectiveLimitValue(effectivePlanLimits?.[key]);
+    const overrideValue = hasOverride ? customLimits[key] : null;
+    const effectiveValue = hasOverride ? toEffectiveLimitValue(overrideValue) : planValue;
+    const currentUsage = hasOwn(limitUsageSnapshot, key)
+      ? toFiniteUsageNumber(limitUsageSnapshot[key])
+      : null;
+    const remaining =
+      effectiveValue === null || currentUsage === null
+        ? null
+        : Math.max(effectiveValue - currentUsage, 0);
+
+    return {
+      key,
+      label: humanizeDynamicConfigLabel(key),
+      type: 'limit',
+      source: hasOverride ? FEATURE_SOURCE_TYPES.OVERRIDE : FEATURE_SOURCE_TYPES.PLAN,
+      status: hasOverride ? 'Custom Override' : 'Using Plan Default',
+      isOverridden: hasOverride,
+      usePlanDefault: !hasOverride,
+      planValue,
+      overrideValue: hasOverride ? overrideValue : null,
+      effectiveValue,
+      currentUsage,
+      remaining,
+      isUnlimited: effectiveValue === null,
+    };
+  });
+
+  const dynamicFeatures = dynamicFeatureKeys
+    .map((key) => {
+      const hasPlanValue = typeof planFeatures?.[key] === 'boolean';
+      const hasOverride = hasOwn(customFeatures, key);
+      const planValue = hasPlanValue ? Boolean(planFeatures[key]) : false;
+      const overrideValue = hasOverride ? Boolean(customFeatures[key]) : null;
+      const effectiveValue = hasOverride ? overrideValue : planValue;
+
+      // Non-boolean feature settings are intentionally excluded from dynamic toggle editing.
+      if (!hasPlanValue && !hasOverride) {
+        return null;
+      }
+
+      return {
+        key,
+        label: humanizeDynamicConfigLabel(key),
+        type: 'feature',
+        source: hasOverride ? FEATURE_SOURCE_TYPES.OVERRIDE : FEATURE_SOURCE_TYPES.PLAN,
+        status: hasOverride ? 'Custom Override' : 'Using Plan Default',
+        isOverridden: hasOverride,
+        usePlanDefault: !hasOverride,
+        planValue,
+        overrideValue: hasOverride ? overrideValue : null,
+        effectiveValue,
+      };
+    })
+    .filter(Boolean);
 
   const mainFeatures = Object.values(MAIN_FEATURE_DEFINITIONS).reduce((accumulator, feature) => {
     accumulator[feature.key] = buildMainFeatureState({
@@ -427,6 +969,24 @@ const buildTenantFeaturePayload = (tenantInput) => {
       main: mainFeatures,
       addons: addonFeatures,
     },
+    configuration: {
+      limits: dynamicLimits,
+      features: dynamicFeatures,
+    },
+    effectiveConfig: {
+      limits: dynamicLimits.reduce((accumulator, entry) => {
+        accumulator[entry.key] = entry.effectiveValue;
+        return accumulator;
+      }, {}),
+      features: dynamicFeatures.reduce((accumulator, entry) => {
+        accumulator[entry.key] = Boolean(entry.effectiveValue);
+        return accumulator;
+      }, {}),
+    },
+    overrides: {
+      custom_limits: { ...customLimits },
+      custom_features: { ...customFeatures },
+    },
     updatedAt: subscription.updatedAt || tenant?.updatedAt || null,
   };
 };
@@ -437,7 +997,22 @@ const resolveLegendEffectiveLimits = ({ planType, tenant, baseLimits }) => {
   const customLimits = normalizeOptionalObject(tenant?.subscription?.customLimits);
   const resolveLimit = (key, legacyValue, baseValue) => {
     if (hasOwn(customLimits, key)) {
-      return parseOptionalLimitValue(customLimits[key]);
+      const customValue = customLimits[key];
+      if (customValue !== null && customValue !== undefined && customValue !== '') {
+        if (Number(customValue) === -1) {
+          return null;
+        }
+        return parseOptionalLimitValue(customValue);
+      }
+    }
+    if (key === 'maxImportFiles' && hasOwn(customLimits, 'importQuestionsPerMonth')) {
+      const aliasedValue = customLimits.importQuestionsPerMonth;
+      if (aliasedValue !== null && aliasedValue !== undefined && aliasedValue !== '') {
+        if (Number(aliasedValue) === -1) {
+          return null;
+        }
+        return parseOptionalLimitValue(aliasedValue);
+      }
     }
     const legacyLimit = parseOptionalLimitValue(legacyValue);
     if (legacyLimit !== null) {
@@ -463,6 +1038,11 @@ const resolveLegendEffectiveLimits = ({ planType, tenant, baseLimits }) => {
       normalizedPlanType === SUBSCRIPTION_PLAN_TYPES.LEGEND ? tenant?.aiUsageLimit : null,
       baseLimits?.maxAiQuestionsPerMonth
     ),
+    maxImportFiles: resolveLimit(
+      'maxImportFiles',
+      null,
+      baseLimits?.importQuestionsPerMonth ?? baseLimits?.maxImportFiles
+    ),
     maxCandidates: resolveLimit('maxCandidates', null, baseLimits?.maxCandidates),
   };
 };
@@ -478,7 +1058,43 @@ const REVENUE_RANGE_TYPES = Object.freeze({
 const REVENUE_INTERVAL_TYPES = Object.freeze({
   DAILY: 'daily',
   MONTHLY: 'monthly',
+  YEARLY: 'yearly',
 });
+
+const REVENUE_TREND_RANGE_TYPES = Object.freeze({
+  DAILY: 'daily',
+  MONTHLY: 'monthly',
+  YEARLY: 'yearly',
+});
+
+const REVENUE_TREND_DEFAULT_LIMITS = Object.freeze({
+  [REVENUE_TREND_RANGE_TYPES.DAILY]: 30,
+  [REVENUE_TREND_RANGE_TYPES.MONTHLY]: 12,
+  [REVENUE_TREND_RANGE_TYPES.YEARLY]: 5,
+});
+
+const REVENUE_TREND_MAX_LIMITS = Object.freeze({
+  [REVENUE_TREND_RANGE_TYPES.DAILY]: 120,
+  [REVENUE_TREND_RANGE_TYPES.MONTHLY]: 36,
+  [REVENUE_TREND_RANGE_TYPES.YEARLY]: 20,
+});
+
+const SUCCESSFUL_TRANSACTION_STATUSES = Object.freeze(['SUCCESS', 'COMPLETED', 'PAID']);
+
+const ADDON_PRICE_CATALOG = Object.freeze({
+  addonAiProctoring: 999,
+  addonAdvancedAnalytics: 1499,
+  addonCustomBranding: 799,
+  addonApiAccess: 1299,
+  addonBulkImportExport: 699,
+  addonCodingCompiler: 999,
+});
+const CREDIT_REQUEST_STATUS_VALUES = new Set(Object.values(CREDIT_REQUEST_STATUSES));
+const CREDIT_REQUEST_TYPE_VALUES = new Set(Object.values(CREDIT_REQUEST_TYPES));
+const CREDIT_REQUEST_REVIEWABLE_STATUS = CREDIT_REQUEST_STATUSES.PENDING;
+
+const REVENUE_TREND_CACHE_TTL_MS = 60 * 1000;
+const revenueTrendCache = new Map();
 
 const REVENUE_MS_PER_DAY = 24 * 60 * 60 * 1000;
 
@@ -487,6 +1103,123 @@ const toValidDate = (value) => {
   const parsed = new Date(value);
   if (Number.isNaN(parsed.getTime())) return null;
   return parsed;
+};
+
+const normalizeCreditRequestStatusInput = (value) => {
+  const normalized = String(value || '')
+    .trim()
+    .toUpperCase();
+  if (!normalized) return null;
+  return CREDIT_REQUEST_STATUS_VALUES.has(normalized) ? normalized : null;
+};
+
+const resolveCreditRequestLimitKey = (type) => {
+  const normalized = normalizeCreditRequestType(type);
+  if (normalized === CREDIT_REQUEST_TYPES.AI) return 'maxAiQuestionsPerMonth';
+  if (normalized === CREDIT_REQUEST_TYPES.ATTEMPTS) return 'maxAttemptsPerMonth';
+  if (normalized === CREDIT_REQUEST_TYPES.EXAMS) return 'maxExamsPerMonth';
+  return null;
+};
+
+const resolveCreditRequestUsageValue = async ({ tenantId, type, start, end }) => {
+  const normalized = normalizeCreditRequestType(type);
+  if (!normalized) return 0;
+  if (normalized === CREDIT_REQUEST_TYPES.AI) {
+    return getAIQuestionCountForTenantByWindow(tenantId, start, end);
+  }
+  if (normalized === CREDIT_REQUEST_TYPES.ATTEMPTS) {
+    return getAttemptCountForTenantByWindow(tenantId, start, end);
+  }
+  if (normalized === CREDIT_REQUEST_TYPES.EXAMS) {
+    return getExamCountForTenantByWindow(tenantId, start, end);
+  }
+  return 0;
+};
+
+const buildCreditRequestResponseItem = (request) => ({
+  id: request?._id ? String(request._id) : null,
+  tenantId: request?.tenantId?._id
+    ? String(request.tenantId._id)
+    : request?.tenantId
+      ? String(request.tenantId)
+      : null,
+  tenantName: request?.tenantId?.name || '',
+  tenantCode: request?.tenantId?.code || '',
+  type: request?.type || '',
+  requestedAmount: Number(request?.requestedAmount) || 0,
+  status: request?.status || CREDIT_REQUEST_STATUSES.PENDING,
+  comment: request?.comment || '',
+  reviewNote: request?.reviewNote || '',
+  unitPriceInr: Number(request?.unitPriceInr) || 0,
+  requestedBy: request?.requestedBy
+    ? {
+        id: request.requestedBy?._id ? String(request.requestedBy._id) : null,
+        name: request.requestedBy?.name || '',
+        email: request.requestedBy?.email || '',
+      }
+    : null,
+  reviewedBy: request?.reviewedBy
+    ? {
+        id: request.reviewedBy?._id ? String(request.reviewedBy._id) : null,
+        name: request.reviewedBy?.name || '',
+        email: request.reviewedBy?.email || '',
+      }
+    : null,
+  reviewedAt: request?.reviewedAt || null,
+  createdAt: request?.createdAt || null,
+  updatedAt: request?.updatedAt || null,
+});
+
+const computeCreditRequestBillingForTenantType = async ({
+  tenant,
+  type,
+  start,
+  end,
+}) => {
+  const normalizedType = normalizeCreditRequestType(type);
+  if (!normalizedType || !tenant?._id) return null;
+  if (!(start instanceof Date) || Number.isNaN(start.getTime())) return null;
+  if (!(end instanceof Date) || Number.isNaN(end.getTime())) return null;
+
+  const subscription = normalizeOptionalObject(tenant?.subscription);
+  const statusAtDate = resolveSubscriptionStatus(subscription, end);
+  const effectivePlanType = resolveEffectivePlanType(
+    resolveSubscriptionPlanType(subscription?.planType || SUBSCRIPTION_PLAN_TYPES.FREE),
+    statusAtDate
+  );
+  const planDefinition = getSubscriptionPlanDefinition(effectivePlanType);
+  const baseLimits = resolveLegendEffectiveLimits({
+    planType: effectivePlanType,
+    tenant,
+    baseLimits: normalizeOptionalObject(planDefinition?.limits),
+  });
+  const extraCredits = normalizeTenantExtraCredits(tenant?.extraCredits);
+  const totalLimits = applyExtraCreditsToPlanLimits(baseLimits, extraCredits);
+  const limitKey = resolveCreditRequestLimitKey(normalizedType);
+  const baseLimit = limitKey ? baseLimits?.[limitKey] : null;
+  const totalLimit = limitKey ? totalLimits?.[limitKey] : null;
+  const usage = await resolveCreditRequestUsageValue({
+    tenantId: tenant._id,
+    type: normalizedType,
+    start,
+    end,
+  });
+  const billing = computeExtraUsageCost({
+    usage,
+    baseLimit,
+    type: normalizedType,
+  });
+
+  return {
+    type: normalizedType,
+    usage: Number(usage) || 0,
+    baseLimit: baseLimit ?? null,
+    totalLimit: totalLimit ?? null,
+    extraCredits,
+    extraUsage: billing.extraUsage,
+    unitPrice: billing.unitPrice,
+    extraCost: billing.extraCost,
+  };
 };
 
 const normalizeSubscriptionStatusInput = (value) => {
@@ -562,10 +1295,18 @@ const toMonthKey = (value) => {
   return `${year}-${month}`;
 };
 
+const toYearKey = (value) => {
+  const date = new Date(value);
+  return String(date.getFullYear());
+};
+
 const formatRevenueBucketLabel = (value, interval) => {
   const date = new Date(value);
   if (interval === REVENUE_INTERVAL_TYPES.DAILY) {
     return date.toLocaleDateString('en-US', { month: 'short', day: 'numeric' });
+  }
+  if (interval === REVENUE_INTERVAL_TYPES.YEARLY) {
+    return String(date.getFullYear());
   }
   return date.toLocaleDateString('en-US', { month: 'short', year: 'numeric' });
 };
@@ -582,6 +1323,122 @@ const extractSubscriptionPlanTypeFromAuditDetails = (details, phase = 'after') =
 
   const rawPlanType = hasDirectValue ? directPayload.planType : nestedPayload.planType;
   return resolveSubscriptionPlanType(rawPlanType || SUBSCRIPTION_PLAN_TYPES.FREE);
+};
+
+const extractCustomFeaturesFromAuditDetails = (details, phase = 'after') => {
+  const safeDetails = normalizeOptionalObject(details);
+  const nestedDetails = normalizeOptionalObject(safeDetails.details);
+  const directPayload = normalizeOptionalObject(safeDetails[phase]);
+  const nestedPayload = normalizeOptionalObject(nestedDetails[phase]);
+  const directCustomFeatures = normalizeOptionalObject(directPayload.customFeatures);
+  const nestedCustomFeatures = normalizeOptionalObject(nestedPayload.customFeatures);
+
+  if (Object.keys(directCustomFeatures).length > 0) {
+    return directCustomFeatures;
+  }
+  return nestedCustomFeatures;
+};
+
+const extractRevenueTransactionStatusFromAuditDetails = (details) => {
+  const safeDetails = normalizeOptionalObject(details);
+  const nestedDetails = normalizeOptionalObject(safeDetails.details);
+  const directStatus = String(
+    safeDetails.transactionStatus ||
+      safeDetails.paymentStatus ||
+      safeDetails.status ||
+      ''
+  )
+    .trim()
+    .toUpperCase();
+  if (directStatus) return directStatus;
+  return String(
+    nestedDetails.transactionStatus ||
+      nestedDetails.paymentStatus ||
+      nestedDetails.status ||
+      ''
+  )
+    .trim()
+    .toUpperCase();
+};
+
+const isSuccessfulRevenueAuditLog = (entry) => {
+  const status = extractRevenueTransactionStatusFromAuditDetails(entry?.details);
+  if (!status) return true;
+  return SUCCESSFUL_TRANSACTION_STATUSES.includes(status);
+};
+
+const resolveAddonPurchaseAmount = (entry, addonKey) => {
+  const safeDetails = normalizeOptionalObject(entry?.details);
+  const nestedDetails = normalizeOptionalObject(safeDetails.details);
+  const directAddonAmounts = normalizeOptionalObject(safeDetails.addonAmounts);
+  const nestedAddonAmounts = normalizeOptionalObject(nestedDetails.addonAmounts);
+  const directAddons = normalizeOptionalObject(safeDetails.addons);
+  const nestedAddons = normalizeOptionalObject(nestedDetails.addons);
+
+  const amountCandidates = [
+    directAddonAmounts[addonKey],
+    nestedAddonAmounts[addonKey],
+    directAddons?.[addonKey]?.amount,
+    nestedAddons?.[addonKey]?.amount,
+  ];
+
+  const resolvedAmount = amountCandidates
+    .map((value) => Number(value))
+    .find((value) => Number.isFinite(value) && value >= 0);
+
+  if (Number.isFinite(resolvedAmount)) {
+    return Number(resolvedAmount.toFixed(2));
+  }
+
+  return Number(ADDON_PRICE_CATALOG[addonKey] || 0);
+};
+
+const normalizeRevenueTrendRange = (value) => {
+  const normalized = String(value || '')
+    .trim()
+    .toLowerCase();
+  if (!normalized) return REVENUE_TREND_RANGE_TYPES.MONTHLY;
+  if (Object.values(REVENUE_TREND_RANGE_TYPES).includes(normalized)) {
+    return normalized;
+  }
+  return null;
+};
+
+const normalizeRevenueTrendLimit = (range, value) => {
+  const fallback = REVENUE_TREND_DEFAULT_LIMITS[range] || 12;
+  if (value === null || value === undefined || value === '') return fallback;
+
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
+
+  const safeLimit = Math.floor(parsed);
+  const maxAllowed = REVENUE_TREND_MAX_LIMITS[range] || fallback;
+  return Math.min(Math.max(safeLimit, 1), maxAllowed);
+};
+
+const getRevenueTrendCacheKey = ({ range, tenantId, planType, limit }) =>
+  JSON.stringify({
+    range,
+    tenantId: String(tenantId || 'all'),
+    planType: String(planType || 'all'),
+    limit: Number(limit) || 0,
+  });
+
+const getCachedRevenueTrend = (cacheKey, now = Date.now()) => {
+  const entry = revenueTrendCache.get(cacheKey);
+  if (!entry) return null;
+  if (entry.expiresAt <= now) {
+    revenueTrendCache.delete(cacheKey);
+    return null;
+  }
+  return entry.payload;
+};
+
+const setCachedRevenueTrend = (cacheKey, payload, now = Date.now()) => {
+  revenueTrendCache.set(cacheKey, {
+    payload,
+    expiresAt: now + REVENUE_TREND_CACHE_TTL_MS,
+  });
 };
 
 const getTenantBillingStartDate = (tenant, fallback = new Date()) => {
@@ -679,6 +1536,65 @@ const buildRevenueBuckets = ({ start, end, interval }) => {
   return buckets;
 };
 
+const buildRevenueTrendBuckets = ({ range, now = new Date(), limit }) => {
+  const safeNow = toValidDate(now) || new Date();
+  const buckets = [];
+
+  if (range === REVENUE_TREND_RANGE_TYPES.DAILY) {
+    const safeLimit = normalizeRevenueTrendLimit(range, limit);
+    const start = startOfDay(addDays(safeNow, -(safeLimit - 1)));
+    for (let cursor = start; cursor <= safeNow; cursor = addDays(cursor, 1)) {
+      const bucketStart = startOfDay(cursor);
+      const bucketEnd = endOfDay(cursor) > safeNow ? new Date(safeNow) : endOfDay(cursor);
+      buckets.push({
+        key: toDayKey(cursor),
+        label: formatRevenueBucketLabel(cursor, REVENUE_INTERVAL_TYPES.DAILY),
+        interval: REVENUE_INTERVAL_TYPES.DAILY,
+        startDate: bucketStart,
+        endDate: bucketEnd,
+      });
+    }
+    return buckets;
+  }
+
+  if (range === REVENUE_TREND_RANGE_TYPES.MONTHLY) {
+    const safeLimit = normalizeRevenueTrendLimit(range, limit);
+    const start = startOfMonth(addMonths(safeNow, -(safeLimit - 1)));
+    const lastMonth = startOfMonth(safeNow);
+    for (let cursor = start; cursor <= lastMonth; cursor = addMonths(cursor, 1)) {
+      const bucketStart = startOfMonth(cursor);
+      const bucketEnd = endOfMonth(cursor) > safeNow ? new Date(safeNow) : endOfMonth(cursor);
+      buckets.push({
+        key: toMonthKey(cursor),
+        label: formatRevenueBucketLabel(cursor, REVENUE_INTERVAL_TYPES.MONTHLY),
+        interval: REVENUE_INTERVAL_TYPES.MONTHLY,
+        startDate: bucketStart,
+        endDate: bucketEnd,
+      });
+    }
+    return buckets;
+  }
+
+  const safeLimit = normalizeRevenueTrendLimit(REVENUE_TREND_RANGE_TYPES.YEARLY, limit);
+  const currentYear = safeNow.getFullYear();
+  const startYear = currentYear - safeLimit + 1;
+
+  for (let year = startYear; year <= currentYear; year += 1) {
+    const bucketStart = new Date(year, 0, 1, 0, 0, 0, 0);
+    const bucketEndRaw = new Date(year, 11, 31, 23, 59, 59, 999);
+    const bucketEnd = bucketEndRaw > safeNow ? new Date(safeNow) : bucketEndRaw;
+    buckets.push({
+      key: toYearKey(bucketStart),
+      label: formatRevenueBucketLabel(bucketStart, REVENUE_INTERVAL_TYPES.YEARLY),
+      interval: REVENUE_INTERVAL_TYPES.YEARLY,
+      startDate: bucketStart,
+      endDate: bucketEnd,
+    });
+  }
+
+  return buckets;
+};
+
 const buildTenantSubscriptionSummary = async (tenant) => {
   const subscription = tenant?.subscription || {};
   const planType = resolveSubscriptionPlanType(subscription.planType || SUBSCRIPTION_PLAN_TYPES.FREE);
@@ -693,9 +1609,10 @@ const buildTenantSubscriptionSummary = async (tenant) => {
   });
   const usageWindow = buildUsageWindow(subscription);
 
-  const [examsUsed, attemptsUsed, activeUsers] = await Promise.all([
+  const [examsUsed, attemptsUsed, aiQuestionsUsed, activeUsers] = await Promise.all([
     getExamCountForTenantByWindow(tenant._id, usageWindow.start, usageWindow.end),
     getAttemptCountForTenantByWindow(tenant._id, usageWindow.start, usageWindow.end),
+    getAIQuestionCountForTenantByWindow(tenant._id, usageWindow.start, usageWindow.end),
     User.countDocuments({
       tenantId: tenant._id,
       status: 'ACTIVE',
@@ -739,6 +1656,7 @@ const buildTenantSubscriptionSummary = async (tenant) => {
     usage: {
       exams: examsUsed,
       attempts: attemptsUsed,
+      aiQuestions: aiQuestionsUsed,
       users: activeUsers,
       window: {
         start: usageWindow.start,
@@ -758,27 +1676,315 @@ router.use(requireRole('SUPER_ADMIN'));
  */
 router.get('/subscriptions/plans', async (_req, res, next) => {
   try {
-    const planOrder = [
+    res.set({
+      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      Pragma: 'no-cache',
+      Expires: '0',
+      'Surrogate-Control': 'no-store',
+    });
+
+    const plans = getSubscriptionPlanCatalog().map((plan) => ({
+      id: plan.id,
+      label: plan.label,
+      price: plan.price,
+      limits: plan.limits,
+      features: plan.features,
+      overrides: normalizeOptionalObject(plan.overrides),
+      ...buildPlanAiSettings(plan),
+    }));
+    const globalLimits = getSubscriptionGlobalLimits();
+
+    res.json({ plans, globalLimits });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * UPDATE GLOBAL SUBSCRIPTION LIMITS
+ * PUT /api/super-admin/subscriptions/global-limits
+ */
+router.put('/subscriptions/global-limits', async (req, res, next) => {
+  try {
+    const incomingGlobalLimits = normalizeOptionalObject(req.body?.globalLimits);
+    const hasGlobalLimitsPayload =
+      Object.keys(incomingGlobalLimits).length > 0 ||
+      PLAN_GLOBAL_OVERRIDE_KEYS.some((key) => hasOwn(req.body, key));
+
+    if (!hasGlobalLimitsPayload) {
+      return res.status(400).json({
+        error: 'globalLimits payload is required.',
+      });
+    }
+
+    const mergedIncoming = {
+      ...incomingGlobalLimits,
+      ...(PLAN_GLOBAL_OVERRIDE_KEYS.reduce((accumulator, key) => {
+        if (hasOwn(req.body, key)) {
+          accumulator[key] = req.body[key];
+        }
+        return accumulator;
+      }, {})),
+    };
+
+    const unknownKeys = Object.keys(mergedIncoming).filter(
+      (key) => !PLAN_GLOBAL_OVERRIDE_KEYS.includes(key)
+    );
+    if (unknownKeys.length > 0) {
+      return res.status(400).json({
+        error: `Unsupported global limit keys: ${unknownKeys.join(', ')}`,
+      });
+    }
+
+    const patch = {};
+    for (const key of PLAN_GLOBAL_OVERRIDE_KEYS) {
+      if (!hasOwn(mergedIncoming, key)) continue;
+      const incomingValue = mergedIncoming[key];
+      if (!isValidLimitInput(incomingValue)) {
+        return res.status(400).json({
+          error: `${key} must be a non-negative number or null.`,
+        });
+      }
+      patch[key] = parseOptionalLimitValue(incomingValue);
+    }
+
+    if (Object.keys(patch).length === 0) {
+      return res.status(400).json({
+        error: 'At least one editable global limit value is required.',
+      });
+    }
+
+    const globalLimits = await persistSubscriptionGlobalLimits({
+      patch,
+      updatedBy: req.user?._id || null,
+    });
+
+    await logAuditEvent(AUDIT_ACTIONS.SUBSCRIPTION_PLAN_UPDATED, {
+      ...buildActorAuditDetails(req),
+      resourceType: 'SubscriptionGlobalLimits',
+      resourceId: 'subscription-global-limits',
+      details: {
+        updatedPatch: patch,
+      },
+    });
+
+    return res.json({ globalLimits });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * UPDATE SUBSCRIPTION PLAN LIMITS
+ * PUT /api/super-admin/subscriptions/plans/:planType
+ */
+router.put('/subscriptions/plans/:planType', async (req, res, next) => {
+  try {
+    const normalizedPlanType = resolveSubscriptionPlanType(req.params.planType);
+    const allowedPlanTypes = new Set([
       SUBSCRIPTION_PLAN_TYPES.FREE,
       SUBSCRIPTION_PLAN_TYPES.PRO,
       SUBSCRIPTION_PLAN_TYPES.ULTIMATE,
       SUBSCRIPTION_PLAN_TYPES.LEGEND,
-    ];
+    ]);
 
-    const plans = planOrder.map((planType) => {
-      const plan = getSubscriptionPlanDefinition(planType);
-      return {
-        id: plan.id,
-        label: plan.label,
-        price: plan.price,
-        limits: plan.limits,
-        features: plan.features,
-      };
+    if (!allowedPlanTypes.has(normalizedPlanType) || !SUBSCRIPTION_PLANS[normalizedPlanType]) {
+      return res.status(400).json({
+        error: 'Invalid planType. Use one of: free, pro, ultimate, legend.',
+      });
+    }
+
+    const hasLabelPayload = hasOwn(req.body, 'label');
+    const hasPricePayload = hasOwn(req.body, 'price');
+    const incomingLimits = normalizeOptionalObject(req.body?.limits);
+    const hasAiUsageLimitPayload = hasOwn(req.body, 'ai_usage_limit');
+    const mergedIncomingLimits = {
+      ...incomingLimits,
+      ...(hasAiUsageLimitPayload
+        ? { maxAiGradingsPerMonth: req.body.ai_usage_limit }
+        : {}),
+    };
+    const incomingOverrides = normalizeOptionalObject(req.body?.overrides);
+    const incomingFeatures = normalizeOptionalObject(req.body?.features);
+    const hasLimitsPayload = Object.keys(mergedIncomingLimits).length > 0;
+    const hasOverridesPayload = Object.keys(incomingOverrides).length > 0;
+    const hasAiEnabledPayload = hasOwn(req.body, 'ai_enabled');
+    const hasAiTypesAllowedPayload = hasOwn(req.body, 'ai_types_allowed');
+    const hasFeaturesPayload =
+      Object.keys(incomingFeatures).length > 0 ||
+      hasAiEnabledPayload ||
+      hasAiTypesAllowedPayload;
+
+    if (
+      !hasLabelPayload &&
+      !hasPricePayload &&
+      !hasLimitsPayload &&
+      !hasOverridesPayload &&
+      !hasFeaturesPayload
+    ) {
+      return res.status(400).json({
+        error:
+          'At least one editable field is required (label, price, limits, overrides, features).',
+      });
+    }
+
+    if (hasLabelPayload) {
+      const nextLabel = String(req.body?.label || '').trim();
+      if (!nextLabel) {
+        return res.status(400).json({
+          error: 'label must be a non-empty string.',
+        });
+      }
+    }
+
+    if (hasPricePayload) {
+      const parsedPrice = Number(req.body?.price);
+      if (!Number.isFinite(parsedPrice) || parsedPrice < 0) {
+        return res.status(400).json({
+          error: 'price must be a non-negative number.',
+        });
+      }
+    }
+
+    if (hasLimitsPayload) {
+      const unknownLimitKeys = Object.keys(mergedIncomingLimits).filter(
+        (key) => !PLAN_LIMIT_EDITABLE_KEYS.includes(key)
+      );
+      if (unknownLimitKeys.length > 0) {
+        return res.status(400).json({
+          error: `Unsupported limit keys: ${unknownLimitKeys.join(', ')}`,
+        });
+      }
+    }
+
+    if (hasOverridesPayload) {
+      const unknownOverrideKeys = Object.keys(incomingOverrides).filter(
+        (key) => !PLAN_GLOBAL_OVERRIDE_KEYS.includes(key)
+      );
+      if (unknownOverrideKeys.length > 0) {
+        return res.status(400).json({
+          error: `Unsupported override keys: ${unknownOverrideKeys.join(', ')}`,
+        });
+      }
+    }
+
+    const nextLimitsPatch = {};
+    if (hasLimitsPayload) {
+      for (const key of PLAN_LIMIT_EDITABLE_KEYS) {
+        if (!hasOwn(mergedIncomingLimits, key)) continue;
+
+        const incomingValue = mergedIncomingLimits[key];
+        if (!isValidPlanLimitInput(key, incomingValue)) {
+          return res.status(400).json({
+            error:
+              key === 'maxAiGradingsPerMonth' || key === 'maxAiQuestionsPerMonth'
+                ? `${key} must be a non-negative number, -1 (unlimited), or null.`
+                : `${key} must be a non-negative number or null.`,
+          });
+        }
+
+        const canonicalLimitKey = key === 'importQuestionsPerMonth' ? 'maxImportFiles' : key;
+        nextLimitsPatch[canonicalLimitKey] = parsePlanLimitInputValue(
+          canonicalLimitKey,
+          incomingValue
+        );
+      }
+    }
+
+    const nextOverridesPatch = {};
+    if (hasOverridesPayload) {
+      for (const key of PLAN_GLOBAL_OVERRIDE_KEYS) {
+        if (!hasOwn(incomingOverrides, key)) continue;
+
+        const incomingValue = incomingOverrides[key];
+        if (!isValidLimitInput(incomingValue)) {
+          return res.status(400).json({
+            error: `${key} must be a non-negative number or null.`,
+          });
+        }
+
+        nextOverridesPatch[key] = parseOptionalLimitValue(incomingValue);
+      }
+    }
+
+    const readFeatureValue = (featureKey, aliases = []) => {
+      if (hasOwn(req.body, featureKey)) return req.body[featureKey];
+      if (hasOwn(incomingFeatures, featureKey)) return incomingFeatures[featureKey];
+      for (const alias of aliases) {
+        if (hasOwn(req.body, alias)) return req.body[alias];
+        if (hasOwn(incomingFeatures, alias)) return incomingFeatures[alias];
+      }
+      return undefined;
+    };
+
+    const nextFeaturesPatch = {};
+    const rawAiEnabled = readFeatureValue('ai_enabled', ['aiEnabled', 'aiGrading']);
+    const hasIncomingAiEnabled = rawAiEnabled !== undefined;
+    if (hasIncomingAiEnabled) {
+      if (typeof rawAiEnabled !== 'boolean') {
+        return res.status(400).json({
+          error: 'ai_enabled must be a boolean.',
+        });
+      }
+      nextFeaturesPatch.aiGrading = rawAiEnabled;
+    }
+
+    const rawAiTypesAllowed = readFeatureValue('ai_types_allowed', ['aiTypesAllowed']);
+    const hasIncomingAiTypesAllowed = rawAiTypesAllowed !== undefined;
+    if (hasIncomingAiTypesAllowed) {
+      let normalizedAiTypesAllowed = normalizeAiTypesAllowedInput(rawAiTypesAllowed);
+      if (
+        normalizedAiTypesAllowed === null &&
+        typeof rawAiTypesAllowed === 'string' &&
+        !rawAiTypesAllowed.trim()
+      ) {
+        normalizedAiTypesAllowed = [];
+      }
+      if (!Array.isArray(normalizedAiTypesAllowed)) {
+        return res.status(400).json({
+          error: 'ai_types_allowed must be an array or comma-separated string.',
+        });
+      }
+      nextFeaturesPatch.aiTypesAllowed = normalizedAiTypesAllowed;
+    }
+
+    const overridePatch = {
+      ...(hasLabelPayload ? { label: String(req.body?.label || '').trim() } : {}),
+      ...(hasPricePayload ? { price: Number(req.body?.price) } : {}),
+      ...(Object.keys(nextLimitsPatch).length > 0 ? { limits: nextLimitsPatch } : {}),
+      ...(Object.keys(nextFeaturesPatch).length > 0 ? { features: nextFeaturesPatch } : {}),
+      ...(Object.keys(nextOverridesPatch).length > 0 ? { overrides: nextOverridesPatch } : {}),
+    };
+
+    const updatedPlan = await persistSubscriptionPlanOverride({
+      planType: normalizedPlanType,
+      patch: overridePatch,
+      updatedBy: req.user?._id || null,
     });
 
-    res.json({ plans });
+    await logAuditEvent(AUDIT_ACTIONS.SUBSCRIPTION_PLAN_UPDATED, {
+      ...buildActorAuditDetails(req),
+      resourceType: 'SubscriptionPlan',
+      resourceId: normalizedPlanType,
+      details: {
+        planType: normalizedPlanType,
+        updatedPatch: overridePatch,
+      },
+    });
+
+    return res.json({
+      plan: {
+        id: updatedPlan.id,
+        label: updatedPlan.label,
+        price: updatedPlan.price,
+        limits: updatedPlan.limits,
+        features: updatedPlan.features,
+        overrides: normalizeOptionalObject(updatedPlan.overrides),
+        ...buildPlanAiSettings(updatedPlan),
+      },
+    });
   } catch (error) {
-    next(error);
+    return next(error);
   }
 });
 
@@ -788,6 +1994,13 @@ router.get('/subscriptions/plans', async (_req, res, next) => {
  */
 router.get('/subscriptions/tenants', async (req, res, next) => {
   try {
+    res.set({
+      'Cache-Control': 'no-store, no-cache, must-revalidate, proxy-revalidate',
+      Pragma: 'no-cache',
+      Expires: '0',
+      'Surrogate-Control': 'no-store',
+    });
+
     const { page = 1, limit = 50, search, q } = req.query;
     const normalizedSearch = String(search || q || '').trim();
     const filter = {};
@@ -845,9 +2058,15 @@ router.get('/subscriptions/tenants', async (req, res, next) => {
 router.get('/subscriptions/revenue-analytics', async (req, res, next) => {
   try {
     const now = new Date();
-    const normalizedRange = String(req.query?.range || REVENUE_RANGE_TYPES.LAST_30_DAYS)
+    const rawRange = String(req.query?.range || REVENUE_RANGE_TYPES.LAST_30_DAYS)
       .trim()
       .toLowerCase();
+    const rangeAliasMap = {
+      [REVENUE_TREND_RANGE_TYPES.DAILY]: REVENUE_RANGE_TYPES.LAST_30_DAYS,
+      [REVENUE_TREND_RANGE_TYPES.MONTHLY]: REVENUE_RANGE_TYPES.LAST_12_MONTHS,
+      [REVENUE_TREND_RANGE_TYPES.YEARLY]: REVENUE_RANGE_TYPES.ALL_TIME,
+    };
+    const normalizedRange = rangeAliasMap[rawRange] || rawRange;
     const normalizedTenantId = String(req.query?.tenantId || 'all').trim();
     const normalizedPlanType = String(req.query?.planType || 'all')
       .trim()
@@ -1234,6 +2453,11 @@ router.get('/subscriptions/revenue-analytics', async (req, res, next) => {
     });
 
     res.json({
+      success: true,
+      data: trend.map((row) => ({
+        label: row?.label || '',
+        revenue: Number(row?.revenue) || 0,
+      })),
       summary: {
         total_revenue: Number(totalRevenue.toFixed(2)),
         monthly_revenue: Number(currentSnapshotFiltered.revenue.toFixed(2)),
@@ -1289,6 +2513,664 @@ router.get('/subscriptions/revenue-analytics', async (req, res, next) => {
 });
 
 /**
+ * REVENUE TREND (REAL DATA)
+ * GET /api/super-admin/revenue-trend
+ * Query params:
+ * - range: daily | monthly | yearly
+ * - tenantId: all | <tenantId>
+ * - planType: all | free | pro | ultimate | legend
+ * - limit: number of buckets (optional)
+ */
+router.get('/revenue-trend', async (req, res, next) => {
+  try {
+    const now = new Date();
+    const normalizedRange = normalizeRevenueTrendRange(req.query?.range);
+    if (!normalizedRange) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid range. Use one of: daily, monthly, yearly.',
+      });
+    }
+
+    const normalizedTenantId = String(req.query?.tenantId || 'all').trim();
+    if (normalizedTenantId !== 'all' && !isValidMongoId(normalizedTenantId)) {
+      return res.status(400).json({
+        success: false,
+        error: 'tenantId must be "all" or a valid tenant id.',
+      });
+    }
+
+    const normalizedPlanTypeInput = String(req.query?.planType || 'all')
+      .trim()
+      .toLowerCase();
+    const allowedPlanFilters = new Set([
+      'all',
+      SUBSCRIPTION_PLAN_TYPES.FREE,
+      SUBSCRIPTION_PLAN_TYPES.PRO,
+      SUBSCRIPTION_PLAN_TYPES.ULTIMATE,
+      SUBSCRIPTION_PLAN_TYPES.LEGEND,
+    ]);
+    const selectedPlanFilter =
+      normalizedPlanTypeInput === 'all'
+        ? 'all'
+        : resolveSubscriptionPlanType(normalizedPlanTypeInput);
+    if (!allowedPlanFilters.has(selectedPlanFilter)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid planType. Use one of: all, free, pro, ultimate, legend.',
+      });
+    }
+
+    const normalizedLimit = normalizeRevenueTrendLimit(normalizedRange, req.query?.limit);
+    const cacheKey = getRevenueTrendCacheKey({
+      range: normalizedRange,
+      tenantId: normalizedTenantId,
+      planType: selectedPlanFilter,
+      limit: normalizedLimit,
+    });
+    const cached = getCachedRevenueTrend(cacheKey);
+    if (cached) {
+      return res.json(cached);
+    }
+
+    const tenantFilter = {};
+    if (normalizedTenantId !== 'all') {
+      tenantFilter._id = normalizedTenantId;
+    }
+
+    const tenants = await Tenant.find(tenantFilter)
+      .select('name code status createdAt subscription')
+      .lean();
+    const tenantIds = (Array.isArray(tenants) ? tenants : [])
+      .map((tenant) => tenant?._id)
+      .filter(Boolean);
+
+    const planChangeLogs = tenantIds.length
+      ? await AuditLog.find({
+          action: AUDIT_ACTIONS.TENANT_UPDATED,
+          tenantId: { $in: tenantIds },
+          timestamp: { $lte: now },
+        })
+          .select('tenantId timestamp details')
+          .sort({ tenantId: 1, timestamp: 1 })
+          .lean()
+      : [];
+
+    const planChangesByTenant = new Map();
+    const addonPurchasesByTenant = new Map();
+    const addonKeys = Object.keys(ADDON_PRICE_CATALOG);
+
+    (Array.isArray(planChangeLogs) ? planChangeLogs : []).forEach((entry) => {
+      if (!isSuccessfulRevenueAuditLog(entry)) return;
+
+      const tenantId = entry?.tenantId ? String(entry.tenantId) : '';
+      if (!tenantId) return;
+
+      const beforePlan = extractSubscriptionPlanTypeFromAuditDetails(entry?.details, 'before');
+      const afterPlan = extractSubscriptionPlanTypeFromAuditDetails(entry?.details, 'after');
+      const changeTimestamp = toValidDate(entry?.timestamp) || now;
+
+      if (beforePlan || afterPlan) {
+        if (!planChangesByTenant.has(tenantId)) {
+          planChangesByTenant.set(tenantId, []);
+        }
+
+        planChangesByTenant.get(tenantId).push({
+          timestamp: changeTimestamp,
+          beforePlan: beforePlan || null,
+          afterPlan: afterPlan || null,
+        });
+      }
+
+      const beforeCustomFeatures = extractCustomFeaturesFromAuditDetails(entry?.details, 'before');
+      const afterCustomFeatures = extractCustomFeaturesFromAuditDetails(entry?.details, 'after');
+
+      addonKeys.forEach((addonKey) => {
+        const wasEnabled = beforeCustomFeatures?.[addonKey] === true;
+        const isEnabled = afterCustomFeatures?.[addonKey] === true;
+        if (wasEnabled || !isEnabled) return;
+
+        const addonAmount = resolveAddonPurchaseAmount(entry, addonKey);
+        if (!Number.isFinite(addonAmount) || addonAmount <= 0) return;
+
+        if (!addonPurchasesByTenant.has(tenantId)) {
+          addonPurchasesByTenant.set(tenantId, []);
+        }
+
+        addonPurchasesByTenant.get(tenantId).push({
+          timestamp: changeTimestamp,
+          addonKey,
+          amount: Number(addonAmount.toFixed(2)),
+        });
+      });
+    });
+
+    const resolvePlanAtDate = (tenant, pointDate) => {
+      const tenantId = tenant?._id ? String(tenant._id) : '';
+      const defaultPlanType = resolveSubscriptionPlanType(
+        tenant?.subscription?.planType || SUBSCRIPTION_PLAN_TYPES.FREE
+      );
+      const changes = planChangesByTenant.get(tenantId) || [];
+      if (!changes.length) return defaultPlanType;
+
+      const targetDate = toValidDate(pointDate) || now;
+      const firstChange = changes[0];
+      let resolvedPlan = firstChange?.beforePlan || defaultPlanType;
+
+      for (let index = 0; index < changes.length; index += 1) {
+        const change = changes[index];
+        const changeTime = toValidDate(change?.timestamp);
+        if (!changeTime) continue;
+        if (targetDate >= changeTime) {
+          if (change?.afterPlan) {
+            resolvedPlan = resolveSubscriptionPlanType(change.afterPlan);
+          }
+        } else {
+          break;
+        }
+      }
+
+      return resolvedPlan || defaultPlanType;
+    };
+
+    const getMonthlyBillingEventsInBucket = (tenant, bucketStart, bucketEnd) => {
+      const events = [];
+      const subscription = normalizeOptionalObject(tenant?.subscription);
+      const billingStart = getTenantBillingStartDate(tenant, now);
+      const expiresAt = toValidDate(subscription.expiresAt);
+      if (billingStart > bucketEnd) return events;
+
+      const cycleDay = billingStart.getDate();
+      let cursor = startOfMonth(bucketStart);
+      if (cursor < startOfMonth(billingStart)) {
+        cursor = startOfMonth(billingStart);
+      }
+
+      for (; cursor <= bucketEnd; cursor = addMonths(cursor, 1)) {
+        const year = cursor.getFullYear();
+        const month = cursor.getMonth();
+        const maxDayInMonth = new Date(year, month + 1, 0).getDate();
+        const billingDate = new Date(
+          year,
+          month,
+          Math.min(cycleDay, maxDayInMonth),
+          12,
+          0,
+          0,
+          0
+        );
+
+        if (billingDate < billingStart) continue;
+        if (billingDate < bucketStart || billingDate > bucketEnd) continue;
+        if (expiresAt && billingDate > expiresAt) break;
+
+        const historicalPlanType = resolvePlanAtDate(tenant, billingDate);
+        const statusAtDate = resolveSubscriptionStatus(subscription, billingDate);
+        const effectivePlanType = resolveEffectivePlanType(historicalPlanType, statusAtDate);
+        const planDefinition = getSubscriptionPlanDefinition(effectivePlanType);
+        const amount = Number(planDefinition?.price) || 0;
+
+        if (amount <= 0) continue;
+        if (selectedPlanFilter !== 'all' && effectivePlanType !== selectedPlanFilter) continue;
+
+        events.push({
+          timestamp: billingDate,
+          amount: Number(amount.toFixed(2)),
+          type: 'SUBSCRIPTION_PAYMENT',
+          planType: effectivePlanType,
+        });
+      }
+
+      return events;
+    };
+
+    const buildBucketRevenue = (bucket) => {
+      const bucketStart = toValidDate(bucket?.startDate) || now;
+      const bucketEnd = toValidDate(bucket?.endDate) || now;
+      let recurringRevenue = 0;
+      let oneTimeRevenue = 0;
+
+      (Array.isArray(tenants) ? tenants : []).forEach((tenant) => {
+        const monthlyEvents = getMonthlyBillingEventsInBucket(tenant, bucketStart, bucketEnd);
+        recurringRevenue += monthlyEvents.reduce(
+          (sum, event) => sum + (Number(event?.amount) || 0),
+          0
+        );
+
+        const tenantId = tenant?._id ? String(tenant._id) : '';
+        if (!tenantId) return;
+
+        const planChanges = planChangesByTenant.get(tenantId) || [];
+        planChanges.forEach((change) => {
+          const changeTime = toValidDate(change?.timestamp);
+          if (!changeTime || changeTime < bucketStart || changeTime > bucketEnd) return;
+
+          const beforePlanType = resolveSubscriptionPlanType(
+            change?.beforePlan || SUBSCRIPTION_PLAN_TYPES.FREE
+          );
+          const afterPlanType = resolveSubscriptionPlanType(
+            change?.afterPlan || beforePlanType
+          );
+          const beforePrice = Number(getSubscriptionPlanDefinition(beforePlanType)?.price) || 0;
+          const afterPrice = Number(getSubscriptionPlanDefinition(afterPlanType)?.price) || 0;
+          const delta = afterPrice - beforePrice;
+          if (delta <= 0) return;
+          if (selectedPlanFilter !== 'all' && afterPlanType !== selectedPlanFilter) return;
+
+          oneTimeRevenue += Number(delta.toFixed(2));
+        });
+
+        const addonPurchases = addonPurchasesByTenant.get(tenantId) || [];
+        addonPurchases.forEach((addonEvent) => {
+          const purchaseTime = toValidDate(addonEvent?.timestamp);
+          if (!purchaseTime || purchaseTime < bucketStart || purchaseTime > bucketEnd) return;
+
+          if (selectedPlanFilter !== 'all') {
+            const planAtPurchase = resolveEffectivePlanType(
+              resolvePlanAtDate(tenant, purchaseTime),
+              resolveSubscriptionStatus(normalizeOptionalObject(tenant?.subscription), purchaseTime)
+            );
+            if (planAtPurchase !== selectedPlanFilter) return;
+          }
+
+          const addonAmount = Number(addonEvent?.amount) || 0;
+          if (addonAmount <= 0) return;
+          oneTimeRevenue += Number(addonAmount.toFixed(2));
+        });
+      });
+
+      return {
+        recurringRevenue: Number(recurringRevenue.toFixed(2)),
+        oneTimeRevenue: Number(oneTimeRevenue.toFixed(2)),
+        totalRevenue: Number((recurringRevenue + oneTimeRevenue).toFixed(2)),
+      };
+    };
+
+    const buckets = buildRevenueTrendBuckets({
+      range: normalizedRange,
+      now,
+      limit: normalizedLimit,
+    });
+
+    const trendRows = buckets.map((bucket) => {
+      const bucketRevenue = buildBucketRevenue(bucket);
+      return {
+        label: bucket.label,
+        revenue: bucketRevenue.totalRevenue,
+      };
+    });
+
+    const totalRevenue = trendRows.reduce(
+      (sum, row) => sum + (Number(row?.revenue) || 0),
+      0
+    );
+
+    const payload = {
+      success: true,
+      data: trendRows,
+      summary: {
+        total_revenue: Number(totalRevenue.toFixed(2)),
+        range: normalizedRange,
+      },
+      meta: {
+        generatedAt: now.toISOString(),
+        range: normalizedRange,
+        limit: normalizedLimit,
+        tenantCount: Array.isArray(tenants) ? tenants.length : 0,
+        filters: {
+          tenantId: normalizedTenantId,
+          planType: selectedPlanFilter,
+        },
+      },
+    };
+
+    setCachedRevenueTrend(cacheKey, payload);
+
+    res.set({
+      'Cache-Control': 'private, max-age=30',
+    });
+
+    return res.json(payload);
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * CREDIT REQUEST MANAGEMENT
+ */
+router.get('/credit-requests', async (req, res, next) => {
+  try {
+    const page = Math.max(parseInt(req.query?.page, 10) || 1, 1);
+    const limit = Math.min(200, Math.max(parseInt(req.query?.limit, 10) || 20, 1));
+    const skip = (page - 1) * limit;
+    const statusFilterRaw = String(req.query?.status || 'all')
+      .trim()
+      .toUpperCase();
+    const typeFilter = normalizeCreditRequestType(req.query?.type || '');
+    const tenantIdFilter = String(req.query?.tenantId || 'all').trim();
+
+    const filter = {};
+    if (statusFilterRaw !== 'ALL') {
+      const normalizedStatus = normalizeCreditRequestStatusInput(statusFilterRaw);
+      if (!normalizedStatus) {
+        return res.status(400).json({
+          error: 'status must be ALL, PENDING, APPROVED, or REJECTED',
+        });
+      }
+      filter.status = normalizedStatus;
+    }
+
+    if (typeFilter) {
+      if (!CREDIT_REQUEST_TYPE_VALUES.has(typeFilter)) {
+        return res.status(400).json({
+          error: 'type must be one of AI, ATTEMPTS, EXAMS',
+        });
+      }
+      filter.type = typeFilter;
+    }
+
+    if (tenantIdFilter !== 'all') {
+      if (!isValidMongoId(tenantIdFilter)) {
+        return res.status(400).json({
+          error: 'tenantId must be "all" or a valid tenant id',
+        });
+      }
+      filter.tenantId = tenantIdFilter;
+    }
+
+    const [requests, total, statusSummary] = await Promise.all([
+      CreditRequest.find(filter)
+        .populate('tenantId', 'name code')
+        .populate('requestedBy', 'name email')
+        .populate('reviewedBy', 'name email')
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      CreditRequest.countDocuments(filter),
+      CreditRequest.aggregate([
+        { $match: filter },
+        {
+          $group: {
+            _id: '$status',
+            count: { $sum: 1 },
+          },
+        },
+      ]),
+    ]);
+
+    const summaryByStatus = {
+      [CREDIT_REQUEST_STATUSES.PENDING]: 0,
+      [CREDIT_REQUEST_STATUSES.APPROVED]: 0,
+      [CREDIT_REQUEST_STATUSES.REJECTED]: 0,
+    };
+    (Array.isArray(statusSummary) ? statusSummary : []).forEach((entry) => {
+      const status = normalizeCreditRequestStatusInput(entry?._id);
+      if (!status) return;
+      summaryByStatus[status] = Number(entry?.count) || 0;
+    });
+
+    return res.json({
+      success: true,
+      requests: (Array.isArray(requests) ? requests : []).map(buildCreditRequestResponseItem),
+      pagination: {
+        page,
+        limit,
+        total,
+        pages: Math.max(1, Math.ceil(total / limit)),
+      },
+      summary: summaryByStatus,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.put('/credit-requests/:requestId/review', async (req, res, next) => {
+  try {
+    const requestId = String(req.params?.requestId || '').trim();
+    if (!isValidMongoId(requestId)) {
+      return res.status(400).json({ error: 'Invalid requestId' });
+    }
+
+    const decision = normalizeCreditRequestStatusInput(req.body?.status);
+    if (!decision || decision === CREDIT_REQUEST_STATUSES.PENDING) {
+      return res.status(400).json({
+        error: 'status must be APPROVED or REJECTED',
+      });
+    }
+
+    const reviewNote = String(req.body?.reviewNote || '')
+      .trim()
+      .slice(0, 500);
+
+    const existingRequest = await CreditRequest.findById(requestId).lean();
+    if (!existingRequest) {
+      return res.status(404).json({ error: 'Credit request not found' });
+    }
+
+    if (existingRequest.status !== CREDIT_REQUEST_REVIEWABLE_STATUS) {
+      return res.status(409).json({
+        error: `Credit request is already ${existingRequest.status}`,
+      });
+    }
+
+    let adjustedCredits = false;
+    if (decision === CREDIT_REQUEST_STATUSES.APPROVED) {
+      const extraCreditField = resolveTenantExtraCreditFieldByType(existingRequest.type);
+      if (!extraCreditField) {
+        return res.status(400).json({ error: 'Unsupported credit request type' });
+      }
+
+      const updateTenantResult = await Tenant.updateOne(
+        { _id: existingRequest.tenantId },
+        {
+          $inc: {
+            [extraCreditField]: Number(existingRequest.requestedAmount) || 0,
+          },
+          $set: {
+            'extraCredits.updatedAt': new Date(),
+          },
+        }
+      );
+
+      if (!updateTenantResult?.matchedCount) {
+        return res.status(404).json({ error: 'Tenant not found for credit request' });
+      }
+      adjustedCredits = true;
+    }
+
+    const reviewedRequest = await CreditRequest.findOneAndUpdate(
+      {
+        _id: requestId,
+        status: CREDIT_REQUEST_REVIEWABLE_STATUS,
+      },
+      {
+        $set: {
+          status: decision,
+          reviewedBy: req.user?._id || null,
+          reviewedAt: new Date(),
+          reviewNote,
+          ...(decision === CREDIT_REQUEST_STATUSES.APPROVED && !existingRequest.unitPriceInr
+            ? { unitPriceInr: resolveExtraCreditUnitPrice(existingRequest.type) }
+            : {}),
+        },
+      },
+      {
+        new: true,
+      }
+    )
+      .populate('tenantId', 'name code')
+      .populate('requestedBy', 'name email')
+      .populate('reviewedBy', 'name email')
+      .lean();
+
+    if (!reviewedRequest) {
+      if (adjustedCredits) {
+        const rollbackField = resolveTenantExtraCreditFieldByType(existingRequest.type);
+        if (rollbackField) {
+          await Tenant.updateOne(
+            { _id: existingRequest.tenantId },
+            {
+              $inc: {
+                [rollbackField]: -Math.max(Number(existingRequest.requestedAmount) || 0, 0),
+              },
+            }
+          );
+        }
+      }
+
+      return res.status(409).json({
+        error: 'Credit request was already processed by another admin',
+      });
+    }
+
+    return res.json({
+      success: true,
+      request: buildCreditRequestResponseItem(reviewedRequest),
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.get('/credit-requests/billing-summary', async (req, res, next) => {
+  try {
+    const now = new Date();
+    const tenantIdFilter = String(req.query?.tenantId || 'all').trim();
+    const typeFilter = normalizeCreditRequestType(req.query?.type || '');
+    const statusesFilterRaw = String(req.query?.statuses || 'APPROVED')
+      .trim()
+      .toUpperCase();
+    const statusesFilter = statusesFilterRaw
+      .split(',')
+      .map((entry) => normalizeCreditRequestStatusInput(entry))
+      .filter(Boolean);
+
+    if (tenantIdFilter !== 'all' && !isValidMongoId(tenantIdFilter)) {
+      return res.status(400).json({
+        error: 'tenantId must be "all" or a valid tenant id',
+      });
+    }
+
+    const { start, end } = getCurrentMonthRange(now);
+    const tenantFilter = tenantIdFilter === 'all' ? {} : { _id: tenantIdFilter };
+    const tenants = await Tenant.find(tenantFilter)
+      .select('name code subscription examLimit attemptLimit aiUsageLimit extraCredits')
+      .lean();
+
+    const allowedStatuses =
+      statusesFilter.length > 0 ? statusesFilter : [CREDIT_REQUEST_STATUSES.APPROVED];
+    const requestFilter = {
+      status: { $in: allowedStatuses },
+      createdAt: { $lte: end },
+      ...(typeFilter ? { type: typeFilter } : {}),
+      ...(tenantIdFilter !== 'all' ? { tenantId: tenantIdFilter } : {}),
+    };
+    const approvedRequests = await CreditRequest.find(requestFilter)
+      .select('tenantId type requestedAmount status unitPriceInr createdAt')
+      .lean();
+    const approvedMap = new Map();
+    (Array.isArray(approvedRequests) ? approvedRequests : []).forEach((request) => {
+      const tenantId = request?.tenantId ? String(request.tenantId) : '';
+      if (!tenantId) return;
+      if (!approvedMap.has(tenantId)) {
+        approvedMap.set(tenantId, {
+          requestCount: 0,
+          totalApprovedUnits: 0,
+          byType: {
+            [CREDIT_REQUEST_TYPES.AI]: 0,
+            [CREDIT_REQUEST_TYPES.ATTEMPTS]: 0,
+            [CREDIT_REQUEST_TYPES.EXAMS]: 0,
+          },
+        });
+      }
+      const bucket = approvedMap.get(tenantId);
+      const normalizedType = normalizeCreditRequestType(request?.type);
+      const amount = Math.max(Number(request?.requestedAmount) || 0, 0);
+      bucket.requestCount += 1;
+      bucket.totalApprovedUnits += amount;
+      if (normalizedType && bucket.byType[normalizedType] !== undefined) {
+        bucket.byType[normalizedType] += amount;
+      }
+    });
+
+    const perTenant = [];
+    let totalExtraUsage = 0;
+    let totalExtraCost = 0;
+
+    for (const tenant of Array.isArray(tenants) ? tenants : []) {
+      const tenantId = tenant?._id ? String(tenant._id) : '';
+      if (!tenantId) continue;
+
+      const typesToCompute = typeFilter
+        ? [typeFilter]
+        : [CREDIT_REQUEST_TYPES.AI, CREDIT_REQUEST_TYPES.ATTEMPTS, CREDIT_REQUEST_TYPES.EXAMS];
+      const summaries = await Promise.all(
+        typesToCompute.map((type) =>
+          computeCreditRequestBillingForTenantType({
+            tenant,
+            type,
+            start,
+            end,
+          })
+        )
+      );
+      const validSummaries = summaries.filter(Boolean);
+      const tenantExtraUsage = validSummaries.reduce(
+        (sum, summary) => sum + (Number(summary?.extraUsage) || 0),
+        0
+      );
+      const tenantExtraCost = Number(
+        validSummaries
+          .reduce((sum, summary) => sum + (Number(summary?.extraCost) || 0), 0)
+          .toFixed(2)
+      );
+
+      totalExtraUsage += tenantExtraUsage;
+      totalExtraCost += tenantExtraCost;
+
+      perTenant.push({
+        tenantId,
+        tenantName: tenant?.name || 'Unknown Tenant',
+        tenantCode: tenant?.code || 'N/A',
+        summaries: validSummaries,
+        totals: {
+          extraUsage: tenantExtraUsage,
+          extraCost: tenantExtraCost,
+        },
+        requests: approvedMap.get(tenantId) || {
+          requestCount: 0,
+          totalApprovedUnits: 0,
+          byType: {
+            [CREDIT_REQUEST_TYPES.AI]: 0,
+            [CREDIT_REQUEST_TYPES.ATTEMPTS]: 0,
+            [CREDIT_REQUEST_TYPES.EXAMS]: 0,
+          },
+        },
+      });
+    }
+
+    return res.json({
+      success: true,
+      period: {
+        start,
+        end,
+      },
+      summary: {
+        totalExtraUsage: Number(totalExtraUsage) || 0,
+        totalExtraCost: Number(totalExtraCost.toFixed(2)) || 0,
+        currency: 'INR',
+      },
+      perTenant,
+    });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
  * CHANGE TENANT SUBSCRIPTION PLAN
  * PUT /api/super-admin/subscriptions/tenants/:tenantId
  */
@@ -1339,11 +3221,11 @@ router.put(
     body('status')
       .optional()
       .isIn(SUBSCRIPTION_STATUS_VALUES)
-      .withMessage('status must be one of ACTIVE, EXPIRED, or SUSPENDED'),
+      .withMessage('status must be one of ACTIVE, EXPIRED, SUSPENDED, or CANCELLED'),
     body('subscriptionStatus')
       .optional()
       .isIn(SUBSCRIPTION_STATUS_VALUES)
-      .withMessage('subscriptionStatus must be one of ACTIVE, EXPIRED, or SUSPENDED'),
+      .withMessage('subscriptionStatus must be one of ACTIVE, EXPIRED, SUSPENDED, or CANCELLED'),
     body('expireNow').optional().isBoolean().withMessage('expireNow must be a boolean'),
     body('resetUsage').optional().isBoolean().withMessage('resetUsage must be a boolean'),
     body('customLimits')
@@ -1370,6 +3252,15 @@ router.put(
         }
         return true;
       }),
+    body('features')
+      .optional()
+      .custom((value) => {
+        if (value === null || value === undefined) return true;
+        if (typeof value !== 'object' || Array.isArray(value)) {
+          throw new Error('features must be an object');
+        }
+        return true;
+      }),
   ],
   async (req, res, next) => {
     try {
@@ -1388,7 +3279,9 @@ router.put(
         return res.status(404).json({ error: 'Tenant not found' });
       }
 
-      const previousSubscription = tenant.subscription || {};
+      const previousSubscription = toPlainOptionalObject(
+        tenant?.subscription?.toObject ? tenant.subscription.toObject() : tenant?.subscription
+      );
       const previousPlanType = resolveSubscriptionPlanType(
         previousSubscription.planType || SUBSCRIPTION_PLAN_TYPES.FREE
       );
@@ -1460,7 +3353,7 @@ router.put(
       const normalizedStatusInput = normalizeSubscriptionStatusInput(statusInputRaw);
       if (hasStatusPayload && !normalizedStatusInput) {
         return res.status(400).json({
-          error: 'subscriptionStatus must be one of ACTIVE, EXPIRED, or SUSPENDED',
+          error: 'subscriptionStatus must be one of ACTIVE, EXPIRED, SUSPENDED, or CANCELLED',
         });
       }
 
@@ -1484,31 +3377,96 @@ router.put(
           ? resetUsageRequested
           : normalizedPlanType !== previousPlanType;
 
+      const selectedPlanDefinition = getSubscriptionPlanDefinition(normalizedPlanType);
+      const selectedPlanFeatures = normalizeOptionalObject(selectedPlanDefinition?.features);
       const hasCustomLimitsPayload = hasOwn(req.body, 'customLimits');
       const hasCustomFeaturesPayload = hasOwn(req.body, 'customFeatures');
-      const previousCustomLimits = normalizeOptionalObject(previousSubscription.customLimits);
-      const previousCustomFeatures = normalizeOptionalObject(previousSubscription.customFeatures);
-      const nextCustomLimits = hasCustomLimitsPayload
-        ? {
-            ...previousCustomLimits,
-            ...extractLegendCustomLimits(req.body.customLimits),
+      const hasFeaturesPayload = hasOwn(req.body, 'features');
+
+      const managedFromCustomFeatures = extractManagedPlanFeatureValues(
+        req.body.customFeatures,
+        'customFeatures'
+      );
+      const managedFromFeatures = extractManagedPlanFeatureValues(req.body.features, 'features');
+      const managedFeatureValidationErrors = [
+        ...managedFromCustomFeatures.validationErrors,
+        ...managedFromFeatures.validationErrors,
+      ];
+      if (managedFeatureValidationErrors.length > 0) {
+        return res.status(400).json({
+          error: 'Invalid feature payload',
+          details: managedFeatureValidationErrors,
+        });
+      }
+
+      const requestedManagedFeatureValues = {
+        ...managedFromCustomFeatures.values,
+        ...managedFromFeatures.values,
+      };
+
+      const restrictedFeatureKey = PLAN_FEATURE_TOGGLE_CANONICAL_KEYS.find(
+        (canonicalKey) =>
+          selectedPlanFeatures?.[canonicalKey] === true &&
+          hasOwn(requestedManagedFeatureValues, canonicalKey) &&
+          requestedManagedFeatureValues[canonicalKey] === false
+      );
+      if (restrictedFeatureKey) {
+        return res.status(400).json({
+          error: `${restrictedFeatureKey} is included in the selected plan and cannot be disabled.`,
+        });
+      }
+
+      const previousCustomLimits = toPlainOptionalObject(previousSubscription.customLimits);
+      const previousCustomFeatures = toPlainOptionalObject(previousSubscription.customFeatures);
+      const nextCustomLimits = toPlainOptionalObject(
+        hasCustomLimitsPayload
+          ? {
+              ...previousCustomLimits,
+              ...extractLegendCustomLimits(req.body.customLimits),
+            }
+          : previousCustomLimits
+      );
+      const nextCustomFeatures = toPlainOptionalObject(
+        hasCustomFeaturesPayload
+          ? {
+              ...previousCustomFeatures,
+              ...extractFeatureOverrides(req.body.customFeatures),
+            }
+          : previousCustomFeatures
+      );
+
+      PLAN_FEATURE_TOGGLE_NON_CANONICAL_ALIAS_KEYS.forEach((aliasKey) => {
+        if (hasOwn(nextCustomFeatures, aliasKey)) {
+          delete nextCustomFeatures[aliasKey];
+        }
+      });
+
+      PLAN_FEATURE_TOGGLE_CANONICAL_KEYS.forEach((canonicalKey) => {
+        const featureIncludedInPlan = selectedPlanFeatures?.[canonicalKey] === true;
+
+        if (featureIncludedInPlan) {
+          if (hasOwn(nextCustomFeatures, canonicalKey)) {
+            delete nextCustomFeatures[canonicalKey];
           }
-        : previousCustomLimits;
-      const nextCustomFeatures = hasCustomFeaturesPayload
-        ? {
-            ...previousCustomFeatures,
-            ...extractFeatureOverrides(req.body.customFeatures),
-          }
-        : previousCustomFeatures;
+          return;
+        }
+
+        if (
+          (hasCustomFeaturesPayload || hasFeaturesPayload) &&
+          hasOwn(requestedManagedFeatureValues, canonicalKey)
+        ) {
+          nextCustomFeatures[canonicalKey] = Boolean(requestedManagedFeatureValues[canonicalKey]);
+        }
+      });
 
       const nextSubscription = {
-        ...previousSubscription,
+        ...toPlainOptionalObject(previousSubscription),
         planType: normalizedPlanType,
         startedAt,
         expiresAt,
-        usageResetAt: shouldResetUsage ? now : previousSubscription.usageResetAt || null,
-        customLimits: nextCustomLimits,
-        customFeatures: nextCustomFeatures,
+        usageResetAt: shouldResetUsage ? now : previousSubscription?.usageResetAt || null,
+        customLimits: toPlainOptionalObject(nextCustomLimits),
+        customFeatures: toPlainOptionalObject(nextCustomFeatures),
         updatedAt: now,
       };
 
@@ -1531,7 +3489,11 @@ router.put(
         tenant.aiUsageLimit = legendLimits.maxAiQuestionsPerMonth;
       }
 
-      tenant.subscription = nextSubscription;
+      tenant.subscription = {
+        ...toPlainOptionalObject(nextSubscription),
+        customLimits: toPlainOptionalObject(nextSubscription.customLimits),
+        customFeatures: toPlainOptionalObject(nextSubscription.customFeatures),
+      };
       await tenant.save();
 
       await User.updateMany(
@@ -1589,13 +3551,13 @@ router.get('/tenants/:tenantId/features', async (req, res, next) => {
     }
 
     const tenant = await Tenant.findById(tenantId).select(
-      'name code subscription examLimit attemptLimit aiUsageLimit updatedAt'
+      'name code subscription examLimit attemptLimit aiUsageLimit ai_usage_count updatedAt'
     );
     if (!tenant) {
       return res.status(404).json({ error: 'Tenant not found' });
     }
 
-    const tenantFeatures = buildTenantFeaturePayload(tenant);
+    const tenantFeatures = await buildTenantFeaturePayload(tenant);
     return res.json({ tenantFeatures });
   } catch (error) {
     return next(error);
@@ -1616,6 +3578,194 @@ router.put('/tenants/:tenantId/features', async (req, res, next) => {
     const tenant = await Tenant.findById(tenantId);
     if (!tenant) {
       return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const hasDynamicCustomLimitsPayload =
+      hasOwn(req.body, 'custom_limits') || hasOwn(req.body, 'customLimits');
+    const hasDynamicCustomFeaturesPayload =
+      hasOwn(req.body, 'custom_features') || hasOwn(req.body, 'customFeatures');
+
+    if (hasDynamicCustomLimitsPayload || hasDynamicCustomFeaturesPayload) {
+      const rawIncomingCustomLimits = hasOwn(req.body, 'custom_limits')
+        ? req.body.custom_limits
+        : req.body.customLimits;
+      const rawIncomingCustomFeatures = hasOwn(req.body, 'custom_features')
+        ? req.body.custom_features
+        : req.body.customFeatures;
+
+      const incomingCustomLimits = normalizeOptionalObject(rawIncomingCustomLimits);
+      const incomingCustomFeatures = normalizeOptionalObject(rawIncomingCustomFeatures);
+      if (
+        hasDynamicCustomLimitsPayload &&
+        (rawIncomingCustomLimits === null ||
+          rawIncomingCustomLimits === undefined ||
+          typeof rawIncomingCustomLimits !== 'object' ||
+          Array.isArray(rawIncomingCustomLimits))
+      ) {
+        return res.status(400).json({
+          error: 'custom_limits/customLimits must be an object.',
+        });
+      }
+      if (
+        hasDynamicCustomFeaturesPayload &&
+        (rawIncomingCustomFeatures === null ||
+          rawIncomingCustomFeatures === undefined ||
+          typeof rawIncomingCustomFeatures !== 'object' ||
+          Array.isArray(rawIncomingCustomFeatures))
+      ) {
+        return res.status(400).json({
+          error: 'custom_features/customFeatures must be an object.',
+        });
+      }
+
+      if (
+        Object.keys(incomingCustomLimits).length === 0 &&
+        Object.keys(incomingCustomFeatures).length === 0
+      ) {
+        return res.status(400).json({
+          error: 'No override updates provided. Include custom_limits and/or custom_features values.',
+        });
+      }
+
+      const tenantObject = tenant.toObject ? tenant.toObject() : tenant;
+      const subscription = normalizeOptionalObject(tenantObject?.subscription);
+      const assignedPlanType = resolveSubscriptionPlanType(
+        subscription.planType || SUBSCRIPTION_PLAN_TYPES.FREE
+      );
+      const previousCustomLimits = extractActiveCustomLimitOverrides(subscription.customLimits);
+      const previousCustomFeatures = extractActiveCustomFeatureOverrides(subscription.customFeatures);
+      const nextCustomLimits = { ...previousCustomLimits };
+      const nextCustomFeatures = { ...previousCustomFeatures };
+
+      const validationErrors = [];
+
+      Object.entries(incomingCustomLimits).forEach(([rawKey, rawValue]) => {
+        const resolvedKey = normalizeLimitOverrideKey(rawKey);
+        if (!resolvedKey) {
+          validationErrors.push(`custom_limits.${rawKey} has an invalid key.`);
+          return;
+        }
+
+        if (rawValue === null || rawValue === undefined || rawValue === '') {
+          delete nextCustomLimits[resolvedKey];
+          return;
+        }
+
+        const parsedValue = Number(rawValue);
+        if (!Number.isFinite(parsedValue)) {
+          validationErrors.push(`custom_limits.${resolvedKey} must be a number, -1, or null.`);
+          return;
+        }
+        if (parsedValue < 0 && parsedValue !== -1) {
+          validationErrors.push(`custom_limits.${resolvedKey} must be non-negative, -1, or null.`);
+          return;
+        }
+
+        nextCustomLimits[resolvedKey] = parsedValue === -1 ? -1 : Math.floor(parsedValue);
+      });
+
+      Object.entries(incomingCustomFeatures).forEach(([rawKey, rawValue]) => {
+        const resolvedKey = normalizeFeatureOverrideKey(rawKey);
+        if (!resolvedKey) {
+          validationErrors.push(`custom_features.${rawKey} has an invalid key.`);
+          return;
+        }
+
+        if (rawValue === null || rawValue === undefined || rawValue === '') {
+          delete nextCustomFeatures[resolvedKey];
+          return;
+        }
+
+        if (typeof rawValue !== 'boolean') {
+          validationErrors.push(`custom_features.${resolvedKey} must be boolean or null.`);
+          return;
+        }
+
+        nextCustomFeatures[resolvedKey] = Boolean(rawValue);
+      });
+
+      if (validationErrors.length > 0) {
+        return res.status(400).json({
+          error: 'Invalid override payload',
+          details: validationErrors,
+        });
+      }
+
+      const limitKeysForValidation = Array.from(
+        new Set(
+          Object.entries(nextCustomLimits)
+            .filter(([, value]) => Number(value) >= 0)
+            .map(([key]) => key)
+        )
+      );
+      const limitUsageSnapshot = await resolveTenantLimitUsageSnapshot({
+        tenant: tenantObject,
+        limitKeys: limitKeysForValidation,
+      });
+
+      const usageValidationErrors = [];
+      limitKeysForValidation.forEach((key) => {
+        const overrideValue = Number(nextCustomLimits[key]);
+        const usageValue = toFiniteUsageNumber(limitUsageSnapshot[key]);
+        if (usageValue === null) return;
+        if (overrideValue < usageValue) {
+          usageValidationErrors.push(
+            `custom_limits.${key} must be greater than or equal to current usage (${usageValue}).`
+          );
+        }
+      });
+
+      if (usageValidationErrors.length > 0) {
+        return res.status(400).json({
+          error: 'Limit validation failed',
+          details: usageValidationErrors,
+        });
+      }
+
+      tenant.subscription = tenant.subscription || {};
+      tenant.subscription.customLimits = nextCustomLimits;
+      tenant.subscription.customFeatures = nextCustomFeatures;
+      tenant.subscription.updatedAt = new Date();
+
+      const currentPlanType = resolveSubscriptionPlanType(
+        tenant?.subscription?.planType || SUBSCRIPTION_PLAN_TYPES.FREE
+      );
+      if (currentPlanType === SUBSCRIPTION_PLAN_TYPES.LEGEND) {
+        const legendLimits = resolveLegendEffectiveLimits({
+          planType: currentPlanType,
+          tenant: tenant.toObject ? tenant.toObject() : tenant,
+          baseLimits: getSubscriptionPlanDefinition(currentPlanType)?.limits || {},
+        });
+        tenant.examLimit = legendLimits.maxExamsPerMonth;
+        tenant.attemptLimit = legendLimits.maxAttemptsPerMonth;
+        tenant.aiUsageLimit = legendLimits.maxAiQuestionsPerMonth;
+      }
+
+      await tenant.save();
+
+      await logAuditEvent(AUDIT_ACTIONS.TENANT_UPDATED, {
+        ...buildActorAuditDetails(req),
+        tenantId: tenant._id,
+        tenantName: tenant.name,
+        resourceType: 'Tenant',
+        resourceId: tenant._id,
+        details: {
+          type: 'TENANT_OVERRIDE_MANAGEMENT',
+          before: {
+            planType: assignedPlanType,
+            customLimits: previousCustomLimits,
+            customFeatures: previousCustomFeatures,
+          },
+          after: {
+            planType: assignedPlanType,
+            customLimits: nextCustomLimits,
+            customFeatures: nextCustomFeatures,
+          },
+        },
+      });
+
+      const tenantFeatures = await buildTenantFeaturePayload(tenant);
+      return res.json({ tenantFeatures });
     }
 
     const incomingMain = normalizeOptionalObject(req.body?.main);
@@ -1675,8 +3825,8 @@ router.put('/tenants/:tenantId/features', async (req, res, next) => {
       baseLimits: normalizeOptionalObject(planDefinition?.limits),
     });
 
-    const previousCustomLimits = normalizeOptionalObject(subscription.customLimits);
-    const previousCustomFeatures = normalizeOptionalObject(subscription.customFeatures);
+    const previousCustomLimits = extractActiveCustomLimitOverrides(subscription.customLimits);
+    const previousCustomFeatures = extractActiveCustomFeatureOverrides(subscription.customFeatures);
     const nextCustomLimits = { ...previousCustomLimits };
     const nextCustomFeatures = { ...previousCustomFeatures };
 
@@ -1783,7 +3933,7 @@ router.put('/tenants/:tenantId/features', async (req, res, next) => {
       },
     });
 
-    const tenantFeatures = buildTenantFeaturePayload(tenant);
+    const tenantFeatures = await buildTenantFeaturePayload(tenant);
     return res.json({ tenantFeatures });
   } catch (error) {
     return next(error);
@@ -1896,6 +4046,8 @@ router.get('/stats', async (req, res, next) => {
  * Optional query params:
  * - range: 24h | 7d | 30d | lifetime
  * - model: all | <configured model>
+ * - tenant_id: all | <tenantId>
+ * - tenantId: all | <tenantId> (alias)
  * - period: daily | monthly (legacy compatibility)
  * - startDate: YYYY-MM-DD or ISO date
  * - endDate: YYYY-MM-DD or ISO date
@@ -1914,9 +4066,28 @@ router.get('/ai-usage', async (req, res, next) => {
     const normalizeRange = (value) => String(value || '').trim().toLowerCase();
     const normalizePeriod = (value) => String(value || '').trim().toLowerCase();
     const normalizeModel = (value) => normalizeModelName(value);
+    const normalizeTenantFilter = (value) => {
+      const normalized = String(value || 'all').trim();
+      if (!normalized) return 'all';
+      if (normalized.toLowerCase() === 'all') return 'all';
+      return normalized;
+    };
     const normalizedRange = normalizeRange(range);
     const normalizedPeriod = normalizePeriod(period);
     const normalizedModel = normalizeModel(model);
+    const normalizedTenantFilter = normalizeTenantFilter(
+      req.query?.tenant_id || req.query?.tenantId || 'all'
+    );
+    const resolvedTenantIdFilter = normalizedTenantFilter || 'all';
+    if (resolvedTenantIdFilter !== 'all' && !isValidMongoId(resolvedTenantIdFilter)) {
+      return res.status(400).json({
+        error: 'tenant_id must be "all" or a valid tenant id.',
+      });
+    }
+    const tenantObjectIdFilter =
+      resolvedTenantIdFilter === 'all'
+        ? null
+        : new mongoose.Types.ObjectId(resolvedTenantIdFilter);
 
     const configuredModel = normalizeModelName(config.openaiModel) || 'gpt-4o-mini';
     const allowedModels = new Set([
@@ -2019,6 +4190,14 @@ router.get('/ai-usage', async (req, res, next) => {
 
     const buildUsageMatch = ({ start, end }) => {
       const match = buildCreatedAtMatch({ start, end });
+      if (tenantObjectIdFilter) {
+        match.$or = [
+          { tenant_id: tenantObjectIdFilter },
+          { tenant_id: resolvedTenantIdFilter },
+          { tenantId: tenantObjectIdFilter },
+          { tenantId: resolvedTenantIdFilter },
+        ];
+      }
       if (resolvedModel !== 'all') {
         match.$expr = {
           $eq: [
@@ -2216,6 +4395,9 @@ router.get('/ai-usage', async (req, res, next) => {
     startOfToday.setHours(0, 0, 0, 0);
     const startOfMonth = new Date(now.getFullYear(), now.getMonth(), 1);
 
+    const tenantLookupFilter =
+      tenantObjectIdFilter ? { _id: tenantObjectIdFilter } : {};
+
     const [selectedTotals, todayTotals, monthTotals, lifetimeTotals, trendDailyRaw, featureUsageRaw, modelUsageRaw, tenantUsageRaw, tenants] =
       await Promise.all([
         aggregateTokenTotals(selectedRangeMatch),
@@ -2315,7 +4497,10 @@ router.get('/ai-usage', async (req, res, next) => {
           },
           { $sort: { request_count: -1, total_tokens: -1 } },
         ]),
-        Tenant.find({}).select('_id name code').sort({ name: 1 }).lean(),
+        Tenant.find(tenantLookupFilter)
+          .select('_id name code subscription ai_usage_count ai_usage_limit')
+          .sort({ name: 1 })
+          .lean(),
       ]);
 
     const ensureCurrencyFields = (row) => ({
@@ -2323,6 +4508,103 @@ router.get('/ai-usage', async (req, res, next) => {
       total_cost_usd: Number(row?.total_cost_usd) || 0,
       total_cost_inr: usdToInr(row?.total_cost_usd),
     });
+
+    const parseOptionalLimit = (value) => {
+      if (value === null || value === undefined || value === '') return null;
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed) || parsed < 0) return null;
+      return Math.floor(parsed);
+    };
+
+    const parseOptionalBoolean = (value) => {
+      if (value === null || value === undefined) return null;
+      if (typeof value === 'boolean') return value;
+      if (typeof value === 'number') {
+        if (value === 1) return true;
+        if (value === 0) return false;
+        return null;
+      }
+      if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        if (normalized === 'true' || normalized === '1') return true;
+        if (normalized === 'false' || normalized === '0') return false;
+      }
+      return null;
+    };
+
+    const resolveTenantAiUsageSettings = (tenant = null) => {
+      if (!tenant || typeof tenant !== 'object') {
+        return {
+          enabled: true,
+          limit: null,
+          aiTypesAllowed: [],
+          message: null,
+        };
+      }
+
+      const subscription =
+        tenant.subscription && typeof tenant.subscription === 'object'
+          ? tenant.subscription
+          : {};
+      const customLimits =
+        subscription.customLimits &&
+        typeof subscription.customLimits === 'object' &&
+        !Array.isArray(subscription.customLimits)
+          ? subscription.customLimits
+          : {};
+      const customFeatures =
+        subscription.customFeatures &&
+        typeof subscription.customFeatures === 'object' &&
+        !Array.isArray(subscription.customFeatures)
+          ? subscription.customFeatures
+          : {};
+
+      const effectivePlanType = resolveEffectivePlanType(
+        subscription?.planType || SUBSCRIPTION_PLAN_TYPES.FREE,
+        resolveSubscriptionStatus(subscription)
+      );
+      const planDefinition = getSubscriptionPlanDefinition(effectivePlanType);
+      const planAiSettings = buildPlanAiSettings(planDefinition);
+      const customAiEnabled = parseOptionalBoolean(
+        customFeatures.aiGrading ?? customFeatures.ai_enabled ?? customFeatures.aiEnabled
+      );
+      const aiEnabled =
+        typeof customAiEnabled === 'boolean'
+          ? customAiEnabled
+          : planAiSettings.ai_enabled === true;
+
+      let limit = null;
+      if (Object.prototype.hasOwnProperty.call(customLimits, 'maxAiGradingsPerMonth')) {
+        const customValue = customLimits.maxAiGradingsPerMonth;
+        if (customValue !== null && customValue !== undefined && customValue !== '') {
+          limit = Number(customValue) === -1 ? null : parseOptionalLimit(customValue);
+        } else {
+          limit = resolveAiUsageLimitFromPlanDefinition(planDefinition);
+        }
+      } else if (Object.prototype.hasOwnProperty.call(customLimits, 'maxAiQuestionsPerMonth')) {
+        const legacyCustomValue = customLimits.maxAiQuestionsPerMonth;
+        if (
+          legacyCustomValue !== null &&
+          legacyCustomValue !== undefined &&
+          legacyCustomValue !== ''
+        ) {
+          limit = Number(legacyCustomValue) === -1 ? null : parseOptionalLimit(legacyCustomValue);
+        } else {
+          limit = resolveAiUsageLimitFromPlanDefinition(planDefinition);
+        }
+      } else {
+        limit = resolveAiUsageLimitFromPlanDefinition(planDefinition);
+      }
+
+      return {
+        enabled: aiEnabled,
+        limit: aiEnabled ? limit : 0,
+        aiTypesAllowed: Array.isArray(planAiSettings.ai_types_allowed)
+          ? planAiSettings.ai_types_allowed
+          : [],
+        message: aiEnabled ? null : AI_NOT_AVAILABLE_IN_PLAN_MESSAGE,
+      };
+    };
 
     const trendMap = new Map(
       (Array.isArray(trendDailyRaw) ? trendDailyRaw : []).map((row) => [
@@ -2512,6 +4794,36 @@ router.get('/ai-usage', async (req, res, next) => {
       );
     });
 
+    const selectedTenant =
+      resolvedTenantIdFilter === 'all'
+        ? null
+        : Array.isArray(tenants) && tenants.length > 0
+          ? tenants[0]
+          : null;
+    const selectedUsageSettings = resolveTenantAiUsageSettings(selectedTenant);
+    const selectedUsageUsed = selectedUsageSettings.enabled
+      ? Number(selectedTotals.request_count) || 0
+      : 0;
+    const selectedUsageLimit = selectedUsageSettings.enabled
+      ? selectedUsageSettings.limit
+      : 0;
+    const selectedUsageRemaining =
+      selectedUsageLimit === null
+        ? null
+        : Math.max((Number(selectedUsageLimit) || 0) - selectedUsageUsed, 0);
+    const normalizeFeatureType = (value) =>
+      String(value || 'unknown')
+        .trim()
+        .replace(/[\s-]+/g, '_')
+        .replace(/[^A-Za-z0-9_]/g, '_')
+        .replace(/_+/g, '_')
+        .toUpperCase();
+    const featureTypeCounts = usageByFeature.map((entry) => ({
+      type: normalizeFeatureType(entry?.feature),
+      count: Number(entry?.request_count) || 0,
+      percentage: Math.max(0, Math.min(Number(entry?.percentage) || 0, 100)),
+    }));
+
     const metrics = {
       tokens_today: Number(todayTotals.total_tokens) || 0,
       tokens_this_month: Number(monthTotals.total_tokens) || 0,
@@ -2538,6 +4850,18 @@ router.get('/ai-usage', async (req, res, next) => {
     });
 
     res.json({
+      tenant_id:
+        resolvedTenantIdFilter === 'all' ? null : String(resolvedTenantIdFilter),
+      usage: {
+        used: selectedUsageUsed,
+        limit: selectedUsageLimit === null ? 'Unlimited' : selectedUsageLimit,
+        remaining:
+          selectedUsageLimit === null ? 'Unlimited' : selectedUsageRemaining,
+        enabled: selectedUsageSettings.enabled,
+        message: selectedUsageSettings.message || null,
+        ai_types_allowed: selectedUsageSettings.aiTypesAllowed || [],
+      },
+      features: featureTypeCounts,
       metrics,
       trend_daily: trendDaily,
       usage_by_feature: usageByFeature,
@@ -2548,6 +4872,8 @@ router.get('/ai-usage', async (req, res, next) => {
       filters: {
         range: resolvedRange,
         model: resolvedModel,
+        tenant_id: resolvedTenantIdFilter,
+        tenantId: resolvedTenantIdFilter,
         period: normalizedPeriod || null,
         startDate: rangeStart ? rangeStart.toISOString() : null,
         endDate: rangeEnd ? rangeEnd.toISOString() : null,
@@ -2681,8 +5007,16 @@ router.get('/backups', async (req, res, next) => {
       page: req.query?.page,
       limit: req.query?.limit,
       type: req.query?.type,
-      companyId: req.query?.companyId,
+      companyId:
+        req.query?.companyId ||
+        req.query?.company_id ||
+        req.query?.tenantId ||
+        req.query?.tenant_id,
       status: req.query?.status,
+      triggerType: req.query?.trigger_type || req.query?.backup_type,
+      startDate: req.query?.startDate || req.query?.fromDate,
+      endDate: req.query?.endDate || req.query?.toDate,
+      search: req.query?.search || req.query?.q,
     });
 
     res.json({
@@ -3004,11 +5338,11 @@ router.post(
     body('status')
       .optional()
       .isIn(SUBSCRIPTION_STATUS_VALUES)
-      .withMessage('status must be one of ACTIVE, EXPIRED, or SUSPENDED'),
+      .withMessage('status must be one of ACTIVE, EXPIRED, SUSPENDED, or CANCELLED'),
     body('subscriptionStatus')
       .optional()
       .isIn(SUBSCRIPTION_STATUS_VALUES)
-      .withMessage('subscriptionStatus must be one of ACTIVE, EXPIRED, or SUSPENDED'),
+      .withMessage('subscriptionStatus must be one of ACTIVE, EXPIRED, SUSPENDED, or CANCELLED'),
   ],
   async (req, res, next) => {
     try {

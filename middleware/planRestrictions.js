@@ -27,14 +27,24 @@ const normalizeUpper = (value) => normalizeString(value).toUpperCase();
 
 const FREE_PLAN_ALLOWED_STORAGE_TYPES = new Set([
   'MULTIPLE_CHOICE',
+  'MULTIPLE_OPTIONS',
   'TRUE_FALSE',
   'SHORT_ANSWER',
 ]);
 
-const FREE_PLAN_BLOCKED_FORMATS = new Set(['PARAGRAPH', 'SCENARIO', 'CODING']);
+const FREE_PLAN_WRITING_TYPES = new Set(['ESSAY', 'ESSAY_LETTER', 'ESSAY_STORY']);
+const FREE_PLAN_BLOCKED_FORMATS = new Set([
+  'PARAGRAPH',
+  'SCENARIO',
+  'ESSAY',
+  'ESSAY_LETTER',
+  'ESSAY_STORY',
+  'CODING',
+]);
 
 export const sendPlanRestriction = (res, message, extra = {}) =>
   res.status(403).json({
+    success: false,
     message,
     showUpgradeModal: true,
     redirectTo: PLAN_LIMIT_REDIRECT,
@@ -188,6 +198,18 @@ export const validateFreePlanQuestionPayload = (payload = {}) => {
   const normalizedFormat = normalizeQuestionFormat(payload);
   const explicitType = normalizeUpper(payload.questionType);
   const explicitFormat = normalizeUpper(payload.questionFormat || payload.question_type);
+  const explicitEssayType =
+    explicitType === 'LETTER_WRITING'
+      ? 'ESSAY_LETTER'
+      : explicitType === 'STORY_WRITING'
+        ? 'ESSAY_STORY'
+        : explicitType;
+  const explicitEssayFormat =
+    explicitFormat === 'LETTER_WRITING'
+      ? 'ESSAY_LETTER'
+      : explicitFormat === 'STORY_WRITING'
+        ? 'ESSAY_STORY'
+        : explicitFormat;
   const hasCoding =
     normalizedType === 'CODING' ||
     normalizedFormat === 'CODING' ||
@@ -197,6 +219,16 @@ export const validateFreePlanQuestionPayload = (payload = {}) => {
 
   if (hasCoding) {
     return FREE_PLAN_MESSAGES.CODING_LOCKED;
+  }
+
+  const hasWritingType =
+    FREE_PLAN_WRITING_TYPES.has(normalizedType) ||
+    FREE_PLAN_WRITING_TYPES.has(normalizedFormat) ||
+    FREE_PLAN_WRITING_TYPES.has(explicitEssayType) ||
+    FREE_PLAN_WRITING_TYPES.has(explicitEssayFormat);
+
+  if (hasWritingType) {
+    return FREE_PLAN_MESSAGES.WRITING_AI_LOCKED;
   }
 
   const isAllowedType = FREE_PLAN_ALLOWED_STORAGE_TYPES.has(normalizedType);

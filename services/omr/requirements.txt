@@ -3,3 +3,4 @@ numpy
 imutils
 pdf2image
 PyMuPDF
+pytesseract

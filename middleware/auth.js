@@ -4,12 +4,19 @@ import User from '../models/User.js';
 import Tenant from '../models/Tenant.js';
 import {
   SUBSCRIPTION_STATUSES,
+  SUBSCRIPTION_STATUS_MESSAGES,
   resolveSubscriptionStatus,
   resolveEffectivePlanType,
   resolveSubscriptionPlanType,
+  isReadOnlyHttpMethod,
 } from '../config/planLimits.js';
 import { isBlacklisted } from '../utils/tokenBlacklist.js';
 import { auditUnauthorized } from './audit.js';
+
+const ALLOW_SUSPENDED_READ_ONLY =
+  String(process.env.ALLOW_SUSPENDED_READ_ONLY || '')
+    .trim()
+    .toLowerCase() === 'true';
 
 export const requireAuth = async (req, res, next) => {
   try {
@@ -104,20 +111,44 @@ export const requireAuth = async (req, res, next) => {
           }
 
           if (subscriptionStatus === SUBSCRIPTION_STATUSES.SUSPENDED) {
+            const readOnlyRequest = isReadOnlyHttpMethod(req.method);
+            const canProceed = ALLOW_SUSPENDED_READ_ONLY && readOnlyRequest;
+            if (!canProceed) {
+              return res.status(403).json({
+                success: false,
+                error: SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.SUSPENDED],
+                message: SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.SUSPENDED],
+                subscriptionStatus,
+              });
+            }
+            subscriptionWarning = SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.SUSPENDED];
+          }
+
+          if (subscriptionStatus === SUBSCRIPTION_STATUSES.CANCELLED) {
             return res.status(403).json({
-              error:
-                'Tenant subscription is suspended. Contact Super Admin to reactivate access.',
+              success: false,
+              error: SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.CANCELLED],
+              message: SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.CANCELLED],
               subscriptionStatus,
             });
           }
 
           if (subscriptionStatus === SUBSCRIPTION_STATUSES.EXPIRED) {
-            subscriptionWarning =
-              'Subscription expired. Access is restricted under free-plan limits until renewal.';
-            res.setHeader('x-subscription-status', subscriptionStatus);
+            const readOnlyRequest = isReadOnlyHttpMethod(req.method);
+            if (!readOnlyRequest) {
+              return res.status(403).json({
+                success: false,
+                error: SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.EXPIRED],
+                message: SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.EXPIRED],
+                subscriptionStatus,
+              });
+            }
+            subscriptionWarning = SUBSCRIPTION_STATUS_MESSAGES[SUBSCRIPTION_STATUSES.EXPIRED];
+          }
+
+          res.setHeader('x-subscription-status', subscriptionStatus);
+          if (subscriptionWarning) {
             res.setHeader('x-subscription-warning', subscriptionWarning);
-          } else {
-            res.setHeader('x-subscription-status', subscriptionStatus);
           }
         } catch (error) {
           // Fall back to user planType if tenant lookup fails
