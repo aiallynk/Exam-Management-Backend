@@ -160,6 +160,21 @@ const toFormattedBackupRecord = (record) => {
 
 const isValidMongoId = (value) => /^[a-fA-F0-9]{24}$/.test(String(value || ''));
 
+const normalizeTenantLifecycleStatus = (value) =>
+  String(value || '')
+    .trim()
+    .toUpperCase();
+
+const normalizeTenantTokenVersion = (value) => {
+  const parsed = Number.parseInt(String(value ?? ''), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) return 0;
+  return parsed;
+};
+
+const shouldIncrementTenantTokenVersionForInactivation = (previousStatus, nextStatus) =>
+  normalizeTenantLifecycleStatus(previousStatus) !== 'INACTIVE' &&
+  normalizeTenantLifecycleStatus(nextStatus) === 'INACTIVE';
+
 const buildActorAuditDetails = (req) => ({
   userId: req.user?._id || null,
   userEmail: req.user?.email || null,
@@ -5572,6 +5587,73 @@ router.get('/tenants/:tenantId', async (req, res, next) => {
   }
 });
 
+// Update tenant active/inactive status with session invalidation support
+router.put(
+  '/tenant/:tenantId/status',
+  [
+    body('status')
+      .trim()
+      .isIn(['ACTIVE', 'INACTIVE'])
+      .withMessage('status must be ACTIVE or INACTIVE'),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
+      const tenant = await Tenant.findById(req.params.tenantId);
+      if (!tenant) {
+        return res.status(404).json({ error: 'Tenant not found' });
+      }
+
+      const nextStatus = normalizeTenantLifecycleStatus(req.body?.status);
+      const previousStatus = normalizeTenantLifecycleStatus(tenant.status);
+      const previousTokenVersion = normalizeTenantTokenVersion(tenant.tokenVersion);
+      const shouldInvalidateSessions = shouldIncrementTenantTokenVersionForInactivation(
+        previousStatus,
+        nextStatus
+      );
+
+      tenant.status = nextStatus;
+      if (shouldInvalidateSessions) {
+        tenant.tokenVersion = previousTokenVersion + 1;
+      }
+
+      await tenant.save();
+      await tenant.populate('createdBy', 'name email');
+
+      await logAuditEvent(AUDIT_ACTIONS.TENANT_UPDATED, {
+        ...buildActorAuditDetails(req),
+        tenantId: tenant._id,
+        tenantName: tenant.name,
+        resourceType: 'Tenant',
+        resourceId: tenant._id,
+        details: {
+          updatedFields: ['status', ...(shouldInvalidateSessions ? ['tokenVersion'] : [])],
+          tenantName: tenant.name,
+          tenantCode: tenant.code,
+          beforeStatus: previousStatus,
+          afterStatus: tenant.status,
+          beforeTokenVersion: previousTokenVersion,
+          afterTokenVersion: normalizeTenantTokenVersion(tenant.tokenVersion),
+          sessionsInvalidated: shouldInvalidateSessions,
+        },
+      });
+
+      res.json({
+        message: shouldInvalidateSessions
+          ? 'Tenant set to INACTIVE and active sessions invalidated successfully.'
+          : 'Tenant status updated successfully.',
+        tenant,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 // Update tenant
 router.put(
   '/tenants/:tenantId',
@@ -5641,6 +5723,7 @@ router.put(
         contactPhone: tenant.contactPhone,
         address: tenant.address,
         status: tenant.status,
+        tokenVersion: normalizeTenantTokenVersion(tenant.tokenVersion),
         examLimit: tenant.examLimit,
         attemptLimit: tenant.attemptLimit,
         aiUsageLimit: tenant.aiUsageLimit,
@@ -5677,7 +5760,13 @@ router.put(
       if (contactEmail) tenant.contactEmail = contactEmail;
       if (contactPhone !== undefined) tenant.contactPhone = contactPhone;
       if (address !== undefined) tenant.address = address;
-      if (status) tenant.status = status;
+      if (status) {
+        const nextStatus = normalizeTenantLifecycleStatus(status);
+        tenant.status = nextStatus;
+        if (shouldIncrementTenantTokenVersionForInactivation(beforeState.status, nextStatus)) {
+          tenant.tokenVersion = normalizeTenantTokenVersion(tenant.tokenVersion) + 1;
+        }
+      }
       if (examLimit !== undefined) tenant.examLimit = parseOptionalLimitValue(examLimit);
       if (attemptLimit !== undefined) tenant.attemptLimit = parseOptionalLimitValue(attemptLimit);
       if (aiUsageLimit !== undefined) tenant.aiUsageLimit = parseOptionalLimitValue(aiUsageLimit);
@@ -5741,6 +5830,7 @@ router.put(
         contactPhone: tenant.contactPhone,
         address: tenant.address,
         status: tenant.status,
+        tokenVersion: normalizeTenantTokenVersion(tenant.tokenVersion),
         examLimit: tenant.examLimit,
         attemptLimit: tenant.attemptLimit,
         aiUsageLimit: tenant.aiUsageLimit,
@@ -5765,6 +5855,8 @@ router.put(
           tenantCode: tenant.code,
           beforeStatus: beforeState.status,
           afterStatus: tenant.status,
+          beforeTokenVersion: beforeState.tokenVersion,
+          afterTokenVersion: normalizeTenantTokenVersion(tenant.tokenVersion),
         },
       });
 
@@ -5799,7 +5891,11 @@ router.delete('/tenants/:tenantId', async (req, res, next) => {
     }
 
     const beforeStatus = tenant.status;
+    const beforeTokenVersion = normalizeTenantTokenVersion(tenant.tokenVersion);
     tenant.status = 'INACTIVE';
+    if (shouldIncrementTenantTokenVersionForInactivation(beforeStatus, tenant.status)) {
+      tenant.tokenVersion = beforeTokenVersion + 1;
+    }
     await tenant.save();
 
     await logAuditEvent(AUDIT_ACTIONS.TENANT_DEACTIVATED, {
@@ -5813,6 +5909,8 @@ router.delete('/tenants/:tenantId', async (req, res, next) => {
         tenantCode: tenant.code,
         beforeStatus,
         afterStatus: tenant.status,
+        beforeTokenVersion,
+        afterTokenVersion: normalizeTenantTokenVersion(tenant.tokenVersion),
       },
     });
 

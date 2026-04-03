@@ -6,6 +6,11 @@ export const parseCSV = (csvContent) => {
       columns: true,
       skip_empty_lines: true,
       trim: true,
+      bom: true,
+      relax_column_count: true,
+      relax_quotes: true,
+      skip_records_with_error: true,
+      delimiter: [',', ';', '\t', '|'],
     });
     return records;
   } catch (error) {

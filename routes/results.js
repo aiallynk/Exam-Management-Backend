@@ -17,6 +17,33 @@ const isResultsReleased = (exam) => {
   return new Date(exam.resultsReleasedAt) <= new Date();
 };
 
+const toNonNegativeInt = (value, fallback = 0) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
+};
+
+const resolveExamStatusFromViolationCount = (violationCount, requestedStatus = '') => {
+  const normalizedRequested = String(requestedStatus || '').trim().toUpperCase();
+  if (normalizedRequested === 'FAIR' || normalizedRequested === 'SUSPICIOUS' || normalizedRequested === 'CHEATING') {
+    return normalizedRequested;
+  }
+  if (violationCount <= 0) return 'FAIR';
+  if (violationCount <= 2) return 'SUSPICIOUS';
+  return 'CHEATING';
+};
+
+const buildIntegritySummary = (attempt) => {
+  const violationDetails = Array.isArray(attempt?.violationLogs) ? attempt.violationLogs : [];
+  const countFromField = toNonNegativeInt(attempt?.violationCount, violationDetails.length);
+  const totalViolations = Math.max(countFromField, violationDetails.length);
+  return {
+    totalViolations,
+    violationDetails,
+    examStatus: resolveExamStatusFromViolationCount(totalViolations, attempt?.examStatus || ''),
+  };
+};
+
 router.get(
   '/leaderboard/:examId',
   requireAuth,
@@ -255,6 +282,7 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
             ? Math.round((section.totalScore / section.maxScore) * 100)
             : 0;
         });
+        const integrity = buildIntegritySummary(attempt);
 
         return {
           attempt,
@@ -272,6 +300,10 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
           progressPercentage: totalQuestions > 0
             ? Math.round((attemptedQuestions / totalQuestions) * 100)
             : 0,
+          totalViolations: integrity.totalViolations,
+          violationDetails: integrity.violationDetails,
+          examStatus: integrity.examStatus,
+          integrity,
         };
       })
     );

@@ -110,12 +110,38 @@ export const extractCodingFields = (payload = {}) => {
   const source = payload?.codingFields && typeof payload.codingFields === 'object'
     ? payload.codingFields
     : {};
+  const primaryLanguage = normalizeCodingLanguage(payload.language ?? source.language);
   const languages = normalizeCodingLanguages(payload.languages ?? source.languages);
+  const resolvedLanguages =
+    languages.length > 0
+      ? languages
+      : primaryLanguage
+        ? [primaryLanguage]
+        : [];
   const starterCode = normalizeCodingStarterCode(
     payload.starterCode ?? source.starterCode,
-    languages
+    resolvedLanguages
   );
   const testCases = normalizeCodingTestCases(payload.testCases ?? source.testCases);
+  const normalizedSampleInput = normalizeString(
+    payload.sample_input ?? payload.sampleInput ?? source.sample_input ?? source.sampleInput
+  );
+  const normalizedSampleOutput = normalizeString(
+    payload.sample_output ?? payload.sampleOutput ?? source.sample_output ?? source.sampleOutput
+  );
+  const resolvedTestCases =
+    testCases.length > 0
+      ? testCases
+      : normalizedSampleInput || normalizedSampleOutput
+        ? [
+            {
+              input: normalizedSampleInput,
+              expectedOutput: normalizedSampleOutput,
+              hidden: false,
+              isSample: true,
+            },
+          ]
+        : [];
   const timeLimitCandidate = Number(payload.timeLimit ?? source.timeLimit);
   const timeLimit = Number.isFinite(timeLimitCandidate) && timeLimitCandidate > 0
     ? Math.floor(timeLimitCandidate)
@@ -128,9 +154,9 @@ export const extractCodingFields = (payload = {}) => {
   return {
     difficulty: normalizeCodingDifficulty(payload.difficulty ?? source.difficulty),
     category: normalizeCodingCategory(payload.category ?? source.category),
-    languages,
+    languages: resolvedLanguages,
     starterCode,
-    testCases,
+    testCases: resolvedTestCases,
     timeLimit,
     memoryLimit,
   };
@@ -155,7 +181,7 @@ export const hasCodingConfiguration = (payload = {}) => {
     payload.questionType || payload.questionFormat || payload.question_type || payload.type
   ).toUpperCase();
 
-  if (normalizedType === 'CODING') {
+  if (normalizedType === 'CODING' || normalizedType === 'CODE') {
     return true;
   }
 
@@ -163,6 +189,15 @@ export const hasCodingConfiguration = (payload = {}) => {
   const source = payload?.codingFields && typeof payload.codingFields === 'object'
     ? payload.codingFields
     : {};
+  const normalizedSimpleLanguage = normalizeCodingLanguage(payload.language ?? source.language);
+  const hasSimpleSampleCase = Boolean(
+    normalizeString(
+      payload.sample_input ?? payload.sampleInput ?? source.sample_input ?? source.sampleInput
+    ) ||
+      normalizeString(
+        payload.sample_output ?? payload.sampleOutput ?? source.sample_output ?? source.sampleOutput
+      )
+  );
   const hasExplicitTimeLimit = payload.timeLimit !== undefined || source.timeLimit !== undefined;
   const hasExplicitMemoryLimit = payload.memoryLimit !== undefined || source.memoryLimit !== undefined;
   const hasMeaningfulStarterCode = Object.values(codingFields.starterCode || {}).some(
@@ -180,8 +215,10 @@ export const hasCodingConfiguration = (payload = {}) => {
 
   return Boolean(
     codingFields.languages.length ||
+      normalizedSimpleLanguage ||
       hasMeaningfulStarterCode ||
       codingFields.testCases.length ||
+      hasSimpleSampleCase ||
       hasMeaningfulResourceLimits
   );
 };

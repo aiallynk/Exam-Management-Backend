@@ -870,13 +870,19 @@ const loadZipEntries = async (fileBuffer, predicate = () => true) => {
 const parseCsvRows = (fileBuffer) => {
   const text = fileBuffer.toString('utf-8');
   let rows = [];
+  const csvOptions = {
+    columns: true,
+    skip_empty_lines: true,
+    trim: true,
+    bom: true,
+    relax_column_count: true,
+    relax_quotes: true,
+    skip_records_with_error: true,
+    delimiter: [',', ';', '\t', '|'],
+  };
 
   try {
-    rows = parseCsv(text, {
-      columns: true,
-      skip_empty_lines: true,
-      trim: true,
-    });
+    rows = parseCsv(text, csvOptions);
   } catch (error) {
     let rawRows = [];
     try {
@@ -884,6 +890,11 @@ const parseCsvRows = (fileBuffer) => {
         columns: false,
         skip_empty_lines: true,
         trim: true,
+        bom: true,
+        relax_column_count: true,
+        relax_quotes: true,
+        skip_records_with_error: true,
+        delimiter: [',', ';', '\t', '|'],
       });
     } catch (fallbackError) {
       const parseError = new Error('Unable to parse CSV file. Please verify delimiters/encoding and try again.');

@@ -3,6 +3,7 @@ import cors from 'cors';
 import helmet from 'helmet';
 import compression from 'compression';
 import path from 'path';
+import os from 'os';
 import { fileURLToPath } from 'url';
 import config from './config/env.js';
 import { connect } from './utils/db.js';
@@ -36,6 +37,7 @@ import analyticsRoutes from './routes/analytics.js';
 import auditLogRoutes from './routes/auditLogs.js';
 import proctoringRoutes from './routes/proctoring.js';
 import examPackageRoutes from './routes/examPackages.js';
+import examPackageStatusRoutes from './routes/examPackageStatus.js';
 import omrRoutes from './routes/omr.js';
 import compilerRoutes from './routes/compiler.js';
 import notificationRoutes from './routes/notifications.js';
@@ -43,12 +45,36 @@ import systemAlertRoutes from './routes/systemAlerts.js';
 import publicRoutes from './routes/public.js';
 import { startSubscriptionExpiryScheduler } from './services/subscriptionLifecycleService.js';
 import { startAutoTenantBackupScheduler } from './services/autoBackupSchedulerService.js';
+import { startIncrementalBackupScheduler } from './services/incrementalBackupSchedulerService.js';
+import { queueExistingExamPackageBackfillOnStartup } from './services/examPackageRegenerationService.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
 app.set('trust proxy', 1);
+
+const resolveLanIp = () => {
+  const interfaces = os.networkInterfaces();
+  for (const entries of Object.values(interfaces)) {
+    if (!entries) continue;
+    for (const entry of entries) {
+      if (entry.family === 'IPv4' && !entry.internal) {
+        return entry.address;
+      }
+    }
+  }
+  return null;
+};
+
+// Fast liveness endpoint for connectivity checks (no DB dependency).
+app.get('/ping', (_req, res) => {
+  res.status(200).json({
+    status: 'ok',
+    message: 'pong',
+    timestamp: new Date().toISOString(),
+  });
+});
 
 // Middleware
 // Compression middleware - compress responses for better performance
@@ -157,13 +183,21 @@ app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 app.use(requestTimeout(30000)); // 30 second timeout for all requests
 app.use(requestContextMiddleware);
+app.use((req, _res, next) => {
+  if (config.nodeEnv !== 'production') {
+    console.log(`[REQ] ${new Date().toISOString()} ${req.method} ${req.originalUrl}`);
+  }
+  next();
+});
 app.use(requestLogger);
 
-// Apply CSRF protection to API routes (state-changing requests)
-app.use('/api', csrfProtection);
+const API_BASE_PATHS = ['/api', '/api/v1'];
 
-// Apply general API rate limiting to all /api routes
-app.use('/api', apiRateLimiter);
+// Apply shared middleware to all supported API versions.
+API_BASE_PATHS.forEach((basePath) => {
+  app.use(basePath, csrfProtection);
+  app.use(basePath, apiRateLimiter);
+});
 
 const uploadsPath = path.isAbsolute(config.uploadDir)
   ? config.uploadDir
@@ -215,45 +249,59 @@ app.get('/health', async (req, res) => {
   }
 });
 
-// API Routes with specific rate limiting
-// Auth routes - strict rate limiting to prevent brute force
-app.use('/api/auth', authRateLimiter, authRoutes);
-app.use('/api/public', publicRoutes);
+const registerApiRoutes = (basePath) => {
+  // API Routes with specific rate limiting
+  // Auth routes - strict rate limiting to prevent brute force
+  app.use(`${basePath}/auth`, authRateLimiter, authRoutes);
+  app.use(`${basePath}/public`, publicRoutes);
 
-// Upload routes - strict rate limiting to prevent storage abuse
-app.use('/api/upload', uploadRateLimiter, uploadRoutes);
+  // Upload routes - strict rate limiting to prevent storage abuse
+  app.use(`${basePath}/upload`, uploadRateLimiter, uploadRoutes);
 
-// Other API routes (already have general apiRateLimiter applied above)
-// Note: AI-specific rate limiting is applied within aiRoutes
-// AI routes - available at both /api/ai and /api/exams for backward compatibility
-app.use('/api/ai', aiRoutes);
-// Exams routes - no rate limiting (skipped in apiRateLimiter)
-app.use('/api/exams', examRoutes);
-app.use('/api/exams', questionRoutes);
-app.use('/api/exams', questionPaperRoutes);
-app.use('/api/exams', aiRoutes); // Keep AI routes at /api/exams for backward compatibility
-app.use('/api/exam-sessions', sessionRoutes);
-app.use('/api/exam-attempts', attemptRoutes);
-app.use('/api/results', resultRoutes);
-app.use('/api/candidates', candidateRoutes); // Universal: renamed from /api/student to /api/candidates
-app.use('/api/admin/system', systemBackupRoutes);
-app.use('/api/admin', systemBackupRoutes);
-app.use('/api/admin', adminRoutes);
-app.use('/api/super-admin', superAdminRoutes);
-app.use('/api/super-admin/system-alerts', systemAlertRoutes);
-app.use('/api/tenant-admin', tenantAdminRoutes);
-app.use('/api/languages', languageRoutes);
-app.use('/api/sections', sectionRoutes);
-app.use('/api/normalization', normalizationRoutes);
-app.use('/api/answer-keys', answerKeyRoutes);
-app.use('/api/analytics', analyticsRoutes);
-app.use('/api/audit-logs', auditLogRoutes);
-app.use('/api/proctoring', proctoringRoutes);
-app.use('/api/exam-packages', examPackageRoutes);
-app.use('/api/omr', omrRoutes);
-app.use('/api/compiler', compilerRoutes);
-app.use('/api/code', compilerRoutes);
-app.use('/api/notifications', notificationRoutes);
+  // Other API routes (already have general apiRateLimiter applied above)
+  // Note: AI-specific rate limiting is applied within aiRoutes
+  // AI routes - available at both /api/ai and /api/exams for backward compatibility
+  app.use(`${basePath}/ai`, aiRoutes);
+  // Exams routes - no rate limiting (skipped in apiRateLimiter)
+  app.use(`${basePath}/exams`, examRoutes);
+  app.use(`${basePath}/exams`, questionRoutes);
+  app.use(`${basePath}/exams`, questionPaperRoutes);
+  app.use(`${basePath}/exams`, aiRoutes); // Keep AI routes at /api/exams for backward compatibility
+  app.use(`${basePath}/exam-sessions`, sessionRoutes);
+  app.use(`${basePath}/exam-attempts`, attemptRoutes);
+  app.use(`${basePath}/results`, resultRoutes);
+  app.use(`${basePath}/candidates`, candidateRoutes); // Universal: renamed from /api/student to /api/candidates
+  app.use(`${basePath}/admin/system`, systemBackupRoutes);
+  app.use(`${basePath}/admin`, systemBackupRoutes);
+  app.use(`${basePath}/admin`, adminRoutes);
+  app.use(`${basePath}/super-admin`, superAdminRoutes);
+  app.use(`${basePath}/super-admin/system-alerts`, systemAlertRoutes);
+  app.use(`${basePath}/tenant-admin`, tenantAdminRoutes);
+  app.use(`${basePath}/languages`, languageRoutes);
+  app.use(`${basePath}/sections`, sectionRoutes);
+  app.use(`${basePath}/normalization`, normalizationRoutes);
+  app.use(`${basePath}/answer-keys`, answerKeyRoutes);
+  app.use(`${basePath}/analytics`, analyticsRoutes);
+  app.use(`${basePath}/audit-logs`, auditLogRoutes);
+  app.use(`${basePath}/proctoring`, proctoringRoutes);
+  app.use(`${basePath}/exam-packages`, examPackageRoutes);
+  app.use(`${basePath}/exam`, examPackageStatusRoutes);
+  app.use(`${basePath}/omr`, omrRoutes);
+  app.use(`${basePath}/compiler`, compilerRoutes);
+  app.use(`${basePath}/code`, compilerRoutes);
+  app.use(`${basePath}/notifications`, notificationRoutes);
+};
+
+API_BASE_PATHS.forEach(registerApiRoutes);
+API_BASE_PATHS.forEach((basePath) => {
+  app.get(`${basePath}/ping`, (_req, res) => {
+    res.status(200).json({
+      status: 'ok',
+      message: 'pong',
+      timestamp: new Date().toISOString(),
+    });
+  });
+});
 
 // Error handling
 app.use(notFound);
@@ -261,7 +309,20 @@ app.use(errorHandler);
 
 const startHttpServer = () =>
   new Promise((resolve, reject) => {
-    const server = app.listen(config.port, () => {
+    const configuredHost = String(config.host || '').trim().toLowerCase();
+    const isLoopbackHost =
+      configuredHost === 'localhost' ||
+      configuredHost === '127.0.0.1' ||
+      configuredHost === '::1';
+    const listenHost = isLoopbackHost ? '0.0.0.0' : config.host;
+
+    if (isLoopbackHost) {
+      console.warn(
+        `[SERVER] HOST="${config.host}" binds loopback only. Overriding to "${listenHost}" for device accessibility.`,
+      );
+    }
+
+    const server = app.listen(config.port, listenHost, () => {
       resolve(server);
     });
     server.once('error', reject);
@@ -272,8 +333,14 @@ const startServer = async () => {
   try {
     await connect();
     await startHttpServer();
+    queueExistingExamPackageBackfillOnStartup();
     startSubscriptionExpiryScheduler();
     startAutoTenantBackupScheduler();
+    startIncrementalBackupScheduler();
+    const lanIp = resolveLanIp();
+    console.log(`LAN URL: http://${lanIp || '127.0.0.1'}:${config.port}`);
+    console.log(`Bound host: ${config.host}`);
+    console.log(`Preferred mobile URL: http://${lanIp || 'YOUR_LAN_IP'}:${config.port}/api`);
     console.log(`🚀 Server running on http://localhost:${config.port}`);
     console.log(`📊 Environment: ${config.nodeEnv}`);
   } catch (error) {

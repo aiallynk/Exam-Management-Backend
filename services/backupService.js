@@ -125,14 +125,20 @@ const createDateTimeStamp = (date = new Date()) => {
 const createMinuteStamp = (date = new Date()) =>
   createDateTimeStamp(date).split('_').slice(0, 5).join('_');
 
-const createBackupFilename = ({ scope, historyType, companyName }) => {
+const createTenantBackupFilename = (companyId) => {
+  const tenantId = String(companyId || '')
+    .trim()
+    .replace(/[^a-zA-Z0-9_-]/g, '');
+  return `tenant_${tenantId || 'unknown'}_backup.zip`;
+};
+
+const createBackupFilename = ({ scope, historyType, companyName, companyId }) => {
   if (historyType === 'pre_restore') {
     return `pre_restore_backup_${createDateTimeStamp()}.zip`;
   }
 
   if (historyType === 'tenant') {
-    const safeName = sanitizeForFilename(companyName);
-    return `${safeName}_${createMinuteStamp()}.zip`;
+    return createTenantBackupFilename(companyId);
   }
 
   if (scope === 'full_system') {
@@ -285,6 +291,128 @@ const importCollectionFromJsonl = async ({ db, collectionName, inputPath }) => {
 
   await flushBatch();
   return importedCount;
+};
+
+const countJsonlRecords = async (inputPath) => {
+  if (!(await fileExists(inputPath))) return 0;
+
+  const stream = fsSync.createReadStream(inputPath, { encoding: 'utf8' });
+  const reader = readline.createInterface({
+    input: stream,
+    crlfDelay: Infinity,
+  });
+
+  let count = 0;
+  for await (const line of reader) {
+    if (line.trim()) {
+      count += 1;
+    }
+  }
+  return count;
+};
+
+const readJsonlIntoMapById = async ({
+  inputPath,
+  map,
+  existingCount = 0,
+}) => {
+  if (!(await fileExists(inputPath))) {
+    return existingCount;
+  }
+
+  const targetMap = map instanceof Map ? map : new Map();
+  const stream = fsSync.createReadStream(inputPath, { encoding: 'utf8' });
+  const reader = readline.createInterface({
+    input: stream,
+    crlfDelay: Infinity,
+  });
+
+  let sequence = existingCount;
+  for await (const line of reader) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    const document = EJSON.parse(trimmed, { relaxed: false });
+    const hasId = document && typeof document === 'object' && document._id !== undefined;
+    const key = hasId
+      ? `id:${EJSON.stringify(document._id, { relaxed: false })}`
+      : `seq:${sequence}`;
+    targetMap.set(key, document);
+    sequence += 1;
+  }
+
+  return sequence;
+};
+
+const writeJsonlFromMap = async ({ outputPath, sourceMap }) => {
+  const writer = fsSync.createWriteStream(outputPath, { encoding: 'utf8' });
+  try {
+    for (const document of sourceMap.values()) {
+      if (document === undefined) continue;
+      const payload = `${EJSON.stringify(document, { relaxed: false })}\n`;
+      if (!writer.write(payload)) {
+        await once(writer, 'drain');
+      }
+    }
+    writer.end();
+    await once(writer, 'finish');
+  } catch (error) {
+    writer.destroy();
+    throw error;
+  }
+};
+
+const mergeJsonlFilesByDocumentId = async ({
+  baseFilePath,
+  deltaFilePath,
+  outputPath,
+}) => {
+  const mergedMap = new Map();
+  let sequence = 0;
+
+  sequence = await readJsonlIntoMapById({
+    inputPath: baseFilePath,
+    map: mergedMap,
+    existingCount: sequence,
+  });
+
+  await readJsonlIntoMapById({
+    inputPath: deltaFilePath,
+    map: mergedMap,
+    existingCount: sequence,
+  });
+
+  await writeJsonlFromMap({
+    outputPath,
+    sourceMap: mergedMap,
+  });
+
+  return mergedMap.size;
+};
+
+const buildIncrementalFilter = ({ baseFilter, since }) => {
+  if (!(since instanceof Date) || Number.isNaN(since.getTime())) {
+    return baseFilter || {};
+  }
+
+  const base = baseFilter && typeof baseFilter === 'object' ? baseFilter : {};
+  const withObjectIdSince = mongoose.Types.ObjectId.createFromTime(
+    Math.max(Math.floor(since.getTime() / 1000), 0)
+  );
+  const timestampWindow = {
+    $or: [
+      { updatedAt: { $gt: since } },
+      { createdAt: { $gt: since } },
+      { _id: { $gt: withObjectIdSince } },
+    ],
+  };
+
+  if (!Object.keys(base).length) {
+    return timestampWindow;
+  }
+
+  return {
+    $and: [base, timestampWindow],
+  };
 };
 
 const zipDirectory = async ({ sourceDirectory, targetZipPath }) =>
@@ -594,16 +722,85 @@ export const createBackup = async ({
     scope,
     historyType: normalizedHistoryType,
     companyName: tenant?.name,
+    companyId: normalizedCompanyId,
   });
-  const backupAbsolutePath = await createUniqueFilePath(
-    backupDirectory,
-    preferredFilename
-  );
+  const isTenantBackup =
+    normalizedHistoryType === 'tenant' && scope === 'company' && Boolean(normalizedCompanyId);
+  const backupAbsolutePath = isTenantBackup
+    ? path.join(backupDirectory, preferredFilename)
+    : await createUniqueFilePath(backupDirectory, preferredFilename);
+  const stagedBackupAbsolutePath = isTenantBackup
+    ? path.join(
+        TMP_DIR,
+        `backup_stage_${Date.now()}_${Math.random().toString(16).slice(2)}.zip`
+      )
+    : backupAbsolutePath;
   const tempDirectory = path.join(TMP_DIR, `backup_${Date.now()}_${Math.random().toString(16).slice(2)}`);
+  const previousBackupExtractDirectory = path.join(
+    TMP_DIR,
+    `backup_previous_${Date.now()}_${Math.random().toString(16).slice(2)}`
+  );
   const sourceBackupObjectId = sourceBackupId ? asObjectId(sourceBackupId) : null;
   let backupHistoryId = null;
+  let previousBackupFilePath = '';
+  let incrementalSince = null;
+  let previousRecordStatus = '';
+  let usingExistingTenantRecord = false;
   const resolvedBackupName = path.basename(backupAbsolutePath);
   const companyRef = scope === 'company' ? normalizedCompanyId : null;
+
+  if (isTenantBackup) {
+    const existingCanonicalRecord = await BackupHistory.findOne({
+      type: 'tenant',
+      company_id: companyRef,
+      backup_name: resolvedBackupName,
+      status: { $ne: 'DELETED' },
+    })
+      .sort({ updated_at: -1, created_at: -1 })
+      .lean();
+
+    const fallbackLatestRecord = existingCanonicalRecord
+      ? null
+      : await BackupHistory.findOne({
+          type: 'tenant',
+          company_id: companyRef,
+          status: { $in: ['COMPLETED', 'RESTORED'] },
+        })
+          .sort({ updated_at: -1, created_at: -1 })
+          .lean();
+
+    if (existingCanonicalRecord?._id) {
+      backupHistoryId = String(existingCanonicalRecord._id);
+      previousRecordStatus = String(existingCanonicalRecord.status || '');
+      usingExistingTenantRecord = true;
+    }
+
+    const previousRecord = existingCanonicalRecord || fallbackLatestRecord;
+    if (previousRecord) {
+      const previousRecordPath = resolveBackupFilePath(
+        previousRecord.storage_path || previousRecord.file_path || ''
+      );
+      if (previousRecordPath && (await fileExists(previousRecordPath))) {
+        previousBackupFilePath = previousRecordPath;
+      }
+      const previousTimestampValue = previousRecord.updated_at || previousRecord.created_at;
+      const parsedPreviousTimestamp = previousTimestampValue
+        ? new Date(previousTimestampValue)
+        : null;
+      if (parsedPreviousTimestamp && !Number.isNaN(parsedPreviousTimestamp.getTime())) {
+        incrementalSince = parsedPreviousTimestamp;
+      }
+    }
+
+    if (!previousBackupFilePath && (await fileExists(backupAbsolutePath))) {
+      previousBackupFilePath = backupAbsolutePath;
+    }
+  }
+
+  const hadPreviousTargetBackup = Boolean(
+    previousBackupFilePath &&
+      path.resolve(previousBackupFilePath) === path.resolve(backupAbsolutePath)
+  );
 
   console.log(
     `[backup] Starting ${normalizedHistoryType} backup for ${
@@ -612,22 +809,56 @@ export const createBackup = async ({
   );
 
   try {
-    const inProgressRecord = await BackupHistory.create({
-      backup_name: resolvedBackupName,
-      type: normalizedHistoryType,
-      trigger_type: normalizedTriggerType,
-      company_id: companyRef,
-      file_size: 0,
-      storage_path: backupAbsolutePath,
-      file_path: backupAbsolutePath,
-      status: 'IN_PROGRESS',
-      created_by: normalizedCreatedBy,
-      source_backup_id: sourceBackupObjectId,
-      error_message: '',
-    });
-    backupHistoryId = inProgressRecord?._id ? String(inProgressRecord._id) : null;
+    if (usingExistingTenantRecord && backupHistoryId) {
+      await BackupHistory.findByIdAndUpdate(backupHistoryId, {
+        $set: {
+          backup_name: resolvedBackupName,
+          trigger_type: normalizedTriggerType,
+          company_id: companyRef,
+          storage_path: backupAbsolutePath,
+          file_path: backupAbsolutePath,
+          status: 'IN_PROGRESS',
+          created_by: normalizedCreatedBy,
+          source_backup_id: sourceBackupObjectId,
+          error_message: '',
+        },
+      });
+    } else {
+      const inProgressRecord = await BackupHistory.create({
+        backup_name: resolvedBackupName,
+        type: normalizedHistoryType,
+        trigger_type: normalizedTriggerType,
+        company_id: companyRef,
+        file_size: 0,
+        storage_path: backupAbsolutePath,
+        file_path: backupAbsolutePath,
+        status: 'IN_PROGRESS',
+        created_by: normalizedCreatedBy,
+        source_backup_id: sourceBackupObjectId,
+        error_message: '',
+      });
+      backupHistoryId = inProgressRecord?._id ? String(inProgressRecord._id) : null;
+    }
 
     await fs.mkdir(tempDirectory, { recursive: true });
+    if (isTenantBackup && previousBackupFilePath && (await fileExists(previousBackupFilePath))) {
+      try {
+        await extractZipArchive({
+          zipPath: previousBackupFilePath,
+          targetDirectory: previousBackupExtractDirectory,
+        });
+      } catch (extractError) {
+        console.warn(
+          `[backup] Could not extract previous tenant backup for incremental merge (${resolvedBackupName}): ${
+            extractError?.message || extractError
+          }`
+        );
+        previousBackupFilePath = '';
+        incrementalSince = null;
+        await safeRemovePath(previousBackupExtractDirectory);
+      }
+    }
+
     const specs = await getCollectionSpecsForScope({
       db,
       scope,
@@ -644,12 +875,59 @@ export const createBackup = async ({
     for (const spec of orderedSpecs) {
       const outputFilename = `${spec.collection}.jsonl`;
       const outputPath = path.join(tempDirectory, outputFilename);
-      const total = await exportCollectionAsJsonl({
-        db,
-        collectionName: spec.collection,
-        filter: spec.filter,
-        outputPath,
-      });
+      let total = 0;
+      const canIncrementallyMerge =
+        isTenantBackup &&
+        previousBackupFilePath &&
+        incrementalSince instanceof Date &&
+        !Number.isNaN(incrementalSince.getTime());
+
+      if (canIncrementallyMerge) {
+        const previousCollectionFilePath = path.join(
+          previousBackupExtractDirectory,
+          outputFilename
+        );
+        const deltaOutputPath = path.join(tempDirectory, `delta_${outputFilename}`);
+        const incrementalFilter = buildIncrementalFilter({
+          baseFilter: spec.filter,
+          since: incrementalSince,
+        });
+        const deltaCount = await exportCollectionAsJsonl({
+          db,
+          collectionName: spec.collection,
+          filter: incrementalFilter,
+          outputPath: deltaOutputPath,
+        });
+
+        if (await fileExists(previousCollectionFilePath)) {
+          if (deltaCount > 0) {
+            total = await mergeJsonlFilesByDocumentId({
+              baseFilePath: previousCollectionFilePath,
+              deltaFilePath: deltaOutputPath,
+              outputPath,
+            });
+          } else {
+            await fs.copyFile(previousCollectionFilePath, outputPath);
+            total = await countJsonlRecords(outputPath);
+          }
+        } else {
+          total = await exportCollectionAsJsonl({
+            db,
+            collectionName: spec.collection,
+            filter: spec.filter,
+            outputPath,
+          });
+        }
+
+        await safeRemovePath(deltaOutputPath);
+      } else {
+        total = await exportCollectionAsJsonl({
+          db,
+          collectionName: spec.collection,
+          filter: spec.filter,
+          outputPath,
+        });
+      }
 
       collectionManifest.push({
         name: spec.collection,
@@ -676,13 +954,17 @@ export const createBackup = async ({
 
     await zipDirectory({
       sourceDirectory: tempDirectory,
-      targetZipPath: backupAbsolutePath,
+      targetZipPath: stagedBackupAbsolutePath,
     });
 
     await validateBackupArchiveIntegrity({
-      zipPath: backupAbsolutePath,
+      zipPath: stagedBackupAbsolutePath,
       expectedCollectionFiles: collectionManifest.map((entry) => entry.file),
     });
+
+    if (path.resolve(stagedBackupAbsolutePath) !== path.resolve(backupAbsolutePath)) {
+      await fs.copyFile(stagedBackupAbsolutePath, backupAbsolutePath);
+    }
 
     const stats = await fs.stat(backupAbsolutePath);
     if (!backupHistoryId) {
@@ -719,11 +1001,17 @@ export const createBackup = async ({
   } catch (error) {
     const errorMessage = sanitizeErrorMessage(error?.message);
     const sizeOnFailure = await getFileSizeSafe(backupAbsolutePath);
+    const safePreviousStatus = String(previousRecordStatus || '').toUpperCase();
+    const shouldRestoreStatus =
+      isTenantBackup &&
+      hadPreviousTargetBackup &&
+      ['COMPLETED', 'RESTORED'].includes(safePreviousStatus);
+    const failureStatus = shouldRestoreStatus ? safePreviousStatus : 'FAILED';
 
     if (backupHistoryId) {
       await BackupHistory.findByIdAndUpdate(backupHistoryId, {
         $set: {
-          status: 'FAILED',
+          status: failureStatus,
           error_message: errorMessage,
           file_size: sizeOnFailure,
           backup_name: resolvedBackupName,
@@ -733,13 +1021,20 @@ export const createBackup = async ({
       });
     }
 
-    await safeRemovePath(backupAbsolutePath);
+    if (!(isTenantBackup && hadPreviousTargetBackup)) {
+      await safeRemovePath(backupAbsolutePath);
+    }
+    await safeRemovePath(stagedBackupAbsolutePath);
     console.error(
       `[backup] Failed ${normalizedHistoryType} backup ${resolvedBackupName}: ${errorMessage}`
     );
     throw error;
   } finally {
     await safeRemovePath(tempDirectory);
+    await safeRemovePath(previousBackupExtractDirectory);
+    if (path.resolve(stagedBackupAbsolutePath) !== path.resolve(backupAbsolutePath)) {
+      await safeRemovePath(stagedBackupAbsolutePath);
+    }
   }
 };
 
@@ -893,10 +1188,20 @@ export const createAutoTenantBackupsForActiveTenants = async ({
         trigger_type: 'AUTO',
         company_id: asObjectId(tenant?._id),
         status: { $in: ['IN_PROGRESS', 'COMPLETED'] },
-        created_at: {
-          $gte: safeDayStart,
-          $lt: safeDayEnd,
-        },
+        $or: [
+          {
+            updated_at: {
+              $gte: safeDayStart,
+              $lt: safeDayEnd,
+            },
+          },
+          {
+            created_at: {
+              $gte: safeDayStart,
+              $lt: safeDayEnd,
+            },
+          },
+        ],
       });
       return existingBackupForDay ? 'already_created_for_ist_day' : '';
     },
@@ -1138,7 +1443,7 @@ export const listBackupHistory = async ({
       .populate('company_id', 'name code')
       .populate('created_by', 'name email')
       .populate('restored_by', 'name email')
-      .sort({ created_at: -1 })
+      .sort({ updated_at: -1, created_at: -1 })
       .skip(skip)
       .limit(normalizedLimit)
       .lean(),

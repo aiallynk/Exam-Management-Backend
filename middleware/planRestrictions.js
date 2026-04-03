@@ -196,8 +196,10 @@ export const blockFreePlanByExamId =
 export const validateFreePlanQuestionPayload = (payload = {}) => {
   const normalizedType = normalizeQuestionTypeForStorage(payload);
   const normalizedFormat = normalizeQuestionFormat(payload);
-  const explicitType = normalizeUpper(payload.questionType);
-  const explicitFormat = normalizeUpper(payload.questionFormat || payload.question_type);
+  const explicitType = normalizeUpper(payload.questionType || payload.type);
+  const explicitFormat = normalizeUpper(
+    payload.questionFormat || payload.question_type || payload.type
+  );
   const explicitEssayType =
     explicitType === 'LETTER_WRITING'
       ? 'ESSAY_LETTER'
@@ -214,7 +216,9 @@ export const validateFreePlanQuestionPayload = (payload = {}) => {
     normalizedType === 'CODING' ||
     normalizedFormat === 'CODING' ||
     explicitType === 'CODING' ||
+    explicitType === 'CODE' ||
     explicitFormat === 'CODING' ||
+    explicitFormat === 'CODE' ||
     hasCodingConfiguration(payload);
 
   if (hasCoding) {

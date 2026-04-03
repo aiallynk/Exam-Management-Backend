@@ -21,7 +21,17 @@ const ACTION_GROUPS = [
   {
     key: 'auth',
     label: 'Authentication',
-    actions: ['USER_LOGIN', 'LOGIN_SUCCESS', 'LOGIN_FAILED', 'USER_LOGGED_IN', 'LOGIN', 'USER_LOGOUT', 'LOGOUT'],
+    actions: [
+      'USER_LOGIN',
+      'LOGIN_SUCCESS',
+      'LOGIN_FAILED',
+      'USER_LOGGED_IN',
+      'LOGIN',
+      'USER_LOGOUT',
+      'LOGOUT',
+      'FORGOT_PASSWORD_REQUEST',
+      'PASSWORD_RESET_SUCCESS',
+    ],
   },
   { key: 'login', label: 'Login', actions: ['USER_LOGIN', 'LOGIN_SUCCESS', 'LOGIN_FAILED', 'USER_LOGGED_IN', 'LOGIN'] },
   { key: 'logout', label: 'Logout', actions: ['USER_LOGOUT', 'LOGOUT'] },
@@ -60,6 +70,8 @@ const SUPER_ADMIN_ACTIVITY_ACTIONS = new Set([
   'LOGOUT',
   'USER_LOGGED_IN',
   'LOGIN',
+  'FORGOT_PASSWORD_REQUEST',
+  'PASSWORD_RESET_SUCCESS',
 ]);
 const SUPER_ADMIN_ACTIVITY_ACTION_LIST = Array.from(SUPER_ADMIN_ACTIVITY_ACTIONS);
 const SUPER_ADMIN_ACTIVITY_ACTION_GROUPS = [
@@ -80,7 +92,17 @@ const SUPER_ADMIN_ACTIVITY_ACTION_GROUPS = [
   {
     key: 'auth',
     label: 'Authentication',
-    actions: ['USER_LOGIN', 'LOGIN_SUCCESS', 'LOGIN_FAILED', 'USER_LOGGED_IN', 'LOGIN', 'USER_LOGOUT', 'LOGOUT'],
+    actions: [
+      'USER_LOGIN',
+      'LOGIN_SUCCESS',
+      'LOGIN_FAILED',
+      'USER_LOGGED_IN',
+      'LOGIN',
+      'USER_LOGOUT',
+      'LOGOUT',
+      'FORGOT_PASSWORD_REQUEST',
+      'PASSWORD_RESET_SUCCESS',
+    ],
   },
   { key: 'login', label: 'Login', actions: ['USER_LOGIN', 'LOGIN_SUCCESS', 'LOGIN_FAILED', 'USER_LOGGED_IN', 'LOGIN'] },
   { key: 'logout', label: 'Logout', actions: ['USER_LOGOUT', 'LOGOUT'] },
@@ -364,6 +386,7 @@ const resolveStatusVerbFromMetadata = (metadata = {}) => {
 const normalizeActivityEventType = (value) => {
   const normalized = toNonEmptyString(value).toLowerCase();
   if (!normalized) return '';
+  if (normalized.startsWith('auth')) return 'auth';
   if (normalized.startsWith('creat')) return 'create';
   if (normalized.startsWith('updat')) return 'update';
   if (normalized.startsWith('delet')) return 'delete';
@@ -376,6 +399,7 @@ const normalizeActivityEventType = (value) => {
 
 const activityEventLabel = (eventType) => {
   const normalized = normalizeActivityEventType(eventType);
+  if (normalized === 'auth') return 'AUTH';
   if (normalized === 'create') return 'CREATE';
   if (normalized === 'update') return 'UPDATE';
   if (normalized === 'delete') return 'DELETE';
@@ -418,6 +442,26 @@ const resolveActivityContext = (log) => {
       subject: 'User',
       verb: loginStatus === 'FAILED' ? 'failed login' : 'logged in',
       eventType: 'login',
+      loginStatus,
+    };
+  }
+
+  if (action === 'FORGOT_PASSWORD_REQUEST') {
+    const loginStatus = resolveLoginAuditStatus(action, metadata);
+    return {
+      subject: 'User',
+      verb: 'requested password reset',
+      eventType: 'auth',
+      loginStatus,
+    };
+  }
+
+  if (action === 'PASSWORD_RESET_SUCCESS') {
+    const loginStatus = resolveLoginAuditStatus(action, metadata);
+    return {
+      subject: 'User',
+      verb: 'password reset',
+      eventType: 'auth',
       loginStatus,
     };
   }
@@ -607,6 +651,20 @@ const buildActivityDescription = (context, entityName, actorName) => {
   const safeEntityName = entityName || `Unknown ${context.subject}`;
   const loginStatus = toNonEmptyString(context.loginStatus).toUpperCase();
 
+  if (context.eventType === 'auth') {
+    if (context.verb === 'requested password reset') {
+      return loginStatus === 'FAILED'
+        ? '\u274C Password reset request failed'
+        : '\u2705 Password reset requested';
+    }
+    if (context.verb === 'password reset') {
+      return loginStatus === 'FAILED'
+        ? '\u274C Password reset failed'
+        : '\u2705 Password reset successful';
+    }
+    return 'Authentication activity';
+  }
+
   if (context.eventType === 'login') {
     return loginStatus === 'FAILED'
       ? '\u274C Failed login attempt'
@@ -773,7 +831,7 @@ const matchesSuperAdminActivityGroup = (log, groupValue) => {
   if (normalizedGroup === 'delete') return eventType === 'delete';
   if (normalizedGroup === 'activate') return eventType === 'activate';
   if (normalizedGroup === 'deactivate') return eventType === 'deactivate';
-  if (normalizedGroup === 'auth') return eventType === 'login' || eventType === 'logout';
+  if (normalizedGroup === 'auth') return eventType === 'login' || eventType === 'logout' || eventType === 'auth';
   if (normalizedGroup === 'login') return eventType === 'login';
   if (normalizedGroup === 'logout') return eventType === 'logout';
 

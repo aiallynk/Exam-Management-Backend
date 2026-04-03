@@ -251,6 +251,13 @@ const normalizeStatusValue = (value) => {
   return value.trim().toUpperCase();
 };
 
+const isOfflineSubmissionSource = (value) => {
+  if (typeof value !== 'string') return false;
+  const normalized = value.trim().toLowerCase();
+  if (!normalized) return false;
+  return normalized.startsWith('offline');
+};
+
 const normalizeIpAddress = (value) => {
   const raw = String(value || '').trim();
   if (!raw) return '';
@@ -390,6 +397,151 @@ const appendAttemptViolationLog = (attempt, violationType, details = {}) => {
     ...details,
   });
 };
+
+const normalizeViolationType = (value) => {
+  const normalized = normalizeStatusValue(value);
+  if (!normalized) return 'OTHER';
+  return normalized.replace(/[\s-]+/g, '_');
+};
+
+const toLegacyViolationEventType = (value) => {
+  const type = normalizeViolationType(value);
+  if (type === 'SCREENSHOT' || type === 'SCREEN_CAPTURE' || type === 'SCREEN_RECORDING') {
+    return 'SCREENSHOT';
+  }
+  if (
+    type === 'BACKGROUND' ||
+    type === 'APP_BACKGROUND' ||
+    type === 'APP_SWITCH' ||
+    type === 'USER_LEAVE_HINT' ||
+    type === 'WINDOW_FOCUS_LOST'
+  ) {
+    return 'BACKGROUND';
+  }
+  if (type === 'SCREEN_LOCK') {
+    return 'SCREEN_LOCK';
+  }
+  if (type === 'APP_KILL' || type === 'APP_PAUSED' || type === 'APP_STOPPED') {
+    return 'APP_KILL';
+  }
+  if (type === 'SPLIT_SCREEN') {
+    return 'SPLIT_SCREEN';
+  }
+  if (type === 'COPY_PASTE' || type === 'COPY_PASTE_ATTEMPT') {
+    return 'COPY_PASTE';
+  }
+  return 'OTHER';
+};
+
+const resolveExamStatusFromViolationCount = (violationCount, requestedStatus = '') => {
+  const normalizedRequested = normalizeStatusValue(requestedStatus);
+  if (normalizedRequested === 'FAIR' || normalizedRequested === 'SUSPICIOUS' || normalizedRequested === 'CHEATING') {
+    return normalizedRequested;
+  }
+  if (violationCount <= 0) return 'FAIR';
+  if (violationCount <= 2) return 'SUSPICIOUS';
+  return 'CHEATING';
+};
+
+const normalizeViolationLogsPayload = (rawLogs, { attempt, defaultReason = '' } = {}) => {
+  if (!Array.isArray(rawLogs)) return [];
+
+  return rawLogs
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') {
+        return null;
+      }
+
+      const eventTimestampRaw = entry.timestamp || entry.time || entry.createdAt;
+      const parsedTimestamp = eventTimestampRaw ? new Date(eventTimestampRaw) : new Date();
+      const timestamp = Number.isNaN(parsedTimestamp.getTime()) ? new Date() : parsedTimestamp;
+      const violationType = normalizeViolationType(
+        entry.violationType || entry.type || entry.eventType || 'OTHER'
+      );
+      const examId =
+        entry.examId ||
+        attempt?.examId?._id ||
+        attempt?.examId ||
+        null;
+      const userId = entry.userId || attempt?.userId || null;
+      const detailsRaw = entry.details;
+      const details =
+        typeof detailsRaw === 'string'
+          ? detailsRaw
+          : typeof detailsRaw === 'object' && detailsRaw !== null
+            ? JSON.stringify(detailsRaw)
+            : (entry.message || defaultReason || '').toString();
+      const deviceInfo =
+        entry.deviceInfo && typeof entry.deviceInfo === 'object'
+          ? { ...entry.deviceInfo }
+          : {};
+
+      return {
+        userId,
+        examId,
+        timestamp,
+        violationType,
+        details: details.slice(0, 500),
+        deviceInfo,
+      };
+    })
+    .filter(Boolean);
+};
+
+const mergeViolationLogs = (existingLogs, incomingLogs) => {
+  const merged = Array.isArray(existingLogs)
+    ? existingLogs.map((entry) => ({ ...entry }))
+    : [];
+
+  if (!Array.isArray(incomingLogs)) {
+    return merged;
+  }
+
+  for (const entry of incomingLogs) {
+    if (!entry || typeof entry !== 'object') continue;
+    const violationType = normalizeViolationType(entry.violationType || entry.type || entry.eventType);
+    const timestampMs = new Date(entry.timestamp || Date.now()).getTime();
+    const duplicate = merged.some((stored) => {
+      const storedType = normalizeViolationType(
+        stored?.violationType || stored?.type || stored?.eventType
+      );
+      if (storedType !== violationType) {
+        return false;
+      }
+      const storedTs = new Date(stored?.timestamp || 0).getTime();
+      return Number.isFinite(storedTs) && Number.isFinite(timestampMs) && Math.abs(storedTs - timestampMs) < 1000;
+    });
+    if (!duplicate) {
+      merged.push(entry);
+    }
+  }
+
+  return merged;
+};
+
+const buildAttemptIntegritySummary = (attempt) => {
+  const logs = Array.isArray(attempt?.violationLogs)
+    ? attempt.violationLogs
+    : [];
+  const countFromField = toNonNegativeInt(attempt?.violationCount, logs.length);
+  const violationCount = Math.max(countFromField, logs.length);
+  const examStatus = resolveExamStatusFromViolationCount(
+    violationCount,
+    attempt?.examStatus || '',
+  );
+
+  return {
+    totalViolations: violationCount,
+    violationDetails: logs,
+    examStatus,
+  };
+};
+
+const countAttemptedQuestionsForAttempt = async (attemptId) =>
+  Answer.countDocuments({
+    attemptId,
+    answerText: { $exists: true, $nin: ['', null] },
+  });
 
 const parseStoredAnswerValue = (questionType, value) => {
   if (questionType === 'MULTIPLE_OPTIONS') {
@@ -1258,181 +1410,221 @@ router.get('/:attemptId/progress', requireAuth, validateObjectId('attemptId'), a
   }
 });
 
+const progressValidationRules = [
+  body('answers').optional().isObject().withMessage('Answers must be an object'),
+  body('lastActivity').optional().isISO8601().withMessage('lastActivity must be an ISO 8601 date'),
+  body('currentSectionId').optional().isMongoId().withMessage('currentSectionId must be a valid section id'),
+];
+
+const updateAttemptProgressHandler = async (req, res, next) => {
+  try {
+    const errors = validationResult(req);
+    if (!errors.isEmpty()) {
+      return res.status(400).json({ errors: errors.array() });
+    }
+
+    const attempt = await ExamAttempt.findById(req.params.attemptId)
+      .populate('examId', '_id duration gracePeriod accessControl')
+      .populate('sessionId', '_id questionPaperId')
+      .populate('questionPaperId', '_id');
+
+    if (!attempt) {
+      return res.status(404).json({ error: 'Attempt not found' });
+    }
+
+    const canReview = await hasExamPermission(
+      req.user._id,
+      attempt.examId?._id || attempt.examId,
+      'REVIEW_ANSWERS'
+    );
+    if (!canReview && attempt.userId.toString() !== req.user._id.toString()) {
+      return res.status(403).json({ error: 'Forbidden - You can only update your own attempt progress' });
+    }
+
+    if (!canReview) {
+      const planContext = await resolveExamPlanContext(attempt.examId?._id || attempt.examId);
+      const accessControlCheck = enforceExamAccessControl({
+        exam: attempt.examId,
+        req,
+        planType: planContext?.planType || null,
+      });
+      if (!accessControlCheck.allowed) {
+        return res.status(403).json({ error: accessControlCheck.error });
+      }
+      const ipLockCheck = await enforceAttemptIpLock({
+        attempt,
+        req,
+        planType: planContext?.planType || null,
+      });
+      if (!ipLockCheck.allowed) {
+        return res.status(403).json({ error: ipLockCheck.error });
+      }
+    }
+
+    if (attempt.isCompleted) {
+      return res.status(400).json({ error: 'Attempt already submitted' });
+    }
+
+    const assignedQuestionPaperId =
+      attempt.questionPaperId?._id ||
+      attempt.questionPaperId ||
+      attempt.sessionId?.questionPaperId;
+
+    if (!assignedQuestionPaperId) {
+      return res.status(400).json({ error: 'No question paper assigned for this attempt.' });
+    }
+
+    const putProgressPlanContext = await resolveExamPlanContext(attempt.examId?._id || attempt.examId);
+    if (
+      !canReview &&
+      putProgressPlanContext?.planType &&
+      isFreePlan(putProgressPlanContext.planType) &&
+      await hasWritingQuestionsInPaper(assignedQuestionPaperId)
+    ) {
+      return sendWritingPlanRestriction(res);
+    }
+
+    let sectionProgress = null;
+    if (req.body.currentSectionId) {
+      try {
+        const timerSync = await startSectionTimer(
+          req.params.attemptId,
+          req.body.currentSectionId
+        );
+        sectionProgress = timerSync?.sectionState || null;
+      } catch (timerError) {
+        // For heartbeat requests, return latest state even if section became locked meanwhile.
+        sectionProgress = await getAttemptSectionProgress(req.params.attemptId);
+      }
+    }
+
+    const incomingAnswers =
+      req.body.answers && typeof req.body.answers === 'object'
+        ? req.body.answers
+        : {};
+    const validQuestionIds = Object.keys(incomingAnswers).filter((id) =>
+      /^[a-fA-F0-9]{24}$/.test(id)
+    );
+
+    let savedCount = 0;
+    if (validQuestionIds.length > 0) {
+      const questions = await Question.find({
+        _id: { $in: validQuestionIds },
+        questionPaperId: assignedQuestionPaperId,
+      }).select('_id questionType');
+
+      const questionMap = new Map(
+        questions.map((question) => [question._id.toString(), question.questionType])
+      );
+
+      const operations = [];
+      for (const [questionId, rawValue] of Object.entries(incomingAnswers)) {
+        const questionType = questionMap.get(questionId);
+        if (!questionType) continue;
+
+        operations.push({
+          updateOne: {
+            filter: { attemptId: attempt._id, questionId },
+            update: {
+              $set: {
+                answerText: normalizeAnswerForStorage(questionType, rawValue),
+                pointsEarned: 0,
+                aiEvaluation: null,
+                needsReview: false,
+                updatedAt: new Date(),
+              },
+              $unset: {
+                isCorrect: '',
+              },
+              $setOnInsert: {
+                attemptId: attempt._id,
+                questionId,
+              },
+            },
+            upsert: true,
+          },
+        });
+      }
+
+      if (operations.length > 0) {
+        await Answer.bulkWrite(operations, { ordered: false });
+        savedCount = operations.length;
+      }
+    }
+
+    const nextLastActivity = req.body.lastActivity
+      ? new Date(req.body.lastActivity)
+      : new Date();
+    attempt.lastActivity = nextLastActivity;
+    await ExamAttempt.updateOne(
+      { _id: attempt._id },
+      { $set: { lastActivity: nextLastActivity } }
+    );
+
+    if (!sectionProgress) {
+      sectionProgress = await getAttemptSectionProgress(req.params.attemptId);
+    }
+
+    const totalTimerSnapshot = await buildTotalTimerSnapshot(
+      attempt,
+      attempt.examId,
+      assignedQuestionPaperId
+    );
+
+    res.json({
+      success: true,
+      attemptStatus: attempt.isCompleted ? 'COMPLETED' : 'IN_PROGRESS',
+      savedCount,
+      lastActivity: attempt.lastActivity,
+      sectionProgress,
+      timer: totalTimerSnapshot,
+      compatibilityRoute: req.path.endsWith('/answers'),
+    });
+  } catch (error) {
+    next(error);
+  }
+};
+
 router.put(
   '/:attemptId/progress',
   requireAuth,
   validateObjectId('attemptId'),
+  progressValidationRules,
+  updateAttemptProgressHandler
+);
+
+// Backward-compatible answer save endpoint.
+// This keeps older clients working by mapping answer payloads to canonical progress writes.
+router.post(
+  '/:attemptId/answers',
+  requireAuth,
+  validateObjectId('attemptId'),
   [
+    body('questionId').optional().isMongoId().withMessage('questionId must be a valid question id'),
     body('answers').optional().isObject().withMessage('Answers must be an object'),
     body('lastActivity').optional().isISO8601().withMessage('lastActivity must be an ISO 8601 date'),
     body('currentSectionId').optional().isMongoId().withMessage('currentSectionId must be a valid section id'),
   ],
   async (req, res, next) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
+    const normalizedAnswers =
+      req.body.answers && typeof req.body.answers === 'object'
+        ? { ...req.body.answers }
+        : {};
 
-      const attempt = await ExamAttempt.findById(req.params.attemptId)
-        .populate('examId', '_id duration gracePeriod accessControl')
-        .populate('sessionId', '_id questionPaperId')
-        .populate('questionPaperId', '_id');
-
-      if (!attempt) {
-        return res.status(404).json({ error: 'Attempt not found' });
-      }
-
-      const canReview = await hasExamPermission(
-        req.user._id,
-        attempt.examId?._id || attempt.examId,
-        'REVIEW_ANSWERS'
-      );
-      if (!canReview && attempt.userId.toString() !== req.user._id.toString()) {
-        return res.status(403).json({ error: 'Forbidden - You can only update your own attempt progress' });
-      }
-
-      if (!canReview) {
-        const planContext = await resolveExamPlanContext(attempt.examId?._id || attempt.examId);
-        const accessControlCheck = enforceExamAccessControl({
-          exam: attempt.examId,
-          req,
-          planType: planContext?.planType || null,
-        });
-        if (!accessControlCheck.allowed) {
-          return res.status(403).json({ error: accessControlCheck.error });
-        }
-        const ipLockCheck = await enforceAttemptIpLock({
-          attempt,
-          req,
-          planType: planContext?.planType || null,
-        });
-        if (!ipLockCheck.allowed) {
-          return res.status(403).json({ error: ipLockCheck.error });
-        }
-      }
-
-      if (attempt.isCompleted) {
-        return res.status(400).json({ error: 'Attempt already submitted' });
-      }
-
-      const assignedQuestionPaperId =
-        attempt.questionPaperId?._id ||
-        attempt.questionPaperId ||
-        attempt.sessionId?.questionPaperId;
-
-      if (!assignedQuestionPaperId) {
-        return res.status(400).json({ error: 'No question paper assigned for this attempt.' });
-      }
-
-      const putProgressPlanContext = await resolveExamPlanContext(attempt.examId?._id || attempt.examId);
-      if (
-        !canReview &&
-        putProgressPlanContext?.planType &&
-        isFreePlan(putProgressPlanContext.planType) &&
-        await hasWritingQuestionsInPaper(assignedQuestionPaperId)
-      ) {
-        return sendWritingPlanRestriction(res);
-      }
-
-      let sectionProgress = null;
-      if (req.body.currentSectionId) {
-        try {
-          const timerSync = await startSectionTimer(
-            req.params.attemptId,
-            req.body.currentSectionId
-          );
-          sectionProgress = timerSync?.sectionState || null;
-        } catch (timerError) {
-          // For heartbeat requests, return latest state even if section became locked meanwhile.
-          sectionProgress = await getAttemptSectionProgress(req.params.attemptId);
-        }
-      }
-
-      const incomingAnswers =
-        req.body.answers && typeof req.body.answers === 'object'
-          ? req.body.answers
-          : {};
-      const validQuestionIds = Object.keys(incomingAnswers).filter((id) =>
-        /^[a-fA-F0-9]{24}$/.test(id)
-      );
-
-      let savedCount = 0;
-      if (validQuestionIds.length > 0) {
-        const questions = await Question.find({
-          _id: { $in: validQuestionIds },
-          questionPaperId: assignedQuestionPaperId,
-        }).select('_id questionType');
-
-        const questionMap = new Map(
-          questions.map((question) => [question._id.toString(), question.questionType])
-        );
-
-        const operations = [];
-        for (const [questionId, rawValue] of Object.entries(incomingAnswers)) {
-          const questionType = questionMap.get(questionId);
-          if (!questionType) continue;
-
-          operations.push({
-            updateOne: {
-              filter: { attemptId: attempt._id, questionId },
-              update: {
-                $set: {
-                  answerText: normalizeAnswerForStorage(questionType, rawValue),
-                  pointsEarned: 0,
-                  aiEvaluation: null,
-                  needsReview: false,
-                  updatedAt: new Date(),
-                },
-                $unset: {
-                  isCorrect: '',
-                },
-                $setOnInsert: {
-                  attemptId: attempt._id,
-                  questionId,
-                },
-              },
-              upsert: true,
-            },
-          });
-        }
-
-        if (operations.length > 0) {
-          await Answer.bulkWrite(operations, { ordered: false });
-          savedCount = operations.length;
-        }
-      }
-
-      const nextLastActivity = req.body.lastActivity
-        ? new Date(req.body.lastActivity)
-        : new Date();
-      attempt.lastActivity = nextLastActivity;
-      await ExamAttempt.updateOne(
-        { _id: attempt._id },
-        { $set: { lastActivity: nextLastActivity } }
-      );
-
-      if (!sectionProgress) {
-        sectionProgress = await getAttemptSectionProgress(req.params.attemptId);
-      }
-
-      const totalTimerSnapshot = await buildTotalTimerSnapshot(
-        attempt,
-        attempt.examId,
-        assignedQuestionPaperId
-      );
-
-      res.json({
-        success: true,
-        attemptStatus: attempt.isCompleted ? 'COMPLETED' : 'IN_PROGRESS',
-        savedCount,
-        lastActivity: attempt.lastActivity,
-        sectionProgress,
-        timer: totalTimerSnapshot,
-      });
-    } catch (error) {
-      next(error);
+    if (
+      typeof req.body.questionId === 'string' &&
+      /^[a-fA-F0-9]{24}$/.test(req.body.questionId) &&
+      Object.prototype.hasOwnProperty.call(req.body, 'answer')
+    ) {
+      normalizedAnswers[req.body.questionId] = req.body.answer;
     }
+
+    req.body = {
+      ...req.body,
+      answers: normalizedAnswers,
+    };
+
+    return updateAttemptProgressHandler(req, res, next);
   }
 );
 
@@ -1547,6 +1739,10 @@ export const submitAttemptHandler = async (req, res, next) => {
       typeof req.body?.violationType === 'string'
         ? req.body.violationType.trim().slice(0, 64)
         : '';
+    const requestedExamStatus =
+      typeof req.body?.examStatus === 'string'
+        ? req.body.examStatus.trim().slice(0, 24)
+        : '';
     const shouldFinalizeStrictViolationSubmission =
       Boolean(attempt.isCompleted) &&
       attempt.submitMeta?.submissionSource === FOCUS_VIOLATION_SUBMISSION_SOURCE &&
@@ -1572,19 +1768,53 @@ export const submitAttemptHandler = async (req, res, next) => {
         maxScore: Number(attempt.scoreSummary?.maxScore) || 0,
         percentage: Number(attempt.scoreSummary?.percentage) || 0,
       };
+      const integrity = buildAttemptIntegritySummary(attempt);
+      const existingSubmissionSource = attempt.submitMeta?.submissionSource || null;
+      const isOfflineSubmission =
+        Boolean(attempt.offlineMode) ||
+        isOfflineSubmissionSource(existingSubmissionSource || '');
       return res.json({
         success: true,
         alreadySubmitted: true,
         attempt,
         attemptStatus: 'COMPLETED',
         submittedAt: attempt.submittedAt || attempt.submitTime || null,
+        clientSubmissionId: attempt.submitMeta?.clientSubmissionId || null,
+        submissionMode: isOfflineSubmission
+          ? 'submitted_offline'
+          : 'submitted_online',
+        offlineSubmission: isOfflineSubmission,
         score: scoringVisible ? summary : null,
+        violationCount: integrity.totalViolations,
+        violationLogs: integrity.violationDetails,
+        examStatus: integrity.examStatus,
+        integrity,
         resultsAvailable: scoringVisible,
+        idempotentRequest:
+          typeof req.body?.clientSubmissionId === 'string' &&
+          req.body.clientSubmissionId.trim().length > 0 &&
+          attempt.submitMeta?.clientSubmissionId === req.body.clientSubmissionId.trim(),
         message: 'Exam submitted successfully',
       });
     }
 
     const { isDisqualified, disqualifyReason } = req.body;
+    const submittedViolationPayload = Array.isArray(req.body?.violationLogs)
+      ? req.body.violationLogs
+      : Array.isArray(req.body?.violationEvents)
+        ? req.body.violationEvents
+        : [];
+    const submittedViolationLogs = normalizeViolationLogsPayload(
+      submittedViolationPayload,
+      {
+        attempt,
+        defaultReason: disqualifyReason || '',
+      }
+    );
+    const clientSubmissionId =
+      typeof req.body?.clientSubmissionId === 'string'
+        ? req.body.clientSubmissionId.trim().slice(0, 128)
+        : '';
     const timerMeta =
       req.body?.timerMeta && typeof req.body.timerMeta === 'object'
         ? req.body.timerMeta
@@ -2063,13 +2293,15 @@ export const submitAttemptHandler = async (req, res, next) => {
       typeof timerMeta?.submittedAtClient === 'string'
         ? new Date(timerMeta.submittedAtClient)
         : null;
+    const submissionSource = shouldFinalizeStrictViolationSubmission
+      ? existingSubmitMeta?.submissionSource || FOCUS_VIOLATION_SUBMISSION_SOURCE
+      : typeof req.body?.submissionSource === 'string'
+        ? req.body.submissionSource.slice(0, 64)
+        : null;
+    const isOfflineSubmission =
+      Boolean(req.body?.offlineMode) || isOfflineSubmissionSource(submissionSource || '');
     attempt.submitMeta = {
-      submissionSource:
-        shouldFinalizeStrictViolationSubmission
-          ? existingSubmitMeta?.submissionSource || FOCUS_VIOLATION_SUBMISSION_SOURCE
-          : typeof req.body?.submissionSource === 'string'
-            ? req.body.submissionSource.slice(0, 64)
-            : null,
+      submissionSource,
       violationType:
         requestedViolationType ||
         existingSubmitMeta?.violationType ||
@@ -2087,11 +2319,18 @@ export const submitAttemptHandler = async (req, res, next) => {
           /^[a-fA-F0-9]{24}$/.test(timerMeta.currentSectionId)
           ? timerMeta.currentSectionId
           : existingSubmitMeta?.currentSectionId || null,
+      clientSubmissionId:
+        clientSubmissionId || existingSubmitMeta?.clientSubmissionId || null,
       finalizedAfterViolation:
         shouldFinalizeStrictViolationSubmission
           ? true
           : Boolean(existingSubmitMeta?.finalizedAfterViolation),
     };
+
+    if (isOfflineSubmission) {
+      attempt.offlineMode = true;
+      attempt.offlineSubmitTime = submitTime;
+    }
 
     if (attempt.isDisqualified && requestedViolationType) {
       appendAttemptViolationLog(attempt, requestedViolationType, {
@@ -2099,7 +2338,50 @@ export const submitAttemptHandler = async (req, res, next) => {
         disqualifyStatus: attempt.disqualifyStatus || null,
         submissionSource: attempt.submitMeta?.submissionSource || null,
       });
+      const disqualifyViolationLog = normalizeViolationLogsPayload(
+        [
+          {
+            violationType: requestedViolationType,
+            details: attempt.disqualifyReason || disqualifyReason || '',
+            timestamp: new Date(),
+          },
+        ],
+        { attempt },
+      );
+      submittedViolationLogs.push(...disqualifyViolationLog);
     }
+
+    const mergedViolationLogs = mergeViolationLogs(
+      Array.isArray(attempt.violationLogs) ? attempt.violationLogs : [],
+      submittedViolationLogs,
+    );
+    const resolvedViolationCount = toNonNegativeInt(
+      req.body?.violationCount,
+      mergedViolationLogs.length,
+    );
+    const finalViolationCount = Math.max(
+      resolvedViolationCount,
+      mergedViolationLogs.length,
+    );
+    const resolvedExamStatus = resolveExamStatusFromViolationCount(
+      finalViolationCount,
+      requestedExamStatus,
+    );
+
+    attempt.violationLogs = mergedViolationLogs;
+    attempt.violationCount = finalViolationCount;
+    attempt.examStatus = resolvedExamStatus;
+    attempt.violationEvents = mergedViolationLogs.map((entry) => ({
+      type: toLegacyViolationEventType(entry?.violationType || entry?.type),
+      timestamp: new Date(entry?.timestamp || Date.now()),
+      details: (entry?.details || '').toString().slice(0, 500),
+    }));
+    attempt.proctoringViolations = mergeViolationLogs(
+      Array.isArray(attempt.proctoringViolations)
+        ? attempt.proctoringViolations
+        : [],
+      submittedViolationLogs,
+    );
 
     await attempt.save();
 
@@ -2161,17 +2443,29 @@ export const submitAttemptHandler = async (req, res, next) => {
         percentage,
       }
       : null;
+    const integrity = buildAttemptIntegritySummary(attempt);
     const hasDeferredCodingEvaluation = deferredCodingEvaluations.length > 0;
     const aiUsagePayload = aiGradingUsageSnapshot
       ? toAiUsageResponsePayload(aiGradingUsageSnapshot)
       : null;
+
+    console.log(
+      `[ATTEMPT_SUBMIT] attempt=${attempt._id} source=${submissionSource || 'unknown'} mode=${isOfflineSubmission ? 'offline' : 'online'} user=${req.user?._id || 'unknown'}`
+    );
 
     res.json({
       success: true,
       attempt,
       attemptStatus: 'COMPLETED',
       submittedAt: submitTime.toISOString(),
+      clientSubmissionId: attempt.submitMeta?.clientSubmissionId || null,
+      submissionMode: isOfflineSubmission ? 'submitted_offline' : 'submitted_online',
+      offlineSubmission: isOfflineSubmission,
       score: responseScore,
+      violationCount: integrity.totalViolations,
+      violationLogs: integrity.violationDetails,
+      examStatus: integrity.examStatus,
+      integrity,
       answers: savedAnswers,
       resultsAvailable: scoringVisible,
       message: 'Exam submitted successfully',
@@ -2216,9 +2510,26 @@ router.post(
     body('codingSubmissions').optional().isArray().withMessage('codingSubmissions must be an array'),
     body('codingAnswers').optional().isArray().withMessage('codingAnswers must be an array'),
     body('timerMeta').optional().isObject().withMessage('timerMeta must be an object'),
+    body('clientSubmissionId')
+      .optional()
+      .isString()
+      .isLength({ max: 128 })
+      .withMessage('clientSubmissionId must be a string up to 128 characters'),
     body('submissionSource').optional().isString().withMessage('submissionSource must be a string'),
     body('disqualifyStatus').optional().isString().withMessage('disqualifyStatus must be a string'),
     body('violationType').optional().isString().withMessage('violationType must be a string'),
+    body('violationCount')
+      .optional()
+      .isInt({ min: 0 })
+      .withMessage('violationCount must be a non-negative integer'),
+    body('violationLogs')
+      .optional()
+      .isArray()
+      .withMessage('violationLogs must be an array'),
+    body('examStatus')
+      .optional()
+      .isIn(['FAIR', 'SUSPICIOUS', 'CHEATING'])
+      .withMessage('examStatus must be FAIR, SUSPICIOUS, or CHEATING'),
   ],
   submitAttemptHandler
 );
@@ -2267,11 +2578,27 @@ router.get('/:attemptId/results', requireAuth, validateObjectId('attemptId'), as
       includeAnswers: true,
       includeQuestionDetails: true,
     });
+    const questionPaperId = attempt.questionPaperId?._id || attempt.questionPaperId;
+    const totalQuestions = questionPaperId
+      ? await Question.countDocuments({ questionPaperId })
+      : 0;
+    const attemptedQuestions = await countAttemptedQuestionsForAttempt(attempt._id);
+    const integrity = buildAttemptIntegritySummary(attempt);
 
     res.json({
       attempt,
       answers,
       score: summary,
+      attemptedQuestions,
+      totalQuestions,
+      progressPercentage:
+        totalQuestions > 0
+          ? Math.round((attemptedQuestions / totalQuestions) * 100)
+          : 0,
+      violationCount: integrity.totalViolations,
+      violationLogs: integrity.violationDetails,
+      examStatus: integrity.examStatus,
+      integrity,
     });
   } catch (error) {
     next(error);
@@ -3091,6 +3418,9 @@ router.post(
     body('answers').isObject().withMessage('Answers must be an object'),
     body('sectionTimings').optional().isArray().withMessage('Section timings must be an array'),
     body('violationEvents').optional().isArray().withMessage('Violation events must be an array'),
+    body('violationLogs').optional().isArray().withMessage('Violation logs must be an array'),
+    body('violationCount').optional().isInt({ min: 0 }).withMessage('Violation count must be a non-negative integer'),
+    body('examStatus').optional().isIn(['FAIR', 'SUSPICIOUS', 'CHEATING']).withMessage('Exam status must be FAIR, SUSPICIOUS, or CHEATING'),
     body('timestampDrift').optional().isNumeric().withMessage('Timestamp drift must be a number'),
     body('offlineStartTime').optional().isISO8601().withMessage('Offline start time must be a valid ISO 8601 date'),
     body('offlineSubmitTime').optional().isISO8601().withMessage('Offline submit time must be a valid ISO 8601 date'),
@@ -3114,6 +3444,9 @@ router.post(
         answers,
         sectionTimings,
         violationEvents,
+        violationLogs,
+        violationCount,
+        examStatus,
         timestampDrift,
         offlineStartTime,
         offlineSubmitTime,
@@ -3152,6 +3485,9 @@ router.post(
         answers,
         sectionTimings: sectionTimings || [],
         violationEvents: violationEvents || [],
+        violationLogs: violationLogs || [],
+        violationCount,
+        examStatus,
         timestampDrift: timestampDrift || 0,
         offlineStartTime,
         offlineSubmitTime,
@@ -3161,6 +3497,29 @@ router.post(
 
       // Reconcile offline attempt
       const reconciliationResult = await reconcileOfflineAttempt(attemptData);
+
+      const offlineSubmitAtClient =
+        typeof offlineSubmitTime === 'string' ? new Date(offlineSubmitTime) : null;
+      const normalizedOfflineSubmitAtClient =
+        offlineSubmitAtClient && !Number.isNaN(offlineSubmitAtClient.getTime())
+          ? offlineSubmitAtClient
+          : null;
+      const offlineSubmissionUpdate = {
+        offlineMode: true,
+        offlineSubmitTime: normalizedOfflineSubmitAtClient || new Date(),
+        'submitMeta.submissionSource': 'offline_submit',
+      };
+      if (normalizedOfflineSubmitAtClient) {
+        offlineSubmissionUpdate['submitMeta.submittedAtClient'] =
+          normalizedOfflineSubmitAtClient;
+      }
+
+      await ExamAttempt.updateOne(
+        { _id: attemptId },
+        {
+          $set: offlineSubmissionUpdate,
+        }
+      );
 
       // Get updated attempt
       const updatedAttempt = await ExamAttempt.findById(attemptId)
@@ -3217,9 +3576,21 @@ router.post(
         console.error('[NOTIFICATIONS] Failed to log offline submission:', notifyError?.message || notifyError);
       }
 
+      console.log(
+        `[ATTEMPT_OFFLINE_SUBMIT] attempt=${attemptId} user=${req.user?._id || 'unknown'} packageVersion=${packageVersion || 'n/a'}`
+      );
+      const integrity = buildAttemptIntegritySummary(updatedAttempt);
+
       res.json({
         attempt: updatedAttempt,
+        attemptStatus: 'COMPLETED',
+        submissionMode: 'submitted_offline',
+        offlineSubmission: true,
         score: scoringVisible ? scoreSummary : null,
+        violationCount: integrity.totalViolations,
+        violationLogs: integrity.violationDetails,
+        examStatus: integrity.examStatus,
+        integrity,
         resultsAvailable: scoringVisible,
         reconciliation: {
           warnings: reconciliationResult.warnings || [],

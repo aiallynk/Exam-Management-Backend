@@ -10,6 +10,112 @@ import Question from '../models/Question.js';
 import Answer from '../models/Answer.js';
 import ExamPackage from '../models/ExamPackage.js';
 
+const normalizeStatusValue = (value) => {
+  if (typeof value !== 'string') return '';
+  return value.trim().toUpperCase();
+};
+
+const clampNonNegativeInteger = (value, fallback = 0) => {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed) || parsed < 0) return fallback;
+  return Math.floor(parsed);
+};
+
+const normalizeViolationType = (value) => {
+  const normalized = normalizeStatusValue(value);
+  if (!normalized) return 'OTHER';
+  return normalized.replace(/[\s-]+/g, '_');
+};
+
+const toLegacyViolationEventType = (value) => {
+  const type = normalizeViolationType(value);
+  if (type === 'SCREENSHOT' || type === 'SCREEN_CAPTURE' || type === 'SCREEN_RECORDING') {
+    return 'SCREENSHOT';
+  }
+  if (
+    type === 'BACKGROUND' ||
+    type === 'APP_BACKGROUND' ||
+    type === 'APP_SWITCH' ||
+    type === 'USER_LEAVE_HINT' ||
+    type === 'WINDOW_FOCUS_LOST'
+  ) {
+    return 'BACKGROUND';
+  }
+  if (type === 'SCREEN_LOCK') {
+    return 'SCREEN_LOCK';
+  }
+  if (type === 'APP_KILL' || type === 'APP_PAUSED' || type === 'APP_STOPPED') {
+    return 'APP_KILL';
+  }
+  if (type === 'SPLIT_SCREEN') {
+    return 'SPLIT_SCREEN';
+  }
+  if (type === 'COPY_PASTE' || type === 'COPY_PASTE_ATTEMPT') {
+    return 'COPY_PASTE';
+  }
+  return 'OTHER';
+};
+
+const resolveExamStatusFromViolationCount = (violationCount, requestedStatus = '') => {
+  const normalizedRequestedStatus = normalizeStatusValue(requestedStatus);
+  if (normalizedRequestedStatus === 'FAIR' ||
+      normalizedRequestedStatus === 'SUSPICIOUS' ||
+      normalizedRequestedStatus === 'CHEATING') {
+    return normalizedRequestedStatus;
+  }
+
+  if (violationCount <= 0) return 'FAIR';
+  if (violationCount <= 2) return 'SUSPICIOUS';
+  return 'CHEATING';
+};
+
+const normalizeViolationLogs = (rawLogs, { attempt, fallbackExamId, fallbackUserId } = {}) => {
+  if (!Array.isArray(rawLogs)) return [];
+
+  return rawLogs
+    .map((entry) => {
+      if (!entry || typeof entry !== 'object') {
+        return null;
+      }
+
+      const eventTimestampRaw = entry.timestamp || entry.time || entry.createdAt;
+      const parsedTimestamp = eventTimestampRaw ? new Date(eventTimestampRaw) : new Date();
+      const timestamp = Number.isNaN(parsedTimestamp.getTime()) ? new Date() : parsedTimestamp;
+
+      const violationType = normalizeViolationType(entry.violationType || entry.type || entry.eventType);
+      const examId =
+        entry.examId ||
+        fallbackExamId ||
+        attempt?.examId?._id ||
+        attempt?.examId ||
+        null;
+      const userId = entry.userId || fallbackUserId || attempt?.userId || null;
+
+      const detailsRaw = entry.details;
+      const details =
+        typeof detailsRaw === 'string'
+          ? detailsRaw
+          : typeof detailsRaw === 'object' && detailsRaw !== null
+            ? JSON.stringify(detailsRaw)
+            : (entry.message || '').toString();
+
+      const deviceInfo =
+        entry.deviceInfo && typeof entry.deviceInfo === 'object'
+          ? { ...entry.deviceInfo }
+          : {};
+
+      return {
+        userId,
+        examId,
+        timestamp,
+        violationType,
+        details: details.slice(0, 500),
+        deviceInfo,
+      };
+    })
+    .filter(Boolean);
+};
+
 /**
  * Validate timestamps for offline attempt
  * @param {Object} attemptData - Offline attempt data
@@ -85,6 +191,7 @@ export const detectAnomalies = (attemptData, exam) => {
     answers,
     sectionTimings,
     violationEvents,
+    violationLogs,
     offlineStartTime,
     offlineSubmitTime,
     packageVersion,
@@ -94,9 +201,13 @@ export const detectAnomalies = (attemptData, exam) => {
   const anomalies = [];
   const flags = [];
 
+  const violationFeed = Array.isArray(violationLogs) && violationLogs.length > 0
+    ? violationLogs
+    : (Array.isArray(violationEvents) ? violationEvents : []);
+
   // Check violation events
-  if (violationEvents && violationEvents.length > 0) {
-    const violationCount = violationEvents.length;
+  if (violationFeed.length > 0) {
+    const violationCount = violationFeed.length;
     if (violationCount > 5) {
       flags.push('HIGH_VIOLATION_COUNT');
       anomalies.push({
@@ -107,7 +218,10 @@ export const detectAnomalies = (attemptData, exam) => {
     }
 
     // Check for suspicious patterns
-    const screenshotCount = violationEvents.filter(v => v.type === 'SCREENSHOT').length;
+    const screenshotCount = violationFeed.filter((event) => {
+      const type = normalizeViolationType(event?.violationType || event?.type || event?.eventType);
+      return type === 'SCREENSHOT' || type === 'SCREEN_CAPTURE' || type === 'SCREEN_RECORDING';
+    }).length;
     if (screenshotCount > 3) {
       flags.push('MULTIPLE_SCREENSHOTS');
       anomalies.push({
@@ -117,7 +231,14 @@ export const detectAnomalies = (attemptData, exam) => {
       });
     }
 
-    const backgroundCount = violationEvents.filter(v => v.type === 'BACKGROUND').length;
+    const backgroundCount = violationFeed.filter((event) => {
+      const type = normalizeViolationType(event?.violationType || event?.type || event?.eventType);
+      return type === 'BACKGROUND' ||
+        type === 'APP_BACKGROUND' ||
+        type === 'APP_SWITCH' ||
+        type === 'WINDOW_FOCUS_LOST' ||
+        type === 'USER_LEAVE_HINT';
+    }).length;
     if (backgroundCount > 10) {
       flags.push('FREQUENT_BACKGROUND');
       anomalies.push({
@@ -204,6 +325,9 @@ export const reconcileOfflineAttempt = async (attemptData) => {
     answers,
     sectionTimings,
     violationEvents,
+    violationLogs,
+    violationCount,
+    examStatus,
     timestampDrift,
     offlineStartTime,
     offlineSubmitTime,
@@ -268,14 +392,38 @@ export const reconcileOfflineAttempt = async (attemptData) => {
   attempt.offlineSubmitTime = offlineSubmitTime ? new Date(offlineSubmitTime) : new Date();
   attempt.timestampDrift = timestampDrift || 0;
 
-  // Store violation events
-  if (violationEvents && Array.isArray(violationEvents)) {
-    attempt.violationEvents = violationEvents.map(event => ({
-      type: event.type,
-      timestamp: new Date(event.timestamp),
-      details: event.details || '',
-    }));
-  }
+  const rawViolationLogList = Array.isArray(violationLogs) && violationLogs.length > 0
+    ? violationLogs
+    : (Array.isArray(violationEvents) ? violationEvents : []);
+  const normalizedLogs = normalizeViolationLogs(rawViolationLogList, {
+    attempt,
+    fallbackExamId: attempt.examId?._id || attempt.examId,
+    fallbackUserId: attempt.userId,
+  });
+  const resolvedViolationCount = Math.max(
+    clampNonNegativeInteger(
+      violationCount,
+      normalizedLogs.length,
+    ),
+    normalizedLogs.length,
+  );
+
+  // Store violation events (legacy) and normalized logs (new schema)
+  attempt.violationEvents = normalizedLogs.map((event) => ({
+    type: toLegacyViolationEventType(event.violationType),
+    timestamp: event.timestamp,
+    details: event.details || '',
+  }));
+  attempt.violationLogs = normalizedLogs;
+  attempt.violationCount = resolvedViolationCount;
+  attempt.examStatus = resolveExamStatusFromViolationCount(
+    resolvedViolationCount,
+    examStatus,
+  );
+  attempt.proctoringViolations = [
+    ...(Array.isArray(attempt.proctoringViolations) ? attempt.proctoringViolations : []),
+    ...normalizedLogs,
+  ];
 
   // Update section timers
   if (sectionTimings && Array.isArray(sectionTimings)) {

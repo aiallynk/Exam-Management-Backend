@@ -68,6 +68,11 @@ const TenantSchema = new mongoose.Schema(
       enum: ['ACTIVE', 'INACTIVE', 'SUSPENDED'],
       default: 'ACTIVE',
     },
+    tokenVersion: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
     subscription: {
       planType: {
         type: String,

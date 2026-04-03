@@ -602,7 +602,7 @@ export const FREE_PLAN_MESSAGES = Object.freeze({
   ATTEMPT_LIMIT: 'Free plan monthly attempt limit reached. Upgrade to allow more candidate attempts.',
   AI_QUESTION_LIMIT:
     'Free plan monthly AI question generation limit reached. Upgrade to generate more AI questions.',
-  CODING_LOCKED: 'Coding questions are available only in higher plans.',
+  CODING_LOCKED: 'Code questions available only in Pro plan.',
   QUESTION_TYPE_LOCKED: 'Free plan supports only MCQ, Multi Select, True/False, and Short Answer questions.',
   WRITING_AI_LOCKED: 'Upgrade your plan to use writing questions with AI grading',
   OMR_LOCKED: 'OMR evaluation is available only in higher plans.',

@@ -103,6 +103,8 @@ const FEATURE_BILLING_DEFAULT_SELECTION = Object.freeze({
 const CREDIT_REQUEST_ALLOWED_TYPES = new Set(Object.values(CREDIT_REQUEST_TYPES));
 const CREDIT_REQUEST_ALLOWED_STATUSES = new Set(Object.values(CREDIT_REQUEST_STATUSES));
 const CREDIT_REQUEST_MAX_AMOUNT = 1000000;
+const DUPLICATE_EXAM_NAME_MESSAGE =
+  'Exam name already exists. Please use a different name.';
 const CREDIT_REQUEST_TYPE_CONFIG = Object.freeze({
   [CREDIT_REQUEST_TYPES.AI]: {
     limitKey: 'maxAiQuestionsPerMonth',
@@ -120,6 +122,56 @@ const CREDIT_REQUEST_TYPE_CONFIG = Object.freeze({
     usageLabel: 'Exams',
   },
 });
+
+const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const resolveExamCode = (examDoc) =>
+  String(examDoc?.exam_code || examDoc?.uniqueId || examDoc?.examCode || '').trim();
+
+const withExamCode = (examDoc) => {
+  if (!examDoc) return examDoc;
+
+  const normalized =
+    typeof examDoc?.toObject === 'function' ? examDoc.toObject() : { ...examDoc };
+  if (!normalized || typeof normalized !== 'object') {
+    return normalized;
+  }
+
+  return {
+    ...normalized,
+    exam_id: normalized._id ? String(normalized._id) : normalized.exam_id || '',
+    exam_code: resolveExamCode(normalized),
+  };
+};
+
+const buildTenantScopedExamNameFilter = ({ title, tenantId, excludeExamId = null }) => {
+  const normalizedTitle = String(title || '').trim();
+  if (!normalizedTitle || !tenantId) {
+    return null;
+  }
+
+  const filter = {
+    title: new RegExp(`^${escapeRegExp(normalizedTitle)}$`, 'i'),
+    tenantId,
+  };
+
+  if (excludeExamId) {
+    filter._id = { $ne: excludeExamId };
+  }
+
+  return filter;
+};
+
+const findDuplicateExamByTitle = async ({ title, tenantId, excludeExamId = null }) => {
+  const duplicateFilter = buildTenantScopedExamNameFilter({
+    title,
+    tenantId,
+    excludeExamId,
+  });
+  if (!duplicateFilter) return null;
+
+  return Exam.findOne(duplicateFilter).select('_id').lean();
+};
 
 const toFiniteLimit = (value) => {
   const parsed = Number(value);
@@ -2154,7 +2206,7 @@ router.get('/exams', async (req, res, next) => {
     ]);
 
     res.json({
-      exams,
+      exams: exams.map((exam) => withExamCode(exam)),
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
@@ -2369,7 +2421,7 @@ router.get('/exams/:examId', async (req, res, next) => {
     examDetails.candidates = candidates;
     examDetails.totalCandidates = candidates.length;
 
-    res.json({ exam: examDetails });
+    res.json({ exam: withExamCode(examDetails) });
   } catch (error) {
     next(error);
   }
@@ -2402,6 +2454,20 @@ router.put(
       }
 
       const { title, description, isActive, duration, maxAttempts } = req.body;
+
+      if (typeof title === 'string' && title.trim()) {
+        const duplicateExam = await findDuplicateExamByTitle({
+          title,
+          tenantId: req.user.tenantId,
+          excludeExamId: exam._id,
+        });
+        if (duplicateExam) {
+          return res.status(409).json({
+            success: false,
+            message: DUPLICATE_EXAM_NAME_MESSAGE,
+          });
+        }
+      }
 
       // Store before state for audit
       const beforeState = {
@@ -2452,7 +2518,7 @@ router.put(
         },
       });
 
-      res.json({ exam });
+      res.json({ exam: withExamCode(exam) });
     } catch (error) {
       next(error);
     }
@@ -2487,7 +2553,7 @@ router.delete('/exams/:examId', async (req, res, next) => {
       },
     });
 
-    res.json({ message: 'Exam deactivated successfully', exam });
+    res.json({ message: 'Exam deactivated successfully', exam: withExamCode(exam) });
   } catch (error) {
     next(error);
   }

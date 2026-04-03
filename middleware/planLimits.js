@@ -582,6 +582,10 @@ export const checkExamCreationLimit = async (req, res, next) => {
 
 export const checkQuestionLimit = async (req, res, next) => {
   try {
+    if (Boolean(req.planLimitContext?.skipExamQuestionLimit)) {
+      return next();
+    }
+
     const examId = getExamIdFromRequest(req);
     if (!examId) return next();
 

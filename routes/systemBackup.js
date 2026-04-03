@@ -17,6 +17,12 @@ import {
   getBackupDownloadPath,
   deleteBackup,
 } from '../services/backupService.js';
+import {
+  runIncrementalBackupForTenants,
+  restoreTenantFromIncrementalBackup,
+  getIncrementalBackupStatus,
+} from '../services/incrementalBackupService.js';
+import { runScheduledIncrementalBackup } from '../services/incrementalBackupSchedulerService.js';
 
 const router = express.Router();
 
@@ -84,6 +90,17 @@ const resolveCompanyId = (payload) =>
   payload?.tenant_id ||
   payload?.tenantId ||
   null;
+
+const toBoolean = (value, fallback = false) => {
+  if (typeof value === 'boolean') return value;
+  if (typeof value === 'number') return value !== 0;
+  if (typeof value !== 'string') return fallback;
+
+  const normalized = value.trim().toLowerCase();
+  if (['1', 'true', 'yes', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'off'].includes(normalized)) return false;
+  return fallback;
+};
 
 const toFormattedBackupRecord = (record) => {
   const company = record?.company_id || null;
@@ -334,6 +351,113 @@ router.post('/restore', requireAuth, superAdminOnly, backupUpload.single('backup
     }
   }
 });
+
+/**
+ * GET /api/admin/system/incremental-backup/status
+ * View incremental JSON backup status (all tenants or single tenant).
+ */
+router.get('/incremental-backup/status', requireAuth, superAdminOnly, async (req, res, next) => {
+  try {
+    const tenantId = req.query?.tenantId || req.query?.tenant_id || null;
+    if (tenantId && !isValidMongoId(tenantId)) {
+      return res.status(400).json({ error: 'tenantId must be a valid ID.' });
+    }
+
+    const status = await getIncrementalBackupStatus({ tenantId: tenantId || null });
+    return res.json({
+      message: 'Incremental backup status fetched successfully.',
+      count: status.length,
+      status,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/admin/system/incremental-backup/run
+ * Manual trigger for incremental tenant backup.
+ */
+router.post('/incremental-backup/run', requireAuth, superAdminOnly, async (req, res, next) => {
+  try {
+    const tenantId = req.body?.tenantId || req.body?.tenant_id || null;
+    if (tenantId && !isValidMongoId(tenantId)) {
+      return res.status(400).json({ error: 'tenantId must be a valid ID.' });
+    }
+
+    const forceFull = toBoolean(req.body?.forceFull ?? req.body?.force_full, false);
+    const includeInactive = toBoolean(
+      req.body?.includeInactive ?? req.body?.include_inactive,
+      false
+    );
+    const respectDailyGuard = toBoolean(
+      req.body?.respectDailyGuard ?? req.body?.respect_daily_guard,
+      false
+    );
+
+    // Optional mode to reuse scheduler's once-per-day IST guard.
+    if (respectDailyGuard && !tenantId) {
+      const forceRun = toBoolean(req.body?.forceRun ?? req.body?.force_run, false);
+      const scheduled = await runScheduledIncrementalBackup({
+        force: forceRun,
+        forceFull,
+      });
+      return res.json({
+        message: scheduled?.skipped
+          ? 'Incremental backup skipped by daily guard.'
+          : 'Incremental backup completed successfully.',
+        result: scheduled,
+      });
+    }
+
+    const summary = await runIncrementalBackupForTenants({
+      tenantId: tenantId || null,
+      forceFull,
+      includeInactive,
+    });
+
+    return res.json({
+      message:
+        summary.failureCount > 0
+          ? 'Incremental backup completed with some failures.'
+          : 'Incremental backup completed successfully.',
+      summary,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+/**
+ * POST /api/admin/system/incremental-backup/:tenantId/restore
+ * Restore tenant data from tenant incremental backup JSON using UPSERT.
+ */
+router.post(
+  '/incremental-backup/:tenantId/restore',
+  requireAuth,
+  superAdminOnly,
+  async (req, res, next) => {
+    try {
+      const { tenantId } = req.params;
+      if (!isValidMongoId(tenantId)) {
+        return res.status(400).json({ error: 'tenantId must be a valid ID.' });
+      }
+
+      const batchSize = Number.parseInt(req.body?.batchSize ?? req.body?.batch_size ?? '', 10);
+      const restoreResult = await restoreTenantFromIncrementalBackup({
+        tenantId,
+        batchSize: Number.isFinite(batchSize) ? batchSize : undefined,
+      });
+
+      return res.json({
+        message: 'Tenant restored successfully from incremental backup.',
+        restore: restoreResult,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
 
 /**
  * DELETE /api/admin/system/backups/:backupId

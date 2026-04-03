@@ -88,7 +88,7 @@ def preprocess_page(color_img):
 def spans_from_mask(mask, min_len=8):
     spans = []
     start = None
-    for idx, val in enumerate(mask):
+    for idx, val in enumerate(mask): 
         if val and start is None:
             start = idx
         if not val and start is not None:

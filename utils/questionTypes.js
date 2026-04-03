@@ -37,6 +37,7 @@ const normalizeUpper = (value) => normalizeString(value).toUpperCase();
 const normalizeFormatAlias = (value) => {
   const normalized = normalizeUpper(value);
   if (normalized === 'IMAGE_BASED') return 'IMAGE';
+  if (normalized === 'CODE') return 'CODING';
   if (['LETTER_WRITING', 'LETTER'].includes(normalized)) return 'ESSAY_LETTER';
   if (['STORY_WRITING', 'STORY'].includes(normalized)) return 'ESSAY_STORY';
   return normalized;
@@ -53,6 +54,9 @@ const normalizeEssayTypeAlias = (value) => {
   }
   if (['LONG_ANSWER', 'DESCRIPTIVE'].includes(normalized)) {
     return 'ESSAY';
+  }
+  if (normalized === 'CODE') {
+    return 'CODING';
   }
   return normalized;
 };
@@ -141,9 +145,9 @@ export const isValidQuestionFormat = (value) => {
 
 export const normalizeQuestionFormat = (payload = {}) => {
   const explicitFormat = normalizeFormatAlias(
-    payload.questionFormat || payload.question_type
+    payload.questionFormat || payload.question_type || payload.type
   );
-  const normalizedType = normalizeEssayTypeAlias(payload.questionType);
+  const normalizedType = normalizeEssayTypeAlias(payload.questionType || payload.type);
 
   if (normalizedType === 'CODING') {
     return 'CODING';
@@ -198,8 +202,10 @@ export const normalizeQuestionFormat = (payload = {}) => {
 };
 
 export const normalizeQuestionTypeForStorage = (payload = {}) => {
-  const normalizedType = normalizeEssayTypeAlias(payload.questionType);
-  const explicitFormat = normalizeFormatAlias(payload.questionFormat || payload.question_type);
+  const normalizedType = normalizeEssayTypeAlias(payload.questionType || payload.type);
+  const explicitFormat = normalizeFormatAlias(
+    payload.questionFormat || payload.question_type || payload.type
+  );
   const normalizedFormat = normalizeQuestionFormat(payload);
   const inferredObjectiveType = inferObjectiveTypeFromOptions(payload.options, payload.correctAnswer);
 

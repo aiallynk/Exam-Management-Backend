@@ -65,6 +65,10 @@ const ExamAttemptSchema = new mongoose.Schema(
         type: mongoose.Schema.Types.ObjectId,
         ref: 'Section',
       },
+      clientSubmissionId: {
+        type: String,
+        trim: true,
+      },
       finalizedAfterViolation: {
         type: Boolean,
         default: false,
@@ -209,6 +213,20 @@ const ExamAttemptSchema = new mongoose.Schema(
     proctoringViolations: {
       type: [mongoose.Schema.Types.Mixed],
       default: [],
+    },
+    violationCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    violationLogs: {
+      type: [mongoose.Schema.Types.Mixed],
+      default: [],
+    },
+    examStatus: {
+      type: String,
+      enum: ['FAIR', 'SUSPICIOUS', 'CHEATING'],
+      default: 'FAIR',
     },
     adminFlags: {
       status: {

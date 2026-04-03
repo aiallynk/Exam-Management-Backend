@@ -321,6 +321,116 @@ const normalizeQuestionsPerParagraph = (value, fallback = DEFAULT_PARAGRAPH_QUES
 const createParagraphGroupId = (groupIndex = 0) =>
   `paragraph-${Date.now().toString(36)}-${groupIndex + 1}-${Math.random().toString(36).slice(2, 8)}`;
 
+const flattenGroupedQuestionContainers = (groupEntries = [], options = {}) => {
+  const { fallbackFormat = 'PARAGRAPH' } = options;
+  const safeEntries = Array.isArray(groupEntries) ? groupEntries : [];
+  const flattenedQuestions = [];
+
+  safeEntries.forEach((groupEntry, groupIndex) => {
+    if (!groupEntry || typeof groupEntry !== 'object') return;
+
+    const sharedPassage = sanitizeString(
+      groupEntry.passage ||
+        groupEntry.context ||
+        groupEntry.paragraph ||
+        groupEntry.scenario ||
+        groupEntry.text
+    );
+    const sharedGroupId =
+      sanitizeString(
+        groupEntry.paragraphGroupId ||
+          groupEntry.paragraph_group_id ||
+          groupEntry.groupId ||
+          groupEntry.id
+      ) || createParagraphGroupId(groupIndex);
+    const groupFormatRaw = sanitizeString(
+      groupEntry.questionFormat || groupEntry.question_type || groupEntry.type || fallbackFormat
+    ).toUpperCase();
+    const groupFormat = groupFormatRaw === 'SCENARIO' ? 'SCENARIO' : 'PARAGRAPH';
+    const safeQuestions = Array.isArray(groupEntry.questions) ? groupEntry.questions : [];
+
+    safeQuestions.forEach((questionEntry, localIndex) => {
+      if (!questionEntry || typeof questionEntry !== 'object') return;
+      flattenedQuestions.push({
+        ...questionEntry,
+        passage: sanitizeString(questionEntry.passage || questionEntry.context || sharedPassage),
+        paragraphGroupId: sanitizeString(
+          questionEntry.paragraphGroupId || questionEntry.paragraph_group_id || sharedGroupId
+        ),
+        questionFormat: sanitizeString(
+          questionEntry.questionFormat || questionEntry.question_type || groupFormat
+        ),
+        question_type: sanitizeString(
+          questionEntry.question_type || questionEntry.questionFormat || groupFormat
+        ),
+        order:
+          Number.isFinite(Number(questionEntry.order))
+            ? Number(questionEntry.order)
+            : Number(groupEntry.order) + localIndex || localIndex + 1,
+      });
+    });
+  });
+
+  return flattenedQuestions;
+};
+
+const extractQuestionsFromAiResponse = (parsedResponse) => {
+  if (Array.isArray(parsedResponse)) {
+    return parsedResponse;
+  }
+
+  if (!parsedResponse || typeof parsedResponse !== 'object') {
+    return [];
+  }
+
+  const topLevelSharedPassage = sanitizeString(
+    parsedResponse.passage ||
+      parsedResponse.context ||
+      parsedResponse.paragraph ||
+      parsedResponse.scenario
+  );
+  if (Array.isArray(parsedResponse.questions) && topLevelSharedPassage) {
+    return flattenGroupedQuestionContainers([parsedResponse], {
+      fallbackFormat: sanitizeString(parsedResponse.type || parsedResponse.questionFormat || 'PARAGRAPH'),
+    });
+  }
+
+  if (Array.isArray(parsedResponse.questions)) {
+    const mixedQuestions = [];
+    parsedResponse.questions.forEach((entry) => {
+      if (
+        entry &&
+        typeof entry === 'object' &&
+        Array.isArray(entry.questions) &&
+        !sanitizeString(entry.questionText || entry.question || entry.title)
+      ) {
+        mixedQuestions.push(
+          ...flattenGroupedQuestionContainers([entry], {
+            fallbackFormat: sanitizeString(entry.type || entry.questionFormat || 'PARAGRAPH'),
+          })
+        );
+      } else {
+        mixedQuestions.push(entry);
+      }
+    });
+    return mixedQuestions;
+  }
+
+  if (Array.isArray(parsedResponse.data)) {
+    return parsedResponse.data;
+  }
+
+  const groupedKeys = ['groups', 'scenarios', 'paragraphs', 'passages', 'sections'];
+  for (const key of groupedKeys) {
+    if (Array.isArray(parsedResponse[key])) {
+      const fallbackFormat = key === 'scenarios' ? 'SCENARIO' : 'PARAGRAPH';
+      return flattenGroupedQuestionContainers(parsedResponse[key], { fallbackFormat });
+    }
+  }
+
+  return [];
+};
+
 const normalizeImageQuestionConfig = ({
   enableImageQuestions,
   imageQuestionCount,
@@ -1403,6 +1513,7 @@ For each question, provide:
 - options: Array of options (for MULTIPLE_CHOICE, MULTIPLE_OPTIONS, TRUE_FALSE). For harder difficulties, make distractors more plausible and challenging.
 - correctAnswer: The correct answer (string) for non-coding questions. Use an empty string for CODING questions.
 - passage: For PARAGRAPH questions, include the supporting passage students must read. Use an empty string for other question types unless contextual text is explicitly required.
+- For grouped PARAGRAPH/SCENARIO output, you may return { "groups": [{ "passage": "...", "questions": [...] }] }. Each nested question counts toward total questions.
 - title: For CODING questions, provide a short problem title.
 - description: For CODING questions, provide a full problem statement.
 - category: For CODING questions, provide a short category label such as Data Structures or Algorithms.
@@ -1481,19 +1592,12 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
           }
         }
 
-        // Extract questions array
-        let questions = [];
-        if (Array.isArray(parsedResponse)) {
-          questions = parsedResponse;
-        } else if (parsedResponse.questions && Array.isArray(parsedResponse.questions)) {
-          questions = parsedResponse.questions;
-        } else if (parsedResponse.data && Array.isArray(parsedResponse.data)) {
-          questions = parsedResponse.data;
-        } else {
+        const extractedQuestions = extractQuestionsFromAiResponse(parsedResponse);
+        if (!extractedQuestions.length) {
           throw new Error('Invalid response format from OpenAI');
         }
 
-        const normalizedQuestions = questions
+        const normalizedQuestions = extractedQuestions
           .map((q, index) => normalizeQuestionObject(q, index + 1))
           .filter(Boolean);
 

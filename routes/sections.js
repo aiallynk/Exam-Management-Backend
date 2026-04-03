@@ -3,6 +3,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { requireTenant } from '../middleware/multiTenant.js';
 import { body, validationResult } from 'express-validator';
+import QuestionPaper from '../models/QuestionPaper.js';
 import {
   getSectionsByQuestionPaper,
   getSectionById,
@@ -18,8 +19,34 @@ import {
   validateSectionNavigation,
 } from '../services/sectionService.js';
 import { auditLog, AUDIT_ACTIONS } from '../middleware/audit.js';
+import { queueExamPackageRegeneration } from '../services/examPackageRegenerationService.js';
 
 const router = express.Router();
+
+const queueRegenerationForQuestionPaper = async (questionPaperId, userId, reason) => {
+  try {
+    const questionPaper = await QuestionPaper.findById(questionPaperId)
+      .populate('examId', '_id examType');
+
+    const exam = questionPaper?.examId;
+    if (!exam?._id || exam.examType === 'OMR') {
+      return;
+    }
+
+    queueExamPackageRegeneration({
+      examId: exam._id,
+      userId,
+      reason,
+      forceRegenerate: true,
+      questionPaperIds: [questionPaperId],
+    });
+  } catch (error) {
+    console.error(
+      `[Package Regeneration] Failed to enqueue for questionPaper ${questionPaperId}:`,
+      error?.message || error
+    );
+  }
+};
 
 // Get sections for question paper
 router.get('/question-paper/:questionPaperId', requireAuth, requireTenant, async (req, res, next) => {
@@ -98,6 +125,11 @@ router.post(
       }
 
       const section = await createSection(req.body);
+      void queueRegenerationForQuestionPaper(
+        section.questionPaperId,
+        req.user._id,
+        'SECTION_CREATED'
+      );
       res.status(201).json({ section });
     } catch (error) {
       next(error);
@@ -117,6 +149,11 @@ router.put(
   async (req, res, next) => {
     try {
       const section = await updateSection(req.params.sectionId, req.body);
+      void queueRegenerationForQuestionPaper(
+        section.questionPaperId,
+        req.user._id,
+        'SECTION_UPDATED'
+      );
       res.json({ section });
     } catch (error) {
       next(error);
@@ -135,7 +172,12 @@ router.delete(
   })),
   async (req, res, next) => {
     try {
-      await deleteSection(req.params.sectionId);
+      const deletedSection = await deleteSection(req.params.sectionId);
+      void queueRegenerationForQuestionPaper(
+        deletedSection.questionPaperId,
+        req.user._id,
+        'SECTION_DELETED'
+      );
       res.json({ message: 'Section deleted successfully' });
     } catch (error) {
       next(error);
@@ -151,6 +193,11 @@ router.put(
   async (req, res, next) => {
     try {
       const sections = await reorderSections(req.params.questionPaperId, req.body.sectionOrders);
+      void queueRegenerationForQuestionPaper(
+        req.params.questionPaperId,
+        req.user._id,
+        'SECTION_REORDERED'
+      );
       res.json({ sections });
     } catch (error) {
       next(error);

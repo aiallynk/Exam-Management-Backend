@@ -5,6 +5,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireRole, requireOwnershipOrAdmin } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { body, validationResult } from 'express-validator';
+import { queueExamPackageRegeneration } from '../services/examPackageRegenerationService.js';
 
 const router = express.Router();
 
@@ -75,6 +76,16 @@ router.post(
 
       await questionPaper.save();
       await questionPaper.populate('createdBy', 'name email');
+
+      if (exam.examType !== 'OMR') {
+        queueExamPackageRegeneration({
+          examId: exam._id,
+          userId: req.user._id,
+          reason: 'QUESTION_PAPER_CREATED',
+          forceRegenerate: true,
+          questionPaperIds: [questionPaper._id],
+        });
+      }
 
       res.status(201).json({ questionPaper });
     } catch (error) {

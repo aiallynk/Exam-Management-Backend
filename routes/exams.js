@@ -30,6 +30,7 @@ import { syncUserExamCount } from '../utils/planUsage.js';
 import { ensureQuestionsImageAvailability } from '../services/questionImportImageService.js';
 import { sanitizeQuestionOptions } from '../utils/questionOptionSanitizer.js';
 import { sanitizeExamAccessControlPayload } from '../utils/examSecurity.js';
+import { queueExamPackageRegeneration } from '../services/examPackageRegenerationService.js';
 
 const router = express.Router();
 const SECTION_BASED_EXAM_TYPE = 'SECTION_BASED';
@@ -59,6 +60,81 @@ const normalizeExamType = (value) => {
 };
 
 const isValidObjectId = (value) => MONGO_OBJECT_ID_PATTERN.test(String(value || '').trim());
+const DUPLICATE_EXAM_NAME_MESSAGE =
+  'Exam name already exists. Please use a different name.';
+
+const resolveTenantIdForExamCreation = (req) => {
+  const tenantCandidates = [
+    req?.user?.tenantId,
+    req?.user?.tenant?._id,
+    req?.tenantFilter?.tenantId,
+    req?.context?.tenantId,
+    req?.body?.tenantId,
+  ];
+
+  for (const candidate of tenantCandidates) {
+    const normalized = String(candidate ?? '').trim();
+    if (!normalized || ['null', 'undefined'].includes(normalized.toLowerCase())) {
+      continue;
+    }
+    if (isValidObjectId(normalized)) {
+      return normalized;
+    }
+  }
+
+  return null;
+};
+
+const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+const buildTenantScopedExamNameFilter = ({ title, tenantId, excludeExamId = null }) => {
+  const normalizedTitle = String(title || '').trim();
+  if (!normalizedTitle) {
+    return null;
+  }
+
+  const filter = {
+    title: new RegExp(`^${escapeRegExp(normalizedTitle)}$`, 'i'),
+    ...(tenantId ? { tenantId } : { tenantId: { $exists: false } }),
+  };
+
+  if (excludeExamId) {
+    filter._id = { $ne: excludeExamId };
+  }
+
+  return filter;
+};
+
+const findDuplicateExamByTitle = async ({ title, tenantId, excludeExamId = null }) => {
+  const duplicateFilter = buildTenantScopedExamNameFilter({
+    title,
+    tenantId,
+    excludeExamId,
+  });
+  if (!duplicateFilter) return null;
+
+  return Exam.findOne(duplicateFilter).select('_id').lean();
+};
+
+const withExamCode = (examDoc) => {
+  if (!examDoc) return examDoc;
+
+  const normalized =
+    typeof examDoc?.toObject === 'function' ? examDoc.toObject() : { ...examDoc };
+  if (!normalized || typeof normalized !== 'object') {
+    return normalized;
+  }
+
+  const resolvedExamCode = String(
+    normalized.exam_code || normalized.uniqueId || normalized.examCode || ''
+  ).trim();
+
+  return {
+    ...normalized,
+    exam_id: normalized._id ? String(normalized._id) : normalized.exam_id || '',
+    exam_code: resolvedExamCode,
+  };
+};
 
 const sanitizeSectionDurationPayload = (sections) => {
   if (!Array.isArray(sections) || sections.length === 0) {
@@ -749,7 +825,7 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, sanitizePag
     const total = await Exam.countDocuments(filter);
 
     res.json({
-      exams,
+      exams: exams.map((exam) => withExamCode(exam)),
       pagination: {
         page,
         limit,
@@ -1107,7 +1183,7 @@ router.get('/:examId', requireAuth, requireTenant, enforceTenantBoundaries, asyn
 
     // SUPER_ADMIN, TENANT_ADMIN, and EXAM_CREATOR can access all exams in their scope
     if (req.user.role === 'SUPER_ADMIN') {
-      return res.json({ exam });
+      return res.json({ exam: withExamCode(exam) });
     }
 
     if (req.user.role === 'TENANT_ADMIN' || req.user.role === 'EXAM_CREATOR') {
@@ -1115,7 +1191,7 @@ router.get('/:examId', requireAuth, requireTenant, enforceTenantBoundaries, asyn
       const examTenantId = exam.tenantId;
 
       if (userTenantId && examTenantId && userTenantId.toString() === examTenantId.toString()) {
-        return res.json({ exam });
+        return res.json({ exam: withExamCode(exam) });
       }
     }
 
@@ -1135,7 +1211,7 @@ router.get('/:examId', requireAuth, requireTenant, enforceTenantBoundaries, asyn
       return res.status(403).json({ error: 'Exam is not currently available' });
     }
 
-    res.json({ exam });
+    res.json({ exam: withExamCode(exam) });
   } catch (error) {
     next(error);
   }
@@ -1188,10 +1264,16 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      if (req.user.role !== 'SUPER_ADMIN' && !req.user.tenantId) {
+      const resolvedTenantId = resolveTenantIdForExamCreation(req);
+      if (req.user.role !== 'SUPER_ADMIN' && !resolvedTenantId) {
         return res.status(403).json({
           error:
             'Your account is not assigned to a tenant workspace yet. Please contact your Super Admin before creating exams.',
+        });
+      }
+      if (!resolvedTenantId) {
+        return res.status(400).json({
+          error: 'tenantId is required before creating an exam.',
         });
       }
 
@@ -1217,6 +1299,18 @@ router.post(
         accessControl,
       } =
         req.body;
+
+      const duplicateExam = await findDuplicateExamByTitle({
+        title,
+        tenantId: resolvedTenantId,
+      });
+      if (duplicateExam) {
+        return res.status(409).json({
+          success: false,
+          message: DUPLICATE_EXAM_NAME_MESSAGE,
+        });
+      }
+
       const effectivePlanType =
         req.planLimitContext?.planType ||
         (await resolveUserEffectivePlanType(req.user));
@@ -1330,8 +1424,7 @@ router.post(
         }
       }
 
-      // Set tenant IDs based on user's tenant (Organization OR Institute)
-      // SUPER_ADMIN can create exams without tenant (for global use)
+      // Resolve and persist tenant scope for exam creation.
       const examData = {
         title,
         description,
@@ -1349,6 +1442,7 @@ router.post(
         examType: isOmrRequest ? OMR_EXAM_TYPE : ONLINE_EXAM_TYPE,
         totalMarks: Number.isFinite(Number(totalMarks)) ? Math.max(0, Number(totalMarks)) : 0,
         createdBy: req.user._id,
+        tenantId: resolvedTenantId,
       };
 
       if (resolvedSubTenantId) {
@@ -1363,11 +1457,6 @@ router.post(
         examData.answerKey = safeOmrPayload.answerKey;
         examData.markingRules = safeOmrPayload.markingRules;
         examData.omrTemplateImage = String(omrTemplateImage || '').trim();
-      }
-
-      // Set tenant ID
-      if (req.user.role !== 'SUPER_ADMIN' && req.user.tenantId) {
-        examData.tenantId = req.user.tenantId;
       }
 
       const exam = new Exam(examData);
@@ -1416,24 +1505,18 @@ router.post(
       res.locals.examTitle = exam.title;
       res.locals.tenantId = exam.tenantId || null;
 
-      // Auto-generate packages if exam is active and has valid question paper
-      if (exam.isActive && exam.examType !== OMR_EXAM_TYPE) {
-        try {
-          const { autoGeneratePackagesOnPublish, examHasValidQuestionPaper } = await import('../services/examPackageService.js');
-          const hasValidQuestionPaper = await examHasValidQuestionPaper(exam._id.toString());
-          if (hasValidQuestionPaper) {
-            const generationResult = await autoGeneratePackagesOnPublish(exam._id.toString(), req.user._id);
-            if (generationResult.errors.length > 0) {
-              console.warn(`Package generation completed with errors for exam ${exam._id}:`, generationResult.errors);
-            }
-          }
-        } catch (error) {
-          // Log error but don't fail the create operation
-          console.error(`Failed to auto-generate packages for exam ${exam._id}:`, error);
-        }
+      // Non-blocking automatic package generation for online exams.
+      if (exam.examType !== OMR_EXAM_TYPE) {
+        queueExamPackageRegeneration({
+          examId: exam._id,
+          userId: req.user._id,
+          reason: 'EXAM_CREATED',
+          forceRegenerate: true,
+          examUpdatedAt: exam.updatedAt,
+        });
       }
 
-      res.status(201).json({ exam });
+      res.status(201).json({ exam: withExamCode(exam) });
     } catch (error) {
       next(error);
     }
@@ -1523,6 +1606,20 @@ router.put(
         accessControl,
       } =
         req.body;
+
+      if (typeof title === 'string' && title.trim()) {
+        const duplicateExam = await findDuplicateExamByTitle({
+          title,
+          tenantId: exam.tenantId || req.user?.tenantId || req.tenantFilter?.tenantId || null,
+          excludeExamId: exam._id,
+        });
+        if (duplicateExam) {
+          return res.status(409).json({
+            success: false,
+            message: DUPLICATE_EXAM_NAME_MESSAGE,
+          });
+        }
+      }
 
       const requestedDuration = duration !== undefined ? toPositiveInt(duration, null) : null;
       if (duration !== undefined && requestedDuration === null) {
@@ -1680,10 +1777,6 @@ router.put(
         exam.resultsReleasedAt = resultsReleasedAt ? new Date(resultsReleasedAt) : null;
       }
 
-      // Check if exam is being published (isActive changing from false to true)
-      const wasInactive = !exam.isActive;
-      const isBeingPublished = isActive !== undefined && isActive && wasInactive;
-
       await exam.save();
       await exam.populate('createdBy', 'name email');
 
@@ -1747,28 +1840,17 @@ router.put(
         },
       });
 
-      // Auto-generate packages when exam becomes ready
-      // Trigger if: exam is active AND has valid question paper
-      // This covers: publish toggle, exam created as active, question papers added later
-      if (exam.isActive && exam.examType !== OMR_EXAM_TYPE) {
-        try {
-          const { autoGeneratePackagesOnPublish, examHasValidQuestionPaper } = await import('../services/examPackageService.js');
-          const hasValidQuestionPaper = await examHasValidQuestionPaper(exam._id.toString());
-          if (hasValidQuestionPaper) {
-            const generationResult = await autoGeneratePackagesOnPublish(exam._id.toString(), req.user._id);
-
-            // Log generation result (don't fail the update if generation fails)
-            if (generationResult.errors.length > 0) {
-              console.warn(`Package generation completed with errors for exam ${exam._id}:`, generationResult.errors);
-            }
-          }
-        } catch (error) {
-          // Log error but don't fail the update operation
-          console.error(`Failed to auto-generate packages for exam ${exam._id}:`, error);
-        }
+      if (exam.examType !== OMR_EXAM_TYPE) {
+        queueExamPackageRegeneration({
+          examId: exam._id,
+          userId: req.user._id,
+          reason: 'EXAM_UPDATED',
+          forceRegenerate: true,
+          examUpdatedAt: exam.updatedAt,
+        });
       }
 
-      res.json({ exam });
+      res.json({ exam: withExamCode(exam) });
     } catch (error) {
       next(error);
     }
@@ -1807,7 +1889,7 @@ router.patch(
 
       res.json({
         message: `Max attempts increased by ${additionalAttempts}. New max attempts: ${exam.maxAttempts}`,
-        exam,
+        exam: withExamCode(exam),
       });
     } catch (error) {
       next(error);
@@ -1910,7 +1992,7 @@ router.post(
         console.error('[NOTIFICATIONS] Failed to log results release:', notifyError?.message || notifyError);
       }
 
-      res.json({ exam });
+      res.json({ exam: withExamCode(exam) });
     } catch (error) {
       next(error);
     }

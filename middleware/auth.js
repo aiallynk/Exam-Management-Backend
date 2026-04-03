@@ -12,6 +12,7 @@ import {
 } from '../config/planLimits.js';
 import { isBlacklisted } from '../utils/tokenBlacklist.js';
 import { auditUnauthorized } from './audit.js';
+import { validateTenantAccessState } from './tenantStatus.js';
 
 const ALLOW_SUSPENDED_READ_ONLY =
   String(process.env.ALLOW_SUSPENDED_READ_ONLY || '')
@@ -70,8 +71,17 @@ export const requireAuth = async (req, res, next) => {
       let subscriptionWarning = '';
 
       if (tenantId && user.role !== 'SUPER_ADMIN') {
+        const tenantAccessState = await validateTenantAccessState({
+          tenantId,
+          decodedTokenVersion: decoded.tokenVersion,
+          select: 'status tokenVersion subscription',
+        });
+        if (!tenantAccessState.allowed) {
+          return res.status(tenantAccessState.statusCode).json(tenantAccessState.payload);
+        }
+
         try {
-          const tenant = await Tenant.findById(tenantId).select('subscription');
+          const tenant = tenantAccessState.tenant;
           const subscription = tenant?.subscription || {};
           subscriptionStatus = resolveSubscriptionStatus(subscription);
           subscriptionPlanType = resolveSubscriptionPlanType(subscription.planType || user.planType);

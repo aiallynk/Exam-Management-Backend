@@ -124,8 +124,35 @@ const ExamSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    packageVersion: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    packageStatus: {
+      type: String,
+      enum: ['PENDING', 'PROCESSING', 'READY', 'GENERATED', 'NOT_GENERATED', 'FAILED'],
+      default: 'PENDING',
+      index: true,
+    },
+    packageGeneratedAt: {
+      type: Date,
+    },
     offlinePackageGeneratedAt: {
       type: Date,
+    },
+    packageLastGeneratedAt: {
+      type: Date,
+    },
+    latestPackageUrl: {
+      type: String,
+      default: '',
+      trim: true,
+    },
+    packageLastError: {
+      type: String,
+      default: '',
+      trim: true,
     },
     offlinePackageEnabled: {
       type: Boolean,
@@ -248,6 +275,10 @@ ExamSchema.pre('save', function (next) {
 
 // Generate uniqueId before validation
 ExamSchema.pre('validate', async function (next) {
+  if (!this.tenantId) {
+    return next(new Error('tenantId is required before saving Exam'));
+  }
+
   if (!this.uniqueId) {
     try {
       this.uniqueId = await generateUniqueIdWithCheck(

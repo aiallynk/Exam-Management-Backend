@@ -624,6 +624,8 @@ router.post(
       }
 
       const importData = await parseQuestionImportFile(req.file);
+      const isCsvImport =
+        String(importData?.extension || '').trim().toLowerCase() === '.csv';
       let { text, structuredRows } = importData;
 
       const structuredRowCount = Array.isArray(structuredRows)
@@ -788,7 +790,7 @@ router.post(
           tenantForQuestionLimit
         );
 
-        if (currentQuestionCount !== null) {
+        if (currentQuestionCount !== null && !isCsvImport) {
           const maxQuestionsPerExam = responseMaxQuestionsPerExam;
           const availableQuestionSlots =
             maxQuestionsPerExam === null
@@ -1042,10 +1044,10 @@ router.post(
         if (disallowed) {
           const message =
             disallowed === 'CODING'
-              ? FREE_PLAN_MESSAGES.CODING_LOCKED
+              ? 'Upgrade to Pro to generate coding questions'
               : WRITING_AI_TYPES.has(disallowed)
                 ? FREE_PLAN_MESSAGES.WRITING_AI_LOCKED
-              : FREE_PLAN_AI_TYPE_LOCKED_MESSAGE;
+                : FREE_PLAN_AI_TYPE_LOCKED_MESSAGE;
           return sendPlanRestriction(res, message);
         }
       }

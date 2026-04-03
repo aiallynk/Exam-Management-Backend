@@ -28,17 +28,49 @@ import {
   extractCodingFields,
   hasCodingConfiguration,
 } from '../utils/codingQuestions.js';
+import { queueExamPackageRegeneration } from '../services/examPackageRegenerationService.js';
 
 const router = express.Router();
 
+const queueExamPackageRegenerationForContentChange = async ({
+  examId,
+  userId,
+  reason,
+  questionPaperId,
+}) => {
+  try {
+    const exam = await Exam.findById(examId).select('_id examType');
+    if (!exam?._id || exam.examType === 'OMR') {
+      return;
+    }
+
+    queueExamPackageRegeneration({
+      examId: exam._id,
+      userId,
+      reason,
+      forceRegenerate: true,
+      questionPaperIds: questionPaperId ? [questionPaperId] : null,
+    });
+  } catch (error) {
+    console.error(
+      `[Package Regeneration] Failed to enqueue for exam ${examId}:`,
+      error?.message || error
+    );
+  }
+};
+
 const prepareImportedQuestionCount = (req, res, next) => {
   try {
+    const importSourceType = String(req.body?.importSourceType || '').trim().toUpperCase();
+    const skipExamQuestionLimitForCsv = importSourceType === 'CSV';
     const importedQuestions = Array.isArray(req.body?.questions) ? req.body.questions : null;
     if (importedQuestions) {
+      const flattenedImportedQuestions = flattenQuestionPayloadList(importedQuestions);
       req.planLimitContext = {
         ...(req.planLimitContext || {}),
-        parsedImportedQuestions: importedQuestions,
-        questionsToAdd: importedQuestions.length,
+        parsedImportedQuestions: flattenedImportedQuestions,
+        questionsToAdd: flattenedImportedQuestions.length,
+        skipExamQuestionLimit: skipExamQuestionLimitForCsv,
       };
       return next();
     }
@@ -55,6 +87,22 @@ const prepareImportedQuestionCount = (req, res, next) => {
       ...(req.planLimitContext || {}),
       parsedCsvRecords: records,
       questionsToAdd: records.length,
+      skipExamQuestionLimit: true,
+    };
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+};
+
+const prepareCreateQuestionCount = (req, res, next) => {
+  try {
+    const isContextGroupPayload = isContextQuestionGroupPayload(req.body || {});
+    const expandedCreateQuestions = flattenQuestionPayloadList([req.body || {}]);
+    req.planLimitContext = {
+      ...(req.planLimitContext || {}),
+      expandedCreateQuestions,
+      questionsToAdd: isContextGroupPayload ? expandedCreateQuestions.length : 1,
     };
     return next();
   } catch (error) {
@@ -86,6 +134,18 @@ const normalizeString = (value) => {
   return String(value).trim();
 };
 
+const normalizeQuestionTypeAlias = (value) => {
+  const normalized = normalizeString(value).toUpperCase();
+  if (normalized === 'CODE') return 'CODING';
+  return normalized;
+};
+
+const normalizeQuestionFormatAlias = (value) => {
+  const normalized = normalizeString(value).toUpperCase();
+  if (normalized === 'CODE') return 'CODING';
+  return normalized;
+};
+
 const parseOptionsInput = (value) => {
   if (Array.isArray(value)) return value;
   if (typeof value !== 'string') return undefined;
@@ -98,6 +158,414 @@ const parseOptionsInput = (value) => {
   } catch {
     return raw.split(/[,;|\n]/).map((item) => item.trim()).filter(Boolean);
   }
+};
+
+const normalizeImportQuestionTypeToken = (value) => {
+  const normalized = normalizeQuestionTypeAlias(value);
+  if (['MULTI_SELECT_MCQ', 'MULTI_SELECT', 'MULTISELECT'].includes(normalized)) {
+    return 'MULTIPLE_OPTIONS';
+  }
+  if (normalized === 'MCQ' || normalized === 'IMAGE_BASED') return 'MULTIPLE_CHOICE';
+  if (normalized === 'CODE') return 'CODING';
+  return normalized;
+};
+
+const normalizeImportQuestionFormatToken = (value) => {
+  const normalized = normalizeQuestionFormatAlias(value);
+  if (normalized === 'IMAGE_BASED') return 'IMAGE';
+  return normalized;
+};
+
+const resolveImportRecordValueByAliases = (record, aliases = []) => {
+  if (!record || typeof record !== 'object') return undefined;
+  const keys = Object.keys(record);
+  const directLookup = keys.reduce((acc, key) => {
+    const lowered = normalizeString(key).toLowerCase();
+    if (lowered && !acc[lowered]) acc[lowered] = key;
+    return acc;
+  }, {});
+  const normalizedLookup = keys.reduce((acc, key) => {
+    const normalized = normalizeString(key).toLowerCase().replace(/[^a-z0-9]/g, '');
+    if (normalized && !acc[normalized]) acc[normalized] = key;
+    return acc;
+  }, {});
+
+  for (const alias of aliases) {
+    const loweredAlias = normalizeString(alias).toLowerCase();
+    const directKey = directLookup[loweredAlias];
+    if (directKey && record[directKey] !== undefined && record[directKey] !== null) {
+      return record[directKey];
+    }
+
+    const normalizedAlias = normalizeString(alias).toLowerCase().replace(/[^a-z0-9]/g, '');
+    const normalizedKey = normalizedLookup[normalizedAlias];
+    if (normalizedKey && record[normalizedKey] !== undefined && record[normalizedKey] !== null) {
+      return record[normalizedKey];
+    }
+  }
+
+  return undefined;
+};
+
+const normalizeImportedOptionsForImport = (value) => {
+  if (Array.isArray(value)) {
+    return sanitizeQuestionOptions(value);
+  }
+
+  if (value && typeof value === 'object') {
+    const options = [];
+    const pushOption = (candidate) => {
+      if (candidate === undefined || candidate === null) return;
+      if (Array.isArray(candidate)) {
+        candidate.forEach((entry) => {
+          const normalized = normalizeString(entry);
+          if (normalized) options.push(normalized);
+        });
+        return;
+      }
+      const normalized = normalizeString(candidate);
+      if (!normalized) return;
+      options.push(normalized);
+    };
+
+    Object.entries(value).forEach(([key, candidate]) => {
+      const normalizedKey = normalizeString(key).toLowerCase().replace(/[^a-z0-9]/g, '');
+      const isOptionKey =
+        normalizedKey === 'options' ||
+        normalizedKey === 'choices' ||
+        normalizedKey.startsWith('option') ||
+        normalizedKey.startsWith('choice') ||
+        ['a', 'b', 'c', 'd', 'e', 'f', 'opt1', 'opt2', 'opt3', 'opt4', 'opt5', 'opt6'].includes(normalizedKey);
+
+      if (!isOptionKey) return;
+
+      if (normalizedKey === 'options' || normalizedKey === 'choices') {
+        const parsedOptions = parseOptionsInput(candidate);
+        if (Array.isArray(parsedOptions)) {
+          parsedOptions.forEach((entry) => pushOption(entry));
+        } else {
+          pushOption(candidate);
+        }
+        return;
+      }
+
+      pushOption(candidate);
+    });
+
+    return sanitizeQuestionOptions(options);
+  }
+
+  const parsedOptions = parseOptionsInput(value);
+  return Array.isArray(parsedOptions) ? sanitizeQuestionOptions(parsedOptions) : [];
+};
+
+const mapImportAnswerTokenToOption = (token, options = []) => {
+  const normalizedToken = normalizeString(token);
+  if (!normalizedToken) return '';
+
+  const upperToken = normalizedToken.toUpperCase();
+  if (/^[A-Z]$/.test(upperToken)) {
+    const optionIndex = upperToken.charCodeAt(0) - 65;
+    if (optionIndex >= 0 && optionIndex < options.length) {
+      return options[optionIndex];
+    }
+  }
+
+  if (/^\d+$/.test(normalizedToken)) {
+    const optionIndex = Number(normalizedToken) - 1;
+    if (optionIndex >= 0 && optionIndex < options.length) {
+      return options[optionIndex];
+    }
+  }
+
+  const matchedOption = options.find(
+    (option) => normalizeString(option).toLowerCase() === normalizedToken.toLowerCase()
+  );
+  return matchedOption || normalizedToken;
+};
+
+const normalizeImportedCorrectAnswerForImport = ({
+  questionType,
+  correctAnswer,
+  options = [],
+}) => {
+  const normalizedQuestionType = normalizeString(questionType).toUpperCase();
+  const safeOptions = Array.isArray(options) ? sanitizeQuestionOptions(options) : [];
+
+  if (normalizedQuestionType === 'TRUE_FALSE') {
+    const normalized = normalizeString(correctAnswer).toLowerCase();
+    return normalized.startsWith('f') ? 'False' : 'True';
+  }
+
+  if (normalizedQuestionType === 'MULTIPLE_OPTIONS') {
+    const tokens = Array.isArray(correctAnswer)
+      ? correctAnswer
+      : (() => {
+          const normalized = normalizeString(correctAnswer);
+          if (!normalized) return [];
+          try {
+            const parsed = JSON.parse(normalized);
+            if (Array.isArray(parsed)) return parsed;
+          } catch {
+            // Fall through to split-based parsing.
+          }
+          return normalized
+            .split(/[,;|\n]/)
+            .map((item) => item.trim())
+            .filter(Boolean);
+        })();
+
+    return Array.from(
+      new Set(tokens.map((token) => mapImportAnswerTokenToOption(token, safeOptions)).filter(Boolean))
+    );
+  }
+
+  return mapImportAnswerTokenToOption(correctAnswer, safeOptions);
+};
+
+const prepareImportedQuestionRecordForInsert = (record = {}, index = 0) => {
+  const questionText = normalizeString(
+    resolveImportRecordValueByAliases(record, ['questionText', 'question', 'prompt', 'title', 'q']) ||
+      record.questionText ||
+      record.question ||
+      record.title
+  );
+  const rawQuestionFormat =
+    resolveImportRecordValueByAliases(record, [
+      'questionFormat',
+      'question_type',
+      'question type',
+      'questionType',
+      'type',
+    ]) ||
+    record.questionFormat ||
+    record.question_type ||
+    record.type;
+  const questionFormat =
+    normalizeImportQuestionFormatToken(rawQuestionFormat) ||
+    normalizeQuestionFormat(record) ||
+    'MCQ';
+  const options = normalizeImportedOptionsForImport(record);
+  const rawCorrectAnswer =
+    resolveImportRecordValueByAliases(record, [
+      'correctAnswer',
+      'correct_answer',
+      'correct answer',
+      'answer',
+      'answers',
+      'correct',
+    ]) ??
+    record.correctAnswer ??
+    record.correct_answer ??
+    '';
+  const rawPoints =
+    resolveImportRecordValueByAliases(record, ['points', 'marks', 'score', 'max_marks']) ??
+    record.points ??
+    record.max_marks;
+  const normalizedQuestionType = normalizeQuestionTypeForStorage({
+    ...record,
+    questionText,
+    questionType: normalizeImportQuestionTypeToken(
+      resolveImportRecordValueByAliases(record, ['questionType', 'question_type', 'question type', 'type']) ||
+        record.questionType ||
+        record.type
+    ),
+    questionFormat,
+    question_type: questionFormat,
+    options,
+    correctAnswer: rawCorrectAnswer,
+  });
+  const questionType = normalizeImportQuestionTypeToken(normalizedQuestionType) || 'SHORT_ANSWER';
+  const normalizedCorrectAnswer = normalizeImportedCorrectAnswerForImport({
+    questionType,
+    correctAnswer: rawCorrectAnswer,
+    options,
+  });
+  const parsedPoints = Number(rawPoints);
+  const points = Number.isFinite(parsedPoints) && parsedPoints > 0 ? parsedPoints : 1;
+
+  return {
+    ...record,
+    questionText,
+    questionType,
+    questionFormat,
+    question_type: questionFormat,
+    options,
+    correctAnswer: normalizedCorrectAnswer,
+    points,
+    max_marks: points,
+    order: Number.isFinite(Number(record.order)) ? Number(record.order) : index,
+  };
+};
+
+const validatePreparedImportQuestion = (record = {}) => {
+  const validationErrors = [];
+  const questionText = normalizeString(record.questionText);
+  const questionType = normalizeString(record.questionType).toUpperCase();
+  const options = Array.isArray(record.options) ? sanitizeQuestionOptions(record.options) : [];
+
+  if (!questionText) {
+    validationErrors.push('Question text is required');
+  }
+
+  if (['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS'].includes(questionType) && options.length < 2) {
+    validationErrors.push('At least two options are required');
+  }
+
+  if (questionType === 'TRUE_FALSE') {
+    const normalizedAnswer = normalizeString(record.correctAnswer);
+    if (!['True', 'False'].includes(normalizedAnswer)) {
+      validationErrors.push('Correct answer must be True or False');
+    }
+  }
+
+  if (questionType === 'MULTIPLE_OPTIONS') {
+    const normalizedAnswers = normalizeQuestionCorrectAnswer({
+      questionType: 'MULTIPLE_OPTIONS',
+      correctAnswer: record.correctAnswer,
+      options,
+    });
+    if (!Array.isArray(normalizedAnswers) || normalizedAnswers.length === 0) {
+      validationErrors.push('At least one correct answer is required');
+    }
+  }
+
+  if (questionType === 'MULTIPLE_CHOICE' && !normalizeString(record.correctAnswer)) {
+    validationErrors.push('Correct answer is required');
+  }
+
+  return validationErrors;
+};
+
+const CONTEXT_GROUP_FORMATS = new Set(['PARAGRAPH', 'SCENARIO']);
+
+const createContextGroupId = (format = 'paragraph') =>
+  `${normalizeString(format).toLowerCase() || 'paragraph'}-${Date.now().toString(36)}-${Math.random()
+    .toString(36)
+    .slice(2, 8)}`;
+
+const resolveContextQuestionFormat = (payload = {}) => {
+  const explicitFormat = normalizeQuestionFormatAlias(
+    payload.questionFormat || payload.question_type || payload.type
+  );
+  if (CONTEXT_GROUP_FORMATS.has(explicitFormat)) {
+    return explicitFormat;
+  }
+
+  const explicitType = normalizeQuestionTypeAlias(payload.questionType || payload.type);
+  if (explicitType === 'PARAGRAPH') {
+    return explicitFormat === 'SCENARIO' ? 'SCENARIO' : 'PARAGRAPH';
+  }
+
+  const inferredFormat = normalizeQuestionFormat(payload);
+  return CONTEXT_GROUP_FORMATS.has(inferredFormat) ? inferredFormat : '';
+};
+
+const isContextQuestionGroupPayload = (payload = {}) =>
+  Array.isArray(payload?.questions) && CONTEXT_GROUP_FORMATS.has(resolveContextQuestionFormat(payload));
+
+const expandContextQuestionGroupPayload = (payload = {}, options = {}) => {
+  const { baseOrder = 0 } = options;
+
+  if (!isContextQuestionGroupPayload(payload)) {
+    return [payload];
+  }
+
+  const format = resolveContextQuestionFormat(payload) || 'PARAGRAPH';
+  const safeSubQuestions = Array.isArray(payload.questions)
+    ? payload.questions.filter((item) => item && typeof item === 'object')
+    : [];
+  const sharedPassage = normalizeString(
+    payload.passage || payload.context || payload.scenario || payload.paragraph
+  );
+  const sharedGroupId =
+    normalizeString(payload.paragraphGroupId || payload.paragraph_group_id) || createContextGroupId(format);
+  const inheritedType = normalizeQuestionTypeAlias(payload.questionType || payload.type);
+  const inheritedPoints = payload.points ?? payload.max_marks;
+
+  return safeSubQuestions.map((subQuestion, index) => {
+    const expanded = {
+      ...payload,
+      ...subQuestion,
+      questionText: normalizeString(
+        subQuestion.questionText ||
+          subQuestion.question ||
+          subQuestion.prompt ||
+          subQuestion.title ||
+          payload.questionText ||
+          payload.question ||
+          payload.title
+      ),
+      question:
+        subQuestion.question ||
+        subQuestion.questionText ||
+        payload.question ||
+        payload.questionText ||
+        '',
+      questionType: normalizeQuestionTypeAlias(
+        subQuestion.questionType || subQuestion.type || inheritedType
+      ),
+      type: normalizeQuestionTypeAlias(subQuestion.type || subQuestion.questionType || inheritedType),
+      questionFormat: format,
+      question_type: format,
+      options:
+        parseOptionsInput(subQuestion.options) ??
+        parseOptionsInput(payload.options) ??
+        subQuestion.options ??
+        payload.options,
+      correctAnswer:
+        subQuestion.correctAnswer ??
+        subQuestion.correct_answer ??
+        subQuestion.answer ??
+        payload.correctAnswer ??
+        payload.correct_answer ??
+        '',
+      points:
+        subQuestion.points ??
+        subQuestion.max_marks ??
+        inheritedPoints,
+      max_marks:
+        subQuestion.max_marks ??
+        subQuestion.points ??
+        inheritedPoints,
+      passage: normalizeString(subQuestion.passage || subQuestion.context || sharedPassage),
+      paragraphGroupId: normalizeString(
+        subQuestion.paragraphGroupId || subQuestion.paragraph_group_id || sharedGroupId
+      ),
+      order:
+        Number.isFinite(Number(subQuestion.order)) ? Number(subQuestion.order) : baseOrder + index,
+    };
+
+    delete expanded.questions;
+    return expanded;
+  });
+};
+
+const flattenQuestionPayloadList = (payloadList = []) => {
+  const safePayloadList = Array.isArray(payloadList) ? payloadList : [];
+  const flattened = [];
+  let runningOrder = 0;
+
+  safePayloadList.forEach((payload) => {
+    const baseOrder = Number.isFinite(Number(payload?.order))
+      ? Number(payload.order)
+      : runningOrder;
+    const expandedPayloads = expandContextQuestionGroupPayload(payload, { baseOrder });
+    const safeExpandedPayloads = Array.isArray(expandedPayloads) ? expandedPayloads : [];
+
+    safeExpandedPayloads.forEach((expandedPayload) => {
+      const resolvedOrder = Number.isFinite(Number(expandedPayload?.order))
+        ? Number(expandedPayload.order)
+        : runningOrder;
+      flattened.push({
+        ...expandedPayload,
+        order: resolvedOrder,
+      });
+      runningOrder = Math.max(runningOrder, resolvedOrder + 1);
+    });
+  });
+
+  return flattened;
 };
 
 const resolveQuestionTypeTokenForExamResponse = (question = {}) => {
@@ -123,8 +591,10 @@ const resolveQuestionTypeTokenForExamResponse = (question = {}) => {
 };
 
 const validateCodingQuestionPayload = (payload = {}) => {
-  const explicitType = normalizeString(payload.questionType).toUpperCase();
-  const explicitFormat = normalizeString(payload.questionFormat || payload.question_type).toUpperCase();
+  const explicitType = normalizeQuestionTypeAlias(payload.questionType || payload.type);
+  const explicitFormat = normalizeQuestionFormatAlias(
+    payload.questionFormat || payload.question_type || payload.type
+  );
   const normalizedType = normalizeQuestionTypeForStorage(payload);
   const normalizedFormat = normalizeQuestionFormat(payload);
   const hasExplicitNonCoding =
@@ -139,10 +609,16 @@ const validateCodingQuestionPayload = (payload = {}) => {
     return null;
   }
 
-  const title = normalizeString(payload.title || payload.questionText);
-  const description = normalizeString(payload.description);
+  const questionPrompt = normalizeString(payload.questionText || payload.question || payload.title);
+  const title = normalizeString(payload.title || questionPrompt);
+  const description = normalizeString(
+    payload.description || payload.problemStatement || payload.prompt || questionPrompt
+  );
   const codingFields = extractCodingFields(payload);
 
+  if (!questionPrompt) {
+    return 'Coding question prompt is required.';
+  }
   if (!title) {
     return 'Coding question title is required.';
   }
@@ -163,8 +639,10 @@ const validateCodingQuestionPayload = (payload = {}) => {
 };
 
 const isCodingQuestionPayload = (payload = {}) => {
-  const explicitType = normalizeString(payload.questionType).toUpperCase();
-  const explicitFormat = normalizeString(payload.questionFormat || payload.question_type).toUpperCase();
+  const explicitType = normalizeQuestionTypeAlias(payload.questionType || payload.type);
+  const explicitFormat = normalizeQuestionFormatAlias(
+    payload.questionFormat || payload.question_type || payload.type
+  );
 
   if (explicitType) {
     return explicitType === 'CODING';
@@ -186,15 +664,18 @@ const createQuestionWithManagedImage = async ({
   examId,
   questionPaperId,
   questionText,
+  questionPrompt,
   title,
   description,
   instructions,
   difficulty,
   category,
   questionType,
+  type,
   options,
   correctAnswer,
   points,
+  max_marks,
   order,
   sectionId,
   passage,
@@ -209,8 +690,11 @@ const createQuestionWithManagedImage = async ({
   generatedImage,
   generated_image,
   languages,
+  language,
   starterCode,
   testCases,
+  sample_input,
+  sample_output,
   timeLimit,
   memoryLimit,
   codingFields,
@@ -225,9 +709,10 @@ const createQuestionWithManagedImage = async ({
     image_base64 ||
     (isDataImageSource(inlineImage) ? inlineImage : '');
   const normalizedStorageQuestionType = normalizeQuestionTypeForStorage({
-    questionType,
-    questionFormat,
-    question_type,
+    questionType: normalizeQuestionTypeAlias(questionType || type),
+    questionFormat: normalizeQuestionFormatAlias(questionFormat),
+    question_type: normalizeQuestionFormatAlias(question_type || type),
+    type,
     options,
     correctAnswer,
     passage,
@@ -242,10 +727,11 @@ const createQuestionWithManagedImage = async ({
   });
   const normalizedQuestionFormat =
     normalizeQuestionFormat({
-      questionType,
-      questionFormat,
-      question_type,
-      questionText,
+      questionType: normalizeQuestionTypeAlias(questionType || type),
+      questionFormat: normalizeQuestionFormatAlias(questionFormat),
+      question_type: normalizeQuestionFormatAlias(question_type || type),
+      type,
+      questionText: questionText || questionPrompt,
       passage,
       paragraphGroupId,
       imageUrl,
@@ -258,23 +744,30 @@ const createQuestionWithManagedImage = async ({
       title,
       description,
       category,
-      languages,
+      languages: languages ?? language,
+      language,
       starterCode,
       testCases,
+      sample_input,
+      sample_output,
       timeLimit,
       memoryLimit,
       codingFields,
     }) || undefined;
-  const normalizedTitle = normalizeString(title || questionText);
-  const normalizedDescription = normalizeString(description);
+  const normalizedQuestionText = normalizeString(questionText || questionPrompt || title);
+  const normalizedTitle = normalizeString(title || normalizedQuestionText);
+  const normalizedDescription = normalizeString(description || normalizedQuestionText);
   const normalizedDifficulty = normalizeString(difficulty);
   const normalizedCategory = normalizeString(category);
   const normalizedCodingFields = extractCodingFields({
     difficulty,
     category,
-    languages,
+    languages: languages ?? language,
+    language,
     starterCode,
     testCases,
+    sample_input,
+    sample_output,
     timeLimit,
     memoryLimit,
     codingFields,
@@ -282,7 +775,7 @@ const createQuestionWithManagedImage = async ({
 
   const question = new Question({
     questionPaperId,
-    questionText: normalizeString(questionText || normalizedTitle),
+    questionText: normalizedQuestionText || normalizedTitle,
     title: normalizedTitle || undefined,
     description: normalizedDescription || undefined,
     instructions: typeof instructions === 'string' ? instructions.trim() : undefined,
@@ -315,7 +808,7 @@ const createQuestionWithManagedImage = async ({
       normalizedStorageQuestionType === 'CODING' || normalizedQuestionFormat === 'CODING'
         ? normalizedCodingFields
         : undefined,
-    points: Number.isFinite(Number(points)) ? Number(points) : 1,
+    points: Number.isFinite(Number(points ?? max_marks)) ? Number(points ?? max_marks) : 1,
     order: Number.isFinite(Number(order)) ? Number(order) : 0,
     sectionId: sectionId || undefined,
   });
@@ -347,11 +840,18 @@ router.get('/:examId/questions', requireAuth, requireTenant, enforceTenantBounda
       .populate('questionPaperId', 'setName')
       .sort({ order: 1 });
 
-    await ensureQuestionsImageAvailability({
-      questions,
-      examId: req.params.examId,
-      persist: true,
-    });
+    try {
+      await ensureQuestionsImageAvailability({
+        questions,
+        examId: req.params.examId,
+        persist: true,
+      });
+    } catch (imageAvailabilityError) {
+      console.warn(
+        '[questions/list] image availability check failed:',
+        imageAvailabilityError?.message || imageAvailabilityError
+      );
+    }
 
     res.json({ questions });
   } catch (error) {
@@ -397,11 +897,18 @@ router.get('/:examId/question-papers/:paperId/questions', requireAuth, requireTe
       .populate('sectionId', 'name order duration') // Populate section info
       .sort({ order: 1 });
 
-    await ensureQuestionsImageAvailability({
-      questions,
-      examId,
-      persist: true,
-    });
+    try {
+      await ensureQuestionsImageAvailability({
+        questions,
+        examId,
+        persist: true,
+      });
+    } catch (imageAvailabilityError) {
+      console.warn(
+        '[questions/list-by-paper] image availability check failed:',
+        imageAvailabilityError?.message || imageAvailabilityError
+      );
+    }
 
     const examResponseQuestions = questions.map((questionDoc) => {
       const serializedQuestion =
@@ -427,10 +934,23 @@ router.post(
   enforceTenantBoundaries,
   requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can create questions
   requireOwnershipOrAdmin,
+  prepareCreateQuestionCount,
   checkQuestionLimit,
   [
-    body('questionText').trim().notEmpty().withMessage('Question text is required'),
+    body('questionText')
+      .customSanitizer((value, { req }) => normalizeString(value || req.body?.question))
+      .custom((value, { req }) => {
+        if (isContextQuestionGroupPayload(req.body || {})) {
+          return true;
+        }
+        if (!normalizeString(value)) {
+          throw new Error('Question text is required');
+        }
+        return true;
+      }),
+    body('question').optional({ nullable: true }).isString().withMessage('question must be a string'),
     body('questionType')
+      .customSanitizer((value, { req }) => normalizeQuestionTypeAlias(value || req.body?.type))
       .isIn([
         'MULTIPLE_CHOICE',
         'MULTIPLE_OPTIONS',
@@ -446,8 +966,10 @@ router.post(
         'IMAGE_BASED',
       ])
       .withMessage('Invalid question type'),
+    body('type').optional({ nullable: true }).isString().withMessage('type must be a string'),
     body('questionFormat')
       .optional({ nullable: true })
+      .customSanitizer((value) => normalizeQuestionFormatAlias(value))
       .isIn([
         'MCQ',
         'MULTIPLE_OPTIONS',
@@ -465,6 +987,7 @@ router.post(
       .withMessage('Invalid question format'),
     body('question_type')
       .optional({ nullable: true })
+      .customSanitizer((value) => normalizeQuestionFormatAlias(value))
       .isIn([
         'MCQ',
         'MULTIPLE_OPTIONS',
@@ -481,7 +1004,7 @@ router.post(
       ])
       .withMessage('Invalid question format'),
     body('questionPaperId').notEmpty().withMessage('Question paper ID is required'),
-    body('order').isInt({ min: 0 }).withMessage('Order must be a non-negative integer'),
+    body('order').optional({ nullable: true }).isInt({ min: 0 }).withMessage('Order must be a non-negative integer'),
     body('imageUrl').optional({ nullable: true }).isString().withMessage('Image URL must be a string'),
     body('image').optional({ nullable: true }).isString().withMessage('Image must be a string'),
     body('imageBase64').optional({ nullable: true }).isString().withMessage('Image Base64 must be a string'),
@@ -489,12 +1012,17 @@ router.post(
     body('sectionId').optional({ nullable: true }).isMongoId().withMessage('Section ID must be a valid id'),
     body('passage').optional({ nullable: true }).isString().withMessage('Passage must be a string'),
     body('paragraphGroupId').optional({ nullable: true }).isString().withMessage('paragraphGroupId must be a string'),
+    body('questions').optional({ nullable: true }).isArray().withMessage('questions must be an array'),
     body('title').optional({ nullable: true }).isString().withMessage('Title must be a string'),
     body('description').optional({ nullable: true }).isString().withMessage('Description must be a string'),
     body('instructions').optional({ nullable: true }).isString().withMessage('Instructions must be a string'),
     body('difficulty').optional({ nullable: true }).isString().withMessage('Difficulty must be a string'),
     body('category').optional({ nullable: true }).isString().withMessage('Category must be a string'),
     body('languages').optional({ nullable: true }).isArray().withMessage('Languages must be an array'),
+    body('language').optional({ nullable: true }).isString().withMessage('language must be a string'),
+    body('sample_input').optional({ nullable: true }).isString().withMessage('sample_input must be a string'),
+    body('sample_output').optional({ nullable: true }).isString().withMessage('sample_output must be a string'),
+    body('max_marks').optional({ nullable: true }).isNumeric().withMessage('max_marks must be numeric'),
     body('starterCode').optional({ nullable: true }).isObject().withMessage('Starter code must be an object'),
     body('testCases').optional({ nullable: true }).isArray().withMessage('Test cases must be an array'),
     body('timeLimit').optional({ nullable: true }).isNumeric().withMessage('Time limit must be numeric'),
@@ -509,17 +1037,20 @@ router.post(
 
       const {
         questionText,
+        question: legacyQuestionText,
         title,
         description,
         instructions,
         difficulty,
         category,
         questionType,
+        type,
         questionFormat,
         question_type,
         options,
         correctAnswer,
         points,
+        max_marks,
         order,
         questionPaperId,
         imageUrl,
@@ -532,6 +1063,9 @@ router.post(
         sectionId,
         paragraphGroupId,
         languages,
+        language,
+        sample_input,
+        sample_output,
         starterCode,
         testCases,
         timeLimit,
@@ -540,10 +1074,62 @@ router.post(
       } =
         req.body;
       const { passage } = req.body;
+      const normalizedQuestionText = normalizeString(questionText || legacyQuestionText);
+      const normalizedQuestionType = normalizeQuestionTypeAlias(questionType || type);
+      const normalizedQuestionFormat = normalizeQuestionFormatAlias(
+        questionFormat || question_type || type
+      );
+      const normalizedPoints = points ?? max_marks;
+      const normalizedPayload = {
+        ...req.body,
+        questionText: normalizedQuestionText,
+        questionType: normalizedQuestionType,
+        questionFormat: normalizedQuestionFormat,
+        question_type: normalizedQuestionFormat,
+        points: normalizedPoints,
+        languages: languages ?? language,
+      };
+      const isContextQuestionGroup = isContextQuestionGroupPayload(req.body || {});
+      const expandedCreateQuestions = Array.isArray(req.planLimitContext?.expandedCreateQuestions)
+        ? req.planLimitContext.expandedCreateQuestions
+        : flattenQuestionPayloadList([req.body || {}]);
 
-      const codingPayloadError = validateCodingQuestionPayload(req.body);
-      if (codingPayloadError) {
-        return res.status(400).json({ error: codingPayloadError });
+      if (isContextQuestionGroup && expandedCreateQuestions.length === 0) {
+        return res.status(400).json({
+          error: 'At least one sub-question is required for paragraph/scenario question groups.',
+        });
+      }
+
+      const createPayloads = isContextQuestionGroup ? expandedCreateQuestions : [normalizedPayload];
+      const normalizedCreatePayloads = createPayloads.map((payload) => {
+        const safePayload = payload && typeof payload === 'object' ? payload : {};
+        const normalizedRecordQuestionText = normalizeString(
+          safePayload.questionText || safePayload.question || safePayload.title
+        );
+        const normalizedRecordQuestionType = normalizeQuestionTypeAlias(
+          safePayload.questionType || safePayload.type || normalizedQuestionType
+        );
+        const normalizedRecordQuestionFormat = normalizeQuestionFormatAlias(
+          safePayload.questionFormat || safePayload.question_type || safePayload.type || normalizedQuestionFormat
+        );
+        const normalizedRecordPoints = safePayload.points ?? safePayload.max_marks ?? normalizedPoints;
+
+        return {
+          ...safePayload,
+          questionText: normalizedRecordQuestionText,
+          questionType: normalizedRecordQuestionType,
+          questionFormat: normalizedRecordQuestionFormat,
+          question_type: normalizedRecordQuestionFormat,
+          points: normalizedRecordPoints,
+          languages: safePayload.languages ?? safePayload.language ?? languages ?? language,
+        };
+      });
+
+      for (const payloadRecord of normalizedCreatePayloads) {
+        const codingPayloadError = validateCodingQuestionPayload(payloadRecord);
+        if (codingPayloadError) {
+          return res.status(400).json({ error: codingPayloadError });
+        }
       }
 
       // Verify question paper belongs to exam
@@ -573,61 +1159,114 @@ router.post(
 
       const planContext = await resolveExamPlanContext(exam._id);
       if (planContext?.planType && isFreePlan(planContext.planType)) {
-        const restrictionError = validateFreePlanQuestionPayload(req.body);
-        if (restrictionError) {
-          return sendPlanRestriction(res, restrictionError);
+        for (const payloadRecord of normalizedCreatePayloads) {
+          const restrictionError = validateFreePlanQuestionPayload(payloadRecord);
+          if (restrictionError) {
+            return sendPlanRestriction(res, restrictionError);
+          }
         }
       }
 
       // If sectionId is provided, verify it belongs to the question paper
-      if (sectionId) {
+      const sectionIdsToValidate = Array.from(
+        new Set(
+          normalizedCreatePayloads
+            .map((payloadRecord) => normalizeString(payloadRecord.sectionId || sectionId))
+            .filter(Boolean)
+        )
+      );
+      if (sectionIdsToValidate.length > 0) {
         const Section = (await import('../models/Section.js')).default;
-        const section = await Section.findOne({
-          _id: sectionId,
-          questionPaperId: questionPaperId,
-        });
-        if (!section) {
-          return res.status(400).json({ error: 'Section does not belong to this question paper' });
+        for (const sectionIdToValidate of sectionIdsToValidate) {
+          const section = await Section.findOne({
+            _id: sectionIdToValidate,
+            questionPaperId: questionPaperId,
+          });
+          if (!section) {
+            return res.status(400).json({ error: 'Section does not belong to this question paper' });
+          }
         }
       }
 
-      const question = await createQuestionWithManagedImage({
-        examId: req.params.examId,
-        questionPaperId,
-        questionText,
-        title,
-        description,
-        instructions,
-        difficulty,
-        category,
-        questionType,
-        questionFormat,
-        question_type,
-        options,
-        correctAnswer,
-        points,
-        order,
-        imageUrl,
-        image_path,
-        image,
-        imageBase64,
-        image_base64,
-        generatedImage,
-        generated_image,
-        sectionId,
-        passage,
-        paragraphGroupId,
-        languages,
-        starterCode,
-        testCases,
-        timeLimit,
-        memoryLimit,
-        codingFields,
-      });
-      await question.populate('questionPaperId', 'setName');
-      await syncExamQuestionCount(req.params.examId);
+      const createdQuestions = [];
+      for (let index = 0; index < normalizedCreatePayloads.length; index += 1) {
+        const payloadRecord = normalizedCreatePayloads[index];
+        const recordQuestionText = normalizeString(
+          payloadRecord.questionText || payloadRecord.question || payloadRecord.title
+        );
 
-      res.status(201).json({ question });
+        if (!recordQuestionText) {
+          return res.status(400).json({ error: `Question text is required for sub-question ${index + 1}.` });
+        }
+
+        const createdQuestion = await createQuestionWithManagedImage({
+          examId: req.params.examId,
+          questionPaperId,
+          questionText: recordQuestionText,
+          questionPrompt: payloadRecord.question,
+          title: payloadRecord.title ?? title,
+          description: payloadRecord.description ?? description,
+          instructions: payloadRecord.instructions ?? instructions,
+          difficulty: payloadRecord.difficulty ?? difficulty,
+          category: payloadRecord.category ?? category,
+          questionType: payloadRecord.questionType ?? normalizedQuestionType,
+          type: payloadRecord.type ?? type,
+          questionFormat: payloadRecord.questionFormat ?? normalizedQuestionFormat,
+          question_type: payloadRecord.question_type ?? normalizedQuestionFormat,
+          options: parseOptionsInput(payloadRecord.options),
+          correctAnswer: payloadRecord.correctAnswer ?? payloadRecord.correct_answer ?? correctAnswer,
+          points: payloadRecord.points ?? payloadRecord.max_marks ?? normalizedPoints,
+          max_marks: payloadRecord.max_marks ?? max_marks,
+          order:
+            Number.isFinite(Number(payloadRecord.order)) ? Number(payloadRecord.order) : order ?? index,
+          imageUrl: payloadRecord.imageUrl ?? imageUrl,
+          image_path: payloadRecord.image_path ?? image_path,
+          image: payloadRecord.image ?? image,
+          imageBase64: payloadRecord.imageBase64 ?? imageBase64,
+          image_base64: payloadRecord.image_base64 ?? image_base64,
+          generatedImage: payloadRecord.generatedImage ?? generatedImage,
+          generated_image: payloadRecord.generated_image ?? generated_image,
+          sectionId: payloadRecord.sectionId ?? sectionId,
+          passage: payloadRecord.passage ?? passage,
+          paragraphGroupId: payloadRecord.paragraphGroupId ?? paragraphGroupId,
+          languages: payloadRecord.languages ?? payloadRecord.language ?? languages ?? language,
+          language: payloadRecord.language ?? language,
+          sample_input: payloadRecord.sample_input ?? payloadRecord.sampleInput ?? sample_input,
+          sample_output: payloadRecord.sample_output ?? payloadRecord.sampleOutput ?? sample_output,
+          starterCode: payloadRecord.starterCode ?? starterCode,
+          testCases: payloadRecord.testCases ?? testCases,
+          timeLimit: payloadRecord.timeLimit ?? timeLimit,
+          memoryLimit: payloadRecord.memoryLimit ?? memoryLimit,
+          codingFields: payloadRecord.codingFields ?? codingFields,
+        });
+        createdQuestions.push(createdQuestion);
+      }
+
+      await Promise.all(
+        createdQuestions.map((createdQuestion) => createdQuestion.populate('questionPaperId', 'setName'))
+      );
+      await syncExamQuestionCount(req.params.examId);
+      void queueExamPackageRegenerationForContentChange({
+        examId: req.params.examId,
+        userId: req.user._id,
+        reason: 'QUESTION_CREATED',
+        questionPaperId,
+      });
+
+      const primaryQuestion = createdQuestions[0] || null;
+      if (!primaryQuestion) {
+        return res.status(400).json({ error: 'No questions were created from the provided payload.' });
+      }
+
+      if (createdQuestions.length > 1) {
+        return res.status(201).json({
+          question: primaryQuestion,
+          questions: createdQuestions,
+          createdCount: createdQuestions.length,
+        });
+      }
+
+      return res.status(201).json({ question: primaryQuestion });
     } catch (error) {
       next(error);
     }
@@ -673,9 +1312,14 @@ router.put(
   requireRole('EXAM_CREATOR'), // Only EXAM_CREATOR can modify questions
   requireOwnershipOrAdmin,
   [
-    body('questionText').optional().trim().notEmpty(),
+    body('questionText')
+      .optional()
+      .customSanitizer((value, { req }) => normalizeString(value || req.body?.question))
+      .notEmpty(),
+    body('question').optional({ nullable: true }).isString().withMessage('question must be a string'),
     body('questionType')
       .optional()
+      .customSanitizer((value, { req }) => normalizeQuestionTypeAlias(value || req.body?.type))
       .isIn([
         'MULTIPLE_CHOICE',
         'MULTIPLE_OPTIONS',
@@ -690,8 +1334,10 @@ router.put(
         'CODING',
         'IMAGE_BASED',
       ]),
+    body('type').optional({ nullable: true }).isString().withMessage('type must be a string'),
     body('questionFormat')
       .optional({ nullable: true })
+      .customSanitizer((value) => normalizeQuestionFormatAlias(value))
       .isIn([
         'MCQ',
         'MULTIPLE_OPTIONS',
@@ -709,6 +1355,7 @@ router.put(
       .withMessage('Invalid question format'),
     body('question_type')
       .optional({ nullable: true })
+      .customSanitizer((value) => normalizeQuestionFormatAlias(value))
       .isIn([
         'MCQ',
         'MULTIPLE_OPTIONS',
@@ -736,6 +1383,10 @@ router.put(
     body('difficulty').optional({ nullable: true }).isString().withMessage('Difficulty must be a string'),
     body('category').optional({ nullable: true }).isString().withMessage('Category must be a string'),
     body('languages').optional({ nullable: true }).isArray().withMessage('Languages must be an array'),
+    body('language').optional({ nullable: true }).isString().withMessage('language must be a string'),
+    body('sample_input').optional({ nullable: true }).isString().withMessage('sample_input must be a string'),
+    body('sample_output').optional({ nullable: true }).isString().withMessage('sample_output must be a string'),
+    body('max_marks').optional({ nullable: true }).isNumeric().withMessage('max_marks must be numeric'),
     body('starterCode').optional({ nullable: true }).isObject().withMessage('Starter code must be an object'),
     body('testCases').optional({ nullable: true }).isArray().withMessage('Test cases must be an array'),
     body('timeLimit').optional({ nullable: true }).isNumeric().withMessage('Time limit must be numeric'),
@@ -763,10 +1414,32 @@ router.put(
       if (exam) {
         const planContext = await resolveExamPlanContext(exam._id);
         if (planContext?.planType && isFreePlan(planContext.planType)) {
-          const restrictionError = validateFreePlanQuestionPayload({
+          const restrictionPayload = {
             ...question.toObject(),
             ...req.body,
-          });
+            questionText: normalizeString(
+              req.body?.questionText ?? req.body?.question ?? question.questionText
+            ),
+            questionType: normalizeQuestionTypeAlias(
+              req.body?.questionType ?? req.body?.type ?? question.questionType
+            ),
+            questionFormat: normalizeQuestionFormatAlias(
+              req.body?.questionFormat ??
+                req.body?.question_type ??
+                req.body?.type ??
+                question.questionFormat
+            ),
+            question_type: normalizeQuestionFormatAlias(
+              req.body?.question_type ??
+                req.body?.questionFormat ??
+                req.body?.type ??
+                question.questionFormat
+            ),
+            points: req.body?.points ?? req.body?.max_marks ?? question.points,
+            languages:
+              req.body?.languages ?? req.body?.language ?? question.codingFields?.languages ?? [],
+          };
+          const restrictionError = validateFreePlanQuestionPayload(restrictionPayload);
           if (restrictionError) {
             return sendPlanRestriction(res, restrictionError);
           }
@@ -775,12 +1448,15 @@ router.put(
 
       const {
         questionText,
+        question: legacyQuestionText,
         questionType,
+        type,
         questionFormat,
         question_type,
         options,
         correctAnswer,
         points,
+        max_marks,
         order,
         imageUrl,
         image_path,
@@ -798,6 +1474,9 @@ router.put(
         difficulty,
         category,
         languages,
+        language,
+        sample_input,
+        sample_output,
         starterCode,
         testCases,
         timeLimit,
@@ -805,26 +1484,54 @@ router.put(
         codingFields,
       } =
         req.body;
-
-      const codingPayloadError = validateCodingQuestionPayload({
+      const normalizedQuestionText =
+        questionText !== undefined || legacyQuestionText !== undefined
+          ? normalizeString(questionText || legacyQuestionText)
+          : undefined;
+      const hasQuestionTypeUpdate = questionType !== undefined || type !== undefined;
+      const normalizedQuestionType = hasQuestionTypeUpdate
+        ? normalizeQuestionTypeAlias(questionType || type)
+        : undefined;
+      const hasQuestionFormatUpdate =
+        questionFormat !== undefined || question_type !== undefined || type !== undefined;
+      const normalizedQuestionFormat = hasQuestionFormatUpdate
+        ? normalizeQuestionFormatAlias(questionFormat || question_type || type)
+        : undefined;
+      const normalizedPoints = points ?? max_marks;
+      const normalizedPayload = {
         ...question.toObject(),
         ...req.body,
-      });
+        ...(normalizedQuestionText !== undefined ? { questionText: normalizedQuestionText } : {}),
+        ...(normalizedQuestionType !== undefined ? { questionType: normalizedQuestionType } : {}),
+        ...(normalizedQuestionFormat !== undefined
+          ? { questionFormat: normalizedQuestionFormat, question_type: normalizedQuestionFormat }
+          : {}),
+        ...(normalizedPoints !== undefined ? { points: normalizedPoints } : {}),
+        ...(languages !== undefined || language !== undefined
+          ? { languages: languages ?? language }
+          : {}),
+      };
+
+      const codingPayloadError = validateCodingQuestionPayload(normalizedPayload);
       if (codingPayloadError) {
         return res.status(400).json({ error: codingPayloadError });
       }
 
-      if (questionText) question.questionText = questionText;
+      if (normalizedQuestionText !== undefined) question.questionText = normalizedQuestionText;
       if (title !== undefined) question.title = title;
       if (description !== undefined) question.description = description;
       if (instructions !== undefined) question.instructions = instructions;
       if (difficulty !== undefined) question.difficulty = difficulty;
       if (category !== undefined) question.category = category;
-      if (questionType || questionFormat || question_type) {
+      if (hasQuestionTypeUpdate || hasQuestionFormatUpdate) {
         question.questionType = normalizeQuestionTypeForStorage({
-          questionType: questionType !== undefined ? questionType : question.questionType,
-          questionFormat: questionFormat !== undefined ? questionFormat : question.questionFormat,
-          question_type,
+          questionType:
+            normalizedQuestionType !== undefined ? normalizedQuestionType : question.questionType,
+          questionFormat:
+            normalizedQuestionFormat !== undefined ? normalizedQuestionFormat : question.questionFormat,
+          question_type:
+            normalizedQuestionFormat !== undefined ? normalizedQuestionFormat : undefined,
+          type,
           options: options !== undefined ? options : question.options,
           correctAnswer: correctAnswer !== undefined ? correctAnswer : question.correctAnswer,
           passage: passage !== undefined ? passage : question.passage,
@@ -841,9 +1548,15 @@ router.put(
           title: title !== undefined ? title : question.title,
           description: description !== undefined ? description : question.description,
           category: category !== undefined ? category : question.category,
-          languages: languages !== undefined ? languages : question.codingFields?.languages,
+          languages:
+            languages !== undefined || language !== undefined
+              ? languages ?? language
+              : question.codingFields?.languages,
+          language,
           starterCode: starterCode !== undefined ? starterCode : question.codingFields?.starterCode,
           testCases: testCases !== undefined ? testCases : question.codingFields?.testCases,
+          sample_input,
+          sample_output,
           timeLimit: timeLimit !== undefined ? timeLimit : question.codingFields?.timeLimit,
           memoryLimit: memoryLimit !== undefined ? memoryLimit : question.codingFields?.memoryLimit,
           codingFields,
@@ -852,9 +1565,12 @@ router.put(
           normalizeQuestionFormat({
             questionType: question.questionType,
             questionFormat:
-              questionFormat !== undefined ? questionFormat : question.questionFormat,
-            question_type,
-            questionText: questionText !== undefined ? questionText : question.questionText,
+              normalizedQuestionFormat !== undefined ? normalizedQuestionFormat : question.questionFormat,
+            question_type:
+              normalizedQuestionFormat !== undefined ? normalizedQuestionFormat : undefined,
+            type,
+            questionText:
+              normalizedQuestionText !== undefined ? normalizedQuestionText : question.questionText,
             passage: passage !== undefined ? passage : question.passage,
             paragraphGroupId:
               paragraphGroupId !== undefined ? paragraphGroupId : question.paragraphGroupId,
@@ -869,9 +1585,15 @@ router.put(
             title: title !== undefined ? title : question.title,
             description: description !== undefined ? description : question.description,
             category: category !== undefined ? category : question.category,
-            languages: languages !== undefined ? languages : question.codingFields?.languages,
+            languages:
+              languages !== undefined || language !== undefined
+                ? languages ?? language
+                : question.codingFields?.languages,
+            language,
             starterCode: starterCode !== undefined ? starterCode : question.codingFields?.starterCode,
             testCases: testCases !== undefined ? testCases : question.codingFields?.testCases,
+            sample_input,
+            sample_output,
             timeLimit: timeLimit !== undefined ? timeLimit : question.codingFields?.timeLimit,
             memoryLimit: memoryLimit !== undefined ? memoryLimit : question.codingFields?.memoryLimit,
             codingFields,
@@ -879,7 +1601,7 @@ router.put(
       }
       if (options !== undefined) question.options = options;
       if (correctAnswer !== undefined) question.correctAnswer = correctAnswer;
-      if (points !== undefined) question.points = points;
+      if (normalizedPoints !== undefined) question.points = normalizedPoints;
       if (order !== undefined) question.order = order;
       if (
         imageUrl !== undefined ||
@@ -943,8 +1665,11 @@ router.put(
       }
       if (
         languages !== undefined ||
+        language !== undefined ||
         starterCode !== undefined ||
         testCases !== undefined ||
+        sample_input !== undefined ||
+        sample_output !== undefined ||
         timeLimit !== undefined ||
         memoryLimit !== undefined ||
         codingFields !== undefined
@@ -952,9 +1677,15 @@ router.put(
         question.codingFields = extractCodingFields({
           difficulty: difficulty !== undefined ? difficulty : question.difficulty,
           category: category !== undefined ? category : question.category,
-          languages: languages !== undefined ? languages : question.codingFields?.languages,
+          languages:
+            languages !== undefined || language !== undefined
+              ? languages ?? language
+              : question.codingFields?.languages,
+          language,
           starterCode: starterCode !== undefined ? starterCode : question.codingFields?.starterCode,
           testCases: testCases !== undefined ? testCases : question.codingFields?.testCases,
+          sample_input,
+          sample_output,
           timeLimit: timeLimit !== undefined ? timeLimit : question.codingFields?.timeLimit,
           memoryLimit: memoryLimit !== undefined ? memoryLimit : question.codingFields?.memoryLimit,
           codingFields,
@@ -986,6 +1717,12 @@ router.put(
         persist: true,
       });
       await question.populate('questionPaperId', 'setName');
+      void queueExamPackageRegenerationForContentChange({
+        examId: req.params.examId,
+        userId: req.user._id,
+        reason: 'QUESTION_UPDATED',
+        questionPaperId: questionPaper._id,
+      });
 
       res.json({ question });
     } catch (error) {
@@ -1017,6 +1754,12 @@ router.delete(
 
       await Question.findByIdAndDelete(req.params.questionId);
       await syncExamQuestionCount(req.params.examId);
+      void queueExamPackageRegenerationForContentChange({
+        examId: req.params.examId,
+        userId: req.user._id,
+        reason: 'QUESTION_DELETED',
+        questionPaperId: questionPaper._id,
+      });
       res.json({ message: 'Question deleted successfully' });
     } catch (error) {
       next(error);
@@ -1079,7 +1822,7 @@ router.post(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR'), // Only EXAM_CREATOR can modify questions
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Keep import permissions aligned with manual question creation
   requireOwnershipOrAdmin,
   prepareImportedQuestionCount,
   checkQuestionLimit,
@@ -1087,24 +1830,62 @@ router.post(
     try {
       const { csvContent, questionPaperId } = req.body;
       const preParsedRecords = req.planLimitContext?.parsedCsvRecords;
-      const importedQuestionsPayload = Array.isArray(req.body?.questions)
-        ? req.body.questions
-        : Array.isArray(req.planLimitContext?.parsedImportedQuestions)
-          ? req.planLimitContext.parsedImportedQuestions
+      const importSourceType = normalizeString(req.body?.importSourceType).toUpperCase() || 'FILE';
+      const importedQuestionsPayload = Array.isArray(req.planLimitContext?.parsedImportedQuestions)
+        ? req.planLimitContext.parsedImportedQuestions
+        : Array.isArray(req.body?.questions)
+          ? flattenQuestionPayloadList(req.body.questions)
           : null;
 
-      if ((!csvContent && !importedQuestionsPayload) || !questionPaperId) {
+      console.log('[questions/import] Request summary:', {
+        examId: req.params.examId,
+        importSourceType,
+        hasCsvContent: Boolean(normalizeString(csvContent)),
+        payloadQuestionsCount: Array.isArray(importedQuestionsPayload) ? importedQuestionsPayload.length : 0,
+        questionPaperIdProvided: Boolean(normalizeString(questionPaperId)),
+      });
+
+      if (!csvContent && !importedQuestionsPayload) {
         return res.status(400).json({
           success: false,
           importedCount: 0,
           message: 'Import failed. No questions were added.',
-          error: 'Questions or CSV content and question paper ID are required',
+          error: 'Questions payload is empty. Please import at least one valid question.',
+        });
+      }
+
+      let effectiveQuestionPaperId = normalizeString(questionPaperId);
+      if (!effectiveQuestionPaperId) {
+        const fallbackQuestionPaper = await QuestionPaper.findOne({
+          examId: req.params.examId,
+        })
+          .select('_id')
+          .sort({ createdAt: 1 })
+          .lean();
+        effectiveQuestionPaperId = fallbackQuestionPaper?._id
+          ? String(fallbackQuestionPaper._id)
+          : '';
+
+        if (effectiveQuestionPaperId) {
+          console.warn(
+            '[questions/import] Missing questionPaperId in payload. Using fallback question paper:',
+            effectiveQuestionPaperId
+          );
+        }
+      }
+
+      if (!effectiveQuestionPaperId) {
+        return res.status(400).json({
+          success: false,
+          importedCount: 0,
+          message: 'Import failed. No questions were added.',
+          error: 'Question paper ID is missing for this import request.',
         });
       }
 
       // Verify question paper belongs to exam
       const questionPaper = await QuestionPaper.findOne({
-        _id: questionPaperId,
+        _id: effectiveQuestionPaperId,
         examId: req.params.examId,
       });
 
@@ -1122,95 +1903,113 @@ router.post(
       }
 
       let createdQuestions = [];
+      const rejectedRows = [];
 
-      if (importedQuestionsPayload) {
-        for (let index = 0; index < importedQuestionsPayload.length; index += 1) {
-          const record = importedQuestionsPayload[index] || {};
-          if (freePlanRestriction) {
-            const restrictionError = validateFreePlanQuestionPayload(record);
-            if (restrictionError) {
-              return sendPlanRestriction(res, restrictionError);
-            }
-          }
-          const createdQuestion = await createQuestionWithManagedImage({
-            examId: req.params.examId,
-            questionPaperId,
-            questionText: record.questionText || record.title,
-            title: record.title,
-            description: record.description,
-            instructions: record.instructions,
-            difficulty: record.difficulty,
-            category: record.category,
-            questionType: record.questionType,
-            options: parseOptionsInput(record.options),
-            correctAnswer: record.correctAnswer || '',
-            points: parseInt(record.points) || 1,
-            order: Number.isFinite(Number(record.order)) ? Number(record.order) : index,
-            sectionId: record.sectionId,
-            passage: record.passage,
-            questionFormat: record.questionFormat,
-            question_type: record.question_type,
-            imageUrl: record.imageUrl,
-            image_path: record.image_path,
-            image: record.image,
-            imageBase64: record.imageBase64,
-            image_base64: record.image_base64,
-            generatedImage: record.generatedImage,
-            generated_image: record.generated_image,
-            languages: record.languages,
-            starterCode: record.starterCode,
-            testCases: record.testCases,
-            timeLimit: record.timeLimit,
-            memoryLimit: record.memoryLimit,
-            codingFields: record.codingFields,
-          });
-          createdQuestions.push(createdQuestion);
+      const importRecords = (() => {
+        if (Array.isArray(importedQuestionsPayload)) {
+          return importedQuestionsPayload;
         }
-      } else {
-        const records = Array.isArray(preParsedRecords)
+
+        const parsedRecords = Array.isArray(preParsedRecords)
           ? preParsedRecords
           : parseCSV(csvContent);
-        validateQuestionCSV(records);
+        validateQuestionCSV(parsedRecords);
+        return parsedRecords;
+      })();
 
-        for (let index = 0; index < records.length; index += 1) {
-          const record = records[index];
-          if (freePlanRestriction) {
-            const restrictionError = validateFreePlanQuestionPayload(record);
-            if (restrictionError) {
-              return sendPlanRestriction(res, restrictionError);
-            }
+      if (importedQuestionsPayload && Array.isArray(importRecords)) {
+        console.log('[questions/import] Payload sample row:', importRecords[0] || null);
+      }
+
+      for (let index = 0; index < importRecords.length; index += 1) {
+        const record = importRecords[index] || {};
+        const preparedRecord = prepareImportedQuestionRecordForInsert(record, index);
+        const rowNumber = Number.isFinite(Number(record?._rowIndex))
+          ? Number(record._rowIndex)
+          : index + 1;
+        const rowValidationErrors = validatePreparedImportQuestion(preparedRecord);
+
+        if (rowValidationErrors.length > 0) {
+          const reason = rowValidationErrors.join('; ');
+          rejectedRows.push({
+            row: rowNumber,
+            reason,
+            questionText: normalizeString(preparedRecord.questionText).slice(0, 140),
+          });
+          console.warn('[questions/import] Row rejected by validation:', {
+            row: rowNumber,
+            reason,
+          });
+          continue;
+        }
+
+        if (freePlanRestriction) {
+          const restrictionError = validateFreePlanQuestionPayload(preparedRecord);
+          if (restrictionError) {
+            return sendPlanRestriction(res, restrictionError);
           }
+        }
+
+        try {
           const createdQuestion = await createQuestionWithManagedImage({
             examId: req.params.examId,
-            questionPaperId,
-            questionText: record.questionText || record.title,
-            title: record.title,
-            description: record.description,
-            instructions: record.instructions,
-            difficulty: record.difficulty,
-            category: record.category,
-            questionType: record.questionType,
-            options: parseOptionsInput(record.options),
-            correctAnswer: record.correctAnswer || '',
-            points: parseInt(record.points) || 1,
-            order: parseInt(record.order) || index,
-            imageUrl: record.imageUrl,
-            image_path: record.image_path,
-            image: record.image,
-            imageBase64: record.imageBase64,
-            image_base64: record.image_base64,
-            generatedImage: record.generatedImage,
-            generated_image: record.generated_image,
-            questionFormat: record.questionFormat,
-            question_type: record.question_type,
-            languages: record.languages,
-            starterCode: record.starterCode,
-            testCases: record.testCases,
-            timeLimit: record.timeLimit,
-            memoryLimit: record.memoryLimit,
-            codingFields: record.codingFields,
+            questionPaperId: effectiveQuestionPaperId,
+            questionText: preparedRecord.questionText || preparedRecord.question || preparedRecord.title,
+            questionPrompt: preparedRecord.question,
+            title: preparedRecord.title,
+            description: preparedRecord.description,
+            instructions: preparedRecord.instructions,
+            difficulty: preparedRecord.difficulty,
+            category: preparedRecord.category,
+            questionType: preparedRecord.questionType,
+            type: preparedRecord.type,
+            options: parseOptionsInput(preparedRecord.options),
+            correctAnswer: preparedRecord.correctAnswer || '',
+            points: parseInt(preparedRecord.points ?? preparedRecord.max_marks, 10) || 1,
+            max_marks: preparedRecord.max_marks,
+            order: Number.isFinite(Number(preparedRecord.order))
+              ? Number(preparedRecord.order)
+              : index,
+            sectionId: preparedRecord.sectionId,
+            passage: preparedRecord.passage,
+            questionFormat: preparedRecord.questionFormat,
+            question_type: preparedRecord.question_type,
+            imageUrl: preparedRecord.imageUrl,
+            image_path: preparedRecord.image_path,
+            image: preparedRecord.image,
+            imageBase64: preparedRecord.imageBase64,
+            image_base64: preparedRecord.image_base64,
+            generatedImage: preparedRecord.generatedImage,
+            generated_image: preparedRecord.generated_image,
+            languages: preparedRecord.languages ?? preparedRecord.language,
+            language: preparedRecord.language,
+            starterCode: preparedRecord.starterCode,
+            testCases: preparedRecord.testCases,
+            sample_input: preparedRecord.sample_input ?? preparedRecord.sampleInput,
+            sample_output: preparedRecord.sample_output ?? preparedRecord.sampleOutput,
+            timeLimit: preparedRecord.timeLimit,
+            memoryLimit: preparedRecord.memoryLimit,
+            codingFields: preparedRecord.codingFields,
           });
           createdQuestions.push(createdQuestion);
+        } catch (rowError) {
+          const detailedReason =
+            rowError?.name === 'ValidationError' && rowError?.errors
+              ? Object.values(rowError.errors)
+                  .map((entry) => entry?.message)
+                  .filter(Boolean)
+                  .join('; ')
+              : rowError?.message || 'Unknown import error';
+
+          rejectedRows.push({
+            row: rowNumber,
+            reason: detailedReason || 'Unknown import error',
+            questionText: normalizeString(preparedRecord.questionText).slice(0, 140),
+          });
+          console.warn('[questions/import] Row failed during save:', {
+            row: rowNumber,
+            reason: detailedReason || 'Unknown import error',
+          });
         }
       }
 
@@ -1241,14 +2040,30 @@ router.post(
         }
       }
 
+      if (rejectedRows.length > 0) {
+        console.warn('[questions/import] Rejected row summary:', rejectedRows.slice(0, 25));
+      }
+
       if (!createdQuestions.length) {
-        return res.status(200).json({
-          success: true,
+        const firstFailureReason = rejectedRows[0]?.reason || 'No valid questions found in the uploaded file.';
+        return res.status(400).json({
+          success: false,
           importedCount: 0,
-          message: 'No valid questions found in the uploaded file.',
+          message: 'Import failed. No questions were added.',
+          error: firstFailureReason,
+          details: rejectedRows
+            .slice(0, 25)
+            .map((entry) => `Row ${entry.row}: ${entry.reason}`),
           questions: [],
         });
       }
+
+      void queueExamPackageRegenerationForContentChange({
+        examId: req.params.examId,
+        userId: req.user._id,
+        reason: 'QUESTIONS_IMPORTED',
+        questionPaperId: effectiveQuestionPaperId,
+      });
 
       console.log('[question-import-debug] TOTAL IMPORTED:', createdQuestions.length);
       createdQuestions.forEach((question, index) => {
@@ -1262,6 +2077,8 @@ router.post(
         importedCount: createdQuestions.length,
         message: `Successfully imported ${createdQuestions.length} question${createdQuestions.length === 1 ? '' : 's'}.`,
         questions: createdQuestions,
+        skippedCount: rejectedRows.length,
+        skipped: rejectedRows.slice(0, 25),
       });
     } catch (error) {
       next(error);
