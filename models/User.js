@@ -98,7 +98,6 @@ const UserSchema = new mongoose.Schema(
 );
 
 // Indexes for efficient queries
-UserSchema.index({ uniqueId: 1 });
 UserSchema.index({ tenantId: 1, role: 1 });
 UserSchema.index({ tenantId: 1, subTenantId: 1, role: 1 });
 UserSchema.index({ status: 1 });

@@ -8,7 +8,6 @@ const NormalizationConfigSchema = new mongoose.Schema(
       required: function() {
         return !this.tenantId; // examId is required if tenantId is not set
       },
-      index: true,
     },
     tenantId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -16,7 +15,6 @@ const NormalizationConfigSchema = new mongoose.Schema(
       required: function() {
         return !this.examId; // tenantId is required if examId is not set
       },
-      index: true,
     },
     formulaType: {
       type: String,

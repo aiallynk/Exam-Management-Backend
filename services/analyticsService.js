@@ -624,6 +624,7 @@ export const getTenantAnalyticsDashboard = async ({
   viewerUserId,
   examId = null,
   startDate = null,
+  endDate = null,
   includeAdvanced = false,
 }) => {
   const examFilter = { tenantId };
@@ -661,8 +662,19 @@ export const getTenantAnalyticsDashboard = async ({
     isDisqualified: false,
   };
 
+  const dateRange = {};
   if (startDate instanceof Date && !Number.isNaN(startDate.getTime())) {
-    attemptFilter.submitTime = { $gte: startDate };
+    dateRange.$gte = startDate;
+  }
+  if (endDate instanceof Date && !Number.isNaN(endDate.getTime())) {
+    dateRange.$lte = endDate;
+  }
+  if (Object.keys(dateRange).length > 0) {
+    attemptFilter.$or = [
+      { submitTime: dateRange },
+      { submittedAt: dateRange },
+      { createdAt: dateRange },
+    ];
   }
 
   const attempts = await ExamAttempt.find(attemptFilter)

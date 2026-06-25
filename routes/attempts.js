@@ -9,7 +9,11 @@ import SystemConfig from '../models/SystemConfig.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
-import { requireExamPermission, hasExamPermission, ensureExamParticipant } from '../middleware/examPermissions.js';
+import {
+  canCandidateAccessSession,
+  requireExamPermission,
+  hasExamPermission,
+} from '../middleware/examPermissions.js';
 import { checkCandidateAttemptLimit } from '../middleware/planLimits.js';
 import { body, validationResult } from 'express-validator';
 import { validateObjectId, sanitizePagination, validateObjectIds } from '../middleware/validation.js';
@@ -297,6 +301,95 @@ const getRequestIpAddress = (req) => {
     req?.socket?.remoteAddress ||
     ''
   );
+};
+
+const getRequestBrowserSessionId = (req) =>
+  normalizeTrimmedString(
+    req?.body?.browserSessionId ||
+    req?.body?.attemptSessionId ||
+    req?.headers?.['x-browser-session-id'] ||
+    req?.headers?.['x-attempt-session-id'] ||
+    ''
+  );
+
+const getRequestDeviceId = (req) =>
+  normalizeTrimmedString(req?.body?.deviceId || req?.headers?.['x-device-id'] || '');
+
+const buildRequestDeviceInfo = (req) => ({
+  ipAddress: getRequestIpAddress(req),
+  userAgent: req?.get?.('user-agent') || '',
+  deviceId: getRequestDeviceId(req),
+  browserSessionId: getRequestBrowserSessionId(req),
+});
+
+const enforceAttemptDeviceLock = async ({ attempt, req }) => {
+  if (!attempt || attempt.isCompleted) {
+    return { allowed: true };
+  }
+
+  const current = buildRequestDeviceInfo(req);
+  const stored = attempt.deviceInfo || {};
+  const currentBrowserSessionId = normalizeTrimmedString(current.browserSessionId);
+  const storedBrowserSessionId = normalizeTrimmedString(stored.browserSessionId);
+  const currentDeviceId = normalizeTrimmedString(current.deviceId);
+  const storedDeviceId = normalizeTrimmedString(stored.deviceId);
+  const currentIp = normalizeIpAddress(current.ipAddress);
+  const storedIp = normalizeIpAddress(stored.ipAddress);
+  const currentUserAgent = normalizeTrimmedString(current.userAgent);
+  const storedUserAgent = normalizeTrimmedString(stored.userAgent);
+
+  if (!storedBrowserSessionId && !storedDeviceId && !storedIp && !storedUserAgent) {
+    attempt.deviceInfo = {
+      ...(attempt.deviceInfo || {}),
+      ...current,
+    };
+    await attempt.save();
+    return { allowed: true };
+  }
+
+  if (storedBrowserSessionId && currentBrowserSessionId && storedBrowserSessionId !== currentBrowserSessionId) {
+    return {
+      allowed: false,
+      error: 'This attempt is already active in another browser session.',
+    };
+  }
+
+  if (storedDeviceId && currentDeviceId && storedDeviceId !== currentDeviceId) {
+    return {
+      allowed: false,
+      error: 'This attempt is already active on another device.',
+    };
+  }
+
+  if (storedIp && currentIp && storedIp !== currentIp) {
+    return {
+      allowed: false,
+      error: 'This attempt is locked to the original network/IP.',
+    };
+  }
+
+  if (storedUserAgent && currentUserAgent && storedUserAgent !== currentUserAgent) {
+    return {
+      allowed: false,
+      error: 'This attempt is already active in another browser.',
+    };
+  }
+
+  const updates = {};
+  if (!stored.browserSessionId && current.browserSessionId) updates.browserSessionId = current.browserSessionId;
+  if (!stored.deviceId && current.deviceId) updates.deviceId = current.deviceId;
+  if (!stored.ipAddress && current.ipAddress) updates.ipAddress = current.ipAddress;
+  if (!stored.userAgent && current.userAgent) updates.userAgent = current.userAgent;
+
+  if (Object.keys(updates).length > 0) {
+    attempt.deviceInfo = {
+      ...(attempt.deviceInfo || {}),
+      ...updates,
+    };
+    await attempt.save();
+  }
+
+  return { allowed: true };
 };
 
 const appendIpLockFlag = (attempt, details = {}) => {
@@ -999,15 +1092,6 @@ router.post(
       const effectivePlanType = req.planLimitContext?.planType || null;
       const planFeatures = getSubscriptionPlanDefinition(effectivePlanType)?.features || {};
 
-      // UNIVERSAL: Ensure ExamParticipant exists with CANDIDATE role FIRST
-      // This must happen before permission check, so the participant exists when we check permissions
-      const participant = await ensureExamParticipant(
-        req.user._id,
-        examId,
-        'CANDIDATE',
-        req.user._id
-      );
-
       // Check exam permission: user must have ATTEMPT_EXAM permission
       const canAttempt = await hasExamPermission(req.user._id, examId, 'ATTEMPT_EXAM');
       if (!canAttempt) {
@@ -1031,6 +1115,9 @@ router.post(
       const session = await ExamSession.findById(sessionId).populate('examId');
       if (!session) {
         return res.status(404).json({ error: 'Session not found' });
+      }
+      if (!(await canCandidateAccessSession(req.user._id, session))) {
+        return res.status(403).json({ error: 'You are not assigned to this session' });
       }
 
       const exam = await Exam.findById(examId);
@@ -1106,14 +1193,29 @@ router.post(
         console.log(`User ${req.user._id} attempting exam ${examId} with re-attempt flag from attempt ${hasReAttemptAllowed._id}`);
       }
 
-      // Check if there's an active attempt
+      // Enforce one active attempt per candidate per exam.
       const activeAttempt = await ExamAttempt.findOne({
         userId: req.user._id,
-        sessionId,
+        examId,
         isCompleted: false,
-      }).populate('questionPaperId', 'setName');
+        isDisqualified: false,
+      })
+        .populate('questionPaperId', 'setName')
+        .populate('sessionId', 'startTime endTime');
 
       if (activeAttempt) {
+        if (activeAttempt.sessionId?._id?.toString() !== sessionId.toString()) {
+          return res.status(409).json({
+            error: 'You already have an active attempt for this exam. Please finish or submit it before starting another session.',
+            attemptId: activeAttempt._id,
+          });
+        }
+
+        const deviceLockCheck = await enforceAttemptDeviceLock({ attempt: activeAttempt, req });
+        if (!deviceLockCheck.allowed) {
+          return res.status(409).json({ error: deviceLockCheck.error });
+        }
+
         if (
           isFreePlan(effectivePlanType) &&
           await hasWritingQuestionsInPaper(
@@ -1133,7 +1235,6 @@ router.post(
         }
 
         await activeAttempt.populate('examId', 'title duration');
-        await activeAttempt.populate('sessionId', 'startTime endTime');
         await ensureQuestionPaperImagesReady({
           questionPaperId:
             activeAttempt.questionPaperId?._id || activeAttempt.questionPaperId,
@@ -1200,13 +1301,22 @@ router.post(
         tenantId: examForTenant?.tenantId || null,
         // Log device info
         deviceInfo: {
-          ipAddress: getRequestIpAddress(req),
-          userAgent: req.get('user-agent') || '',
-          deviceId: req.body.deviceId || req.headers['x-device-id'] || '',
+          ...buildRequestDeviceInfo(req),
         },
       });
 
       await attempt.save();
+      if (hasReAttemptAllowed?._id) {
+        await ExamAttempt.updateOne(
+          { _id: hasReAttemptAllowed._id },
+          {
+            $set: {
+              reAttemptAllowed: false,
+              reAttemptReason: hasReAttemptAllowed.reAttemptReason || 'Re-attempt allowance consumed',
+            },
+          }
+        );
+      }
       if (req.planLimitContext?.shouldIncrementCandidateCount) {
         await syncExamCandidateCount(examId);
       }
@@ -1216,22 +1326,6 @@ router.post(
         const tenantId = exam?.tenantId || examForTenant?.tenantId || null;
         const examTitle = exam?.title || attempt.examSnapshot?.title || 'Exam';
         const candidateName = req.user.name || req.user.email || 'Candidate';
-
-        if (participant?.__assigned) {
-          await createUserNotification({
-            title: 'Exam Assigned',
-            message: `You have been assigned to "${examTitle}".`,
-            type: 'exam_assigned',
-            roles: ['CANDIDATE'],
-            userId: req.user._id,
-            tenantId,
-            examId: examId,
-            sessionId,
-            attemptId: attempt._id,
-            createdBy: req.user._id,
-            metadata: { examId, examTitle },
-          });
-        }
 
         await createUserNotification({
           title: 'Exam Started',
@@ -1328,6 +1422,9 @@ router.get('/:attemptId/progress', requireAuth, validateObjectId('attemptId'), a
     }
 
     if (!canReview) {
+      if (!(await canCandidateAccessSession(req.user._id, attempt.sessionId))) {
+        return res.status(403).json({ error: 'You are not assigned to this session' });
+      }
       const planContext = await resolveExamPlanContext(attempt.examId?._id || attempt.examId);
       const accessControlCheck = enforceExamAccessControl({
         exam: attempt.examId,
@@ -1344,6 +1441,13 @@ router.get('/:attemptId/progress', requireAuth, validateObjectId('attemptId'), a
       });
       if (!ipLockCheck.allowed) {
         return res.status(403).json({ error: ipLockCheck.error });
+      }
+      const deviceLockCheck = await enforceAttemptDeviceLock({ attempt, req });
+      if (!deviceLockCheck.allowed) {
+        return res.status(409).json({ error: deviceLockCheck.error });
+      }
+      if (attempt.isDisqualified && !attempt.isCompleted) {
+        return res.status(403).json({ error: 'Attempt is disqualified and cannot be resumed.' });
       }
     }
 
@@ -1442,6 +1546,9 @@ const updateAttemptProgressHandler = async (req, res, next) => {
     }
 
     if (!canReview) {
+      if (!(await canCandidateAccessSession(req.user._id, attempt.sessionId))) {
+        return res.status(403).json({ error: 'You are not assigned to this session' });
+      }
       const planContext = await resolveExamPlanContext(attempt.examId?._id || attempt.examId);
       const accessControlCheck = enforceExamAccessControl({
         exam: attempt.examId,
@@ -1458,6 +1565,13 @@ const updateAttemptProgressHandler = async (req, res, next) => {
       });
       if (!ipLockCheck.allowed) {
         return res.status(403).json({ error: ipLockCheck.error });
+      }
+      const deviceLockCheck = await enforceAttemptDeviceLock({ attempt, req });
+      if (!deviceLockCheck.allowed) {
+        return res.status(409).json({ error: deviceLockCheck.error });
+      }
+      if (attempt.isDisqualified && !attempt.isCompleted) {
+        return res.status(403).json({ error: 'Attempt is disqualified and cannot be continued.' });
       }
     }
 
@@ -1712,6 +1826,9 @@ export const submitAttemptHandler = async (req, res, next) => {
     }
 
     if (!canReview && !attempt.isCompleted) {
+      if (!(await canCandidateAccessSession(req.user._id, attempt.sessionId))) {
+        return res.status(403).json({ error: 'You are not assigned to this session' });
+      }
       const accessControlCheck = enforceExamAccessControl({
         exam: attempt.examId,
         req,
@@ -1728,6 +1845,13 @@ export const submitAttemptHandler = async (req, res, next) => {
       });
       if (!ipLockCheck.allowed) {
         return res.status(403).json({ error: ipLockCheck.error });
+      }
+      const deviceLockCheck = await enforceAttemptDeviceLock({ attempt, req });
+      if (!deviceLockCheck.allowed) {
+        return res.status(409).json({ error: deviceLockCheck.error });
+      }
+      if (attempt.isDisqualified && !attempt.isCompleted) {
+        return res.status(403).json({ error: 'Attempt is disqualified and cannot be submitted manually.' });
       }
     }
 
@@ -2657,6 +2781,10 @@ router.get('/:attemptId/certificate', requireAuth, validateObjectId('attemptId')
 
     if (!isOwnAttempt && !canViewAnyAttempt) {
       return res.status(403).json({ error: 'Forbidden - You can only view your own certificates' });
+    }
+
+    if (!attempt.examId?.allowCertification) {
+      return res.status(403).json({ error: 'Certification is disabled for this exam.' });
     }
 
     // Block certificate until results are released OR certificates are sent (for own attempts)

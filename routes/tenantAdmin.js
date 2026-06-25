@@ -128,6 +128,28 @@ const escapeRegExp = (value) => String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\
 const resolveExamCode = (examDoc) =>
   String(examDoc?.exam_code || examDoc?.uniqueId || examDoc?.examCode || '').trim();
 
+const parseDateBoundary = (value, boundary = 'start') => {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const raw = value.trim();
+  const dateOnly = /^\d{4}-\d{2}-\d{2}$/.test(raw);
+  const parsed = new Date(dateOnly
+    ? `${raw}T${boundary === 'end' ? '23:59:59.999' : '00:00:00.000'}`
+    : raw);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+};
+
+const parseQueryDateRange = (query = {}) => {
+  const startDate = parseDateBoundary(
+    query.startDate || query.fromDate || query.dateFrom || query.from,
+    'start'
+  );
+  const endDate = parseDateBoundary(
+    query.endDate || query.toDate || query.dateTo || query.to,
+    'end'
+  );
+  return { startDate, endDate };
+};
+
 const withExamCode = (examDoc) => {
   if (!examDoc) return examDoc;
 
@@ -153,6 +175,7 @@ const buildTenantScopedExamNameFilter = ({ title, tenantId, excludeExamId = null
   const filter = {
     title: new RegExp(`^${escapeRegExp(normalizedTitle)}$`, 'i'),
     tenantId,
+    isActive: true,
   };
 
   if (excludeExamId) {
@@ -895,20 +918,15 @@ router.get(
       'advancedAnalytics'
     );
     const requestedExamId = req.query.examId || req.query.specificExamId || null;
-    const parsedStartDate =
-      typeof req.query.startDate === 'string' && req.query.startDate
-        ? new Date(req.query.startDate)
-        : null;
+    const { startDate, endDate } = parseQueryDateRange(req.query);
 
     const analytics = await getTenantAnalyticsDashboard({
       tenantId: req.user.tenantId,
       viewerRole: req.user.role,
       viewerUserId: req.user._id,
       examId: requestedExamId,
-      startDate:
-        parsedStartDate && !Number.isNaN(parsedStartDate.getTime())
-          ? parsedStartDate
-          : null,
+      startDate,
+      endDate,
       includeAdvanced: includeAdvancedAnalytics,
     });
 
@@ -2985,11 +3003,22 @@ router.get('/attempts', async (req, res, next) => {
   try {
     const { page = 1, limit = 20, examId, userId, isCompleted } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
+    const { startDate, endDate } = parseQueryDateRange(req.query);
 
     const filter = { tenantId: req.user.tenantId };
     if (examId) filter.examId = examId;
     if (userId) filter.userId = userId;
     if (isCompleted !== undefined) filter.isCompleted = isCompleted === 'true';
+    const createdAtRange = {};
+    if (startDate) createdAtRange.$gte = startDate;
+    if (endDate) createdAtRange.$lte = endDate;
+    if (Object.keys(createdAtRange).length > 0) {
+      filter.$or = [
+        { createdAt: createdAtRange },
+        { submittedAt: createdAtRange },
+        { submitTime: createdAtRange },
+      ];
+    }
 
     const [attempts, total] = await Promise.all([
       ExamAttempt.find(filter)

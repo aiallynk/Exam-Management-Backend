@@ -18,7 +18,6 @@ const TenantFeatureBillingSchema = new Schema(
       ref: 'Tenant',
       required: true,
       unique: true,
-      index: true,
     },
     selectedFeatures: {
       type: TenantFeatureSelectionSchema,
@@ -39,7 +38,5 @@ const TenantFeatureBillingSchema = new Schema(
     timestamps: true,
   }
 );
-
-TenantFeatureBillingSchema.index({ tenantId: 1 }, { unique: true });
 
 export default mongoose.model('TenantFeatureBilling', TenantFeatureBillingSchema);

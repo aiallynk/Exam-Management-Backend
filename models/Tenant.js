@@ -215,8 +215,6 @@ TenantSchema.pre('validate', async function (next) {
 });
 
 // Indexes for efficient queries
-TenantSchema.index({ uniqueId: 1 });
-TenantSchema.index({ code: 1 });
 TenantSchema.index({ type: 1, status: 1 });
 TenantSchema.index({ status: 1, createdAt: -1 });
 TenantSchema.index({ createdBy: 1 });

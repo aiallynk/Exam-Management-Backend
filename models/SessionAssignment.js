@@ -17,7 +17,11 @@ const SessionAssignmentSchema = new mongoose.Schema(
     questionPaperId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'QuestionPaper',
-      required: true,
+      default: null,
+    },
+    grantsAccess: {
+      type: Boolean,
+      default: false,
     },
     orderIndex: {
       type: Number,
@@ -27,6 +31,11 @@ const SessionAssignmentSchema = new mongoose.Schema(
       type: Date,
       default: Date.now,
     },
+    assignedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
   },
   {
     timestamps: true,
@@ -35,6 +44,7 @@ const SessionAssignmentSchema = new mongoose.Schema(
 
 SessionAssignmentSchema.index({ sessionId: 1, userId: 1 }, { unique: true });
 SessionAssignmentSchema.index({ sessionId: 1, orderIndex: -1 });
+SessionAssignmentSchema.index({ sessionId: 1, grantsAccess: 1 });
 
 const SessionAssignment = mongoose.model('SessionAssignment', SessionAssignmentSchema);
 

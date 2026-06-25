@@ -83,7 +83,6 @@ SectionSchema.pre('validate', async function (next) {
   next();
 });
 
-SectionSchema.index({ uniqueId: 1 });
 SectionSchema.index({ questionPaperId: 1, order: 1 });
 SectionSchema.index({ questionPaperId: 1, isActive: 1 });
 

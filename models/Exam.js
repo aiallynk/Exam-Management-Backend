@@ -293,7 +293,6 @@ ExamSchema.pre('validate', async function (next) {
 });
 
 // Indexes
-ExamSchema.index({ uniqueId: 1 });
 ExamSchema.index({ tenantId: 1, createdAt: -1 });
 ExamSchema.index({ createdBy: 1, createdAt: -1 });
 ExamSchema.index({ tenantId: 1, isActive: 1 });

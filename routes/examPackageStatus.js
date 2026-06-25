@@ -2,12 +2,16 @@ import express from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { requireTenant } from '../middleware/multiTenant.js';
-import { hasExamPermission } from '../middleware/examPermissions.js';
+import {
+  canCandidateAccessSession,
+  hasExamPermission,
+} from '../middleware/examPermissions.js';
 import { isExamPackageRegenerationInFlight } from '../services/examPackageRegenerationService.js';
 import Exam from '../models/Exam.js';
 import ExamPackage from '../models/ExamPackage.js';
 import ExamSession from '../models/ExamSession.js';
 import SessionAssignment from '../models/SessionAssignment.js';
+import { assignQuestionPaperToStudent } from '../services/sessionAssignment.js';
 
 const router = express.Router();
 
@@ -136,7 +140,7 @@ router.get(
       }
 
       const session = await ExamSession.findById(sessionId).select(
-        '_id examId tenantId questionPaperId questionPaperIds'
+        '_id examId tenantId questionPaperId questionPaperIds distributionMode distributionState assignAllCandidates'
       );
       if (!session) {
         return res.status(404).json({
@@ -187,21 +191,27 @@ router.get(
 
       const isPackageManagerRole = ['EXAM_CREATOR', 'TENANT_ADMIN'].includes(req.user.role);
       if (!isPackageManagerRole) {
-        const canAttempt = await hasExamPermission(req.user._id, exam._id, 'ATTEMPT_EXAM');
+        const canAttempt = await canCandidateAccessSession(req.user._id, session);
         if (!canAttempt) {
           return res.status(403).json({
-            error: 'You do not have permission to access this exam package',
+            error: 'You are not assigned to this session',
           });
         }
       }
 
       const requestedQuestionPaperId = normalizeOptionalObjectId(req.query?.questionPaperId);
-      const assignment = await SessionAssignment.findOne({
+      let assignment = await SessionAssignment.findOne({
         sessionId: session._id,
         userId: req.user._id,
       })
         .select('questionPaperId')
         .lean();
+      if (!assignment?.questionPaperId && req.user.role === 'CANDIDATE') {
+        assignment = await assignQuestionPaperToStudent({
+          session,
+          userId: req.user._id,
+        });
+      }
       const assignedQuestionPaperId = normalizeOptionalObjectId(
         assignment?.questionPaperId?.toString() || null
       );

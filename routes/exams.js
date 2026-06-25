@@ -3,11 +3,15 @@ import Exam from '../models/Exam.js';
 import ExamAttempt from '../models/ExamAttempt.js';
 import Answer from '../models/Answer.js';
 import ExamParticipant from '../models/ExamParticipant.js';
+import User from '../models/User.js';
 import SubTenant from '../models/SubTenant.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole, requireOwnershipOrAdmin } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
-import { ensureExamParticipant } from '../middleware/examPermissions.js';
+import {
+  ensureExamParticipant,
+  canCandidateAccessExam,
+} from '../middleware/examPermissions.js';
 import { checkExamCreationLimit } from '../middleware/planLimits.js';
 import { body, validationResult } from 'express-validator';
 import { sanitizePagination } from '../middleware/validation.js';
@@ -31,6 +35,7 @@ import { ensureQuestionsImageAvailability } from '../services/questionImportImag
 import { sanitizeQuestionOptions } from '../utils/questionOptionSanitizer.js';
 import { sanitizeExamAccessControlPayload } from '../utils/examSecurity.js';
 import { queueExamPackageRegeneration } from '../services/examPackageRegenerationService.js';
+import { resolveAttemptExhaustedExamIds } from '../utils/attemptAvailability.js';
 
 const router = express.Router();
 const SECTION_BASED_EXAM_TYPE = 'SECTION_BASED';
@@ -39,6 +44,7 @@ const ONLINE_EXAM_TYPE = 'ONLINE';
 const MAX_OMR_OPTIONS = 4;
 const OMR_OPTION_LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
 const MONGO_OBJECT_ID_PATTERN = /^[a-fA-F0-9]{24}$/;
+const CANDIDATE_ASSIGNMENT_MODES = new Set(['add', 'remove', 'replace']);
 
 const toPositiveInt = (value, fallback = null) => {
   const parsed = Number(value);
@@ -60,6 +66,171 @@ const normalizeExamType = (value) => {
 };
 
 const isValidObjectId = (value) => MONGO_OBJECT_ID_PATTERN.test(String(value || '').trim());
+const normalizeObjectIdArray = (value) => {
+  if (!Array.isArray(value)) return [];
+  return [...new Set(
+    value
+      .map((candidate) => String(candidate || '').trim())
+      .filter((candidate) => isValidObjectId(candidate))
+  )];
+};
+
+const parseCandidateIdPayload = (value) => {
+  if (value === undefined) {
+    return { candidateIds: [], invalidIds: [], duplicateIds: [] };
+  }
+
+  const rawIds = Array.isArray(value)
+    ? value.map((candidate) => String(candidate || '').trim()).filter(Boolean)
+    : [];
+  const invalidIds = rawIds.filter((candidateId) => !isValidObjectId(candidateId));
+  const validIds = rawIds.filter((candidateId) => isValidObjectId(candidateId));
+  const duplicateIds = [...new Set(validIds.filter((candidateId, index) => validIds.indexOf(candidateId) !== index))];
+
+  return {
+    candidateIds: [...new Set(validIds)],
+    invalidIds: [...new Set(invalidIds)],
+    duplicateIds,
+  };
+};
+
+const resolveAssignmentMode = (value) => {
+  const normalized = String(value || 'replace').trim().toLowerCase();
+  return CANDIDATE_ASSIGNMENT_MODES.has(normalized) ? normalized : 'replace';
+};
+
+const resolveCandidateUsersForTenant = async (candidateIds, tenantId) => {
+  const uniqueCandidateIds = normalizeObjectIdArray(candidateIds);
+  if (!uniqueCandidateIds.length) {
+    return { candidateIds: [], users: [] };
+  }
+
+  const users = await User.find({
+    _id: { $in: uniqueCandidateIds },
+    role: 'CANDIDATE',
+  }).select('_id tenantId role').lean();
+
+  const userMap = new Map(users.map((user) => [String(user._id), user]));
+  const missingIds = uniqueCandidateIds.filter((candidateId) => !userMap.has(candidateId));
+  if (missingIds.length > 0) {
+    const missingCount = missingIds.length;
+    return {
+      error: {
+        status: 404,
+        message:
+          missingCount === 1
+            ? `Candidate ${missingIds[0]} not found.`
+            : `${missingCount} candidate accounts were not found.`,
+      },
+    };
+  }
+
+  const crossTenantIds = users
+    .filter((user) => String(user.tenantId || '') !== String(tenantId || ''))
+    .map((user) => String(user._id));
+  if (crossTenantIds.length > 0) {
+    return {
+      error: {
+        status: 403,
+        message:
+          crossTenantIds.length === 1
+            ? 'Candidate does not belong to this tenant.'
+            : 'One or more candidates do not belong to this tenant.',
+      },
+    };
+  }
+
+  return { candidateIds: uniqueCandidateIds, users };
+};
+
+const loadExamCandidateAssignments = async (examId) =>
+  ExamParticipant.find({ examId, examRole: 'CANDIDATE' })
+    .select('userId')
+    .lean();
+
+const applyCandidateAssignments = async ({
+  exam,
+  candidateIds = [],
+  mode = 'replace',
+  assignedBy = null,
+}) => {
+  const resolvedMode = resolveAssignmentMode(mode);
+  const normalizedCandidateIds = normalizeObjectIdArray(candidateIds);
+  const currentAssignments = await loadExamCandidateAssignments(exam._id);
+  const currentCandidateIds = currentAssignments.map((assignment) => String(assignment.userId));
+  const currentCandidateSet = new Set(currentCandidateIds);
+  const requestedCandidateSet = new Set(normalizedCandidateIds);
+
+  let nextCandidateIds;
+  if (resolvedMode === 'add') {
+    nextCandidateIds = [...new Set([...currentCandidateIds, ...normalizedCandidateIds])];
+  } else if (resolvedMode === 'remove') {
+    nextCandidateIds = currentCandidateIds.filter((candidateId) => !requestedCandidateSet.has(candidateId));
+  } else {
+    nextCandidateIds = normalizedCandidateIds;
+  }
+
+  const nextCandidateSet = new Set(nextCandidateIds);
+  const addedCandidateIds = nextCandidateIds.filter((candidateId) => !currentCandidateSet.has(candidateId));
+  const removedCandidateIds = currentCandidateIds.filter((candidateId) => !nextCandidateSet.has(candidateId));
+
+  if (removedCandidateIds.length > 0) {
+    await ExamParticipant.deleteMany({
+      examId: exam._id,
+      examRole: 'CANDIDATE',
+      userId: { $in: removedCandidateIds },
+    });
+  }
+
+  for (const candidateId of addedCandidateIds) {
+    const participant = new ExamParticipant({
+      examId: exam._id,
+      userId: candidateId,
+      examRole: 'CANDIDATE',
+      assignedBy: assignedBy || exam.createdBy,
+      tenantId: exam.tenantId || null,
+    });
+    await participant.save();
+  }
+
+  exam.candidateCount = nextCandidateIds.length;
+  await exam.save();
+
+  return {
+    mode: resolvedMode,
+    candidateIds: nextCandidateIds,
+    addedCandidateIds,
+    removedCandidateIds,
+  };
+};
+
+const buildCandidateAccessibleExamFilter = async ({ tenantId, userId }) => {
+  const [assignedExamIds, restrictedExamIds] = await Promise.all([
+    ExamParticipant.distinct('examId', {
+      tenantId,
+      userId,
+      examRole: 'CANDIDATE',
+    }),
+    ExamParticipant.distinct('examId', {
+      tenantId,
+      examRole: 'CANDIDATE',
+    }),
+  ]);
+
+  const assignedIds = assignedExamIds.map((value) => String(value));
+  const restrictedIds = restrictedExamIds.map((value) => String(value));
+
+  if (restrictedIds.length === 0) {
+    return {};
+  }
+
+  return {
+    $or: [
+      { _id: { $in: assignedIds } },
+      { _id: { $nin: restrictedIds } },
+    ],
+  };
+};
 const DUPLICATE_EXAM_NAME_MESSAGE =
   'Exam name already exists. Please use a different name.';
 
@@ -96,6 +267,7 @@ const buildTenantScopedExamNameFilter = ({ title, tenantId, excludeExamId = null
   const filter = {
     title: new RegExp(`^${escapeRegExp(normalizedTitle)}$`, 'i'),
     ...(tenantId ? { tenantId } : { tenantId: { $exists: false } }),
+    isActive: true,
   };
 
   if (excludeExamId) {
@@ -114,6 +286,18 @@ const findDuplicateExamByTitle = async ({ title, tenantId, excludeExamId = null 
   if (!duplicateFilter) return null;
 
   return Exam.findOne(duplicateFilter).select('_id').lean();
+};
+
+const mergeExamIdExclusion = (filter, excludedExamIds = []) => {
+  if (!excludedExamIds.length) return;
+  const existing = filter._id && typeof filter._id === 'object' ? filter._id : {};
+  filter._id = {
+    ...existing,
+    $nin: [
+      ...(Array.isArray(existing.$nin) ? existing.$nin : []),
+      ...excludedExamIds,
+    ],
+  };
 };
 
 const withExamCode = (examDoc) => {
@@ -771,47 +955,42 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, sanitizePag
         filter.isActive = isActive === 'true';
       }
     } else {
-      // Regular users see exams based on their exam context roles
-      // Get all ExamParticipant records for this user
-      const participants = await ExamParticipant.find({ userId: req.user._id })
-        .select('examId examRole')
-        .lean();
-
-      const examIds = participants.map(p => p.examId);
+      // Candidate-facing exam lists should include public exams and private exams
+      // only when the signed-in candidate is explicitly assigned.
+      const candidateVisibilityFilter = await buildCandidateAccessibleExamFilter({
+        tenantId: req.user.tenantId,
+        userId: req.user._id,
+      });
 
       if (filterBy === 'created') {
-        // Show only exams user created (CREATOR role)
+        const participants = await ExamParticipant.find({ userId: req.user._id })
+          .select('examId examRole')
+          .lean();
         const creatorExamIds = participants
-          .filter(p => p.examRole === 'CREATOR')
-          .map(p => p.examId);
+          .filter((p) => p.examRole === 'CREATOR')
+          .map((p) => p.examId);
         filter._id = { $in: creatorExamIds };
-      } else if (filterBy === 'canAttempt') {
-        // Show only exams user can attempt (CANDIDATE role)
-        const candidateExamIds = participants
-          .filter(p => p.examRole === 'CANDIDATE')
-          .map(p => p.examId);
-        filter._id = { $in: candidateExamIds };
-        filter.isActive = true; // Only active exams can be attempted
       } else if (filterBy === 'canEvaluate') {
-        // Show only exams user can evaluate (EVALUATOR role)
+        const participants = await ExamParticipant.find({ userId: req.user._id })
+          .select('examId examRole')
+          .lean();
         const evaluatorExamIds = participants
-          .filter(p => p.examRole === 'EVALUATOR')
-          .map(p => p.examId);
+          .filter((p) => p.examRole === 'EVALUATOR')
+          .map((p) => p.examId);
         filter._id = { $in: evaluatorExamIds };
       } else {
-        // Default: show all exams user has any role in
-        if (examIds.length > 0) {
-          filter._id = { $in: examIds };
-          // For candidates, only show active exams
-          const candidateExamIds = participants
-            .filter(p => p.examRole === 'CANDIDATE')
-            .map(p => p.examId);
-          if (candidateExamIds.length > 0 && examIds.every(id => candidateExamIds.includes(id))) {
-            filter.isActive = true;
-          }
+        if (Object.keys(candidateVisibilityFilter).length > 0) {
+          Object.assign(filter, candidateVisibilityFilter);
+        }
+        const exhaustedExamIds = await resolveAttemptExhaustedExamIds({
+          userId: req.user._id,
+          tenantId: req.user.tenantId,
+        });
+        mergeExamIdExclusion(filter, exhaustedExamIds);
+        if (isActive !== undefined) {
+          filter.isActive = isActive === 'true';
         } else {
-          // User has no exam roles, return empty
-          filter._id = { $in: [] };
+          filter.isActive = true;
         }
       }
     }
@@ -1195,19 +1374,14 @@ router.get('/:examId', requireAuth, requireTenant, enforceTenantBoundaries, asyn
       }
     }
 
-    // Regular users: check exam permissions
-    const { hasExamPermission } = await import('../middleware/examPermissions.js');
-    const hasViewResults = await hasExamPermission(req.user._id, exam._id, 'VIEW_RESULTS');
-    const hasAttemptExam = await hasExamPermission(req.user._id, exam._id, 'ATTEMPT_EXAM');
-    const hasCreateSession = await hasExamPermission(req.user._id, exam._id, 'CREATE_SESSION');
-
-    // User must have at least one permission to view exam
-    if (!hasViewResults && !hasAttemptExam && !hasCreateSession) {
+    // Candidate users can only see public exams or the exams they were assigned to.
+    const canAccessExam = await canCandidateAccessExam(req.user._id, exam._id);
+    if (!canAccessExam) {
       return res.status(403).json({ error: 'You do not have access to this exam' });
     }
 
-    // Candidates can only see active exams
-    if (hasAttemptExam && !hasCreateSession && !exam.isActive) {
+    // Candidates can only see active exams, matching existing availability behavior.
+    if (!exam.isActive) {
       return res.status(403).json({ error: 'Exam is not currently available' });
     }
 
@@ -1256,6 +1430,12 @@ router.post(
       .custom((value) => value === null || value === '' || isValidObjectId(value))
       .withMessage('subTenantId must be a valid id when provided'),
     body('accessControl').optional().isObject().withMessage('accessControl must be an object'),
+    body('candidateIds').optional().isArray().withMessage('candidateIds must be an array'),
+    body('assignedCandidates').optional().isArray().withMessage('assignedCandidates must be an array'),
+    body('candidateAssignmentMode')
+      .optional()
+      .isIn(['replace'])
+      .withMessage('candidateAssignmentMode must be replace when provided during creation'),
   ],
   async (req, res, next) => {
     try {
@@ -1308,6 +1488,25 @@ router.post(
         return res.status(409).json({
           success: false,
           message: DUPLICATE_EXAM_NAME_MESSAGE,
+        });
+      }
+
+      const candidatePayload = parseCandidateIdPayload(req.body?.candidateIds || req.body?.assignedCandidates);
+      if (candidatePayload.invalidIds.length > 0 || candidatePayload.duplicateIds.length > 0) {
+        return res.status(400).json({
+          error: candidatePayload.invalidIds.length > 0
+            ? 'candidateIds must contain only valid user IDs.'
+            : 'candidateIds must not contain duplicates.',
+        });
+      }
+
+      const candidateResolution =
+        candidatePayload.candidateIds.length > 0
+          ? await resolveCandidateUsersForTenant(candidatePayload.candidateIds, resolvedTenantId)
+          : { candidateIds: [] };
+      if (candidateResolution.error) {
+        return res.status(candidateResolution.error.status).json({
+          error: candidateResolution.error.message,
         });
       }
 
@@ -1463,6 +1662,30 @@ router.post(
       await exam.save();
       await exam.populate('createdBy', 'name email');
 
+      if (candidateResolution.candidateIds.length > 0) {
+        const assignmentResult = await applyCandidateAssignments({
+          exam,
+          candidateIds: candidateResolution.candidateIds,
+          mode: 'replace',
+          assignedBy: req.user._id,
+        });
+        exam.candidateCount = assignmentResult.candidateIds.length;
+
+        await logAuditEvent(AUDIT_ACTIONS.EXAM_CANDIDATES_ASSIGNED, {
+          userId: req.user._id,
+          userEmail: req.user.email,
+          userName: req.user.name,
+          userRole: req.user.role,
+          tenantId: exam.tenantId || null,
+          resourceType: 'Exam',
+          resourceId: exam._id,
+          method: req.method,
+          path: req.path,
+          candidateIds: assignmentResult.candidateIds,
+          mode: 'replace',
+        });
+      }
+
       // UNIVERSAL: Auto-create ExamParticipant with CREATOR role
       // This enables exam-context permissions instead of role-based assumptions
       await ensureExamParticipant(
@@ -1549,6 +1772,12 @@ router.put(
       .custom((value) => value === null || value === '' || isValidObjectId(value))
       .withMessage('subTenantId must be a valid id when provided'),
     body('accessControl').optional().isObject().withMessage('accessControl must be an object'),
+    body('candidateIds').optional().isArray().withMessage('candidateIds must be an array'),
+    body('assignedCandidates').optional().isArray().withMessage('assignedCandidates must be an array'),
+    body('candidateAssignmentMode')
+      .optional()
+      .isIn(['add', 'remove', 'replace'])
+      .withMessage('candidateAssignmentMode must be add, remove, or replace'),
   ],
   async (req, res, next) => {
     try {
@@ -1561,6 +1790,42 @@ router.put(
       if (!exam) {
         return res.status(404).json({ error: 'Exam not found' });
       }
+
+      const hasCandidateAssignmentUpdate = Object.prototype.hasOwnProperty.call(
+        req.body || {},
+        'candidateIds'
+      ) || Object.prototype.hasOwnProperty.call(
+        req.body || {},
+        'assignedCandidates'
+      );
+      const candidateIds = req.body?.candidateIds || req.body?.assignedCandidates;
+      const candidateAssignmentMode = req.body?.candidateAssignmentMode;
+      const requestedAssignmentMode = resolveAssignmentMode(candidateAssignmentMode);
+      const candidatePayload = parseCandidateIdPayload(candidateIds);
+      if (hasCandidateAssignmentUpdate && (candidatePayload.invalidIds.length > 0 || candidatePayload.duplicateIds.length > 0)) {
+        return res.status(400).json({
+          error: candidatePayload.invalidIds.length > 0
+            ? 'candidateIds must contain only valid user IDs.'
+            : 'candidateIds must not contain duplicates.',
+        });
+      }
+      const requestedCandidateIds = candidatePayload.candidateIds;
+      const shouldValidateCandidateAssignments =
+        hasCandidateAssignmentUpdate &&
+        (requestedCandidateIds.length > 0 || requestedAssignmentMode === 'replace');
+      let candidateValidation = { candidateIds: [] };
+      if (shouldValidateCandidateAssignments) {
+        candidateValidation = await resolveCandidateUsersForTenant(
+          requestedCandidateIds,
+          exam.tenantId
+        );
+        if (candidateValidation.error) {
+          return res.status(candidateValidation.error.status).json({
+            error: candidateValidation.error.message,
+          });
+        }
+      }
+
       const examPlanContext = await resolveExamPlanContext(exam._id);
       const effectivePlanType =
         examPlanContext?.planType ||
@@ -1779,6 +2044,46 @@ router.put(
 
       await exam.save();
       await exam.populate('createdBy', 'name email');
+
+      let candidateAssignmentResult = null;
+      if (hasCandidateAssignmentUpdate) {
+        candidateAssignmentResult = await applyCandidateAssignments({
+          exam,
+          candidateIds: requestedCandidateIds,
+          mode: requestedAssignmentMode,
+          assignedBy: req.user._id,
+        });
+
+        const assignmentAction =
+          candidateAssignmentResult.addedCandidateIds.length > 0 &&
+          candidateAssignmentResult.removedCandidateIds.length > 0
+            ? AUDIT_ACTIONS.EXAM_CANDIDATES_UPDATED
+            : candidateAssignmentResult.addedCandidateIds.length > 0
+              ? AUDIT_ACTIONS.EXAM_CANDIDATES_ASSIGNED
+              : candidateAssignmentResult.removedCandidateIds.length > 0
+                ? AUDIT_ACTIONS.EXAM_CANDIDATES_REMOVED
+                : null;
+
+        if (assignmentAction) {
+          await logAuditEvent(assignmentAction, {
+            userId: req.user._id,
+            userEmail: req.user.email,
+            userName: req.user.name,
+            userRole: req.user.role,
+            tenantId: exam.tenantId || null,
+            resourceType: 'Exam',
+            resourceId: exam._id,
+            ip: req.ip,
+            userAgent: req.get('user-agent'),
+            method: req.method,
+            path: req.path,
+            candidateIds: candidateAssignmentResult.candidateIds,
+            addedCandidateIds: candidateAssignmentResult.addedCandidateIds,
+            removedCandidateIds: candidateAssignmentResult.removedCandidateIds,
+            mode: candidateAssignmentResult.mode,
+          });
+        }
+      }
 
       const updatedFields = [];
       const valueToTime = (value) => {
@@ -2011,6 +2316,10 @@ router.post(
       const exam = await Exam.findById(req.params.examId);
       if (!exam) {
         return res.status(404).json({ error: 'Exam not found' });
+      }
+
+      if (!exam.allowCertification) {
+        return res.status(403).json({ error: 'Certification is disabled for this exam.' });
       }
 
       // Find all completed attempts for this exam

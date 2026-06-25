@@ -138,7 +138,6 @@ ExamParticipantSchema.pre('save', function (next) {
 ExamParticipantSchema.index({ examId: 1, userId: 1, examRole: 1 }, { unique: true });
 
 // Single field indexes
-ExamParticipantSchema.index({ uniqueId: 1 });
 ExamParticipantSchema.index({ userId: 1, examRole: 1 });
 ExamParticipantSchema.index({ examId: 1, examRole: 1 });
 

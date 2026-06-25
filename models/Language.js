@@ -49,7 +49,6 @@ LanguageSchema.pre('save', async function (next) {
   next();
 });
 
-LanguageSchema.index({ code: 1 }, { unique: true });
 LanguageSchema.index({ isActive: 1, isDefault: 1 });
 
 export default mongoose.model('Language', LanguageSchema);

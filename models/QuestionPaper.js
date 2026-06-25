@@ -60,7 +60,6 @@ QuestionPaperSchema.pre('validate', async function (next) {
 });
 
 // Unique constraint: one set name per exam
-QuestionPaperSchema.index({ uniqueId: 1 });
 QuestionPaperSchema.index({ examId: 1, setName: 1 }, { unique: true });
 
 export default mongoose.model('QuestionPaper', QuestionPaperSchema);

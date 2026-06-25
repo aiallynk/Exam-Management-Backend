@@ -48,7 +48,10 @@ const chooseRandom = (ids, lastAssigned) => {
 
 const chooseSequential = async (sessionId, ids) => {
   if (!ids.length) return null;
-  const lastAssignment = await SessionAssignment.findOne({ sessionId }).sort({ orderIndex: -1 });
+  const lastAssignment = await SessionAssignment.findOne({
+    sessionId,
+    questionPaperId: { $ne: null },
+  }).sort({ orderIndex: -1 });
   const nextIndex = ((lastAssignment?.orderIndex ?? -1) + 1) % ids.length;
   return { id: ids[nextIndex], orderIndex: (lastAssignment?.orderIndex ?? -1) + 1 };
 };
@@ -60,11 +63,11 @@ export const assignQuestionPaperToStudent = async ({ session, userId, modeOverri
     userId,
   }).populate('questionPaperId', 'setName');
 
-  if (existing) {
+  if (existing?.questionPaperId) {
     return existing;
   }
 
-  const { ids, papers } = await getQuestionPaperPool(session);
+  const { ids } = await getQuestionPaperPool(session);
 
   if (!ids.length) {
     throw new Error('No question sets available for this session.');
@@ -74,7 +77,10 @@ export const assignQuestionPaperToStudent = async ({ session, userId, modeOverri
   let orderIndex = 0;
 
   if (mode === 'random') {
-    const lastPaper = await SessionAssignment.findOne({ sessionId: session._id })
+    const lastPaper = await SessionAssignment.findOne({
+      sessionId: session._id,
+      questionPaperId: { $ne: null },
+    })
       .sort({ orderIndex: -1 })
       .lean();
     const lastAssigned = lastPaper?.questionPaperId?.toString() || session.distributionState?.lastAssignedPaper?.toString();
@@ -85,25 +91,32 @@ export const assignQuestionPaperToStudent = async ({ session, userId, modeOverri
     selectedId = result.id;
     orderIndex = result.orderIndex;
   } else if (mode === 'roll') {
-    const assignmentsCount = await SessionAssignment.countDocuments({ sessionId: session._id });
+    const assignmentsCount = await SessionAssignment.countDocuments({
+      sessionId: session._id,
+      questionPaperId: { $ne: null },
+    });
     const nextIndex = assignmentsCount % ids.length;
     selectedId = ids[nextIndex];
     orderIndex = assignmentsCount;
   } else {
     // single or manual fallback
     selectedId = ids[0];
-    const last = await SessionAssignment.findOne({ sessionId: session._id })
+    const last = await SessionAssignment.findOne({
+      sessionId: session._id,
+      questionPaperId: { $ne: null },
+    })
       .sort({ orderIndex: -1 })
       .lean();
     orderIndex = (last?.orderIndex ?? -1) + 1;
   }
 
-  const assignment = await SessionAssignment.create({
+  const assignment = existing || new SessionAssignment({
     sessionId: session._id,
     userId,
-    questionPaperId: selectedId,
-    orderIndex,
   });
+  assignment.questionPaperId = selectedId;
+  assignment.orderIndex = orderIndex;
+  await assignment.save();
 
   if (!session.distributionState) {
     session.distributionState = {};

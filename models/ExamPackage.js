@@ -86,7 +86,6 @@ ExamPackageSchema.pre('validate', async function (next) {
 });
 
 // Indexes
-ExamPackageSchema.index({ uniqueId: 1 });
 ExamPackageSchema.index({ examId: 1, version: 1 }, { unique: true });
 ExamPackageSchema.index({ examId: 1, isActive: 1 });
 ExamPackageSchema.index({ tenantId: 1 });

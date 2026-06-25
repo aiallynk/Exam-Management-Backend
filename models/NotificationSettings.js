@@ -39,7 +39,6 @@ const NotificationSettingsSchema = new Schema(
       ref: 'Tenant',
       required: true,
       unique: true,
-      index: true,
     },
     notifications: {
       tenant: { type: TenantNotificationSchema, default: () => ({}) },
@@ -61,7 +60,5 @@ const NotificationSettingsSchema = new Schema(
     timestamps: true,
   }
 );
-
-NotificationSettingsSchema.index({ tenantId: 1 }, { unique: true });
 
 export default mongoose.model('NotificationSettings', NotificationSettingsSchema);

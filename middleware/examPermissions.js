@@ -14,6 +14,130 @@
 
 import ExamParticipant from '../models/ExamParticipant.js';
 import Exam from '../models/Exam.js';
+import ExamSession from '../models/ExamSession.js';
+import SessionAssignment from '../models/SessionAssignment.js';
+
+const normalizeId = (value) => String(value || '').trim();
+
+const getCandidateAssignmentCount = async (examId) =>
+  ExamParticipant.countDocuments({
+    examId,
+    examRole: 'CANDIDATE',
+  });
+
+export const isExamPublicForCandidates = async (examId) => {
+  try {
+    return (await getCandidateAssignmentCount(examId)) === 0;
+  } catch (error) {
+    console.error('isExamPublicForCandidates error:', error);
+    return false;
+  }
+};
+
+export const isCandidateAssignedToExam = async (userId, examId) => {
+  try {
+    const participant = await ExamParticipant.findOne({
+      examId,
+      userId,
+      examRole: 'CANDIDATE',
+    })
+      .select('_id')
+      .lean();
+    return Boolean(participant);
+  } catch (error) {
+    console.error('isCandidateAssignedToExam error:', error);
+    return false;
+  }
+};
+
+export const canCandidateAccessExam = async (userId, examId) => {
+  try {
+    const User = (await import('../models/User.js')).default;
+    const [user, exam, publicExam, assigned] = await Promise.all([
+      User.findById(userId).select('role tenantId').lean(),
+      Exam.findById(examId).select('tenantId isActive').lean(),
+      isExamPublicForCandidates(examId),
+      isCandidateAssignedToExam(userId, examId),
+    ]);
+
+    if (!user || !exam) {
+      return false;
+    }
+
+    if (user.role !== 'CANDIDATE') {
+      return false;
+    }
+
+    const userTenantId = normalizeId(user.tenantId);
+    const examTenantId = normalizeId(exam.tenantId);
+    if (!userTenantId || !examTenantId || userTenantId !== examTenantId) {
+      return false;
+    }
+
+    return publicExam || assigned;
+  } catch (error) {
+    console.error('canCandidateAccessExam error:', error);
+    return false;
+  }
+};
+
+export const canCandidateAccessSession = async (userId, sessionOrId) => {
+  try {
+    const suppliedSessionHasAccessFields =
+      typeof sessionOrId === 'object' &&
+      sessionOrId?.examId &&
+      sessionOrId?.assignAllCandidates !== undefined;
+    const session =
+      suppliedSessionHasAccessFields
+        ? sessionOrId
+        : await ExamSession.findById(sessionOrId?._id || sessionOrId)
+            .select('examId tenantId assignAllCandidates')
+            .lean();
+
+    if (!session) {
+      return false;
+    }
+
+    const User = (await import('../models/User.js')).default;
+    const examId = session.examId?._id || session.examId;
+    const [canAccessExam, user, exam] = await Promise.all([
+      canCandidateAccessExam(userId, examId),
+      User.findById(userId).select('tenantId').lean(),
+      Exam.findById(examId).select('tenantId').lean(),
+    ]);
+    if (!canAccessExam) {
+      return false;
+    }
+    const sessionTenantId = session.tenantId || exam?.tenantId;
+    if (
+      !user?.tenantId ||
+      !sessionTenantId ||
+      normalizeId(user.tenantId) !== normalizeId(sessionTenantId) ||
+      (session.tenantId &&
+        exam?.tenantId &&
+        normalizeId(session.tenantId) !== normalizeId(exam.tenantId))
+    ) {
+      return false;
+    }
+
+    if (session.assignAllCandidates !== false) {
+      return true;
+    }
+
+    const assignment = await SessionAssignment.findOne({
+      sessionId: session._id,
+      userId,
+      grantsAccess: true,
+    })
+      .select('_id')
+      .lean();
+
+    return Boolean(assignment);
+  } catch (error) {
+    console.error('canCandidateAccessSession error:', error);
+    return false;
+  }
+};
 
 /**
  * Check if user has a specific exam role
@@ -149,6 +273,12 @@ export const hasExamPermission = async (userId, examId, permission) => {
       }
     }
 
+    const permissionKey = String(permission || '').toUpperCase();
+
+    if (permissionKey === 'ATTEMPT_EXAM') {
+      return await canCandidateAccessExam(userId, examId);
+    }
+
     // Check ExamParticipant permissions
     const participant = await ExamParticipant.findOne({
       examId,
@@ -160,7 +290,6 @@ export const hasExamPermission = async (userId, examId, permission) => {
     }
 
     // Check specific permission
-    const permissionKey = permission.toUpperCase();
     return participant.permissions[permissionKey] === true;
   } catch (error) {
     console.error('hasExamPermission error:', error);

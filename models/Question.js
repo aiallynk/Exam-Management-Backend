@@ -442,7 +442,6 @@ QuestionSchema.pre('validate', async function (next) {
   next();
 });
 
-QuestionSchema.index({ uniqueId: 1 });
 QuestionSchema.index({ questionPaperId: 1, order: 1 });
 QuestionSchema.index({ sectionId: 1, order: 1 });
 

@@ -522,7 +522,28 @@ export const updateSection = async (sectionId, updateData) => {
     throw new Error('Section not found');
   }
 
-  Object.assign(section, updateData);
+  const allowedFields = [
+    'name',
+    'description',
+    'duration',
+    'order',
+    'expectedQuestions',
+    'navigationRule',
+    'isActive',
+  ];
+
+  allowedFields.forEach((field) => {
+    if (!Object.prototype.hasOwnProperty.call(updateData || {}, field)) return;
+    if (field === 'duration') {
+      const duration = Number(updateData.duration);
+      if (!Number.isInteger(duration) || duration < 1) {
+        throw new Error('Duration must be at least 1 minute');
+      }
+      section.duration = duration;
+      return;
+    }
+    section[field] = updateData[field];
+  });
   const savedSection = await section.save();
 
   try {

@@ -41,7 +41,7 @@ const isSrvDnsLookupError = (error) => {
 
     if (
       current.syscall === 'querySrv' &&
-      ['EREFUSED', 'ENOTFOUND', 'ETIMEOUT', 'EAI_AGAIN'].includes(current.code)
+      ['EREFUSED', 'ENOTFOUND', 'ETIMEOUT', 'EAI_AGAIN', 'ECONNREFUSED', 'ECONNRESET'].includes(current.code)
     ) {
       return true;
     }

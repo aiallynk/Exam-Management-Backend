@@ -87,24 +87,35 @@ const buildAccessFilter = (user) => {
   const role = normalizeRole(user?.role);
   const tenantId = user?.tenantId || null;
 
-  const or = [{ userId: user._id }];
+  const or = [{ userId: user._id, ...(tenantId ? { tenantId } : {}) }];
 
   if (role === 'SUPER_ADMIN') {
+    // Super admins can see all notifications, including global ones
     or.push({ roles: 'SUPER_ADMIN' });
-  } else if (role) {
+    or.push({ isGlobal: true });
+  } else if (role && tenantId) {
     const tenantScope = [];
     if (tenantId) {
       tenantScope.push({ tenantId });
     }
-    tenantScope.push({ tenantId: null });
+    // Role broadcasts are tenant-scoped; tenant-null role rows are not visible to tenant users.
 
     or.push({
       roles: role,
+      userId: null,
       ...(tenantScope.length > 0 ? { $or: tenantScope } : {}),
     });
+    // Non‑super admins should not receive global notifications unless explicitly marked global for all (isGlobal)
+    // Here we treat isGlobal as true only for super admin visibility; otherwise filter them out
+    // No additional or clause needed because global notifications are excluded by default
   }
 
-  return { $or: or };
+  // Ensure non‑super admin users do not receive notifications flagged as global
+  const baseFilter = { $or: or };
+  if (role !== 'SUPER_ADMIN') {
+    return { $and: [baseFilter, { isGlobal: false }] };
+  }
+  return baseFilter;
 };
 
 const mapNotification = (notification, userId) => {

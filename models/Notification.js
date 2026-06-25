@@ -26,6 +26,10 @@ const NotificationSchema = new Schema(
       type: [String],
       default: [],
     },
+    isGlobal: {
+      type: Boolean,
+      default: false,
+    },
     userId: {
       type: Schema.Types.ObjectId,
       ref: 'User',
@@ -71,6 +75,7 @@ const NotificationSchema = new Schema(
 );
 
 NotificationSchema.index({ roles: 1, tenantId: 1, createdAt: -1 });
+NotificationSchema.index({ isGlobal: 1, tenantId: 1, createdAt: -1 });
 NotificationSchema.index({ userId: 1, createdAt: -1 });
 NotificationSchema.index({ examId: 1, createdAt: -1 });
 

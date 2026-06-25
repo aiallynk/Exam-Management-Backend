@@ -64,6 +64,11 @@ const ExamSessionSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Tenant',
     },
+    // Assign all candidates by default; false means specific candidates list
+    assignAllCandidates: {
+      type: Boolean,
+      default: true,
+    },
     createdBy: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'User',
@@ -120,10 +125,7 @@ ExamSessionSchema.pre('save', function (next) {
 });
 
 // Single field indexes
-ExamSessionSchema.index({ uniqueId: 1 });
 ExamSessionSchema.index({ tenantId: 1 });
-ExamSessionSchema.index({ qrCode: 1 });
-ExamSessionSchema.index({ manualToken: 1 });
 
 // Compound indexes for common query patterns
 // For exam sessions: { examId, createdAt }

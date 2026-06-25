@@ -141,13 +141,26 @@ router.post(
 router.put(
   '/:sectionId',
   requireAuth,
+  requireTenant,
   requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
+  [
+    body('name').optional().trim().notEmpty().withMessage('Name cannot be empty'),
+    body('duration').optional().isInt({ min: 1 }).withMessage('Duration must be at least 1 minute'),
+    body('order').optional().isInt({ min: 0 }).withMessage('Order must be a non-negative integer'),
+    body('expectedQuestions').optional().isInt({ min: 0 }).withMessage('Expected questions must be non-negative'),
+    body('navigationRule').optional().isIn(['FREE', 'NO_FREE']).withMessage('Invalid navigation rule'),
+  ],
   auditLog(AUDIT_ACTIONS.SECTION_UPDATED, (req) => ({
     resourceType: 'Section',
     resourceId: req.params.sectionId,
   })),
   async (req, res, next) => {
     try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) {
+        return res.status(400).json({ errors: errors.array() });
+      }
+
       const section = await updateSection(req.params.sectionId, req.body);
       void queueRegenerationForQuestionPaper(
         section.questionPaperId,

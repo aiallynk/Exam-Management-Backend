@@ -1,16 +1,24 @@
 import express from 'express';
+import mongoose from 'mongoose';
 import ExamSession from '../models/ExamSession.js';
 import Exam from '../models/Exam.js';
+import ExamParticipant from '../models/ExamParticipant.js';
+import User from '../models/User.js';
 import QuestionPaper from '../models/QuestionPaper.js';
 import Question from '../models/Question.js';
 import SessionAssignment from '../models/SessionAssignment.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
-import { hasExamPermission, ensureExamParticipant } from '../middleware/examPermissions.js';
+import {
+  canCandidateAccessSession,
+  hasExamPermission,
+} from '../middleware/examPermissions.js';
 import { body, validationResult } from 'express-validator';
 import { generateSessionQRCode } from '../services/qrService.js';
 import { assignQuestionPaperToStudent } from '../services/sessionAssignment.js';
+import { AUDIT_ACTIONS, logAuditEvent } from '../utils/auditLogger.js';
+import { resolveAttemptExhaustedExamIds } from '../utils/attemptAvailability.js';
 
 const router = express.Router();
 
@@ -24,6 +32,132 @@ const generateManualToken = async () => {
   }
 
   return token;
+};
+
+const parseCandidateIds = (value) => {
+  if (value === undefined) {
+    return { provided: false, ids: [], invalidIds: [], duplicateIds: [] };
+  }
+
+  if (!Array.isArray(value)) {
+    return {
+      provided: true,
+      ids: [],
+      invalidIds: ['Candidate assignments must be an array.'],
+      duplicateIds: [],
+    };
+  }
+
+  const rawIds = value;
+  const normalizedIds = rawIds.map((id) => String(id || '').trim());
+  const invalidIds = normalizedIds.filter((id) => !mongoose.Types.ObjectId.isValid(id));
+  const duplicateIds = normalizedIds.filter((id, index) => normalizedIds.indexOf(id) !== index);
+
+  return {
+    provided: true,
+    ids: [...new Set(normalizedIds)],
+    invalidIds: [...new Set(invalidIds)],
+    duplicateIds: [...new Set(duplicateIds)],
+  };
+};
+
+const validateCandidateUsers = async (candidateIds, tenantId, { requireActive = true } = {}) => {
+  if (!candidateIds.length) {
+    return [];
+  }
+
+  const candidateFilter = {
+    _id: { $in: candidateIds },
+    role: 'CANDIDATE',
+    tenantId,
+  };
+  if (requireActive) {
+    candidateFilter.status = 'ACTIVE';
+  }
+
+  const candidates = await User.find(candidateFilter)
+    .select('_id')
+    .lean();
+
+  if (candidates.length !== candidateIds.length) {
+    const validIds = new Set(candidates.map((candidate) => String(candidate._id)));
+    const rejectedIds = candidateIds.filter((id) => !validIds.has(id));
+    const error = new Error(
+      'Candidates must exist, be active, have the CANDIDATE role, and belong to the session tenant.'
+    );
+    error.statusCode = 400;
+    error.rejectedIds = rejectedIds;
+    throw error;
+  }
+
+  return candidates;
+};
+
+const updateSessionCandidateAssignments = async ({
+  session,
+  candidateIds,
+  mode = 'replace',
+  assignedBy,
+}) => {
+  const existingAssignments = await SessionAssignment.find({
+    sessionId: session._id,
+    grantsAccess: true,
+  })
+    .select('userId')
+    .lean();
+  const existingIds = new Set(existingAssignments.map((assignment) => String(assignment.userId)));
+  const requestedIds = new Set(candidateIds);
+  let nextIds;
+
+  if (mode === 'add') {
+    nextIds = new Set([...existingIds, ...requestedIds]);
+  } else if (mode === 'remove') {
+    nextIds = new Set([...existingIds].filter((id) => !requestedIds.has(id)));
+  } else {
+    nextIds = requestedIds;
+  }
+
+  const addedIds = [...nextIds].filter((id) => !existingIds.has(id));
+  const removedIds = [...existingIds].filter((id) => !nextIds.has(id));
+  const operations = [];
+
+  if (removedIds.length) {
+    operations.push({
+      updateMany: {
+        filter: { sessionId: session._id, userId: { $in: removedIds } },
+        update: { $set: { grantsAccess: false } },
+      },
+    });
+  }
+
+  for (const userId of addedIds) {
+    operations.push({
+      updateOne: {
+        filter: { sessionId: session._id, userId },
+        update: {
+          $set: {
+            grantsAccess: true,
+            assignedAt: new Date(),
+            assignedBy,
+          },
+          $setOnInsert: {
+            sessionId: session._id,
+            userId,
+          },
+        },
+        upsert: true,
+      },
+    });
+  }
+
+  if (operations.length) {
+    await SessionAssignment.bulkWrite(operations);
+  }
+
+  session.assignAllCandidates = nextIds.size === 0;
+  await session.save();
+
+  return { addedIds, removedIds, candidateIds: [...nextIds] };
 };
 
 const validateSessionAvailability = async (session, user) => {
@@ -44,10 +178,10 @@ const validateSessionAvailability = async (session, user) => {
     return { valid: false, message: 'Session has ended' };
   }
 
-  // Universal: Check if user is blocked (changed from blocked_student_ to blocked_user_)
+  // Universal: Check if user is blocked
   const SystemConfig = (await import('../models/SystemConfig.js')).default;
   const blockedConfig = await SystemConfig.findOne({
-    key: `blocked_user_${user._id}`, // Universal: changed from blocked_student_
+    key: `blocked_user_${user._id}`,
   });
 
   if (blockedConfig && blockedConfig.value === 'true') {
@@ -55,6 +189,35 @@ const validateSessionAvailability = async (session, user) => {
   }
 
   return { valid: true };
+};
+
+const resolveCandidateAccessibleExamIds = async ({ tenantId, userId }) => {
+  const [assignedExamIds, restrictedExamIds] = await Promise.all([
+    ExamParticipant.distinct('examId', {
+      tenantId,
+      userId,
+      examRole: 'CANDIDATE',
+    }),
+    ExamParticipant.distinct('examId', {
+      tenantId,
+      examRole: 'CANDIDATE',
+    }),
+  ]);
+
+  const assignedIds = assignedExamIds.map((id) => String(id));
+  const restrictedIds = restrictedExamIds.map((id) => String(id));
+
+  if (restrictedIds.length === 0) {
+    return null;
+  }
+
+  const examFilter = {
+    tenantId,
+    $or: [{ _id: { $in: assignedIds } }, { _id: { $nin: restrictedIds } }],
+  };
+
+  const accessibleExams = await Exam.find(examFilter).select('_id').lean();
+  return accessibleExams.map((exam) => exam._id);
 };
 
 // Get all sessions (role filtered and tenant filtered)
@@ -80,34 +243,70 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
         filter.isActive = isActive === 'true';
       }
     } else {
-      // Regular users: check exam permissions
-      const ExamParticipant = (await import('../models/ExamParticipant.js')).default;
-      const participants = await ExamParticipant.find({ userId: req.user._id })
-        .select('examId examRole')
-        .lean();
+      const accessibleExamIds = await resolveCandidateAccessibleExamIds({
+        tenantId: req.user.tenantId,
+        userId: req.user._id,
+      });
 
-      const examIds = participants.map(p => p.examId);
-
-      if (examIds.length > 0) {
-        filter.examId = { $in: examIds };
-        // Candidates only see active sessions they can attempt
-        const candidateExamIds = participants
-          .filter(p => p.examRole === 'CANDIDATE')
-          .map(p => p.examId);
-        if (candidateExamIds.length > 0 && examIds.every(id => candidateExamIds.includes(id))) {
+      if (!accessibleExamIds) {
+        if (isActive !== undefined) {
+          filter.isActive = isActive === 'true';
+        } else {
           filter.isActive = true;
           const now = new Date();
           filter.startTime = { $lte: now };
           filter.endTime = { $gte: now };
         }
       } else {
-        // User has no exam roles, return empty
-        filter.examId = { $in: [] };
+        if (examId && !accessibleExamIds.some((id) => String(id) === String(examId))) {
+          filter._id = { $in: [] };
+        } else {
+          filter.examId = examId || { $in: accessibleExamIds };
+        }
+        if (isActive !== undefined) {
+          filter.isActive = isActive === 'true';
+        } else {
+          filter.isActive = true;
+          const now = new Date();
+          filter.startTime = { $lte: now };
+          filter.endTime = { $gte: now };
+        }
+      }
+
+      const assignedSessionIds = await SessionAssignment.distinct('sessionId', {
+        userId: req.user._id,
+        grantsAccess: true,
+      });
+      filter.$and = [
+        ...(filter.$and || []),
+        {
+          $or: [
+            { assignAllCandidates: { $ne: false } },
+            { _id: { $in: assignedSessionIds } },
+          ],
+        },
+      ];
+
+      const exhaustedExamIds = await resolveAttemptExhaustedExamIds({
+        userId: req.user._id,
+        tenantId: req.user.tenantId,
+      });
+      if (exhaustedExamIds.length > 0) {
+        if (examId && exhaustedExamIds.some((id) => String(id) === String(examId))) {
+          filter._id = { $in: [] };
+        } else if (filter.examId && typeof filter.examId === 'object' && Array.isArray(filter.examId.$in)) {
+          filter.examId = {
+            ...filter.examId,
+            $nin: exhaustedExamIds,
+          };
+        } else if (!filter.examId) {
+          filter.examId = { $nin: exhaustedExamIds };
+        }
       }
     }
 
     const sessions = await ExamSession.find(filter)
-      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
+      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt candidateCount')
       .populate('questionPaperId', 'setName')
       .populate('questionPaperIds', 'setName')
       .populate('createdBy', 'name email')
@@ -117,14 +316,226 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
 
     const total = await ExamSession.countDocuments(filter);
 
+    const sessionIds = sessions.map((session) => session._id);
+    const candidateCounts = sessionIds.length
+      ? await SessionAssignment.aggregate([
+          {
+            $match: {
+              sessionId: { $in: sessionIds },
+              grantsAccess: true,
+            },
+          },
+          { $group: { _id: '$sessionId', count: { $sum: 1 } } },
+        ])
+      : [];
+
+    const countMap = {};
+    candidateCounts.forEach((c) => { countMap[String(c._id)] = c.count; });
+
+    const sessionsWithCounts = sessions.map((s) => {
+      const sessionId = String(s._id);
+      const plain = s.toObject ? s.toObject() : { ...s };
+      plain.assignedCandidatesCount = countMap[sessionId] ?? 0;
+      return plain;
+    });
+
     res.json({
-      sessions,
+      sessions: sessionsWithCounts,
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
         total,
         pages: Math.ceil(total / parseInt(limit)),
       },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// -------------------------------------------------------------------------
+// Get all assigned candidates for a session (with attempt status)
+// Must be registered BEFORE /:sessionId to avoid route conflicts
+// -------------------------------------------------------------------------
+router.get('/:sessionId/candidates', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
+  try {
+    const session = await ExamSession.findById(req.params.sessionId)
+      .select('examId tenantId createdBy assignAllCandidates')
+      .populate('examId', 'subTenantId')
+      .lean();
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const examId = session.examId?._id || session.examId;
+
+    // Only EXAM_CREATOR / TENANT_ADMIN / SUPER_ADMIN may list candidates
+    const canCreateSession = await hasExamPermission(req.user._id, examId, 'CREATE_SESSION');
+    if (!canCreateSession && req.user.role !== 'SUPER_ADMIN' && req.user.role !== 'TENANT_ADMIN' && req.user.role !== 'EXAM_CREATOR') {
+      return res.status(403).json({ error: 'Access denied' });
+    }
+
+    const ExamAttempt = (await import('../models/ExamAttempt.js')).default;
+
+    let candidatesList = [];
+    if (session.assignAllCandidates === false) {
+      const [assignments, participants] = await Promise.all([
+        SessionAssignment.find({
+          sessionId: session._id,
+          grantsAccess: true,
+        })
+          .select('userId assignedAt')
+          .lean(),
+        ExamParticipant.find({
+          examId,
+          examRole: 'CANDIDATE',
+        })
+          .select('userId assignedAt')
+          .lean(),
+      ]);
+      const sessionAssignmentByUserId = new Map(
+        assignments.map((assignment) => [String(assignment.userId), assignment])
+      );
+      const examParticipantByUserId = new Map(
+        participants.map((participant) => [String(participant.userId), participant])
+      );
+      const candidateUserIds = [
+        ...new Set([
+          ...assignments.map((assignment) => String(assignment.userId)),
+          ...participants.map((participant) => String(participant.userId)),
+        ]),
+      ];
+      const users = await User.find({ _id: { $in: candidateUserIds } })
+        .select('name email profileImage')
+        .lean();
+      const userMap = {};
+      users.forEach((u) => { userMap[String(u._id)] = u; });
+
+      candidatesList = candidateUserIds.map((uid) => {
+        const assignment = sessionAssignmentByUserId.get(uid);
+        const participant = examParticipantByUserId.get(uid);
+        const user = userMap[uid] || null;
+        return {
+          _id: assignment?._id || participant?._id || uid,
+          userId: { _id: uid, ...(user || {}) },
+          assignedAt: assignment?.assignedAt || participant?.assignedAt || null,
+          sessionAssigned: Boolean(assignment),
+          examAssigned: Boolean(participant),
+        };
+      });
+    } else {
+      const participants = await ExamParticipant.find({
+        examId,
+        examRole: 'CANDIDATE',
+      }).lean();
+
+      if (participants.length > 0) {
+        const candidateUserIds = participants.map((participant) => participant.userId);
+        const users = await User.find({ _id: { $in: candidateUserIds } })
+          .select('name email profileImage')
+          .lean();
+        const userMap = new Map(users.map((user) => [String(user._id), user]));
+        candidatesList = participants.map((participant) => ({
+          _id: participant._id,
+          userId: {
+            _id: participant.userId,
+            ...(userMap.get(String(participant.userId)) || {}),
+          },
+          assignedAt: participant.assignedAt,
+          sessionAssigned: true,
+          examAssigned: true,
+        }));
+      } else {
+        const userQuery = {
+          role: 'CANDIDATE',
+          tenantId: session.tenantId,
+          status: 'ACTIVE',
+        };
+        if (session.examId?.subTenantId) {
+          userQuery.subTenantId = session.examId.subTenantId;
+        }
+        const users = await User.find(userQuery)
+          .select('name email profileImage createdAt')
+          .lean();
+
+        candidatesList = users.map((user) => ({
+          _id: user._id,
+          userId: user,
+          assignedAt: user.createdAt,
+          sessionAssigned: true,
+          examAssigned: false,
+        }));
+      }
+    }
+
+    // Fetch attempts for this specific session
+    const attempts = await ExamAttempt.find({ sessionId: req.params.sessionId })
+      .select('userId isCompleted isDisqualified scoreSummary startTime submittedAt createdAt')
+      .lean();
+
+    const attemptMap = {};
+    attempts.forEach((a) => { attemptMap[String(a.userId)] = a; });
+
+    // Make sure all users who have attempts are also included in candidatesList if not already present
+    const candidateMap = {};
+    candidatesList.forEach((c) => {
+      candidateMap[String(c.userId._id)] = c;
+    });
+
+    const missingAttemptUserIds = attempts
+      .map((attempt) => attempt.userId)
+      .filter((userId) => !candidateMap[String(userId)]);
+    const missingAttemptUsers = missingAttemptUserIds.length
+      ? await User.find({ _id: { $in: missingAttemptUserIds } })
+          .select('name email profileImage createdAt')
+          .lean()
+      : [];
+
+    for (const attemptUser of missingAttemptUsers) {
+      candidateMap[String(attemptUser._id)] = {
+        _id: attemptUser._id,
+        userId: attemptUser,
+        assignedAt: attemptUser.createdAt,
+        sessionAssigned: false,
+        examAssigned: false,
+      };
+    }
+
+    const candidates = Object.values(candidateMap).map((c) => {
+      const uid = String(c.userId._id);
+      const attempt = attemptMap[uid] || null;
+
+      return {
+        _id: c._id,
+        participantId: c._id,
+        userId: c.userId,
+        assignedAt: c.assignedAt,
+        sessionAssigned: c.sessionAssigned !== false,
+        examAssigned: Boolean(c.examAssigned),
+        // Attempt fields (null/false if not started yet)
+        attemptId: attempt?._id || null,
+        isCompleted: attempt?.isCompleted || false,
+        isDisqualified: attempt?.isDisqualified || false,
+        score: attempt?.isCompleted && attempt?.scoreSummary
+          ? (attempt.scoreSummary.percentage ?? null)
+          : null,
+        startTime: attempt?.startTime || null,
+        submittedAt: attempt?.submittedAt || null,
+        hasStarted: !!attempt,
+      };
+    });
+
+    // Aggregate stats
+    const total = candidates.length;
+    const started = candidates.filter((c) => c.hasStarted).length;
+    const submitted = candidates.filter((c) => c.isCompleted && !c.isDisqualified).length;
+    const inProgress = candidates.filter((c) => c.hasStarted && !c.isCompleted && !c.isDisqualified).length;
+    const disqualified = candidates.filter((c) => c.isDisqualified).length;
+    const notStarted = candidates.filter((c) => !c.hasStarted).length;
+
+    res.json({
+      candidates,
+      stats: { total, started, submitted, inProgress, disqualified, notStarted },
     });
   } catch (error) {
     next(error);
@@ -147,9 +558,15 @@ router.get('/:sessionId', requireAuth, requireTenant, enforceTenantBoundaries, a
       return res.status(404).json({ error: 'Session not found' });
     }
 
-    // Universal: Check exam permissions
-    const canAttempt = await hasExamPermission(req.user._id, session.examId._id, 'ATTEMPT_EXAM');
+    const canAttempt =
+      req.user.role === 'CANDIDATE'
+        ? await canCandidateAccessSession(req.user._id, session)
+        : await hasExamPermission(req.user._id, session.examId._id, 'ATTEMPT_EXAM');
     const canCreateSession = await hasExamPermission(req.user._id, session.examId._id, 'CREATE_SESSION');
+
+    if (!canAttempt && !canCreateSession && req.user.role !== 'SUPER_ADMIN') {
+      return res.status(403).json({ error: 'You are not assigned to this session' });
+    }
 
     // For candidates, only show if active and within time
     if (canAttempt && !canCreateSession) {
@@ -186,7 +603,7 @@ router.get('/:sessionId', requireAuth, requireTenant, enforceTenantBoundaries, a
 
 /**
  * Create session - Only EXAM_CREATOR can create sessions
- * 
+ *
  * Simple flow:
  * 1. User must be EXAM_CREATOR role
  * 2. User must belong to a tenant (except SUPER_ADMIN)
@@ -197,7 +614,7 @@ router.post(
   '/',
   requireAuth,
   requireTenant,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can create sessions
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
   [
     body('examId').notEmpty().withMessage('Exam ID is required'),
     body('questionPaperId').optional().isMongoId(),
@@ -206,6 +623,11 @@ router.post(
     body('distributionMode')
       .optional()
       .isIn(['single', 'random', 'sequential', 'roll', 'manual']),
+    body('candidateIds').optional().isArray(),
+    body('candidateIds.*').optional().isMongoId(),
+    body('assignedCandidates').optional().isArray(),
+    body('assignedCandidates.*').optional().isMongoId(),
+    body('candidateAssignmentMode').optional().isIn(['replace']),
     body('startTime').isISO8601().withMessage('Valid start time is required'),
     body('endTime').isISO8601().withMessage('Valid end time is required'),
   ],
@@ -226,6 +648,21 @@ router.post(
       } = req.body;
 
       const normalizedMode = distributionMode || 'single';
+      const candidatePayloadValue = Object.prototype.hasOwnProperty.call(req.body, 'candidateIds')
+        ? req.body.candidateIds
+        : Object.prototype.hasOwnProperty.call(req.body, 'assignedCandidates')
+          ? req.body.assignedCandidates
+          : req.body.assignAllCandidates === true
+            ? []
+            : undefined;
+      const candidatePayload = parseCandidateIds(candidatePayloadValue);
+      if (candidatePayload.invalidIds.length || candidatePayload.duplicateIds.length) {
+        return res.status(400).json({
+          error: 'Candidate assignments contain invalid or duplicate user IDs.',
+          invalidIds: candidatePayload.invalidIds,
+          duplicateIds: candidatePayload.duplicateIds,
+        });
+      }
 
       // Verify exam exists and user has CREATE_SESSION permission
       const exam = await Exam.findById(examId);
@@ -241,6 +678,7 @@ router.post(
 
       // Inherit tenant ID from exam
       const tenantId = exam.tenantId || null;
+      await validateCandidateUsers(candidatePayload.ids, tenantId);
 
       let selectedPaperIds = Array.isArray(questionPaperIds)
         ? questionPaperIds.map((id) => id.toString())
@@ -300,8 +738,8 @@ router.post(
         startTime: start,
         endTime: end,
         createdBy: req.user._id,
-        // Inherit tenant ID from exam
-        tenantId: tenantId,
+        tenantId,
+        assignAllCandidates: candidatePayload.ids.length === 0,
       });
 
       const requestOrigin =
@@ -320,10 +758,27 @@ router.post(
       session.qrImage = qrImage;
 
       await session.save();
-      await session.populate(
-        'examId',
-        'title duration showResultsImmediately resultsReleasedAt'
-      );
+      const assignmentChanges = await updateSessionCandidateAssignments({
+        session,
+        candidateIds: candidatePayload.ids,
+        mode: 'replace',
+        assignedBy: req.user._id,
+      });
+
+      if (assignmentChanges.addedIds.length) {
+        await logAuditEvent(AUDIT_ACTIONS.SESSION_CANDIDATES_ASSIGNED, {
+          userId: req.user._id,
+          userRole: req.user.role,
+          tenantId,
+          resourceType: 'ExamSession',
+          resourceId: session._id,
+          candidateIds: assignmentChanges.addedIds,
+          method: req.method,
+          path: req.path,
+        });
+      }
+
+      await session.populate('examId', 'title duration showResultsImmediately resultsReleasedAt');
       await session.populate('questionPaperId', 'setName');
       await session.populate('questionPaperIds', 'setName');
 
@@ -331,6 +786,7 @@ router.post(
         session,
         qrImage,
         manualToken,
+        assignedCandidateIds: assignmentChanges.candidateIds,
       });
     } catch (error) {
       next(error);
@@ -373,6 +829,33 @@ router.put(
         });
       }
 
+      const candidatePayloadValue = Object.prototype.hasOwnProperty.call(req.body, 'candidateIds')
+        ? req.body.candidateIds
+        : Object.prototype.hasOwnProperty.call(req.body, 'assignedCandidates')
+          ? req.body.assignedCandidates
+          : req.body.assignAllCandidates === true
+            ? []
+            : undefined;
+      const candidatePayload = parseCandidateIds(candidatePayloadValue);
+      const assignmentMode = String(req.body?.candidateAssignmentMode || 'replace').toLowerCase();
+      if (!['add', 'remove', 'replace'].includes(assignmentMode)) {
+        return res.status(400).json({
+          error: 'candidateAssignmentMode must be add, remove, or replace',
+        });
+      }
+      if (candidatePayload.invalidIds.length || candidatePayload.duplicateIds.length) {
+        return res.status(400).json({
+          error: 'Candidate assignments contain invalid or duplicate user IDs.',
+          invalidIds: candidatePayload.invalidIds,
+          duplicateIds: candidatePayload.duplicateIds,
+        });
+      }
+      if (candidatePayload.provided) {
+        await validateCandidateUsers(candidatePayload.ids, session.tenantId, {
+          requireActive: assignmentMode !== 'remove',
+        });
+      }
+
       const action = String(req.body?.action || '').trim().toLowerCase();
       const nextEndTimeRaw = req.body?.endTime;
       const now = new Date();
@@ -391,13 +874,48 @@ router.put(
           return res.status(400).json({ error: 'End time must be after start time' });
         }
         session.endTime = nextEndTime;
-      } else {
+      } else if (!candidatePayload.provided) {
         return res.status(400).json({
-          error: 'Nothing to update. Provide action="end" or a valid endTime.',
+          error:
+            'Nothing to update. Provide action="end", a valid endTime, or candidateIds.',
         });
       }
 
       await session.save();
+      let assignmentChanges = null;
+      if (candidatePayload.provided) {
+        assignmentChanges = await updateSessionCandidateAssignments({
+          session,
+          candidateIds: candidatePayload.ids,
+          mode: assignmentMode,
+          assignedBy: req.user._id,
+        });
+
+        let auditAction = null;
+        if (assignmentChanges.addedIds.length && assignmentChanges.removedIds.length) {
+          auditAction = AUDIT_ACTIONS.SESSION_CANDIDATES_UPDATED;
+        } else if (assignmentChanges.addedIds.length) {
+          auditAction = AUDIT_ACTIONS.SESSION_CANDIDATES_ASSIGNED;
+        } else if (assignmentChanges.removedIds.length) {
+          auditAction = AUDIT_ACTIONS.SESSION_CANDIDATES_REMOVED;
+        }
+
+        if (auditAction) {
+          await logAuditEvent(auditAction, {
+            userId: req.user._id,
+            userRole: req.user.role,
+            tenantId: session.tenantId,
+            resourceType: 'ExamSession',
+            resourceId: session._id,
+            candidateAssignmentMode: assignmentMode,
+            addedCandidateIds: assignmentChanges.addedIds,
+            removedCandidateIds: assignmentChanges.removedIds,
+            method: req.method,
+            path: req.path,
+          });
+        }
+      }
+
       await session.populate('examId', 'title duration showResultsImmediately resultsReleasedAt');
       await session.populate('questionPaperId', 'setName');
       await session.populate('questionPaperIds', 'setName');
@@ -406,6 +924,7 @@ router.put(
       res.json({
         message: action === 'end' ? 'Session ended successfully' : 'Session updated successfully',
         session,
+        assignedCandidateIds: assignmentChanges?.candidateIds,
       });
     } catch (error) {
       next(error);
@@ -486,48 +1005,20 @@ router.get('/validate/:qrCode', requireAuth, async (req, res, next) => {
       return res.json({ valid: false, message: validation.message });
     }
 
-    // UNIVERSAL: Check exam permission and create ExamParticipant if needed
-    const canAttempt = await hasExamPermission(req.user._id, session.examId._id, 'ATTEMPT_EXAM');
-    let participant = null;
+    const canAttempt =
+      req.user.role === 'CANDIDATE'
+        ? await canCandidateAccessSession(req.user._id, session)
+        : await hasExamPermission(req.user._id, session.examId._id, 'ATTEMPT_EXAM');
     if (!canAttempt) {
-      // User doesn't have permission yet - create ExamParticipant with CANDIDATE role
-      // This happens when user scans QR or enters token
-      participant = await ensureExamParticipant(
-        req.user._id,
-        session.examId._id,
-        'CANDIDATE',
-        req.user._id
-      );
+      return res.status(403).json({ error: 'You are not assigned to this session' });
     }
 
     let assignment = null;
-    // Assign question paper if user can attempt (now they have CANDIDATE role)
+    // Assign question paper if user can attempt.
     assignment = await assignQuestionPaperToStudent({
       session,
       userId: req.user._id,
     });
-
-    if (participant?.__assigned) {
-      try {
-        const { createUserNotification } = await import('../services/notificationService.js');
-        await createUserNotification({
-          title: 'Exam Assigned',
-          message: `You have been assigned to "${session.examId?.title || 'an exam'}".`,
-          type: 'exam_assigned',
-          roles: ['CANDIDATE'],
-          userId: req.user._id,
-          examId: session.examId?._id || session.examId,
-          sessionId: session._id,
-          createdBy: req.user._id,
-          metadata: {
-            examId: session.examId?._id || session.examId,
-            examTitle: session.examId?.title || '',
-          },
-        });
-      } catch (notifyError) {
-        console.error('[NOTIFICATIONS] Failed to log exam assignment:', notifyError?.message || notifyError);
-      }
-    }
 
     res.json({
       valid: true,
@@ -561,48 +1052,20 @@ router.get('/manual-token/:token', requireAuth, async (req, res, next) => {
       return res.json({ valid: false, message: validation.message });
     }
 
-    // UNIVERSAL: Check exam permission and create ExamParticipant if needed
-    const canAttempt = await hasExamPermission(req.user._id, session.examId._id, 'ATTEMPT_EXAM');
-    let participant = null;
+    const canAttempt =
+      req.user.role === 'CANDIDATE'
+        ? await canCandidateAccessSession(req.user._id, session)
+        : await hasExamPermission(req.user._id, session.examId._id, 'ATTEMPT_EXAM');
     if (!canAttempt) {
-      // User doesn't have permission yet - create ExamParticipant with CANDIDATE role
-      // This happens when user scans QR or enters token
-      participant = await ensureExamParticipant(
-        req.user._id,
-        session.examId._id,
-        'CANDIDATE',
-        req.user._id
-      );
+      return res.status(403).json({ error: 'You are not assigned to this session' });
     }
 
     let assignment = null;
-    // Assign question paper if user can attempt (now they have CANDIDATE role)
+    // Assign question paper if user can attempt.
     assignment = await assignQuestionPaperToStudent({
       session,
       userId: req.user._id,
     });
-
-    if (participant?.__assigned) {
-      try {
-        const { createUserNotification } = await import('../services/notificationService.js');
-        await createUserNotification({
-          title: 'Exam Assigned',
-          message: `You have been assigned to "${session.examId?.title || 'an exam'}".`,
-          type: 'exam_assigned',
-          roles: ['CANDIDATE'],
-          userId: req.user._id,
-          examId: session.examId?._id || session.examId,
-          sessionId: session._id,
-          createdBy: req.user._id,
-          metadata: {
-            examId: session.examId?._id || session.examId,
-            examTitle: session.examId?.title || '',
-          },
-        });
-      } catch (notifyError) {
-        console.error('[NOTIFICATIONS] Failed to log exam assignment:', notifyError?.message || notifyError);
-      }
-    }
 
     res.json({
       valid: true,
@@ -622,4 +1085,3 @@ router.get('/manual-token/:token', requireAuth, async (req, res, next) => {
 });
 
 export default router;
-

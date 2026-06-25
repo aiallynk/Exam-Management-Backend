@@ -201,6 +201,7 @@ const ExamAttemptSchema = new mongoose.Schema(
       ipAddress: { type: String },
       userAgent: { type: String },
       deviceId: { type: String },
+      browserSessionId: { type: String },
     },
     suspiciousActivity: {
       type: Boolean,
@@ -332,7 +333,6 @@ ExamAttemptSchema.pre('save', function (next) {
 });
 
 // Single field indexes
-ExamAttemptSchema.index({ uniqueId: 1 });
 ExamAttemptSchema.index({ userId: 1, createdAt: -1 });
 ExamAttemptSchema.index({ tenantId: 1 });
 

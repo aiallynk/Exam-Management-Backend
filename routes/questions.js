@@ -143,6 +143,7 @@ const normalizeQuestionTypeAlias = (value) => {
 const normalizeQuestionFormatAlias = (value) => {
   const normalized = normalizeString(value).toUpperCase();
   if (normalized === 'CODE') return 'CODING';
+  if (normalized === 'SHORT_ANSWER' || normalized === 'SHORT ANSWER') return '';
   return normalized;
 };
 
