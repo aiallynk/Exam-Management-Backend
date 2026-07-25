@@ -405,7 +405,9 @@ export const queueExistingExamPackageBackfill = async ({
 
     const filter = {
       examType: { $ne: 'OMR' },
-      packageStatus: { $nin: [PACKAGE_STATUS.GENERATED, PACKAGE_STATUS.READY] },
+      packageStatus: {
+        $nin: [PACKAGE_STATUS.GENERATED, PACKAGE_STATUS.READY, PACKAGE_STATUS.FAILED],
+      },
     };
     if (lastSeenId) {
       filter._id = { $gt: lastSeenId };

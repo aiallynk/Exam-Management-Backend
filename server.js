@@ -47,6 +47,17 @@ import { startSubscriptionExpiryScheduler } from './services/subscriptionLifecyc
 import { startAutoTenantBackupScheduler } from './services/autoBackupSchedulerService.js';
 import { startIncrementalBackupScheduler } from './services/incrementalBackupSchedulerService.js';
 import { queueExistingExamPackageBackfillOnStartup } from './services/examPackageRegenerationService.js';
+import { getBackupConfiguration, refreshBackupConfiguration } from './services/backup/backupConfiguration.js';
+import {
+  superAdminBackupsRouter,
+  tenantAdminBackupsRouter,
+  superAdminBackupSchedulesRouter,
+  tenantAdminBackupSchedulesRouter,
+  superAdminRestoresRouter,
+  tenantAdminRestoresRouter,
+  backupStorageSettingsRouter,
+  backupJobsRouter,
+} from './routes/backupManagement.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -290,6 +301,19 @@ const registerApiRoutes = (basePath) => {
   app.use(`${basePath}/compiler`, compilerRoutes);
   app.use(`${basePath}/code`, compilerRoutes);
   app.use(`${basePath}/notifications`, notificationRoutes);
+
+  // New backup/restore APIs are intentionally canonical and v1-only. Legacy local-file
+  // endpoints remain mounted above only as a temporary migration compatibility path.
+  if (basePath === '/api/v1') {
+    app.use(`${basePath}/super-admin/backups`, superAdminBackupsRouter);
+    app.use(`${basePath}/tenant-admin/backups`, tenantAdminBackupsRouter);
+    app.use(`${basePath}/super-admin/backup-schedules`, superAdminBackupSchedulesRouter);
+    app.use(`${basePath}/tenant-admin/backup-schedules`, tenantAdminBackupSchedulesRouter);
+    app.use(`${basePath}/super-admin/restores`, superAdminRestoresRouter);
+    app.use(`${basePath}/tenant-admin/restores`, tenantAdminRestoresRouter);
+    app.use(`${basePath}/super-admin/backup-storage-settings`, backupStorageSettingsRouter);
+    app.use(`${basePath}/jobs`, backupJobsRouter);
+  }
 };
 
 API_BASE_PATHS.forEach(registerApiRoutes);
@@ -332,11 +356,16 @@ const startHttpServer = () =>
 const startServer = async () => {
   try {
     await connect();
+    await refreshBackupConfiguration();
     await startHttpServer();
     queueExistingExamPackageBackfillOnStartup();
     startSubscriptionExpiryScheduler();
-    startAutoTenantBackupScheduler();
-    startIncrementalBackupScheduler();
+    if (!getBackupConfiguration().enabled) {
+      startAutoTenantBackupScheduler();
+      startIncrementalBackupScheduler();
+    } else {
+      console.log('[backup] Legacy local-disk backup schedulers are disabled; use the dedicated backup worker.');
+    }
     const lanIp = resolveLanIp();
     console.log(`LAN URL: http://${lanIp || '127.0.0.1'}:${config.port}`);
     console.log(`Bound host: ${config.host}`);

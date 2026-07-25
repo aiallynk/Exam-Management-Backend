@@ -5,6 +5,8 @@ const STORAGE_QUESTION_TYPES = [
   'MULTIPLE_OPTIONS',
   'TRUE_FALSE',
   'SHORT_ANSWER',
+  'FILL_IN_THE_BLANK',
+  'MATCHING',
   'PARAGRAPH',
   'ESSAY',
   'ESSAY_LETTER',
@@ -19,6 +21,8 @@ const QUESTION_FORMATS = [
   'PARAGRAPH',
   'SCENARIO',
   'TRUE_FALSE',
+  'FILL_IN_THE_BLANK',
+  'MATCHING',
   'ESSAY',
   'ESSAY_LETTER',
   'ESSAY_STORY',
@@ -54,6 +58,12 @@ const normalizeEssayTypeAlias = (value) => {
   }
   if (['LONG_ANSWER', 'DESCRIPTIVE'].includes(normalized)) {
     return 'ESSAY';
+  }
+  if (['FILL_BLANK', 'FILL_IN_BLANK', 'FILLINTHEBLANK', 'FIB'].includes(normalized)) {
+    return 'FILL_IN_THE_BLANK';
+  }
+  if (['MATCH', 'MATCH_THE_FOLLOWING', 'MATCHING_PAIRS'].includes(normalized)) {
+    return 'MATCHING';
   }
   if (normalized === 'CODE') {
     return 'CODING';
@@ -153,6 +163,10 @@ export const normalizeQuestionFormat = (payload = {}) => {
     return 'CODING';
   }
 
+  if (['FILL_IN_THE_BLANK', 'MATCHING'].includes(normalizedType)) {
+    return normalizedType;
+  }
+
   if (['ESSAY', 'ESSAY_LETTER', 'ESSAY_STORY'].includes(normalizedType)) {
     return normalizedType;
   }
@@ -215,6 +229,14 @@ export const normalizeQuestionTypeForStorage = (payload = {}) => {
 
   if (['MULTI_SELECT_MCQ', 'MULTI_SELECT', 'MULTISELECT'].includes(normalizedType)) {
     return 'MULTIPLE_OPTIONS';
+  }
+
+  if (['FILL_BLANK', 'FILL_IN_BLANK', 'FILLINTHEBLANK', 'FIB'].includes(normalizedType)) {
+    return 'FILL_IN_THE_BLANK';
+  }
+
+  if (['MATCH', 'MATCH_THE_FOLLOWING', 'MATCHING_PAIRS'].includes(normalizedType)) {
+    return 'MATCHING';
   }
 
   if (

@@ -137,6 +137,8 @@ const normalizeString = (value) => {
 const normalizeQuestionTypeAlias = (value) => {
   const normalized = normalizeString(value).toUpperCase();
   if (normalized === 'CODE') return 'CODING';
+  if (['FILL_BLANK', 'FILL_IN_BLANK', 'FILLINTHEBLANK', 'FIB'].includes(normalized)) return 'FILL_IN_THE_BLANK';
+  if (['MATCH', 'MATCH_THE_FOLLOWING', 'MATCHING_PAIRS'].includes(normalized)) return 'MATCHING';
   return normalized;
 };
 
@@ -582,6 +584,8 @@ const resolveQuestionTypeTokenForExamResponse = (question = {}) => {
   if (normalizedType === 'MULTIPLE_OPTIONS') return 'multi_select_mcq';
   if (normalizedType === 'TRUE_FALSE') return 'true_false';
   if (normalizedType === 'NUMBER') return 'numeric';
+  if (normalizedType === 'FILL_IN_THE_BLANK') return 'fill_in_the_blank';
+  if (normalizedType === 'MATCHING') return 'matching';
   if (normalizedType === 'SHORT_ANSWER') return 'short_answer';
   if (normalizedType === 'PARAGRAPH' || normalizedFormat === 'PARAGRAPH') return 'paragraph';
   if (normalizedFormat === 'SCENARIO') return 'scenario';
@@ -699,6 +703,8 @@ const createQuestionWithManagedImage = async ({
   timeLimit,
   memoryLimit,
   codingFields,
+  matchingPairs,
+  evaluationConfig,
 }) => {
   const inlineImage = typeof image === 'string' ? image.trim() : '';
   const normalizedImageUrlCandidate =
@@ -715,6 +721,7 @@ const createQuestionWithManagedImage = async ({
     question_type: normalizeQuestionFormatAlias(question_type || type),
     type,
     options,
+    matchingPairs,
     correctAnswer,
     passage,
     paragraphGroupId,
@@ -785,6 +792,11 @@ const createQuestionWithManagedImage = async ({
     questionType: normalizedStorageQuestionType,
     questionFormat: normalizedQuestionFormat,
     options,
+    matchingPairs: Array.isArray(matchingPairs) ? matchingPairs : [],
+    evaluationConfig:
+      evaluationConfig && typeof evaluationConfig === 'object' && !Array.isArray(evaluationConfig)
+        ? evaluationConfig
+        : {},
     correctAnswer: normalizeCorrectAnswerForStorage(
       normalizedStorageQuestionType,
       correctAnswer,
@@ -958,6 +970,8 @@ router.post(
         'MULTI_SELECT_MCQ',
         'TRUE_FALSE',
         'SHORT_ANSWER',
+        'FILL_IN_THE_BLANK',
+        'MATCHING',
         'PARAGRAPH',
         'ESSAY',
         'ESSAY_LETTER',
@@ -980,6 +994,8 @@ router.post(
         'PARAGRAPH',
         'SCENARIO',
         'TRUE_FALSE',
+        'FILL_IN_THE_BLANK',
+        'MATCHING',
         'ESSAY',
         'ESSAY_LETTER',
         'ESSAY_STORY',
@@ -998,6 +1014,8 @@ router.post(
         'PARAGRAPH',
         'SCENARIO',
         'TRUE_FALSE',
+        'FILL_IN_THE_BLANK',
+        'MATCHING',
         'ESSAY',
         'ESSAY_LETTER',
         'ESSAY_STORY',
@@ -1013,6 +1031,8 @@ router.post(
     body('sectionId').optional({ nullable: true }).isMongoId().withMessage('Section ID must be a valid id'),
     body('passage').optional({ nullable: true }).isString().withMessage('Passage must be a string'),
     body('paragraphGroupId').optional({ nullable: true }).isString().withMessage('paragraphGroupId must be a string'),
+    body('matchingPairs').optional({ nullable: true }).isArray().withMessage('matchingPairs must be an array'),
+    body('evaluationConfig').optional({ nullable: true }).isObject().withMessage('evaluationConfig must be an object'),
     body('questions').optional({ nullable: true }).isArray().withMessage('questions must be an array'),
     body('title').optional({ nullable: true }).isString().withMessage('Title must be a string'),
     body('description').optional({ nullable: true }).isString().withMessage('Description must be a string'),
@@ -1072,6 +1092,8 @@ router.post(
         timeLimit,
         memoryLimit,
         codingFields,
+        matchingPairs,
+        evaluationConfig,
       } =
         req.body;
       const { passage } = req.body;
@@ -1089,6 +1111,7 @@ router.post(
         question_type: normalizedQuestionFormat,
         points: normalizedPoints,
         languages: languages ?? language,
+        evaluationConfig,
       };
       const isContextQuestionGroup = isContextQuestionGroupPayload(req.body || {});
       const expandedCreateQuestions = Array.isArray(req.planLimitContext?.expandedCreateQuestions)
@@ -1239,6 +1262,7 @@ router.post(
           timeLimit: payloadRecord.timeLimit ?? timeLimit,
           memoryLimit: payloadRecord.memoryLimit ?? memoryLimit,
           codingFields: payloadRecord.codingFields ?? codingFields,
+          matchingPairs: payloadRecord.matchingPairs ?? matchingPairs,
         });
         createdQuestions.push(createdQuestion);
       }
@@ -1327,6 +1351,8 @@ router.put(
         'MULTI_SELECT_MCQ',
         'TRUE_FALSE',
         'SHORT_ANSWER',
+        'FILL_IN_THE_BLANK',
+        'MATCHING',
         'PARAGRAPH',
         'ESSAY',
         'ESSAY_LETTER',
@@ -1348,6 +1374,8 @@ router.put(
         'PARAGRAPH',
         'SCENARIO',
         'TRUE_FALSE',
+        'FILL_IN_THE_BLANK',
+        'MATCHING',
         'ESSAY',
         'ESSAY_LETTER',
         'ESSAY_STORY',
@@ -1366,6 +1394,8 @@ router.put(
         'PARAGRAPH',
         'SCENARIO',
         'TRUE_FALSE',
+        'FILL_IN_THE_BLANK',
+        'MATCHING',
         'ESSAY',
         'ESSAY_LETTER',
         'ESSAY_STORY',
@@ -1378,6 +1408,8 @@ router.put(
     body('generatedImage').optional({ nullable: true }).isString().withMessage('Generated image must be a string'),
     body('passage').optional({ nullable: true }).isString().withMessage('Passage must be a string'),
     body('paragraphGroupId').optional({ nullable: true }).isString().withMessage('paragraphGroupId must be a string'),
+    body('matchingPairs').optional({ nullable: true }).isArray().withMessage('matchingPairs must be an array'),
+    body('evaluationConfig').optional({ nullable: true }).isObject().withMessage('evaluationConfig must be an object'),
     body('title').optional({ nullable: true }).isString().withMessage('Title must be a string'),
     body('description').optional({ nullable: true }).isString().withMessage('Description must be a string'),
     body('instructions').optional({ nullable: true }).isString().withMessage('Instructions must be a string'),
@@ -1483,6 +1515,8 @@ router.put(
         timeLimit,
         memoryLimit,
         codingFields,
+        matchingPairs,
+        evaluationConfig,
       } =
         req.body;
       const normalizedQuestionText =
@@ -1601,6 +1635,13 @@ router.put(
           }) || undefined;
       }
       if (options !== undefined) question.options = options;
+      if (matchingPairs !== undefined) question.matchingPairs = Array.isArray(matchingPairs) ? matchingPairs : [];
+      if (evaluationConfig !== undefined) {
+        question.evaluationConfig =
+          evaluationConfig && typeof evaluationConfig === 'object' && !Array.isArray(evaluationConfig)
+            ? evaluationConfig
+            : {};
+      }
       if (correctAnswer !== undefined) question.correctAnswer = correctAnswer;
       if (normalizedPoints !== undefined) question.points = normalizedPoints;
       if (order !== undefined) question.order = order;
@@ -2088,4 +2129,3 @@ router.post(
 );
 
 export default router;
-

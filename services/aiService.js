@@ -27,6 +27,8 @@ const VALID_QUESTION_TYPES = [
   'MULTIPLE_OPTIONS',
   'TRUE_FALSE',
   'SHORT_ANSWER',
+  'FILL_IN_THE_BLANK',
+  'MATCHING',
   'PARAGRAPH',
   'ESSAY',
   'ESSAY_LETTER',
@@ -49,6 +51,12 @@ const DEFAULT_CODING_STARTER_CODE = {
   cpp: '#include <bits/stdc++.h>\nusing namespace std;\n\nint main() {\n    return 0;\n}\n',
   javascript: 'function solve(input) {\n  return input;\n}\n',
 };
+const QUESTION_SORTING_PATTERNS = new Set([
+  'MIX_ALL',
+  'GROUP_BY_TYPE',
+  'ALTERNATING',
+  'CUSTOM',
+]);
 
 const sanitizeString = (value) => {
   if (value === undefined || value === null) return '';
@@ -72,6 +80,12 @@ const normalizeQuestionTypeToken = (value) => {
   }
   if (['SHORT', 'SHORTANSWER', 'SHORT_ANSWER'].includes(normalized)) {
     return 'SHORT_ANSWER';
+  }
+  if (['FILL_BLANK', 'FILL_IN_BLANK', 'FILLINTHEBLANK', 'FIB'].includes(normalized)) {
+    return 'FILL_IN_THE_BLANK';
+  }
+  if (['MATCH', 'MATCH_THE_FOLLOWING', 'MATCHING_PAIRS'].includes(normalized)) {
+    return 'MATCHING';
   }
   if (['LONG_ANSWER', 'LONGANSWER', 'DESCRIPTIVE', 'ESSAY'].includes(normalized)) {
     return 'ESSAY';
@@ -243,6 +257,14 @@ const normalizeQuestionObject = (question, index = 0) => {
       question.reading ||
       ''
   );
+  const matchingPairs = Array.isArray(question.matchingPairs || question.matching_pairs)
+    ? (question.matchingPairs || question.matching_pairs)
+        .map((pair) => ({
+          left: sanitizeString(pair?.left || pair?.term || pair?.prompt),
+          right: sanitizeString(pair?.right || pair?.match || pair?.answer),
+        }))
+        .filter((pair) => pair.left && pair.right)
+    : [];
   const paragraphGroupId = sanitizeString(
     question.paragraphGroupId || question.paragraph_group_id || question.scenarioGroupId || ''
   );
@@ -259,6 +281,7 @@ const normalizeQuestionObject = (question, index = 0) => {
     imageUrl: sanitizeString(
       question.imageUrl || question.image_path || question.imagePath || question.diagram || question.figure || ''
     ),
+    matchingPairs,
     sourceRowIndex: Number.isInteger(question.sourceRowIndex)
       ? question.sourceRowIndex
       : Number.isInteger(question._sourceRowIndex)
@@ -496,6 +519,72 @@ const shuffleArray = (values = []) => {
   return items;
 };
 
+const normalizeQuestionSorting = (value) =>
+  QUESTION_SORTING_PATTERNS.has(sanitizeString(value).toUpperCase())
+    ? sanitizeString(value).toUpperCase()
+    : 'MIX_ALL';
+
+const normalizeSortPattern = (value, allowedTypes = []) => {
+  const allowed = new Set(allowedTypes);
+  const raw = Array.isArray(value) ? value : [];
+  const pattern = raw
+    .map((type) => normalizeQuestionTypeToken(type))
+    .filter((type) => allowed.has(type));
+  return pattern.length ? pattern : [...allowed];
+};
+
+const applyQuestionSorting = ({
+  questions = [],
+  questionSorting = 'MIX_ALL',
+  questionSortPattern = [],
+  questionTypes = [],
+} = {}) => {
+  const safeQuestions = Array.isArray(questions) ? [...questions] : [];
+  const sorting = normalizeQuestionSorting(questionSorting);
+  const allowedTypes = normalizeRequestedQuestionTypes(questionTypes);
+
+  if (sorting === 'MIX_ALL') {
+    return shuffleArray(safeQuestions).map((question, index) => ({ ...question, order: index + 1 }));
+  }
+
+  const order = normalizeSortPattern(questionSortPattern, allowedTypes);
+  const rank = new Map(order.map((type, index) => [type, index]));
+  if (sorting === 'GROUP_BY_TYPE') {
+    return safeQuestions
+      .map((question, index) => ({ question, index }))
+      .sort((left, right) => {
+        const leftType = normalizeQuestionTypeToken(left.question?.questionType);
+        const rightType = normalizeQuestionTypeToken(right.question?.questionType);
+        return (rank.get(leftType) ?? order.length) - (rank.get(rightType) ?? order.length) || left.index - right.index;
+      })
+      .map(({ question }, index) => ({ ...question, order: index + 1 }));
+  }
+
+  const queues = new Map();
+  safeQuestions.forEach((question) => {
+    const type = normalizeQuestionTypeToken(question?.questionType);
+    if (!queues.has(type)) queues.set(type, []);
+    queues.get(type).push(question);
+  });
+  const result = [];
+  while (result.length < safeQuestions.length) {
+    let added = false;
+    order.forEach((type) => {
+      const next = queues.get(type)?.shift();
+      if (next) {
+        result.push(next);
+        added = true;
+      }
+    });
+    if (!added) {
+      queues.forEach((queue) => {
+        while (queue.length) result.push(queue.shift());
+      });
+    }
+  }
+  return result.map((question, index) => ({ ...question, order: index + 1 }));
+};
+
 const pickRandomIndexes = (total, count) =>
   shuffleArray(Array.from({ length: Math.max(0, total) }, (_, index) => index))
     .slice(0, Math.max(0, count))
@@ -674,6 +763,36 @@ const buildFallbackQuestionForType = ({ type, index, topic }) => {
     };
   }
 
+  if (safeType === 'FILL_IN_THE_BLANK') {
+    return {
+      questionText: `Complete the blank: ${safeTopic} is an important concept in _____.`,
+      questionType: safeType,
+      options: undefined,
+      correctAnswer: safeTopic,
+      points: 1,
+      order: index + 1,
+      passage: '',
+    };
+  }
+
+  if (safeType === 'MATCHING') {
+    const matchingPairs = [
+      { left: `${safeTopic} term 1`, right: 'Definition 1' },
+      { left: `${safeTopic} term 2`, right: 'Definition 2' },
+      { left: `${safeTopic} term 3`, right: 'Definition 3' },
+    ];
+    return {
+      questionText: `Match the following items related to ${safeTopic}.`,
+      questionType: safeType,
+      options: undefined,
+      matchingPairs,
+      correctAnswer: JSON.stringify(matchingPairs),
+      points: 1,
+      order: index + 1,
+      passage: '',
+    };
+  }
+
   if (safeType === 'PARAGRAPH') {
     return {
       questionText: baseQuestionText,
@@ -841,6 +960,34 @@ const normalizeToRequestedType = ({ question, type, index, topic }) => {
       questionType: type,
       options: undefined,
       correctAnswer: answer || '0',
+      points,
+      order: index + 1,
+      passage: '',
+    });
+  }
+
+  if (type === 'FILL_IN_THE_BLANK') {
+    return attachScenarioContext({
+      questionText,
+      questionType: type,
+      options: undefined,
+      correctAnswer: sanitizeString(normalized.correctAnswer) || sanitizeString(fallback.correctAnswer),
+      points,
+      order: index + 1,
+      passage: '',
+    });
+  }
+
+  if (type === 'MATCHING') {
+    const matchingPairs = Array.isArray(normalized.matchingPairs) && normalized.matchingPairs.length
+      ? normalized.matchingPairs
+      : fallback.matchingPairs;
+    return attachScenarioContext({
+      questionText,
+      questionType: type,
+      options: undefined,
+      matchingPairs,
+      correctAnswer: JSON.stringify(matchingPairs),
       points,
       order: index + 1,
       passage: '',
@@ -1316,6 +1463,8 @@ export const generateQuestions = async (params) => {
     questionTypes,
     scenarioQuestionTypes = ['PARAGRAPH'],
     questionTypeDistribution, // NEW: Array of { type, count } for specific distribution
+    questionSorting = 'MIX_ALL',
+    questionSortPattern = [],
     duration,
     uploadedContent,
     examTitle,
@@ -1512,6 +1661,8 @@ For each question, provide:
 - questionType: MUST be one of ONLY these types: ${questionTypes.join(', ')}. DO NOT use any other types.
 - options: Array of options (for MULTIPLE_CHOICE, MULTIPLE_OPTIONS, TRUE_FALSE). For harder difficulties, make distractors more plausible and challenging.
 - correctAnswer: The correct answer (string) for non-coding questions. Use an empty string for CODING questions.
+- For FILL_IN_THE_BLANK, place exactly one blank in questionText and return the exact missing text as correctAnswer.
+- For MATCHING, return matchingPairs as an array of at least 3 objects, each with non-empty left and right fields; correctAnswer must be the same pair mapping serialized as JSON.
 - passage: For PARAGRAPH questions, include the supporting passage students must read. Use an empty string for other question types unless contextual text is explicitly required.
 - For grouped PARAGRAPH/SCENARIO output, you may return { "groups": [{ "passage": "...", "questions": [...] }] }. Each nested question counts toward total questions.
 - title: For CODING questions, provide a short problem title.
@@ -1622,7 +1773,7 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
           userId: trackingContext.userId,
         });
 
-        return attachImageBasedQuestions({
+        const imageEnhancedQuestions = await attachImageBasedQuestions({
           questions: paragraphEnhancedQuestions,
           imageConfig: effectiveImageQuestionConfig,
           topic: sanitizedTopic,
@@ -1632,6 +1783,12 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
           examDescription,
           tenantId: trackingContext.tenantId,
           userId: trackingContext.userId,
+        });
+        return applyQuestionSorting({
+          questions: imageEnhancedQuestions,
+          questionSorting,
+          questionSortPattern,
+          questionTypes,
         });
       } catch (error) {
         lastError = error;
@@ -1806,8 +1963,87 @@ export const extractQuestionsFromContent = async (params) => {
   }
 };
 
+const normalizeEvaluationText = (value) =>
+  sanitizeString(value)
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+const normalizeEvaluationList = (value) =>
+  (Array.isArray(value) ? value : value ? [value] : [])
+    .map((item) => sanitizeString(typeof item === 'object' ? item?.text || item?.concept || item?.value : item))
+    .filter(Boolean)
+    .slice(0, 20);
+
+const buildSemanticRubric = ({ evaluationConfig = {}, rubric = [], points = 0, questionType = '' }) => {
+  const config = evaluationConfig && typeof evaluationConfig === 'object' ? evaluationConfig : {};
+  const configuredRubric = Array.isArray(config.rubric) && config.rubric.length ? config.rubric : rubric;
+  const expectedConcepts = normalizeEvaluationList(config.expectedConcepts || config.keyPoints);
+  const maxPoints = Math.max(Number(points) || 0, 0);
+  const defaults =
+    ['ESSAY', 'ESSAY_LETTER', 'ESSAY_STORY'].includes(String(questionType).toUpperCase())
+      ? [
+          { criterion: 'Relevance and factual accuracy', weight: 30 },
+          { criterion: 'Required concepts and completeness', weight: 30 },
+          { criterion: 'Structure and coherence', weight: 20 },
+          { criterion: 'Language and presentation', weight: 10 },
+          { criterion: 'Conclusion or completeness', weight: 10 },
+        ]
+      : [
+          { criterion: 'Conceptual correctness', weight: 50 },
+          { criterion: 'Required concepts and completeness', weight: 35 },
+          { criterion: 'Reasoning and relevance', weight: 15 },
+        ];
+  const source = Array.isArray(configuredRubric) && configuredRubric.length ? configuredRubric : defaults;
+  const entries = source
+    .map((entry, index) => {
+      const criterion = sanitizeString(entry?.criterion || entry?.name || entry?.title) || `Criterion ${index + 1}`;
+      const rawMax = Number(entry?.maxMarks ?? entry?.marks ?? entry?.maxScore);
+      const rawWeight = Number(entry?.weight ?? entry?.percentage);
+      return {
+        criterion,
+        description: sanitizeString(entry?.description),
+        mandatory: Boolean(entry?.mandatory),
+        keyPoints: normalizeEvaluationList(entry?.keyPoints || entry?.expectedConcepts),
+        acceptableAlternatives: normalizeEvaluationList(entry?.acceptableAlternatives || entry?.alternatives),
+        rawMax: Number.isFinite(rawMax) && rawMax > 0 ? rawMax : 0,
+        weight: Number.isFinite(rawWeight) && rawWeight > 0 ? rawWeight : 0,
+      };
+    })
+    .filter((entry) => entry.criterion);
+  const explicitTotal = entries.reduce((sum, entry) => sum + entry.rawMax, 0);
+  const weightTotal = entries.reduce((sum, entry) => sum + entry.weight, 0);
+  const scoredEntries = entries.map((entry) => {
+    const share = explicitTotal > 0
+      ? entry.rawMax / explicitTotal
+      : weightTotal > 0
+        ? entry.weight / weightTotal
+        : 1 / Math.max(entries.length, 1);
+    return {
+      ...entry,
+      maxScore: Number((maxPoints * share).toFixed(2)),
+      weight: Number((share * 100).toFixed(2)),
+    };
+  });
+  if (scoredEntries.length) {
+    const precedingTotal = scoredEntries.slice(0, -1).reduce((sum, item) => sum + item.maxScore, 0);
+    scoredEntries[scoredEntries.length - 1].maxScore = Number((maxPoints - precedingTotal).toFixed(2));
+  }
+  return scoredEntries;
+};
+
+const normalizeEvaluationItems = (value, fallback = []) => {
+  const items = Array.isArray(value)
+    ? value.map((item) => sanitizeString(item)).filter(Boolean)
+    : [];
+  return items.length ? items.slice(0, 10) : fallback;
+};
+
 /**
- * Evaluate subjective answers using OpenAI
+ * Evaluate text answers semantically against the question, supporting context and
+ * an author-defined rubric. The reference answer is evidence, never a required
+ * sentence to reproduce.
  */
 export const evaluateAnswer = async (params) => {
   const {
@@ -1818,6 +2054,7 @@ export const evaluateAnswer = async (params) => {
     points,
     rubric = [],
     rubricScoringEnabled = false,
+    evaluationConfig = {},
     tenantId = null,
     userId = null,
     metadata = null,
@@ -1854,112 +2091,65 @@ export const evaluateAnswer = async (params) => {
             ? 'essay_letter'
             : ['ESSAY_STORY', 'STORY_WRITING', 'STORY'].includes(normalizedQuestionType)
               ? 'essay_story'
-          : null;
+              : ['FILL_IN_THE_BLANK', 'FILL_IN_BLANK'].includes(normalizedQuestionType)
+                ? 'fill_in_the_blank'
+                : ['NUMBER', 'NUMERICAL'].includes(normalizedQuestionType)
+                  ? 'numerical'
+                  : null;
 
   if (!evaluationType) {
     throw new Error(
-      'Evaluation only supported for SHORT_ANSWER, PARAGRAPH, ESSAY, ESSAY_LETTER, and ESSAY_STORY types'
+      'Evaluation only supported for text, fill-in-the-blank, and numerical answer types'
     );
   }
 
   const maxPoints = Math.max(Number(points) || 0, 0);
-  const normalizedRubric = (Array.isArray(rubric) ? rubric : [])
-    .map((entry, index) => {
-      const criterion = String(entry?.criterion || entry?.name || '').trim();
-      const weight = Number(entry?.weight ?? entry?.percentage);
-      return {
-        criterion: criterion || `Criterion ${index + 1}`,
-        weight: Number.isFinite(weight) && weight > 0 ? weight : 0,
-        description: String(entry?.description || '').trim(),
-      };
-    })
-    .filter((entry) => entry.weight > 0);
-  const rubricWeightTotal = normalizedRubric.reduce((sum, entry) => sum + entry.weight, 0);
-  const effectiveRubric = rubricScoringEnabled
-    ? (
-      normalizedRubric.length > 0
-        ? normalizedRubric.map((entry) => ({
-          ...entry,
-          weight: Number((((entry.weight / rubricWeightTotal) * 100).toFixed(2))),
-        }))
-        : [
-          { criterion: 'Accuracy', weight: 40, description: 'Conceptual correctness and factual accuracy.' },
-          { criterion: 'Completeness', weight: 30, description: 'Coverage of all required points from the answer key.' },
-          { criterion: 'Reasoning', weight: 20, description: 'Logical explanation and justification quality.' },
-          { criterion: 'Clarity', weight: 10, description: 'Clarity, structure, and communication quality.' },
-        ]
-    )
-    : [];
+  const effectiveRubric = buildSemanticRubric({
+    evaluationConfig,
+    rubric,
+    points: maxPoints,
+    questionType: normalizedQuestionType,
+  });
+  const config = evaluationConfig && typeof evaluationConfig === 'object' ? evaluationConfig : {};
+  const expectedConcepts = normalizeEvaluationList(config.expectedConcepts || config.keyPoints);
+  const acceptableAnswers = normalizeEvaluationList(config.acceptableAnswers || config.acceptableAlternatives);
+  const commonMisconceptions = normalizeEvaluationList(config.commonMisconceptions);
 
   try {
-    const systemPrompt = `You are an expert exam evaluator.
+    const systemPrompt = `You are a careful, consistent exam examiner. Grade the MEANING and factual correctness of the student's answer, never whether it copies the reference wording.
 
-Your task is to evaluate a student's answer based on the question, expected answer, and answer type.
+The reference answer is evidence only. Equivalent wording, sentence order, case, punctuation, and minor spelling differences must receive the same credit when they communicate the same correct meaning. Do not award credit for irrelevant, fabricated, or contradictory claims. Award partial credit only for demonstrated criteria or concepts.
 
-EVALUATION RULES:
+Score each supplied rubric criterion independently. Its score must be between 0 and its maxScore. The final total is the sum of criterion scores; never invent a score outside the rubric. Do not deduct grammar, presentation, format, creativity, or structure unless that appears as a rubric criterion. If a mandatory concept is absent, say so. For a fill blank, accept configured alternatives and semantically equivalent answers; for numerical work assess the final answer, method, units, and steps only when the rubric/configuration asks for them. For a passage or case question, use the supplied context as the authority.
 
-1. For SHORT answers:
-- Focus on keyword matching and correctness
-- Ignore grammar/spelling mistakes
-- Be strict with correctness
-
-2. For PARAGRAPH answers:
-- Evaluate meaning and completeness
-- Check if key points are covered
-- Allow partial marks
-- Ignore minor grammar mistakes
-
-3. For ESSAY answers:
-- Evaluate:
-  a) Structure (intro, body, conclusion)
-  b) Content depth
-  c) Logical flow
-  d) Relevance to question
-- Give balanced scoring (do NOT be overly strict)
-
-4. For ESSAY_LETTER answers:
-- Evaluate:
-  a) Letter format
-  b) Tone suitability
-  c) Content relevance and completeness
-- Allow partial marks for partially correct format/content
-
-5. For ESSAY_STORY answers:
-- Evaluate:
-  a) Creativity and originality
-  b) Coherence and narrative flow
-  c) Relevance to prompt
-- Give balanced scoring (do NOT be overly strict)
-
-GENERAL RULES:
-- Do NOT hallucinate missing facts
-- If answer is irrelevant -> give low score
-- If partially correct -> give partial marks
-- Keep evaluation consistent
-- Be fair and deterministic
-
-SCORING:
-- Score must be between 0 and Maximum Marks
-- Use full range (avoid always giving mid scores)
-
-OUTPUT FORMAT (STRICT JSON ONLY):
-
+Return STRICT JSON only:
 {
-  "score": number,
-  "feedback": "clear and concise feedback",
-  "strengths": ["point1", "point2"],
-  "weaknesses": ["point1", "point2"],
-  "confidence": number
+  "rubricScores": [{"criterion":"exact criterion name","score":number,"rationale":"brief evidence","identifiedConcepts":["..."],"missingConcepts":["..."]}],
+  "correctConcepts":["..."],
+  "missingConcepts":["..."],
+  "incorrectStatements":["..."],
+  "grammarFeedback":"only when language/grammar is rubric-scored, otherwise empty",
+  "feedback":"short explanation for the awarded marks",
+  "confidence":number,
+  "manualReviewRecommended":boolean
 }
+Do not include markdown, code fences, or other keys.`;
 
-Do not include markdown, code fences, or extra keys.`;
-
-    const userPrompt = `INPUT:
-- Question Type: ${evaluationType}
-- Question: ${question}
-- Expected Answer / Key Points: ${correctAnswer || 'N/A'}
-- Student Answer: ${studentAnswer}
-- Maximum Marks: ${maxPoints}`;
+    const userPrompt = `GRADE THIS ANSWER
+Question type: ${evaluationType}
+Question: ${question}
+Reference answer (not required wording): ${correctAnswer || 'None provided'}
+Student answer: ${studentAnswer}
+Maximum marks: ${maxPoints}
+Difficulty: ${sanitizeString(config.difficulty || '') || 'Not specified'}
+Passage/case/supporting context: ${sanitizeString(config.supportingContext || config.passage || '') || 'None provided'}
+Expected concepts: ${JSON.stringify(expectedConcepts)}
+Acceptable alternatives: ${JSON.stringify(acceptableAnswers)}
+Common misconceptions: ${JSON.stringify(commonMisconceptions)}
+Minimum answer requirements: ${sanitizeString(config.minimumAnswerRequirements || '') || 'None specified'}
+Partial-marking configuration: ${JSON.stringify(config.partialMarking || {})}
+Numerical configuration: ${JSON.stringify(config.numerical || {})}
+Rubric (score only these criteria): ${JSON.stringify(effectiveRubric.map(({ criterion, description, maxScore, mandatory, keyPoints, acceptableAlternatives }) => ({ criterion, description, maxScore, mandatory, keyPoints, acceptableAlternatives })))} `;
 
     const completion = await createTrackedChatCompletion({
       client,
@@ -1983,30 +2173,42 @@ Do not include markdown, code fences, or extra keys.`;
       throw new Error('Failed to parse evaluation response');
     }
 
-    const normalizeFeedbackItems = (value, fallback = []) => {
-      const items = Array.isArray(value)
-        ? value.map((item) => sanitizeString(item)).filter(Boolean)
-        : [];
-      return items.length > 0 ? items.slice(0, 5) : fallback;
-    };
-
-    const scoreRaw = Number(evaluation?.score);
-    const score = Number(
-      clampNumber(Number.isFinite(scoreRaw) ? scoreRaw : 0, 0, maxPoints).toFixed(2)
-    );
+    const receivedRubricScores = Array.isArray(evaluation?.rubricScores) ? evaluation.rubricScores : [];
+    const mappedScores = effectiveRubric.map((rubricEntry) => {
+      const candidate = receivedRubricScores.find(
+        (item) => normalizeEvaluationText(item?.criterion) === normalizeEvaluationText(rubricEntry.criterion)
+      );
+      const rawScore = Number(candidate?.score);
+      const score = Number(clampNumber(Number.isFinite(rawScore) ? rawScore : 0, 0, rubricEntry.maxScore).toFixed(2));
+      return {
+        criterion: rubricEntry.criterion,
+        weight: rubricEntry.weight,
+        score,
+        maxScore: rubricEntry.maxScore,
+        rationale: sanitizeString(candidate?.rationale) || 'No criterion-specific rationale provided.',
+        identifiedConcepts: normalizeEvaluationItems(candidate?.identifiedConcepts),
+        missingConcepts: normalizeEvaluationItems(candidate?.missingConcepts),
+        mandatory: rubricEntry.mandatory,
+      };
+    });
+    const score = Number(clampNumber(mappedScores.reduce((sum, item) => sum + item.score, 0), 0, maxPoints).toFixed(2));
     const confidenceRaw = Number(evaluation?.confidence);
     const confidence = Number(
       clampNumber(Number.isFinite(confidenceRaw) ? confidenceRaw : 0.5, 0, 1).toFixed(3)
     );
     const feedback = sanitizeString(evaluation?.feedback) || 'No feedback provided';
-    const strengths = normalizeFeedbackItems(evaluation?.strengths, [
+    const correctConcepts = normalizeEvaluationItems(evaluation?.correctConcepts);
+    const missingConcepts = normalizeEvaluationItems(evaluation?.missingConcepts);
+    const incorrectStatements = normalizeEvaluationItems(evaluation?.incorrectStatements);
+    const strengths = correctConcepts.length ? correctConcepts : [
       score > 0 ? 'Some alignment with expected answer.' : 'No clear strengths identified.',
-    ]);
-    const weaknesses = normalizeFeedbackItems(evaluation?.weaknesses, [
+    ];
+    const weaknesses = [...missingConcepts, ...incorrectStatements].slice(0, 10);
+    if (!weaknesses.length) weaknesses.push(
       score >= maxPoints
         ? 'No major weaknesses observed.'
         : 'Expected key points are missing or underdeveloped.',
-    ]);
+    );
     const correctnessThreshold = evaluationType === 'short' ? 0.85 : 0.6;
 
     const result = {
@@ -2017,31 +2219,19 @@ Do not include markdown, code fences, or extra keys.`;
       confidence,
       isCorrect: maxPoints > 0 ? score >= (maxPoints * correctnessThreshold) : score > 0,
       pointsEarned: score,
-      needsReview: confidence < 0.8,
-      mode: rubricScoringEnabled ? 'rubric' : 'standard',
+      needsReview: confidence < 0.8 || Boolean(evaluation?.manualReviewRecommended),
+      mode: 'semantic_rubric',
+      evaluationMethod: 'semantic_context_rubric',
       rubric: effectiveRubric,
-      rubricScores: [],
-      rubricTotal: null,
+      rubricScores: mappedScores,
+      rubricTotal: score,
+      correctConcepts,
+      missingConcepts,
+      incorrectStatements,
+      grammarFeedback: sanitizeString(evaluation?.grammarFeedback),
+      shortExplanation: feedback,
       provider: 'openai',
     };
-
-    if (rubricScoringEnabled) {
-      const mappedScores = effectiveRubric.map((rubricEntry) => {
-        const maxScore = Number(((maxPoints * rubricEntry.weight) / 100).toFixed(2));
-        const criterionScore = Number(((score * rubricEntry.weight) / 100).toFixed(2));
-        return {
-          criterion: rubricEntry.criterion,
-          weight: rubricEntry.weight,
-          score: Math.min(Math.max(0, criterionScore), maxScore),
-          maxScore,
-          rationale: feedback,
-        };
-      });
-
-      result.rubricScores = mappedScores;
-      result.rubricTotal = score;
-      result.pointsEarned = score;
-    }
 
     return result;
   } catch (error) {
@@ -3512,6 +3702,8 @@ const generateFallbackQuestions = async (params) => {
     questionTypes = ['MULTIPLE_CHOICE'],
     scenarioQuestionTypes = ['PARAGRAPH'],
     questionTypeDistribution,
+    questionSorting = 'MIX_ALL',
+    questionSortPattern = [],
     difficulty,
     uploadedContent,
     examTitle,
@@ -3600,7 +3792,7 @@ const generateFallbackQuestions = async (params) => {
     userId: trackingContext.userId,
   });
 
-  return attachImageBasedQuestions({
+  const imageEnhancedQuestions = await attachImageBasedQuestions({
     questions: paragraphEnhancedQuestions,
     imageConfig: effectiveImageConfig,
     topic,
@@ -3611,26 +3803,29 @@ const generateFallbackQuestions = async (params) => {
     tenantId: trackingContext.tenantId,
     userId: trackingContext.userId,
   });
+  return applyQuestionSorting({
+    questions: imageEnhancedQuestions,
+    questionSorting,
+    questionSortPattern,
+    questionTypes: safeQuestionTypes,
+  });
 };
 
 /**
  * Fallback answer evaluation using keyword matching
  */
 const evaluateFallbackAnswer = (params) => {
-  const { correctAnswer, studentAnswer, points, rubricScoringEnabled = false, rubric = [] } = params;
+  const {
+    correctAnswer,
+    studentAnswer,
+    points,
+    rubric = [],
+    evaluationConfig = {},
+    questionType = '',
+  } = params;
   const maxPoints = Math.max(Number(points) || 0, 0);
-  const effectiveRubric = rubricScoringEnabled
-    ? (
-      Array.isArray(rubric) && rubric.length > 0
-        ? rubric
-        : [
-          { criterion: 'Accuracy', weight: 40 },
-          { criterion: 'Completeness', weight: 30 },
-          { criterion: 'Reasoning', weight: 20 },
-          { criterion: 'Clarity', weight: 10 },
-        ]
-    )
-    : [];
+  const effectiveRubric = buildSemanticRubric({ evaluationConfig, rubric, points: maxPoints, questionType });
+  const config = evaluationConfig && typeof evaluationConfig === 'object' ? evaluationConfig : {};
 
   if (!correctAnswer || !studentAnswer) {
     return {
@@ -3642,27 +3837,38 @@ const evaluateFallbackAnswer = (params) => {
       isCorrect: false,
       pointsEarned: 0,
       needsReview: true,
-      mode: rubricScoringEnabled ? 'rubric' : 'standard',
+      mode: 'semantic_rubric_fallback',
+      evaluationMethod: 'fallback_reference_similarity',
       rubric: effectiveRubric,
       rubricScores: [],
-      rubricTotal: rubricScoringEnabled ? 0 : null,
+      rubricTotal: 0,
+      correctConcepts: [],
+      missingConcepts: normalizeEvaluationList(config.expectedConcepts || config.keyPoints),
+      incorrectStatements: [],
     };
   }
 
-  // Simple keyword-based matching
-  const correctLower = correctAnswer.toLowerCase();
-  const studentLower = studentAnswer.toLowerCase();
-  const correctWords = correctLower.split(/\s+/);
-  const studentWords = studentLower.split(/\s+/);
-
-  const matchingWords = correctWords.filter((word) =>
-    studentWords.includes(word)
-  );
-  const similarity = matchingWords.length / Math.max(correctWords.length, 1);
+  // A conservative offline fallback: exact normalized alternatives are accepted,
+  // otherwise it reports limited lexical overlap and requests human review. It
+  // deliberately does not pretend to perform semantic AI evaluation offline.
+  const correctLower = normalizeEvaluationText(correctAnswer);
+  const studentLower = normalizeEvaluationText(studentAnswer);
+  const alternatives = [
+    correctLower,
+    ...normalizeEvaluationList(config.acceptableAnswers || config.acceptableAlternatives)
+      .map(normalizeEvaluationText),
+  ].filter(Boolean);
+  const equivalentConfiguredAnswer = alternatives.includes(studentLower);
+  const correctWords = new Set(correctLower.split(/\s+/).filter((word) => word.length > 1));
+  const studentWords = new Set(studentLower.split(/\s+/).filter((word) => word.length > 1));
+  const matchingWords = Array.from(correctWords).filter((word) => studentWords.has(word));
+  const similarity = equivalentConfiguredAnswer
+    ? 1
+    : matchingWords.length / Math.max(correctWords.size, 1);
 
   const isCorrect = similarity > 0.6;
-  const pointsEarned = Math.round(maxPoints * similarity);
-  const confidence = Math.min(similarity + 0.2, 1);
+  const pointsEarned = Number((maxPoints * similarity).toFixed(2));
+  const confidence = equivalentConfiguredAnswer ? 0.9 : Math.min(similarity + 0.1, 0.7);
   const feedback = isCorrect
     ? 'Answer appears to be correct based on keyword matching.'
     : 'Answer may need review. Consider providing more detail.';
@@ -3679,30 +3885,29 @@ const evaluateFallbackAnswer = (params) => {
     isCorrect,
     pointsEarned,
     needsReview: confidence < 0.8,
-    mode: rubricScoringEnabled ? 'rubric' : 'standard',
+    mode: 'semantic_rubric_fallback',
+    evaluationMethod: equivalentConfiguredAnswer
+      ? 'configured_alternative_exact_match'
+      : 'fallback_reference_similarity',
     rubric: effectiveRubric,
     rubricScores: [],
-    rubricTotal: rubricScoringEnabled ? pointsEarned : null,
+    rubricTotal: pointsEarned,
+    correctConcepts: equivalentConfiguredAnswer ? ['Matched a configured acceptable answer.'] : [],
+    missingConcepts: similarity < 1 ? normalizeEvaluationList(config.expectedConcepts || config.keyPoints) : [],
+    incorrectStatements: [],
   };
 
-  if (rubricScoringEnabled && effectiveRubric.length > 0) {
-    const normalizedWeights = effectiveRubric
-      .map((item) => ({
-        criterion: String(item?.criterion || item?.name || 'Criterion').trim(),
-        weight: Number(item?.weight) || 0,
-      }))
-      .filter((item) => item.weight > 0);
-    const totalWeight = normalizedWeights.reduce((sum, item) => sum + item.weight, 0) || 100;
-
-    fallbackResult.rubricScores = normalizedWeights.map((item) => {
-      const weightPercent = (item.weight / totalWeight) * 100;
-      const maxScore = Number(((maxPoints * weightPercent) / 100).toFixed(2));
+  if (effectiveRubric.length > 0) {
+    fallbackResult.rubricScores = effectiveRubric.map((item) => {
+      const maxScore = Number(item.maxScore || 0);
       return {
         criterion: item.criterion,
-        weight: Number(weightPercent.toFixed(2)),
+        weight: Number(item.weight || 0),
         score: Number((maxScore * similarity).toFixed(2)),
         maxScore,
-        rationale: 'Fallback rubric score based on keyword overlap similarity.',
+        rationale: equivalentConfiguredAnswer
+          ? 'Matched a configured acceptable answer.'
+          : 'Fallback score based on limited reference overlap; manual review is recommended.',
       };
     });
   }

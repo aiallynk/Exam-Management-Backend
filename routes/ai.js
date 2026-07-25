@@ -981,6 +981,9 @@ router.post(
     body('count').isInt({ min: 1, max: 50 }).withMessage('Count must be between 1 and 50'),
     body('difficulty').isIn(['easy', 'medium', 'hard', 'ultra_hard']).withMessage('Invalid difficulty'),
     body('questionTypes').isArray().withMessage('Question types must be an array'),
+    body('questionTypeDistribution').optional().isArray().withMessage('Question type distribution must be an array'),
+    body('questionSorting').optional().isIn(['MIX_ALL', 'GROUP_BY_TYPE', 'ALTERNATING', 'CUSTOM']).withMessage('Invalid question sorting'),
+    body('questionSortPattern').optional().isArray().withMessage('Question sort pattern must be an array'),
     body('enableImageQuestions').optional().isBoolean().withMessage('enableImageQuestions must be boolean'),
     body('imageQuestionCount').optional().isInt({ min: 0, max: 50 }).withMessage('imageQuestionCount must be between 0 and 50'),
     body('imageQuestionRatio').optional().isFloat({ min: 0, max: 100 }).withMessage('imageQuestionRatio must be between 0 and 100'),
@@ -1004,6 +1007,8 @@ router.post(
         difficulty,
         questionTypes,
         questionTypeDistribution, // NEW: Array of { type, count } objects for specific distribution
+        questionSorting,
+        questionSortPattern,
         duration,
         uploadedContent,
         examTitle,
@@ -1113,6 +1118,8 @@ router.post(
         difficulty,
         questionTypes,
         questionTypeDistribution: Array.isArray(questionTypeDistribution) ? questionTypeDistribution : undefined,
+        questionSorting,
+        questionSortPattern: Array.isArray(questionSortPattern) ? questionSortPattern : undefined,
         duration,
         uploadedContent,
         examTitle,
@@ -1344,4 +1351,3 @@ Format: { "answers": { "q1": { "questionText": "...", "correctAnswer": "...", "p
 );
 
 export default router;
-

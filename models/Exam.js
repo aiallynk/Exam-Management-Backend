@@ -35,6 +35,15 @@ const ExamSchema = new mongoose.Schema(
       required: true,
       min: 1,
     },
+    timingMode: {
+      type: String,
+      enum: ['overall', 'section_based'],
+      default: 'overall',
+    },
+    allowDurationOverride: {
+      type: Boolean,
+      default: false,
+    },
     gracePeriod: {
       type: Number,
       default: 0,

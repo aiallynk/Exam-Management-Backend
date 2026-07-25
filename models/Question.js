@@ -44,6 +44,8 @@ const QuestionSchema = new mongoose.Schema(
         'MULTIPLE_OPTIONS',
         'TRUE_FALSE',
         'SHORT_ANSWER',
+        'FILL_IN_THE_BLANK',
+        'MATCHING',
         'PARAGRAPH',
         'ESSAY',
         'ESSAY_LETTER',
@@ -61,6 +63,8 @@ const QuestionSchema = new mongoose.Schema(
         'PARAGRAPH',
         'SCENARIO',
         'TRUE_FALSE',
+        'FILL_IN_THE_BLANK',
+        'MATCHING',
         'ESSAY',
         'ESSAY_LETTER',
         'ESSAY_STORY',
@@ -93,6 +97,10 @@ const QuestionSchema = new mongoose.Schema(
     },
     options: {
       type: mongoose.Schema.Types.Mixed,
+    },
+    matchingPairs: {
+      type: mongoose.Schema.Types.Mixed,
+      default: [],
     },
     optionA: {
       type: String,
@@ -181,6 +189,12 @@ const QuestionSchema = new mongoose.Schema(
         default: 128,
         min: 1,
       },
+    },
+    // Configuration used by the marking engine. It is deliberately stored with the
+    // question so a published exam is graded against the rubric the author set.
+    evaluationConfig: {
+      type: mongoose.Schema.Types.Mixed,
+      default: {},
     },
     points: {
       type: Number,
@@ -446,4 +460,3 @@ QuestionSchema.index({ questionPaperId: 1, order: 1 });
 QuestionSchema.index({ sectionId: 1, order: 1 });
 
 export default mongoose.model('Question', QuestionSchema);
-

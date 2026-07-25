@@ -1,0 +1,5 @@
+import mongoose from 'mongoose';
+const BackupStorageConfigurationSchema = new mongoose.Schema({
+  environment: { type: String, required: true, unique: true, default: 'default' }, enabled: { type: Boolean, default: false }, provider: { type: String, default: 's3' }, bucket: String, region: { type: String, default: 'ap-south-1' }, endpoint: String, forcePathStyle: { type: Boolean, default: false }, defaultStorageClass: { type: String, default: 'STANDARD' }, kmsKeyId: String, applicationEncryptionEnabled: { type: Boolean, default: true }, signedUrlExpirySeconds: { type: Number, default: 300 }, objectPrefix: { type: String, default: 'xamigo-backups' }, queuePrefix: { type: String, default: 'xamigo' }, tenantSelfServiceRestoreEnabled: { type: Boolean, default: false }, pricingConfiguration: { type: mongoose.Schema.Types.Mixed, default: {} }, lifecycleConfiguration: { type: mongoose.Schema.Types.Mixed, default: {} }, healthStatus: { type: String, default: 'UNKNOWN' }, lastHealthCheckAt: Date,
+}, { timestamps: true, collection: 'backup_storage_configurations' });
+export default mongoose.model('BackupStorageConfiguration', BackupStorageConfigurationSchema);

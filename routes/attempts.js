@@ -120,6 +120,15 @@ const arrayEqualsIgnoreOrder = (a, b) => {
 };
 
 const WRITING_QUESTION_TYPES = new Set(['ESSAY', 'ESSAY_LETTER', 'ESSAY_STORY']);
+const SEMANTIC_EVALUATION_QUESTION_TYPES = new Set([
+  'SHORT_ANSWER',
+  'PARAGRAPH',
+  'ESSAY',
+  'ESSAY_LETTER',
+  'ESSAY_STORY',
+  'FILL_IN_THE_BLANK',
+  'NUMBER',
+]);
 
 const sendWritingPlanRestriction = (res) =>
   res.status(403).json({
@@ -163,6 +172,8 @@ const resolveAiGradingTypeForQuestion = (questionType) => {
   if (normalized === 'essay_story' || normalized === 'story_writing') {
     return 'essay_story';
   }
+  if (normalized === 'fill_in_the_blank') return 'fill_in_the_blank';
+  if (normalized === 'number' || normalized === 'numerical') return 'numerical';
   return '';
 };
 
@@ -239,6 +250,9 @@ const normalizeAnswerForStorage = (questionType, value) => {
   if (questionType === 'CODING') {
     return normalizeCodingAnswerForStorage(value);
   }
+  if (questionType === 'MATCHING') {
+    return value && typeof value === 'object' ? JSON.stringify(value) : '';
+  }
   if (value === undefined || value === null) {
     return '';
   }
@@ -302,6 +316,8 @@ const getRequestIpAddress = (req) => {
     ''
   );
 };
+
+const normalizeTrimmedString = (value) => String(value || '').trim();
 
 const getRequestBrowserSessionId = (req) =>
   normalizeTrimmedString(
@@ -642,6 +658,14 @@ const parseStoredAnswerValue = (questionType, value) => {
   }
   if (questionType === 'CODING') {
     return parseCodingAnswerPayload(value);
+  }
+  if (questionType === 'MATCHING') {
+    try {
+      const parsed = JSON.parse(String(value || ''));
+      return parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    } catch {
+      return {};
+    }
   }
   if (value === undefined || value === null) {
     return '';
@@ -1742,6 +1766,31 @@ router.post(
   }
 );
 
+// Section-timer heartbeats (PUT /progress) load and save their own ExamAttempt
+// copy concurrently with a long-running submit request, so the in-memory
+// `attempt` here can go stale by the time we reach the final save. Retry once
+// against a freshly-loaded document instead of failing the whole submission.
+const saveAttemptWithVersionRetry = async (attempt) => {
+  try {
+    await attempt.save();
+    return attempt;
+  } catch (error) {
+    if (error?.name !== 'VersionError') {
+      throw error;
+    }
+    const fresh = await ExamAttempt.findById(attempt._id);
+    if (!fresh) {
+      throw error;
+    }
+    const pendingChanges = attempt.toObject({ getters: false, virtuals: false, depopulate: true });
+    delete pendingChanges._id;
+    delete pendingChanges.__v;
+    fresh.set(pendingChanges);
+    await fresh.save();
+    return fresh;
+  }
+};
+
 export const submitAttemptHandler = async (req, res, next) => {
   try {
     const errors = validationResult(req);
@@ -1749,7 +1798,7 @@ export const submitAttemptHandler = async (req, res, next) => {
       return res.status(400).json({ errors: errors.array() });
     }
 
-    const attempt = await ExamAttempt.findById(req.params.attemptId)
+    let attempt = await ExamAttempt.findById(req.params.attemptId)
       .populate(
         'examId',
         'title duration showResultsImmediately resultsReleasedAt accessControl markingRules'
@@ -2043,7 +2092,7 @@ export const submitAttemptHandler = async (req, res, next) => {
 
       // Auto-grade objective questions
       if (
-        ['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE', 'NUMBER', 'IMAGE_BASED'].includes(
+        ['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE', 'IMAGE_BASED', 'MATCHING'].includes(
           question.questionType
         )
       ) {
@@ -2057,9 +2106,38 @@ export const submitAttemptHandler = async (req, res, next) => {
           isCorrect = multiSelectResult.isCorrect;
           normalizedAnswerText = multiSelectResult.normalizedAnswerText;
           pointsEarned = multiSelectResult.pointsEarned;
-        } else if (question.questionType === 'NUMBER') {
-          isCorrect = String(studentAnswer).trim() === String(question.correctAnswer ?? '').trim();
-          pointsEarned = isCorrect ? question.points : 0;
+        } else if (question.questionType === 'MATCHING') {
+          const pairs = Array.isArray(question.matchingPairs) ? question.matchingPairs : [];
+          const expected = pairs.reduce((result, pair) => {
+            const left = normalizeString(pair?.left || pair?.term || pair?.prompt);
+            const right = normalizeString(pair?.right || pair?.match || pair?.answer);
+            if (left && right) result[left] = right;
+            return result;
+          }, {});
+          const received = studentAnswer && typeof studentAnswer === 'object' ? studentAnswer : {};
+          const expectedEntries = Object.entries(expected);
+          const correctPairCount = expectedEntries.filter(
+            ([left, right]) => normalizeString(received[left]).toLowerCase() === right.toLowerCase()
+          ).length;
+          isCorrect = expectedEntries.length > 0 && correctPairCount === expectedEntries.length;
+          normalizedAnswerText = JSON.stringify(received);
+          const matchingPartialEnabled =
+            question.evaluationConfig?.partialMarking?.enabled === true ||
+            question.evaluationConfig?.partialMarking?.matching === true;
+          pointsEarned = isCorrect
+            ? question.points
+            : matchingPartialEnabled && expectedEntries.length
+              ? Number(((Number(question.points) * correctPairCount) / expectedEntries.length).toFixed(2))
+              : 0;
+          aiEvaluation = {
+            provider: 'deterministic',
+            evaluationMethod: matchingPartialEnabled ? 'matching_partial' : 'matching_exact',
+            correctConcepts: correctPairCount ? [`${correctPairCount} matching pair(s) correct.`] : [],
+            missingConcepts: isCorrect ? [] : [`${expectedEntries.length - correctPairCount} matching pair(s) incorrect or missing.`],
+            incorrectStatements: [],
+            confidence: 1,
+            needsReview: false,
+          };
         } else {
           const expected = normalizeQuestionCorrectAnswer({
             questionType: question.questionType,
@@ -2076,13 +2154,27 @@ export const submitAttemptHandler = async (req, res, next) => {
           pointsEarned = isCorrect ? question.points : 0;
         }
       } else if (
-        ['SHORT_ANSWER', 'PARAGRAPH', 'ESSAY', 'ESSAY_LETTER', 'ESSAY_STORY'].includes(
-          question.questionType
-        )
+        SEMANTIC_EVALUATION_QUESTION_TYPES.has(question.questionType)
       ) {
         const hasSubjectiveAnswer = String(studentAnswer).trim().length > 0;
 
-        if (hasSubjectiveAnswer) {
+        const existingSubjectiveEvaluation =
+          existingAnswerDoc?.aiEvaluation &&
+            String(existingAnswerDoc.aiEvaluation.provider || '').toLowerCase() === 'openai' &&
+            Number.isFinite(Number(existingAnswerDoc?.pointsEarned))
+            ? existingAnswerDoc.aiEvaluation
+            : null;
+        const hasSubjectiveAnswerChanged =
+          normalizeString(existingAnswerDoc?.answerText) !== normalizeString(normalizedAnswerText);
+
+        if (hasSubjectiveAnswer && existingSubjectiveEvaluation && !hasSubjectiveAnswerChanged) {
+          // Answer is unchanged since it was last AI-graded (e.g. re-submission after a
+          // heartbeat race, a retried request, or violation finalization) — reuse the
+          // cached evaluation instead of re-billing the AI grading call.
+          isCorrect = Boolean(existingAnswerDoc.isCorrect);
+          pointsEarned = Number(existingAnswerDoc.pointsEarned) || 0;
+          aiEvaluation = existingSubjectiveEvaluation;
+        } else if (hasSubjectiveAnswer) {
           if (!subjectiveAutoGradingEnabled) {
             pointsEarned = 0;
             isCorrect = false;
@@ -2131,6 +2223,20 @@ export const submitAttemptHandler = async (req, res, next) => {
                     studentAnswer,
                     questionType: question.questionType,
                     points: question.points,
+                    evaluationConfig: {
+                      ...(question.evaluationConfig && typeof question.evaluationConfig === 'object'
+                        ? question.evaluationConfig
+                        : {}),
+                      rubric: rubricScoringEnabled
+                        ? (Array.isArray(question.evaluationConfig?.rubric) ? question.evaluationConfig.rubric : [])
+                        : [],
+                      difficulty: question.difficulty,
+                      supportingContext:
+                        question.passage ||
+                        question.instructions ||
+                        question.evaluationConfig?.supportingContext ||
+                        '',
+                    },
                     tenantId: attempt?.tenantId || req.user?.tenantId || null,
                     userId: req.user?._id || null,
                     metadata: {
@@ -2507,7 +2613,7 @@ export const submitAttemptHandler = async (req, res, next) => {
       submittedViolationLogs,
     );
 
-    await attempt.save();
+    attempt = await saveAttemptWithVersionRetry(attempt);
 
     try {
       const { createRoleNotification, createUserNotification } = await import('../services/notificationService.js');
@@ -3071,6 +3177,79 @@ router.post(
       });
 
       res.json({ attempt, message: 'Note added successfully' });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Recalculate attempt result (admin only, requires confirmation)
+router.put(
+  '/:attemptId/answers/:answerId/manual-grade',
+  requireAuth,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  validateObjectId('attemptId'),
+  validateObjectId('answerId'),
+  [
+    body('pointsEarned').isFloat({ min: 0 }).withMessage('pointsEarned must be a non-negative number'),
+    body('feedback').optional({ nullable: true }).isString().isLength({ max: 4000 }),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+      const attempt = await ExamAttempt.findById(req.params.attemptId).select('tenantId isCompleted');
+      if (!attempt) return res.status(404).json({ error: 'Attempt not found' });
+      if (!attempt.isCompleted) return res.status(400).json({ error: 'Only completed attempts can be manually graded' });
+      if (
+        req.user.role !== 'SUPER_ADMIN' &&
+        req.user.tenantId &&
+        attempt.tenantId &&
+        String(req.user.tenantId) !== String(attempt.tenantId)
+      ) {
+        return res.status(403).json({ error: 'You cannot grade an attempt outside your organisation' });
+      }
+
+      const answer = await Answer.findOne({ _id: req.params.answerId, attemptId: attempt._id })
+        .populate('questionId', 'points');
+      if (!answer) return res.status(404).json({ error: 'Answer not found for this attempt' });
+
+      const maximumMarks = Math.max(Number(answer.questionId?.points) || 0, 0);
+      const requestedMarks = Number(req.body.pointsEarned);
+      if (requestedMarks > maximumMarks) {
+        return res.status(400).json({ error: `Marks cannot exceed the question maximum of ${maximumMarks}` });
+      }
+
+      const previousMarks = Number(answer.pointsEarned) || 0;
+      const priorEvaluation = answer.aiEvaluation && typeof answer.aiEvaluation === 'object'
+        ? answer.aiEvaluation
+        : {};
+      answer.pointsEarned = Number(requestedMarks.toFixed(2));
+      answer.isCorrect = maximumMarks > 0 && answer.pointsEarned >= maximumMarks;
+      answer.needsReview = false;
+      answer.aiEvaluation = {
+        ...priorEvaluation,
+        manualOverride: {
+          applied: true,
+          previousMarks,
+          marks: answer.pointsEarned,
+          feedback: normalizeString(req.body.feedback),
+          overriddenBy: req.user._id,
+          overriddenAt: new Date(),
+        },
+      };
+      await answer.save();
+
+      const updatedAttempt = await ExamAttempt.findById(attempt._id);
+      await ensureScoreSummary(updatedAttempt, { includeAnswers: false });
+      await updatedAttempt.save();
+
+      res.json({
+        answer,
+        scoreSummary: updatedAttempt.scoreSummary,
+        message: 'Manual marks and feedback saved.',
+      });
     } catch (error) {
       next(error);
     }

@@ -22,6 +22,67 @@ import { resolveAttemptExhaustedExamIds } from '../utils/attemptAvailability.js'
 
 const router = express.Router();
 
+// `exam.duration` is always the exam's single resolved "effective minutes"
+// value (overall duration, section-duration sum, or manual override — see
+// Exam.js/routes/exams.js), so reading it directly covers every case,
+// including legacy exams created before timingMode/allowDurationOverride existed.
+const getEffectiveExamDurationMinutes = (exam) => {
+  const minutes = Number(exam?.duration);
+  return Number.isFinite(minutes) && minutes > 0 ? minutes : null;
+};
+
+const END_TIME_TOLERANCE_MS = 60 * 1000; // allow ~1 minute of rounding drift
+
+/**
+ * Resolve and validate a session's end time against the exam's effective
+ * duration. Returns `{ end, durationOverride }` or throws an Error with a
+ * `.status` for the route to translate into an HTTP response.
+ */
+const resolveSessionEndTime = ({ exam, start, endTime, overrideEndTime, overrideReason }) => {
+  const effectiveDurationMinutes = getEffectiveExamDurationMinutes(exam);
+  if (!effectiveDurationMinutes) {
+    const err = new Error("This exam's duration is not configured correctly.");
+    err.status = 400;
+    throw err;
+  }
+
+  const expectedEnd = new Date(start.getTime() + effectiveDurationMinutes * 60 * 1000);
+
+  if (!endTime) {
+    return { end: expectedEnd, durationOverride: undefined };
+  }
+
+  const end = new Date(endTime);
+  if (Number.isNaN(end.getTime())) {
+    const err = new Error('Valid end time is required');
+    err.status = 400;
+    throw err;
+  }
+
+  const diffMs = Math.abs(end.getTime() - expectedEnd.getTime());
+  if (diffMs <= END_TIME_TOLERANCE_MS) {
+    return { end, durationOverride: undefined };
+  }
+
+  if (overrideEndTime !== true || !String(overrideReason || '').trim()) {
+    const err = new Error(
+      `End time does not match the exam's calculated duration (${effectiveDurationMinutes} min from ${start.toISOString()}, expected ${expectedEnd.toISOString()}). ` +
+      'Provide overrideEndTime=true with a non-empty overrideReason to override, or omit endTime to auto-calculate.'
+    );
+    err.status = 400;
+    throw err;
+  }
+
+  return {
+    end,
+    durationOverride: {
+      applied: true,
+      reason: String(overrideReason).trim(),
+      calculatedEndTime: expectedEnd,
+    },
+  };
+};
+
 const generateManualToken = async () => {
   let token;
   let exists = true;
@@ -629,7 +690,9 @@ router.post(
     body('assignedCandidates.*').optional().isMongoId(),
     body('candidateAssignmentMode').optional().isIn(['replace']),
     body('startTime').isISO8601().withMessage('Valid start time is required'),
-    body('endTime').isISO8601().withMessage('Valid end time is required'),
+    body('endTime').optional().isISO8601().withMessage('End time must be a valid date when provided'),
+    body('overrideEndTime').optional().isBoolean(),
+    body('overrideReason').optional().isString(),
   ],
   async (req, res, next) => {
     try {
@@ -645,6 +708,8 @@ router.post(
         startTime,
         endTime,
         distributionMode = 'single',
+        overrideEndTime,
+        overrideReason,
       } = req.body;
 
       const normalizedMode = distributionMode || 'single';
@@ -718,7 +783,24 @@ router.post(
 
       // Verify times
       const start = new Date(startTime);
-      const end = new Date(endTime);
+      if (Number.isNaN(start.getTime())) {
+        return res.status(400).json({ error: 'Valid start time is required' });
+      }
+
+      let end;
+      let durationOverride;
+      try {
+        ({ end, durationOverride } = resolveSessionEndTime({
+          exam,
+          start,
+          endTime,
+          overrideEndTime,
+          overrideReason,
+        }));
+      } catch (resolveError) {
+        return res.status(resolveError.status || 400).json({ error: resolveError.message });
+      }
+
       if (end <= start) {
         return res.status(400).json({ error: 'End time must be after start time' });
       }
@@ -740,6 +822,7 @@ router.post(
         createdBy: req.user._id,
         tenantId,
         assignAllCandidates: candidatePayload.ids.length === 0,
+        ...(durationOverride ? { durationOverride } : {}),
       });
 
       const requestOrigin =
@@ -866,14 +949,30 @@ router.put(
           session.endTime = now;
         }
       } else if (nextEndTimeRaw) {
-        const nextEndTime = new Date(nextEndTimeRaw);
-        if (Number.isNaN(nextEndTime.getTime())) {
-          return res.status(400).json({ error: 'Valid end time is required' });
+        const exam = await Exam.findById(session.examId);
+        if (!exam) {
+          return res.status(404).json({ error: 'Exam not found' });
         }
+
+        let nextEndTime;
+        let durationOverride;
+        try {
+          ({ end: nextEndTime, durationOverride } = resolveSessionEndTime({
+            exam,
+            start: session.startTime,
+            endTime: nextEndTimeRaw,
+            overrideEndTime: req.body?.overrideEndTime,
+            overrideReason: req.body?.overrideReason,
+          }));
+        } catch (resolveError) {
+          return res.status(resolveError.status || 400).json({ error: resolveError.message });
+        }
+
         if (nextEndTime <= session.startTime) {
           return res.status(400).json({ error: 'End time must be after start time' });
         }
         session.endTime = nextEndTime;
+        session.durationOverride = durationOverride || { applied: false };
       } else if (!candidatePayload.provided) {
         return res.status(400).json({
           error:

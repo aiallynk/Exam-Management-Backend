@@ -96,6 +96,19 @@ const ExamSessionSchema = new mongoose.Schema(
     normalizationLockedAt: {
       type: Date,
     },
+    durationOverride: {
+      applied: {
+        type: Boolean,
+        default: false,
+      },
+      reason: {
+        type: String,
+        trim: true,
+      },
+      calculatedEndTime: {
+        type: Date,
+      },
+    },
   },
   {
     timestamps: true,

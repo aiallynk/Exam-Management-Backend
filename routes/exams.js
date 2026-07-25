@@ -1420,6 +1420,8 @@ router.post(
     body('showResultsImmediately').optional().isBoolean(),
     body('examType').optional().isString(),
     body('sections').optional().isArray(),
+    body('timingMode').optional().isIn(['overall', 'section_based']),
+    body('allowDurationOverride').optional().isBoolean(),
     body('markingRules').optional().isObject(),
     body('answerKey').optional(),
     body('omrTemplateImage').optional().isString(),
@@ -1471,6 +1473,8 @@ router.post(
         certificateTemplate,
         examType,
         sections,
+        timingMode,
+        allowDurationOverride,
         answerKey,
         markingRules,
         omrTemplateImage,
@@ -1555,12 +1559,18 @@ router.post(
         }
 
         const computedDuration = computeSectionDurationTotal(safeSections);
-        if (requestedDuration !== null && requestedDuration !== computedDuration) {
+        const durationOverrideAllowed = allowDurationOverride === true;
+        if (
+          requestedDuration !== null &&
+          requestedDuration !== computedDuration &&
+          !durationOverrideAllowed
+        ) {
           return res.status(400).json({
             error: `Duration mismatch for section-based exam. Expected ${computedDuration} minutes from sections.`,
           });
         }
-        resolvedDuration = computedDuration;
+        resolvedDuration =
+          durationOverrideAllowed && requestedDuration !== null ? requestedDuration : computedDuration;
       }
 
       if (resolvedDuration === null) {
@@ -1639,6 +1649,8 @@ router.post(
           : 60,
         certificateTemplate: allowCertification ? (certificateTemplate || null) : null,
         examType: isOmrRequest ? OMR_EXAM_TYPE : ONLINE_EXAM_TYPE,
+        timingMode: sectionBasedRequest ? 'section_based' : 'overall',
+        allowDurationOverride: sectionBasedRequest ? Boolean(allowDurationOverride) : false,
         totalMarks: Number.isFinite(Number(totalMarks)) ? Math.max(0, Number(totalMarks)) : 0,
         createdBy: req.user._id,
         tenantId: resolvedTenantId,
@@ -1762,6 +1774,8 @@ router.put(
     body('showResultsImmediately').optional().isBoolean(),
     body('examType').optional().isString(),
     body('sections').optional().isArray(),
+    body('timingMode').optional().isIn(['overall', 'section_based']),
+    body('allowDurationOverride').optional().isBoolean(),
     body('markingRules').optional().isObject(),
     body('answerKey').optional(),
     body('omrTemplateImage').optional().isString(),
@@ -1863,6 +1877,8 @@ router.put(
         resultsReleasedAt,
         examType,
         sections,
+        timingMode,
+        allowDurationOverride,
         answerKey,
         markingRules,
         omrTemplateImage,
@@ -1993,12 +2009,26 @@ router.put(
         }
 
         const computedDuration = computeSectionDurationTotal(safeSections);
-        if (requestedDuration !== null && requestedDuration !== computedDuration) {
+        const durationOverrideAllowed = allowDurationOverride === true;
+        if (
+          requestedDuration !== null &&
+          requestedDuration !== computedDuration &&
+          !durationOverrideAllowed
+        ) {
           return res.status(400).json({
             error: `Duration mismatch for section-based exam. Expected ${computedDuration} minutes from sections.`,
           });
         }
-        exam.duration = computedDuration;
+        exam.duration =
+          durationOverrideAllowed && requestedDuration !== null ? requestedDuration : computedDuration;
+      }
+
+      if (sectionBasedUpdate) {
+        exam.timingMode = 'section_based';
+        exam.allowDurationOverride = Boolean(allowDurationOverride);
+      } else if (timingMode !== undefined || allowDurationOverride !== undefined) {
+        if (timingMode !== undefined) exam.timingMode = timingMode;
+        if (allowDurationOverride !== undefined) exam.allowDurationOverride = Boolean(allowDurationOverride);
       }
 
       if (title) exam.title = title;
