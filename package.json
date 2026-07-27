@@ -7,8 +7,10 @@
   "scripts": {
     "start": "node server.js",
     "dev": "node --watch server.js",
-    "build": "pip install -r services/omr/requirements.txt && echo 'Server build complete - ready for production'",
+    "test": "node --test tests/*.test.js",
+    "build": "node --check server.js && node --check routes/tenantFeatures.js && node --check routes/superAdmin.js && node --check routes/tenantEvaluators.js && node --check routes/examEvaluators.js && node --check services/evaluatorAssignmentService.js && node --check models/ExaminerAssignment.js && node --check scripts/migrateEvaluatorAssignmentIndexes.js && python3 -c \"from pathlib import Path; compile(Path('services/omr/omr.py').read_text(), 'services/omr/omr.py', 'exec')\" && echo 'Server build checks complete'",
     "seed": "node scripts/seed.js",
+    "migrate:evaluator-assignment-indexes": "node scripts/migrateEvaluatorAssignmentIndexes.js",
     "backfill:exam-packages": "node scripts/backfillExamPackages.js",
     "backfill:question-paper-questions": "node scripts/backfillQuestionPaperQuestions.js",
     "backup:worker": "node workers/backupWorker.js",

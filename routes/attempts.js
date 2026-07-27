@@ -13,12 +13,17 @@ import {
   canCandidateAccessSession,
   requireExamPermission,
   hasExamPermission,
+  hasActiveExaminerAssignment,
 } from '../middleware/examPermissions.js';
+import ExaminerAssignment from '../models/ExaminerAssignment.js';
 import { checkCandidateAttemptLimit } from '../middleware/planLimits.js';
 import { body, validationResult } from 'express-validator';
 import { validateObjectId, sanitizePagination, validateObjectIds } from '../middleware/validation.js';
 import { auditLog, AUDIT_ACTIONS } from '../middleware/audit.js';
+import { logAuditEvent } from '../utils/auditLogger.js';
 import { evaluateAnswer } from '../services/aiService.js';
+import { classifySubmissionEvaluations } from '../services/evaluationOrchestratorService.js';
+import { autoDistributeOnAttemptCompletion } from '../services/responseDistributionService.js';
 import { assignQuestionPaperToStudent } from '../services/sessionAssignment.js';
 import {
   MIN_CERTIFICATION_PERCENTAGE,
@@ -46,6 +51,7 @@ import {
   saveCodingSubmissionRecord,
 } from '../services/codingSubmissionService.js';
 import { normalizeCodingLanguage } from '../utils/codingQuestions.js';
+import { hasRole } from '../utils/userRoles.js';
 import {
   FOCUS_VIOLATION_SUBMISSION_SOURCE,
   TAB_SWITCH_DISQUALIFY_STATUS,
@@ -205,12 +211,25 @@ const computeMultiSelectScoring = ({
     correctSelectionCount === expectedSet.size &&
     receivedSet.size === expectedSet.size;
 
+  // New question configuration is persisted in evaluationConfig. Retain the
+  // former top-level shape as a read-only compatibility fallback for records
+  // created before that contract was introduced.
   const questionScoring =
-    question?.multiSelectScoring &&
-    typeof question.multiSelectScoring === 'object' &&
-    !Array.isArray(question.multiSelectScoring)
-      ? question.multiSelectScoring
-      : {};
+    question?.evaluationConfig?.multiSelectScoring &&
+    typeof question.evaluationConfig.multiSelectScoring === 'object' &&
+    !Array.isArray(question.evaluationConfig.multiSelectScoring)
+      ? question.evaluationConfig.multiSelectScoring
+      : question?.multiSelectScoring &&
+          typeof question.multiSelectScoring === 'object' &&
+          !Array.isArray(question.multiSelectScoring)
+        ? question.multiSelectScoring
+        : {};
+  const scoringMode = String(
+    questionScoring.scoringMode ||
+      (questionScoring.partialMarking || questionScoring.enablePartialMarking
+        ? 'PROPORTIONAL_PARTIAL'
+        : 'ALL_OR_NOTHING')
+  ).toUpperCase();
   const partialMarkingEnabled =
     questionScoring.partialMarking === true ||
     questionScoring.enablePartialMarking === true ||
@@ -223,16 +242,42 @@ const computeMultiSelectScoring = ({
     examMarkingRules?.multiSelectWrongSelectionPenalty ??
     (examMarkingRules?.negativeMarking ? examMarkingRules?.negativeMarks : 0);
   const wrongSelectionPenalty = Number.isFinite(Number(configuredPenaltyRaw))
-    ? Number(configuredPenaltyRaw)
+    ? Math.max(0, Number(configuredPenaltyRaw))
     : 0;
+  const defaultCorrectOptionMarks = expectedSet.size > 0 ? questionPoints / expectedSet.size : 0;
 
   let pointsEarned = allCorrect ? questionPoints : 0;
-  if (!allCorrect && partialMarkingEnabled && expectedSet.size > 0) {
-    pointsEarned = (questionPoints * correctSelectionCount) / expectedSet.size;
-    if (deductWrongSelections && wrongSelectionCount > 0 && wrongSelectionPenalty > 0) {
-      pointsEarned -= wrongSelectionCount * wrongSelectionPenalty;
+  if (!allCorrect && expectedSet.size > 0) {
+    if (scoringMode === 'PROPORTIONAL_PARTIAL' || partialMarkingEnabled) {
+      pointsEarned = (questionPoints * correctSelectionCount) / expectedSet.size;
+      // A proportional policy must not award full marks for selecting every
+      // option. If no explicit penalty is configured, one correct-option
+      // share is deducted for each incorrect selection.
+      const penalty = deductWrongSelections || wrongSelectionCount > 0
+        ? wrongSelectionPenalty || defaultCorrectOptionMarks
+        : 0;
+      pointsEarned -= wrongSelectionCount * penalty;
+    } else if (scoringMode === 'POSITIVE_MINUS_INCORRECT') {
+      const correctOptionMarks = Number.isFinite(Number(questionScoring.correctOptionMarks))
+        ? Math.max(0, Number(questionScoring.correctOptionMarks))
+        : defaultCorrectOptionMarks;
+      const penalty = wrongSelectionPenalty || correctOptionMarks;
+      pointsEarned = correctSelectionCount * correctOptionMarks - wrongSelectionCount * penalty;
+    } else if (scoringMode === 'PER_OPTION_WEIGHT') {
+      const optionWeights =
+        questionScoring.optionWeights && typeof questionScoring.optionWeights === 'object'
+          ? questionScoring.optionWeights
+          : {};
+      pointsEarned = Array.from(receivedSet).reduce((score, option) => {
+        const configuredWeight = optionWeights[option] ?? optionWeights[String(option).toLowerCase()];
+        if (Number.isFinite(Number(configuredWeight))) {
+          return score + Number(configuredWeight);
+        }
+        return score + (expectedSet.has(option) ? defaultCorrectOptionMarks : -wrongSelectionPenalty);
+      }, 0);
     }
-    pointsEarned = Number(Math.max(pointsEarned, 0).toFixed(2));
+
+    pointsEarned = Number(Math.min(questionPoints, Math.max(pointsEarned, 0)).toFixed(2));
   }
 
   return {
@@ -1801,7 +1846,7 @@ export const submitAttemptHandler = async (req, res, next) => {
     let attempt = await ExamAttempt.findById(req.params.attemptId)
       .populate(
         'examId',
-        'title duration showResultsImmediately resultsReleasedAt accessControl markingRules'
+        'title duration showResultsImmediately resultsReleasedAt accessControl markingRules evaluationMode'
       )
       .populate('sessionId');
 
@@ -2491,6 +2536,26 @@ export const submitAttemptHandler = async (req, res, next) => {
 
     if (answerWriteOperations.length > 0) {
       await Answer.bulkWrite(answerWriteOperations, { ordered: false });
+    }
+
+    try {
+      await classifySubmissionEvaluations(attempt._id, attempt.examId);
+    } catch (classifyError) {
+      // Never block submission on this bookkeeping step; evaluationMode
+      // defaults to AUTOMATIC anyway, so this only affects opted-in exams.
+      console.error('[EVALUATION] Failed to classify submission evaluations:', classifyError?.message || classifyError);
+    }
+
+    try {
+      // No-op for every exam that hasn't opted into evaluatorDistributionStrategy
+      // (i.e. every exam that existed before this feature). autoDistributeOnAttemptCompletion
+      // never throws — it swallows and logs its own errors.
+      await autoDistributeOnAttemptCompletion({
+        attemptId: attempt._id,
+        examId: attempt.examId?._id || attempt.examId,
+      });
+    } catch (distributionError) {
+      console.error('[RESPONSE_DISTRIBUTION] Unexpected error invoking auto-distribution:', distributionError?.message || distributionError);
     }
 
     const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
@@ -3183,37 +3248,155 @@ router.post(
   }
 );
 
-// Recalculate attempt result (admin only, requires confirmation)
+// Fetch an attempt + its answers for examiner review. Requires an active
+// ExaminerAssignment covering this attempt (privileged roles bypass, same as
+// the grading routes below). Student identity is omitted unless the
+// assignment grants canViewStudentIdentity.
+router.get(
+  '/:attemptId/for-review',
+  requireAuth,
+  validateObjectId('attemptId'),
+  async (req, res, next) => {
+    try {
+      const attempt = await ExamAttempt.findById(req.params.attemptId)
+        .populate('examId', 'title duration evaluationMode')
+        .populate('userId', 'name email');
+      if (!attempt) return res.status(404).json({ error: 'Attempt not found' });
+      if (!attempt.isCompleted) return res.status(400).json({ error: 'This attempt has not been submitted yet' });
+
+      const isPrivilegedRole = ['EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+      // An active ExaminerAssignment alone is not sufficient authorization —
+      // the caller must also hold the EVALUATOR role. Assignments can only
+      // be created for users with evaluatorAccess.enabled today, but the
+      // role check is the actual authorization boundary going forward.
+      if (!isPrivilegedRole && !hasRole(req.user, 'EVALUATOR')) {
+        return res.status(403).json({ error: 'Evaluator role required to review this attempt.' });
+      }
+      const allAnswers = await Answer.find({ attemptId: attempt._id })
+        .populate('questionId', 'questionText questionType options correctAnswer points sectionId order evaluationConfig');
+
+      let examinerAssignment = null;
+      let answers = allAnswers;
+      let matchingAssignments = [];
+
+      if (!isPrivilegedRole) {
+        // A section/question assignment grants visibility only to the matching
+        // answers, never the entire attempt. This prevents a scoped evaluator
+        // from learning unrelated candidate responses through the review API.
+        const scopedAnswers = await Promise.all(
+          allAnswers.map(async (answer) => {
+            const assignment = await hasActiveExaminerAssignment(
+              req.user._id,
+              attempt.examId?._id || attempt.examId,
+              {
+                attemptId: attempt._id,
+                questionId: answer.questionId?._id || answer.questionId,
+                sectionId: answer.questionId?.sectionId,
+              }
+            );
+            return assignment ? { answer, assignment } : null;
+          })
+        );
+
+        const permitted = scopedAnswers.filter(Boolean);
+        if (!permitted.length) {
+          return res.status(403).json({ error: 'You do not have an active examiner assignment covering this evaluation scope.' });
+        }
+
+        answers = permitted.map(({ answer }) => answer);
+        matchingAssignments = permitted.map(({ assignment }) => assignment);
+        examinerAssignment = matchingAssignments[0];
+      }
+
+      const canViewStudentIdentity =
+        isPrivilegedRole || matchingAssignments.every((assignment) => assignment.canViewStudentIdentity);
+
+      res.json({
+        attempt: {
+          _id: attempt._id,
+          examId: attempt.examId,
+          submitTime: attempt.submitTime,
+          scoreSummary: attempt.scoreSummary,
+          candidate: canViewStudentIdentity ? attempt.userId : null,
+        },
+        answers,
+        assignment: examinerAssignment
+          ? {
+            canApproveAiScore: examinerAssignment.canApproveAiScore,
+            canOverrideScore: examinerAssignment.canOverrideScore,
+            canAddFeedback: examinerAssignment.canAddFeedback,
+            requiresOverrideReason: examinerAssignment.requiresOverrideReason,
+          }
+          : null,
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Manually grade an answer. Allowed for EXAM_CREATOR/TENANT_ADMIN/SUPER_ADMIN
+// (as before), OR for an examiner holding an active ExaminerAssignment that
+// covers this attempt and permits score overrides.
 router.put(
   '/:attemptId/answers/:answerId/manual-grade',
   requireAuth,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
   validateObjectId('attemptId'),
   validateObjectId('answerId'),
   [
     body('pointsEarned').isFloat({ min: 0 }).withMessage('pointsEarned must be a non-negative number'),
     body('feedback').optional({ nullable: true }).isString().isLength({ max: 4000 }),
+    body('overrideReason').optional({ nullable: true }).isString().isLength({ max: 1000 }),
   ],
   async (req, res, next) => {
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-      const attempt = await ExamAttempt.findById(req.params.attemptId).select('tenantId isCompleted');
+      const attempt = await ExamAttempt.findById(req.params.attemptId).select('tenantId isCompleted examId');
       if (!attempt) return res.status(404).json({ error: 'Attempt not found' });
       if (!attempt.isCompleted) return res.status(400).json({ error: 'Only completed attempts can be manually graded' });
-      if (
-        req.user.role !== 'SUPER_ADMIN' &&
-        req.user.tenantId &&
-        attempt.tenantId &&
-        String(req.user.tenantId) !== String(attempt.tenantId)
-      ) {
-        return res.status(403).json({ error: 'You cannot grade an attempt outside your organisation' });
+
+      const isPrivilegedRole = ['EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+      // An active ExaminerAssignment alone is not sufficient authorization —
+      // the caller must also hold the EVALUATOR role. Assignments can only
+      // be created for users with evaluatorAccess.enabled today, but the
+      // role check is the actual authorization boundary going forward.
+      if (!isPrivilegedRole && !hasRole(req.user, 'EVALUATOR')) {
+        return res.status(403).json({ error: 'Evaluator role required to review this attempt.' });
+      }
+      let examinerAssignment = null;
+
+      if (isPrivilegedRole) {
+        if (
+          req.user.role !== 'SUPER_ADMIN' &&
+          req.user.tenantId &&
+          attempt.tenantId &&
+          String(req.user.tenantId) !== String(attempt.tenantId)
+        ) {
+          return res.status(403).json({ error: 'You cannot grade an attempt outside your organisation' });
+        }
       }
 
       const answer = await Answer.findOne({ _id: req.params.answerId, attemptId: attempt._id })
-        .populate('questionId', 'points');
+        .populate('questionId', 'points sectionId');
       if (!answer) return res.status(404).json({ error: 'Answer not found for this attempt' });
+
+      if (!isPrivilegedRole) {
+        examinerAssignment = await hasActiveExaminerAssignment(req.user._id, attempt.examId, {
+          attemptId: attempt._id,
+          questionId: answer.questionId?._id || answer.questionId,
+          sectionId: answer.questionId?.sectionId,
+        });
+        if (!examinerAssignment || !examinerAssignment.canOverrideScore) {
+          return res.status(403).json({
+            error: 'You do not have an active examiner assignment permitting score overrides for this answer.',
+          });
+        }
+        if (examinerAssignment.requiresOverrideReason && !String(req.body.overrideReason || '').trim()) {
+          return res.status(400).json({ error: 'A reason is required to override this score.' });
+        }
+      }
 
       const maximumMarks = Math.max(Number(answer.questionId?.points) || 0, 0);
       const requestedMarks = Number(req.body.pointsEarned);
@@ -3239,16 +3422,212 @@ router.put(
           overriddenAt: new Date(),
         },
       };
+
+      if (examinerAssignment) {
+        answer.examinerScore = answer.pointsEarned;
+        answer.examinerFeedback = normalizeString(req.body.feedback) || answer.examinerFeedback;
+        answer.examinerId = req.user._id;
+        answer.examinerReviewedAt = new Date();
+        answer.finalScoreSource = 'EXAMINER';
+        answer.evaluationStatus = 'REVIEWED';
+      } else {
+        answer.finalScoreSource = 'ADMIN_OVERRIDE';
+        answer.evaluationStatus = 'FINALIZED';
+      }
+
       await answer.save();
 
       const updatedAttempt = await ExamAttempt.findById(attempt._id);
-      await ensureScoreSummary(updatedAttempt, { includeAnswers: false });
+      await ensureScoreSummary(updatedAttempt, { includeAnswers: false, force: true });
       await updatedAttempt.save();
+
+      await logAuditEvent(AUDIT_ACTIONS.ANSWER_SCORE_OVERRIDDEN, {
+        userId: req.user._id,
+        userRole: req.user.role,
+        tenantId: attempt.tenantId || null,
+        resourceType: 'Answer',
+        resourceId: answer._id,
+        details: {
+          attemptId: attempt._id,
+          previousMarks,
+          newMarks: answer.pointsEarned,
+          reason: req.body.overrideReason || null,
+          viaExaminerAssignment: Boolean(examinerAssignment),
+        },
+      });
 
       res.json({
         answer,
         scoreSummary: updatedAttempt.scoreSummary,
         message: 'Manual marks and feedback saved.',
+      });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+// Examiner review action: approve the current AI/rule score as-is, override
+// it, or flag it for moderation. Requires an active ExaminerAssignment
+// covering this attempt (privileged roles bypass this the same way the
+// manual-grade route does, so exam creators/admins can always act too).
+router.put(
+  '/:attemptId/answers/:answerId/examiner-review',
+  requireAuth,
+  validateObjectId('attemptId'),
+  validateObjectId('answerId'),
+  [
+    body('action').isIn(['approve', 'override', 'flag']).withMessage('action must be approve, override, or flag'),
+    body('pointsEarned').optional({ nullable: true }).isFloat({ min: 0 }),
+    body('feedback').optional({ nullable: true }).isString().isLength({ max: 4000 }),
+    body('overrideReason').optional({ nullable: true }).isString().isLength({ max: 1000 }),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+      const attempt = await ExamAttempt.findById(req.params.attemptId).select('tenantId isCompleted examId');
+      if (!attempt) return res.status(404).json({ error: 'Attempt not found' });
+      if (!attempt.isCompleted) return res.status(400).json({ error: 'Only completed attempts can be reviewed' });
+
+      const isPrivilegedRole = ['EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'].includes(req.user.role);
+      // An active ExaminerAssignment alone is not sufficient authorization —
+      // the caller must also hold the EVALUATOR role. Assignments can only
+      // be created for users with evaluatorAccess.enabled today, but the
+      // role check is the actual authorization boundary going forward.
+      if (!isPrivilegedRole && !hasRole(req.user, 'EVALUATOR')) {
+        return res.status(403).json({ error: 'Evaluator role required to review this attempt.' });
+      }
+      let examinerAssignment = null;
+
+      if (isPrivilegedRole && (
+        req.user.role !== 'SUPER_ADMIN' &&
+        req.user.tenantId &&
+        attempt.tenantId &&
+        String(req.user.tenantId) !== String(attempt.tenantId)
+      )) {
+        return res.status(403).json({ error: 'You cannot review an attempt outside your organisation' });
+      }
+
+      const answer = await Answer.findOne({ _id: req.params.answerId, attemptId: attempt._id })
+        .populate('questionId', 'points sectionId');
+      if (!answer) return res.status(404).json({ error: 'Answer not found for this attempt' });
+
+      if (!isPrivilegedRole) {
+        examinerAssignment = await hasActiveExaminerAssignment(req.user._id, attempt.examId, {
+          attemptId: attempt._id,
+          questionId: answer.questionId?._id || answer.questionId,
+          sectionId: answer.questionId?.sectionId,
+        });
+        if (!examinerAssignment) {
+          return res.status(403).json({
+            error: 'You do not have an active examiner assignment covering this answer.',
+          });
+        }
+      }
+
+      const action = req.body.action;
+      const maximumMarks = Math.max(Number(answer.questionId?.points) || 0, 0);
+      const feedback = normalizeString(req.body.feedback);
+      let auditAction = AUDIT_ACTIONS.ANSWER_EXAMINER_REVIEWED;
+      let scoreChanged = false;
+
+      if (action === 'approve') {
+        if (examinerAssignment && !examinerAssignment.canApproveAiScore) {
+          return res.status(403).json({ error: 'This assignment does not permit approving AI scores.' });
+        }
+        answer.examinerScore = answer.pointsEarned;
+        answer.examinerFeedback = feedback || answer.examinerFeedback;
+        answer.examinerId = req.user._id;
+        answer.examinerReviewedAt = new Date();
+        answer.finalScoreSource = 'EXAMINER';
+        answer.evaluationStatus = 'REVIEWED';
+        answer.needsReview = false;
+      } else if (action === 'override') {
+        if (examinerAssignment && !examinerAssignment.canOverrideScore) {
+          return res.status(403).json({ error: 'This assignment does not permit overriding scores.' });
+        }
+        if (
+          examinerAssignment?.requiresOverrideReason &&
+          !String(req.body.overrideReason || '').trim()
+        ) {
+          return res.status(400).json({ error: 'A reason is required to override this score.' });
+        }
+        if (req.body.pointsEarned === undefined || req.body.pointsEarned === null) {
+          return res.status(400).json({ error: 'pointsEarned is required to override a score.' });
+        }
+        const requestedMarks = Number(req.body.pointsEarned);
+        if (requestedMarks > maximumMarks) {
+          return res.status(400).json({ error: `Marks cannot exceed the question maximum of ${maximumMarks}` });
+        }
+        const previousMarks = Number(answer.pointsEarned) || 0;
+        answer.pointsEarned = Number(requestedMarks.toFixed(2));
+        answer.isCorrect = maximumMarks > 0 && answer.pointsEarned >= maximumMarks;
+        answer.examinerScore = answer.pointsEarned;
+        answer.examinerFeedback = feedback || answer.examinerFeedback;
+        answer.examinerId = req.user._id;
+        answer.examinerReviewedAt = new Date();
+        answer.finalScoreSource = 'EXAMINER';
+        answer.evaluationStatus = 'REVIEWED';
+        answer.needsReview = false;
+        auditAction = AUDIT_ACTIONS.ANSWER_SCORE_OVERRIDDEN;
+        scoreChanged = true;
+        req.body.__previousMarks = previousMarks;
+      } else if (action === 'flag') {
+        answer.examinerFeedback = feedback || answer.examinerFeedback;
+        answer.examinerId = req.user._id;
+        answer.examinerReviewedAt = new Date();
+        answer.evaluationStatus = 'FLAGGED';
+        auditAction = AUDIT_ACTIONS.ANSWER_FLAGGED_FOR_MODERATION;
+      }
+
+      await answer.save();
+
+      let scoreSummary = null;
+      if (scoreChanged) {
+        const updatedAttempt = await ExamAttempt.findById(attempt._id);
+        await ensureScoreSummary(updatedAttempt, { includeAnswers: false, force: true });
+        await updatedAttempt.save();
+        scoreSummary = updatedAttempt.scoreSummary;
+      }
+
+      await logAuditEvent(auditAction, {
+        userId: req.user._id,
+        userRole: req.user.role,
+        tenantId: attempt.tenantId || null,
+        resourceType: 'Answer',
+        resourceId: answer._id,
+        details: {
+          attemptId: attempt._id,
+          action,
+          previousMarks: req.body.__previousMarks ?? null,
+          newMarks: scoreChanged ? answer.pointsEarned : null,
+          reason: req.body.overrideReason || null,
+        },
+      });
+
+      if (action === 'flag' && attempt.tenantId) {
+        try {
+          const { createRoleNotification } = await import('../services/notificationService.js');
+          await createRoleNotification({
+            title: 'Answer Flagged for Moderation',
+            message: 'An examiner has flagged an answer for moderation review.',
+            type: 'answer_flagged_for_moderation',
+            tenantId: attempt.tenantId,
+            createdBy: req.user._id,
+            roles: ['TENANT_ADMIN', 'EXAM_CREATOR'],
+            metadata: { attemptId: attempt._id, answerId: answer._id },
+          });
+        } catch (notifyError) {
+          console.error('[NOTIFICATIONS] Failed to notify moderation flag:', notifyError?.message || notifyError);
+        }
+      }
+
+      res.json({
+        answer,
+        scoreSummary,
+        message: `Answer ${action === 'approve' ? 'approved' : action === 'override' ? 'overridden' : 'flagged for moderation'}.`,
       });
     } catch (error) {
       next(error);
@@ -3290,9 +3669,10 @@ router.post(
         percentile: attempt.percentile || null,
       };
 
-      // Recalculate score summary
+      // Recalculate score summary (force: bypass the cache so an updated
+      // Answer.pointsEarned actually changes the attempt total)
       const { ensureScoreSummary } = await import('../utils/attemptScores.js');
-      const scoreResult = await ensureScoreSummary(attempt, { includeAnswers: false });
+      const scoreResult = await ensureScoreSummary(attempt, { includeAnswers: false, force: true });
 
       // Recalculate normalization if applicable
       let normalizationResult = null;
@@ -3346,104 +3726,6 @@ router.post(
           percentage: attempt.scoreSummary?.percentage || 0,
           normalizedScore: attempt.normalizedScore || null,
           percentile: attempt.percentile || null,
-        },
-      });
-    } catch (error) {
-      next(error);
-    }
-  }
-);
-
-// Recalculate attempt result (admin only, requires confirmation)
-router.post(
-  '/:attemptId/recalculate',
-  requireAuth,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
-  validateObjectId('attemptId'),
-  [
-    body('confirm').equals('true').withMessage('Confirmation required'),
-  ],
-  async (req, res, next) => {
-    try {
-      const errors = validationResult(req);
-      if (!errors.isEmpty()) {
-        return res.status(400).json({ errors: errors.array() });
-      }
-
-      const attempt = await ExamAttempt.findById(req.params.attemptId);
-      if (!attempt) {
-        return res.status(404).json({ error: 'Attempt not found' });
-      }
-
-      if (!attempt.isCompleted) {
-        return res.status(400).json({ error: 'Cannot recalculate score for incomplete attempt' });
-      }
-
-      // Store before state for audit
-      const beforeState = {
-        totalScore: attempt.scoreSummary?.totalScore || 0,
-        maxScore: attempt.scoreSummary?.maxScore || 0,
-        percentage: attempt.scoreSummary?.percentage || 0,
-        normalizedScore: attempt.normalizedScore,
-        percentile: attempt.percentile,
-      };
-
-      // Recalculate score summary
-      const { ensureScoreSummary } = await import('../utils/attemptScores.js');
-      const scoreResult = await ensureScoreSummary(attempt, { includeAnswers: false });
-
-      // Recalculate normalization if applicable
-      let normalizationResult = null;
-      try {
-        const { calculateNormalizedScore } = await import('../services/normalizationService.js');
-        normalizationResult = await calculateNormalizedScore(attempt._id);
-
-        attempt.normalizedScore = normalizationResult.normalizedScore;
-        attempt.percentile = normalizationResult.percentile;
-        attempt.sessionPercentile = normalizationResult.sessionPercentile;
-      } catch (err) {
-        // Normalization might not be configured - that's okay
-        console.log('Normalization not available:', err.message);
-      }
-
-      await attempt.save();
-
-      // Log audit
-      const { logAuditEvent, AUDIT_ACTIONS } = await import('../utils/auditLogger.js');
-      await logAuditEvent(AUDIT_ACTIONS.ATTEMPT_RECALCULATED || 'ATTEMPT_RECALCULATED', {
-        userId: req.user._id,
-        userEmail: req.user.email,
-        userName: req.user.name,
-        userRole: req.user.role,
-        tenantId: attempt.tenantId || null,
-        resourceType: 'ExamAttempt',
-        resourceId: attempt._id,
-        ip: req.ip,
-        userAgent: req.get('user-agent'),
-        method: req.method,
-        path: req.path,
-        details: {
-          before: beforeState,
-          after: {
-            totalScore: attempt.scoreSummary?.totalScore || 0,
-            maxScore: attempt.scoreSummary?.maxScore || 0,
-            percentage: attempt.scoreSummary?.percentage || 0,
-            normalizedScore: attempt.normalizedScore,
-            percentile: attempt.percentile,
-          },
-        },
-      });
-
-      res.json({
-        attempt,
-        message: 'Result recalculated successfully',
-        before: beforeState,
-        after: {
-          totalScore: attempt.scoreSummary?.totalScore || 0,
-          maxScore: attempt.scoreSummary?.maxScore || 0,
-          percentage: attempt.scoreSummary?.percentage || 0,
-          normalizedScore: attempt.normalizedScore,
-          percentile: attempt.percentile,
         },
       });
     } catch (error) {

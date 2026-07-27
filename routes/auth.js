@@ -524,6 +524,11 @@ const buildAccessTokenPayload = ({ user, tenantId, tokenVersion }) => {
     email: user.email,
     name: user.name,
     role: user.role,
+    // Informational only — middleware/auth.js's requireAuth always re-derives
+    // req.user.roles from a fresh DB read on every request, the same way it
+    // already does for `role`, so a role change takes effect immediately
+    // without waiting for the next token refresh.
+    roles: user.roles && user.roles.length ? user.roles : [user.role],
     tenantId: tenantId || null,
   };
 
@@ -678,6 +683,7 @@ router.post(
           name: user.name,
           email: user.email,
           role: user.role,
+          roles: user.roles && user.roles.length ? user.roles : [user.role],
           planType: user.planType,
           examsCreated: user.examsCreated ?? 0,
           tenantId: tenant?._id || null,
@@ -976,6 +982,7 @@ router.post(
           name: user.name,
           email: user.email,
           role: user.role,
+          roles: user.roles && user.roles.length ? user.roles : [user.role],
           planType: user.planType,
           examsCreated: user.examsCreated ?? 0,
           tenantId: tenant?._id || null,
@@ -1273,6 +1280,7 @@ router.post('/refresh', async (req, res, next) => {
           name: user.name,
           email: user.email,
           role: user.role,
+          roles: user.roles && user.roles.length ? user.roles : [user.role],
           planType: user.planType,
           examsCreated: user.examsCreated ?? 0,
           tenantId: tenant?._id || null,

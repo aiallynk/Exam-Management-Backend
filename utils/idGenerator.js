@@ -88,4 +88,5 @@ export const ID_PREFIXES = {
   USER: 'USR',
   EXAM_PARTICIPANT: 'EP',
   SECTION: 'SEC',
+  EXAMINER_ASSIGNMENT: 'EXA',
 };

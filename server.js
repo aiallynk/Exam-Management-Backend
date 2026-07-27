@@ -21,6 +21,8 @@ import questionRoutes from './routes/questions.js';
 import questionPaperRoutes from './routes/questionPapers.js';
 import sessionRoutes from './routes/sessions.js';
 import attemptRoutes from './routes/attempts.js';
+import examinerAssignmentRoutes from './routes/examinerAssignments.js';
+import examEvaluatorRoutes from './routes/examEvaluators.js';
 import resultRoutes from './routes/results.js';
 import candidateRoutes from './routes/candidates.js'; // Universal: renamed from student.js
 import adminRoutes from './routes/admin.js';
@@ -29,6 +31,8 @@ import uploadRoutes from './routes/upload.js';
 import aiRoutes from './routes/ai.js';
 import superAdminRoutes from './routes/superAdmin.js';
 import tenantAdminRoutes from './routes/tenantAdmin.js';
+import tenantFeatureRoutes from './routes/tenantFeatures.js';
+import tenantEvaluatorRoutes from './routes/tenantEvaluators.js';
 import languageRoutes from './routes/languages.js';
 import sectionRoutes from './routes/sections.js';
 import normalizationRoutes from './routes/normalization.js';
@@ -277,9 +281,11 @@ const registerApiRoutes = (basePath) => {
   app.use(`${basePath}/exams`, examRoutes);
   app.use(`${basePath}/exams`, questionRoutes);
   app.use(`${basePath}/exams`, questionPaperRoutes);
+  app.use(`${basePath}/exams`, examEvaluatorRoutes);
   app.use(`${basePath}/exams`, aiRoutes); // Keep AI routes at /api/exams for backward compatibility
   app.use(`${basePath}/exam-sessions`, sessionRoutes);
   app.use(`${basePath}/exam-attempts`, attemptRoutes);
+  app.use(`${basePath}/examiner-assignments`, examinerAssignmentRoutes);
   app.use(`${basePath}/results`, resultRoutes);
   app.use(`${basePath}/candidates`, candidateRoutes); // Universal: renamed from /api/student to /api/candidates
   app.use(`${basePath}/admin/system`, systemBackupRoutes);
@@ -288,6 +294,8 @@ const registerApiRoutes = (basePath) => {
   app.use(`${basePath}/super-admin`, superAdminRoutes);
   app.use(`${basePath}/super-admin/system-alerts`, systemAlertRoutes);
   app.use(`${basePath}/tenant-admin`, tenantAdminRoutes);
+  app.use(`${basePath}/tenant/features`, tenantFeatureRoutes);
+  app.use(`${basePath}/tenant/evaluators`, tenantEvaluatorRoutes);
   app.use(`${basePath}/languages`, languageRoutes);
   app.use(`${basePath}/sections`, sectionRoutes);
   app.use(`${basePath}/normalization`, normalizationRoutes);

@@ -16,6 +16,10 @@ import ExamParticipant from '../models/ExamParticipant.js';
 import Exam from '../models/Exam.js';
 import ExamSession from '../models/ExamSession.js';
 import SessionAssignment from '../models/SessionAssignment.js';
+import ExaminerAssignment from '../models/ExaminerAssignment.js';
+import User from '../models/User.js';
+import { resolveTenantFeature } from '../services/tenantFeatureService.js';
+import { hasRole } from '../utils/userRoles.js';
 
 const normalizeId = (value) => String(value || '').trim();
 
@@ -279,18 +283,21 @@ export const hasExamPermission = async (userId, examId, permission) => {
       return await canCandidateAccessExam(userId, examId);
     }
 
-    // Check ExamParticipant permissions
-    const participant = await ExamParticipant.findOne({
+    // A user can hold multiple ExamParticipant docs for the same exam (one per
+    // examRole, enforced by the {examId,userId,examRole} unique index) — e.g.
+    // EVALUATOR and MODERATOR simultaneously. Check every role doc the user
+    // holds for this exam and grant the permission if ANY of them allow it,
+    // rather than picking whichever doc Mongo happens to return first.
+    const participants = await ExamParticipant.find({
       examId,
       userId,
-    });
+    }).select('permissions');
 
-    if (!participant) {
+    if (!participants.length) {
       return false;
     }
 
-    // Check specific permission
-    return participant.permissions[permissionKey] === true;
+    return participants.some((participant) => participant.permissions?.[permissionKey] === true);
   } catch (error) {
     console.error('hasExamPermission error:', error);
     return false;
@@ -398,3 +405,162 @@ export const ensureExamParticipant = async (userId, examId, examRole, assignedBy
   }
 };
 
+/**
+ * Find the ExaminerAssignment (if any) that grants `userId` access to a given
+ * evaluation scope within `examId` right now — active, not expired/revoked,
+ * and matching the requested section/question/attempt.
+ * @param {ObjectId|string} userId
+ * @param {ObjectId|string} examId
+ * @param {{sectionId?, questionId?, attemptId?}} scope - what's being accessed
+ * @returns {Promise<ExaminerAssignment|null>}
+ */
+export const hasActiveExaminerAssignment = async (userId, examId, scope = {}) => {
+  try {
+    const now = new Date();
+    const assignments = await ExaminerAssignment.find({
+      examId,
+      examinerId: userId,
+      status: 'ACTIVE',
+      accessStartsAt: { $lte: now },
+      $or: [{ accessExpiresAt: { $exists: false } }, { accessExpiresAt: null }, { accessExpiresAt: { $gte: now } }],
+    });
+
+    if (!assignments.length) return null;
+    const evaluatorReview = await resolveTenantFeature(assignments[0].tenantId, 'EVALUATOR_REVIEW');
+    if (!evaluatorReview?.effectiveEnabled) return null;
+
+    const { sectionId, questionId, attemptId } = scope;
+
+    return (
+      assignments.find((assignment) => {
+        switch (assignment.scopeType) {
+          case 'FULL_EXAM':
+            return true;
+          case 'SECTION':
+            return Boolean(sectionId) && (assignment.scopeData?.sectionIds || [])
+              .map(normalizeId)
+              .includes(normalizeId(sectionId));
+          case 'QUESTIONS':
+            return Boolean(questionId) && (assignment.scopeData?.questionIds || [])
+              .map(normalizeId)
+              .includes(normalizeId(questionId));
+          case 'ATTEMPTS':
+            return Boolean(attemptId) && (assignment.scopeData?.attemptIds || [])
+              .map(normalizeId)
+              .includes(normalizeId(attemptId));
+          default:
+            return false;
+        }
+      }) || null
+    );
+  } catch (error) {
+    console.error('hasActiveExaminerAssignment error:', error);
+    return null;
+  }
+};
+
+/**
+ * Express middleware for the evaluator workspace's entry points (assignment
+ * list, per-assignment attempt list). Gates on the full chain the correction
+ * spec requires — not just `evaluatorAccess.enabled`, which alone used to be
+ * treated as sufficient:
+ *
+ *   user has EVALUATOR in their effective roles
+ *   AND account is active
+ *   AND evaluatorAccess is enabled and unexpired
+ *   AND EVALUATOR_REVIEW is effectively enabled for the tenant
+ *
+ * Deliberately does NOT check for a specific assignment — that is exam/
+ * scope-specific and stays the job of hasActiveExaminerAssignment /
+ * requireExaminerAssignment. This only answers "is this person currently
+ * allowed to be an evaluator at all".
+ */
+export const requireEvaluatorAccess = () => {
+  return async (req, res, next) => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+      if (!hasRole(req.user, 'EVALUATOR')) {
+        return res.status(403).json({ error: 'Evaluator role required' });
+      }
+
+      const user = await User.findById(req.user._id).select('status evaluatorAccess tenantId');
+      if (!user || (user.status && user.status !== 'ACTIVE')) {
+        return res.status(403).json({ error: 'Account is not active' });
+      }
+      if (!user.evaluatorAccess?.enabled) {
+        return res.status(403).json({ error: 'Evaluator access is disabled for this account' });
+      }
+      if (user.evaluatorAccess.accessExpiresAt && new Date(user.evaluatorAccess.accessExpiresAt) < new Date()) {
+        return res.status(403).json({
+          error: 'Evaluator access has expired',
+          expiredAt: user.evaluatorAccess.accessExpiresAt,
+        });
+      }
+
+      const feature = await resolveTenantFeature(user.tenantId || req.user.tenantId, 'EVALUATOR_REVIEW');
+      if (!feature?.effectiveEnabled) {
+        return res.status(403).json({ error: 'Evaluator Review is not enabled for this tenant' });
+      }
+
+      next();
+    } catch (error) {
+      console.error('requireEvaluatorAccess error:', error);
+      return res.status(500).json({ error: 'Authorization error' });
+    }
+  };
+};
+
+/**
+ * Express middleware: requires an active ExaminerAssignment covering the
+ * scope implied by the request (examId + optional sectionId/questionId/
+ * attemptId in params/body/query). Attaches the matching assignment to
+ * `req.examinerAssignment` for handlers to read capability flags from.
+ * SUPER_ADMIN/TENANT_ADMIN/EXAM_CREATOR (within their tenant) always pass,
+ * matching the existing exam-permission bypass convention.
+ */
+export const requireExaminerAssignment = () => {
+  return async (req, res, next) => {
+    try {
+      if (!req.user) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+
+      const examId = req.params.examId || req.body.examId || req.query.examId;
+      if (!examId) {
+        return res.status(400).json({ error: 'Exam ID is required' });
+      }
+
+      if (req.user.role === 'SUPER_ADMIN') {
+        return next();
+      }
+
+      if (req.user.role === 'EXAM_CREATOR' || req.user.role === 'TENANT_ADMIN') {
+        const exam = await Exam.findById(examId).select('tenantId');
+        if (exam && req.user.tenantId && exam.tenantId && String(req.user.tenantId) === String(exam.tenantId)) {
+          return next();
+        }
+      }
+
+      const scope = {
+        sectionId: req.params.sectionId || req.body.sectionId || req.query.sectionId,
+        questionId: req.params.questionId || req.body.questionId || req.query.questionId,
+        attemptId: req.params.attemptId || req.body.attemptId || req.query.attemptId,
+      };
+
+      const assignment = await hasActiveExaminerAssignment(req.user._id, examId, scope);
+      if (!assignment) {
+        return res.status(403).json({
+          error: 'You do not have an active examiner assignment covering this evaluation.',
+        });
+      }
+
+      req.examinerAssignment = assignment;
+      next();
+    } catch (error) {
+      console.error('requireExaminerAssignment error:', error);
+      return res.status(500).json({ error: 'Permission check failed' });
+    }
+  };
+};

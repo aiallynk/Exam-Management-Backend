@@ -170,6 +170,12 @@ export const requireAuth = async (req, res, next) => {
         ...decoded,
         _id: decoded.sub,
         role: user.role,
+        // Always derived fresh from the DB document, never from the JWT —
+        // matches the existing `role` handling above, so a role/roles change
+        // takes effect on the very next request without waiting for token
+        // refresh. Falls back to [role] for any user saved before `roles`
+        // existed.
+        roles: user.roles && user.roles.length ? user.roles : [user.role],
         tenantId,
         planType: effectivePlanType,
         subscriptionStatus,

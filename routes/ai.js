@@ -18,6 +18,7 @@ import readXlsxFile from 'read-excel-file/node';
 import OpenAI from 'openai';
 import config from '../config/env.js';
 import { normalizeQuestionFormat } from '../utils/questionTypes.js';
+import { computeDistributionDiagnostics } from '../utils/questionTypeRegistry.js';
 import {
   createTrackedChatCompletion,
   getAIQuestionCountForTenantByWindow,
@@ -1139,9 +1140,19 @@ router.post(
         metadata: aiMetadata, // Pass metadata to AI service for logging
       });
 
-      res.json({ 
+      // Requested-vs-generated distribution diagnostics: compares the exact
+      // per-type counts the caller asked for against what actually came
+      // back, so the frontend can show a distribution-mismatch warning
+      // instead of silently trusting the count.
+      const distributionDiagnostics = computeDistributionDiagnostics(questionTypeDistribution, questions);
+
+      res.json({
         questions,
         metadata: aiMetadata, // Return metadata for frontend to store with exam
+        requestedDistribution: distributionDiagnostics.requested,
+        generatedDistribution: distributionDiagnostics.generated,
+        totalQuestions: Array.isArray(questions) ? questions.length : 0,
+        validationStatus: distributionDiagnostics.validationStatus,
       });
     } catch (error) {
       next(error);

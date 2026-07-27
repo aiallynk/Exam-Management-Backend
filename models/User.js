@@ -3,19 +3,30 @@ import bcrypt from 'bcryptjs';
 import { generateUniqueIdWithCheck, ID_PREFIXES } from '../utils/idGenerator.js';
 
 /**
- * User Model - 4-Role System
- * 
+ * User Model - Multi-Role System
+ *
  * ROLES:
  * - SUPER_ADMIN: Full system access, can create tenants
  * - TENANT_ADMIN: Manages all data within their tenant (users, exams, sessions, etc.)
  * - EXAM_CREATOR: Can create exams and sessions within their tenant
  * - CANDIDATE: Can attempt exams within their tenant
- * 
+ * - EVALUATOR: Can review/score exam responses they are explicitly assigned to
+ *
+ * `role` is the legacy primary role and stays authoritative for anything that
+ * only understands a single role (self-signup, older call sites). `roles` is
+ * the authoritative collection going forward — a user may hold more than one,
+ * e.g. an EXAM_CREATOR who is additionally an EVALUATOR keeps
+ * role='EXAM_CREATOR', roles=['EXAM_CREATOR','EVALUATOR']. Never read
+ * `user.role` alone to decide EVALUATOR access; use the helpers in
+ * utils/userRoles.js (normalizeRoles/hasRole/hasAnyRole), which fall back to
+ * `[role]` for any document that predates this field.
+ *
  * TENANT:
  * - All users (except SUPER_ADMIN) must belong to a tenant
  * - Tenant represents exam hosting entity (School, College, Company, etc.)
  * - Users are assigned to tenants by SUPER_ADMIN
  */
+const ROLE_VALUES = ['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR', 'CANDIDATE', 'EVALUATOR'];
 const UserSchema = new mongoose.Schema(
   {
     uniqueId: {
@@ -44,10 +55,18 @@ const UserSchema = new mongoose.Schema(
     },
     role: {
       type: String,
-      // Role system: SUPER_ADMIN, TENANT_ADMIN, EXAM_CREATOR, CANDIDATE
-      enum: ['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR', 'CANDIDATE'],
+      enum: ROLE_VALUES,
       default: 'CANDIDATE',
       required: true,
+    },
+    // Authoritative multi-role collection. Kept in sync with `role` (the
+    // primary role always stays a member) by the pre-save hook below and by
+    // services/userRoleService.js's addRole/removeRole. Do not write to this
+    // directly from routes — go through that service so `role` and `roles`
+    // can never disagree about the primary role's membership.
+    roles: {
+      type: [{ type: String, enum: ROLE_VALUES }],
+      default: undefined,
     },
     // Tenant field - User belongs to a tenant (except SUPER_ADMIN)
     tenantId: {
@@ -77,6 +96,17 @@ const UserSchema = new mongoose.Schema(
       lowercase: true,
       trim: true,
     },
+    // Tenant-scoped evaluator capability. This is deliberately metadata, not
+    // a new global RBAC role: a user can remain a candidate/creator while
+    // receiving a time-bounded evaluator preset and exam assignments.
+    evaluatorAccess: {
+      enabled: { type: Boolean, default: false },
+      accessExpiresAt: { type: Date, default: null },
+      assignedAt: { type: Date, default: null },
+      assignedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      removedAt: { type: Date, default: null },
+      removedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    },
     examsCreated: {
       type: Number,
       default: 0,
@@ -102,6 +132,22 @@ UserSchema.index({ tenantId: 1, role: 1 });
 UserSchema.index({ tenantId: 1, subTenantId: 1, role: 1 });
 UserSchema.index({ status: 1 });
 UserSchema.index({ planType: 1 });
+UserSchema.index({ tenantId: 1, roles: 1 });
+
+// Keep `roles` populated and guaranteed to contain the primary `role`.
+// Documents saved before this field existed have no `roles` at all — this
+// backfills them in place, additively, the first time they're loaded and
+// re-saved; it never removes a role a caller already added.
+UserSchema.pre('save', function (next) {
+  const current = Array.isArray(this.roles) ? this.roles.filter(Boolean) : [];
+  const merged = new Set(current.length ? current : [this.role]);
+  merged.add(this.role);
+  const resolved = Array.from(merged);
+  if (resolved.length !== current.length || resolved.some((r) => !current.includes(r))) {
+    this.roles = resolved;
+  }
+  next();
+});
 
 // Generate uniqueId before validation (only for new documents or existing ones without uniqueId)
 UserSchema.pre('validate', async function (next) {
@@ -170,4 +216,3 @@ UserSchema.methods.toJSON = function () {
 };
 
 export default mongoose.model('User', UserSchema);
-

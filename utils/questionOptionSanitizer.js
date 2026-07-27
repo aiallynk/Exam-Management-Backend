@@ -133,6 +133,22 @@ const resolveOptionIndex = (value, options) => {
   return -1;
 };
 
+// Extracts the first numeric token from arbitrary text — handles a plain
+// number, a negative/decimal value, scientific notation, or a number
+// embedded in text such as "42 cm" or "Answer: -3.5". Returns '' (never a
+// non-numeric string) when nothing numeric can be found, so a NUMBER
+// question's correctAnswer can never silently end up as MCQ-shaped text
+// like "Option A" — the caller must treat '' as "invalid for this type",
+// not paper over it.
+const parseNumericAnswer = (value) => {
+  const normalized = normalizeWhitespace(value);
+  if (!normalized) return '';
+  const match = normalized.match(/-?\d+(?:\.\d+)?(?:[eE][+-]?\d+)?/);
+  if (!match) return '';
+  const numeric = Number(match[0]);
+  return Number.isFinite(numeric) ? String(numeric) : '';
+};
+
 const resolveObjectiveAnswerValue = (answer, options, { allowFallbackToFirst = false } = {}) => {
   const list = Array.isArray(options) ? options : [];
   const normalized = normalizeWhitespace(answer);
@@ -182,5 +198,11 @@ export const normalizeQuestionCorrectAnswer = ({
     });
   }
 
+  if (normalizedType === 'NUMBER') {
+    return parseNumericAnswer(correctAnswer);
+  }
+
   return normalizeWhitespace(correctAnswer);
 };
+
+export { parseNumericAnswer };

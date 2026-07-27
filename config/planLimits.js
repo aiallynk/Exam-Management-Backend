@@ -111,6 +111,10 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       aiGradingMode: 'objective_only',
       questionTypes: ['MCQ', 'TRUE_FALSE', 'SHORT_ANSWER', 'MULTIPLE_OPTIONS'],
       reports: 'basic',
+      examinerReview: false,
+      temporaryExaminerAssignment: false,
+      mandatoryVerification: false,
+      moderatorWorkflow: false,
     },
   },
   [SUBSCRIPTION_PLAN_TYPES.PRO]: {
@@ -167,6 +171,10 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
         'ESSAY_STORY',
       ],
       reports: 'detailed',
+      examinerReview: true,
+      temporaryExaminerAssignment: true,
+      mandatoryVerification: false,
+      moderatorWorkflow: false,
     },
   },
   [SUBSCRIPTION_PLAN_TYPES.ULTIMATE]: {
@@ -225,6 +233,10 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
         'SCENARIO',
       ],
       reports: 'advanced',
+      examinerReview: true,
+      temporaryExaminerAssignment: true,
+      mandatoryVerification: true,
+      moderatorWorkflow: true,
     },
   },
   [SUBSCRIPTION_PLAN_TYPES.LEGEND]: {
@@ -288,6 +300,10 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       tenantAdminAdvancedControls: true,
       featureCustomization: true,
       enterpriseHierarchy: true,
+      examinerReview: true,
+      temporaryExaminerAssignment: true,
+      mandatoryVerification: true,
+      moderatorWorkflow: true,
     },
   },
 });
@@ -619,6 +635,8 @@ export const FREE_PLAN_MESSAGES = Object.freeze({
   GEO_LOCKED: 'Geo-location restrictions are available only in higher plans.',
   SECURE_BROWSER_LOCKED: 'Secure browser controls are available only in higher plans.',
   MULTI_TENANT_LOCKED: 'Sub-tenant and department controls are available only in higher plans.',
+  EXAMINER_REVIEW_LOCKED: 'Examiner assignments and evaluation review are available only in higher plans.',
+  MANDATORY_VERIFICATION_LOCKED: 'Mandatory/manual/hybrid evaluation modes are available only in higher plans.',
 });
 
 export const PLAN_LIMIT_MESSAGES = Object.freeze({

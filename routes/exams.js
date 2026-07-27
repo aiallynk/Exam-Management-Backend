@@ -1421,6 +1421,7 @@ router.post(
     body('examType').optional().isString(),
     body('sections').optional().isArray(),
     body('timingMode').optional().isIn(['overall', 'section_based']),
+    body('evaluationMode').optional().isIn(['AUTOMATIC', 'AI_OPTIONAL_REVIEW', 'AI_MANDATORY_REVIEW', 'MANUAL', 'HYBRID']),
     body('allowDurationOverride').optional().isBoolean(),
     body('markingRules').optional().isObject(),
     body('answerKey').optional(),
@@ -1475,6 +1476,7 @@ router.post(
         sections,
         timingMode,
         allowDurationOverride,
+        evaluationMode,
         answerKey,
         markingRules,
         omrTemplateImage,
@@ -1633,6 +1635,19 @@ router.post(
         }
       }
 
+      const requestedEvaluationMode = typeof evaluationMode === 'string' ? evaluationMode : 'AUTOMATIC';
+      if (requestedEvaluationMode !== 'AUTOMATIC') {
+        if (!isPlanFeatureEnabled(effectivePlanType, 'examinerReview')) {
+          return sendPlanRestriction(res, FREE_PLAN_MESSAGES.EXAMINER_REVIEW_LOCKED);
+        }
+        if (
+          ['AI_MANDATORY_REVIEW', 'MANUAL', 'HYBRID'].includes(requestedEvaluationMode) &&
+          !isPlanFeatureEnabled(effectivePlanType, 'mandatoryVerification')
+        ) {
+          return sendPlanRestriction(res, FREE_PLAN_MESSAGES.MANDATORY_VERIFICATION_LOCKED);
+        }
+      }
+
       // Resolve and persist tenant scope for exam creation.
       const examData = {
         title,
@@ -1651,6 +1666,7 @@ router.post(
         examType: isOmrRequest ? OMR_EXAM_TYPE : ONLINE_EXAM_TYPE,
         timingMode: sectionBasedRequest ? 'section_based' : 'overall',
         allowDurationOverride: sectionBasedRequest ? Boolean(allowDurationOverride) : false,
+        evaluationMode: requestedEvaluationMode,
         totalMarks: Number.isFinite(Number(totalMarks)) ? Math.max(0, Number(totalMarks)) : 0,
         createdBy: req.user._id,
         tenantId: resolvedTenantId,
@@ -1775,6 +1791,7 @@ router.put(
     body('examType').optional().isString(),
     body('sections').optional().isArray(),
     body('timingMode').optional().isIn(['overall', 'section_based']),
+    body('evaluationMode').optional().isIn(['AUTOMATIC', 'AI_OPTIONAL_REVIEW', 'AI_MANDATORY_REVIEW', 'MANUAL', 'HYBRID']),
     body('allowDurationOverride').optional().isBoolean(),
     body('markingRules').optional().isObject(),
     body('answerKey').optional(),
@@ -1879,6 +1896,7 @@ router.put(
         sections,
         timingMode,
         allowDurationOverride,
+        evaluationMode,
         answerKey,
         markingRules,
         omrTemplateImage,
@@ -2029,6 +2047,21 @@ router.put(
       } else if (timingMode !== undefined || allowDurationOverride !== undefined) {
         if (timingMode !== undefined) exam.timingMode = timingMode;
         if (allowDurationOverride !== undefined) exam.allowDurationOverride = Boolean(allowDurationOverride);
+      }
+
+      if (evaluationMode !== undefined && evaluationMode !== exam.evaluationMode) {
+        if (evaluationMode !== 'AUTOMATIC') {
+          if (!isPlanFeatureEnabled(effectivePlanType, 'examinerReview')) {
+            return sendPlanRestriction(res, FREE_PLAN_MESSAGES.EXAMINER_REVIEW_LOCKED);
+          }
+          if (
+            ['AI_MANDATORY_REVIEW', 'MANUAL', 'HYBRID'].includes(evaluationMode) &&
+            !isPlanFeatureEnabled(effectivePlanType, 'mandatoryVerification')
+          ) {
+            return sendPlanRestriction(res, FREE_PLAN_MESSAGES.MANDATORY_VERIFICATION_LOCKED);
+          }
+        }
+        exam.evaluationMode = evaluationMode;
       }
 
       if (title) exam.title = title;
@@ -2285,6 +2318,38 @@ router.post(
         return res.status(404).json({ error: 'Exam not found' });
       }
 
+      // Evaluation-mode gate: exams that require examiner/moderator review
+      // cannot publish while any in-scope answer is still pending review.
+      // Optional review never blocks publication. Existing exams default to
+      // AUTOMATIC, so historic behavior and already-published results remain
+      // untouched.
+      if (['AI_MANDATORY_REVIEW', 'MANUAL', 'HYBRID'].includes(exam.evaluationMode)) {
+        const attemptIds = await ExamAttempt.find({
+          examId: exam._id,
+          isCompleted: true,
+        }).distinct('_id');
+
+        const pendingReviewCount = await Answer.countDocuments({
+          attemptId: { $in: attemptIds },
+          evaluationStatus: { $in: ['PENDING_REVIEW', 'UNDER_REVIEW', 'FLAGGED'] },
+        });
+
+        if (pendingReviewCount > 0) {
+          await logAuditEvent(AUDIT_ACTIONS.RESULT_PUBLICATION_BLOCKED, {
+            userId: req.user._id,
+            userRole: req.user.role,
+            tenantId: exam.tenantId || null,
+            resourceType: 'Exam',
+            resourceId: exam._id,
+            details: { evaluationMode: exam.evaluationMode, pendingReviewCount },
+          });
+          return res.status(409).json({
+            error: `Cannot publish results: ${pendingReviewCount} answer(s) are still pending examiner or moderator review.`,
+            pendingReviewCount,
+          });
+        }
+      }
+
       exam.resultsReleasedAt = new Date();
       await exam.save();
       await exam.populate('createdBy', 'name email');
@@ -2529,5 +2594,4 @@ router.post(
 );
 
 export default router;
-
 

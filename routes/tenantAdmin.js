@@ -15,6 +15,7 @@ import SystemConfig from '../models/SystemConfig.js';
 import TenantFeatureBilling from '../models/TenantFeatureBilling.js';
 import CreditRequest from '../models/CreditRequest.js';
 import { validatePasswordStrength, generateSecurePassword } from '../utils/passwordValidator.js';
+import { createTenantUser, addRole, removeRole, assertEvaluatorRoleAllowed, UserRoleError } from '../services/userRoleService.js';
 import { AUDIT_ACTIONS } from '../middleware/audit.js';
 import { logAuditEvent } from '../utils/auditLogger.js';
 import { checkTenantLimits } from '../middleware/planLimits.js';
@@ -54,6 +55,7 @@ import {
   getExamCountForTenantByWindow,
 } from '../utils/planUsage.js';
 import { getAIQuestionCountForTenantByWindow } from '../services/aiTokenUsageService.js';
+import { resolveSessionEndTime } from './sessions.js';
 
 const router = express.Router();
 const requireMultiTenantFeature = blockFreePlanByUser(
@@ -1853,12 +1855,13 @@ router.post(
     body('name').trim().notEmpty().withMessage('Name is required'),
     body('email').isEmail().normalizeEmail().withMessage('Valid email is required'),
     body('password').isLength({ min: 6 }).withMessage('Password must be at least 6 characters'),
-    body('role').isIn(['EXAM_CREATOR', 'CANDIDATE']).withMessage('Invalid role. Must be EXAM_CREATOR or CANDIDATE'),
+    body('role').isIn(['EXAM_CREATOR', 'CANDIDATE', 'EVALUATOR']).withMessage('Invalid role. Must be EXAM_CREATOR, CANDIDATE, or EVALUATOR'),
     body('mobile').optional().trim(),
     body('subTenantId')
       .optional({ nullable: true })
       .custom((value) => value === null || value === '' || /^[a-fA-F0-9]{24}$/.test(String(value).trim()))
       .withMessage('subTenantId must be a valid id when provided'),
+    body('accessExpiresAt').optional({ nullable: true }).isISO8601(),
   ],
   checkTenantLimits,
   async (req, res, next) => {
@@ -1868,13 +1871,7 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { name, email, password, role, mobile, subTenantId } = req.body;
-
-      // Check if user exists
-      const existing = await User.findOne({ email });
-      if (existing) {
-        return res.status(409).json({ error: 'Email already registered' });
-      }
+      const { name, email, password, role, mobile, subTenantId, accessExpiresAt } = req.body;
 
       let resolvedSubTenantId = null;
       if (subTenantId !== undefined) {
@@ -1899,22 +1896,37 @@ router.post(
         }
       }
 
-      const user = new User({
-        name,
-        email,
-        password,
-        role,
-        tenantId: req.user.tenantId, // Automatically assign to tenant admin's tenant
-        subTenantId: resolvedSubTenantId,
-        mobile,
-        status: 'ACTIVE',
-      });
+      // Every tenant user — including EVALUATOR — is created through this
+      // single service, whether the request came from this normal
+      // Create User form or the evaluator-management convenience API
+      // (routes/tenantEvaluators.js). This is the fix for the defect where
+      // a newly created evaluator used to be silently persisted as
+      // role='CANDIDATE': createTenantUser never downgrades an unsupported
+      // or not-yet-entitled role, it rejects with a typed error instead.
+      let user;
+      try {
+        user = await createTenantUser({
+          name,
+          email,
+          password,
+          role,
+          tenantId: req.user.tenantId,
+          mobile,
+          subTenantId: resolvedSubTenantId,
+          actorId: req.user._id,
+          evaluatorAccess: role === 'EVALUATOR' ? { accessExpiresAt: accessExpiresAt || null } : undefined,
+        });
+      } catch (roleError) {
+        if (roleError instanceof UserRoleError) {
+          return res.status(roleError.status).json({ error: roleError.message });
+        }
+        throw roleError;
+      }
 
-      await user.save();
       const userObj = user.toObject();
       delete userObj.password;
 
-      await logAuditEvent(AUDIT_ACTIONS.USER_CREATED, {
+      await logAuditEvent(role === 'EVALUATOR' ? AUDIT_ACTIONS.EVALUATOR_USER_CREATED : AUDIT_ACTIONS.USER_CREATED, {
         ...buildActorAuditDetails(req),
         tenantId: user.tenantId || req.user.tenantId || null,
         resourceType: 'User',
@@ -1923,6 +1935,7 @@ router.post(
           createdUserName: user.name,
           createdUserEmail: user.email,
           createdUserRole: user.role,
+          createdUserRoles: user.roles,
         },
       });
 
@@ -1939,7 +1952,7 @@ router.put(
   [
     body('name').optional().trim().notEmpty(),
     body('email').optional().isEmail().normalizeEmail(),
-    body('role').optional().isIn(['EXAM_CREATOR', 'CANDIDATE']),
+    body('role').optional().isIn(['EXAM_CREATOR', 'CANDIDATE', 'EVALUATOR']),
     body('status').optional().isIn(['ACTIVE', 'INACTIVE', 'SUSPENDED', 'BLOCKED']),
     body('mobile').optional().trim(),
     body('subTenantId')
@@ -1990,7 +2003,19 @@ router.put(
         user.email = email;
       }
       if (password) user.password = password;
-      if (role) user.role = role;
+      if (role) {
+        if (role === 'EVALUATOR') {
+          try {
+            await assertEvaluatorRoleAllowed(req.user.tenantId);
+          } catch (roleError) {
+            if (roleError instanceof UserRoleError) {
+              return res.status(roleError.status).json({ error: roleError.message });
+            }
+            throw roleError;
+          }
+        }
+        user.role = role;
+      }
       if (status) user.status = status;
       if (mobile !== undefined) user.mobile = mobile;
       if (subTenantId !== undefined) {
@@ -2608,6 +2633,116 @@ router.get('/sessions', async (req, res, next) => {
         total,
         pages: Math.ceil(total / parseInt(limit)),
       },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Get a single session's details + candidate stats. No status filter is
+// applied so this works identically for upcoming/active/expired sessions.
+router.get('/sessions/:sessionId', async (req, res, next) => {
+  try {
+    const session = await ExamSession.findOne({
+      _id: req.params.sessionId,
+      tenantId: req.user.tenantId,
+    })
+      .populate('examId', 'title duration gracePeriod')
+      .populate('questionPaperId', 'setName')
+      .populate('questionPaperIds', 'setName')
+      .populate('createdBy', 'name email');
+
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const attempts = await ExamAttempt.find({
+      sessionId: session._id,
+      tenantId: req.user.tenantId,
+    }).select('isCompleted isDisqualified');
+
+    const totalCandidates = attempts.length;
+    const disqualified = attempts.filter((a) => a.isDisqualified).length;
+    const submitted = attempts.filter((a) => a.isCompleted && !a.isDisqualified).length;
+    const inProgress = attempts.filter((a) => !a.isCompleted && !a.isDisqualified).length;
+
+    res.json({
+      session,
+      stats: { totalCandidates, submitted, inProgress, disqualified },
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+// Update a session: end it now, or extend/change its end time.
+router.put('/sessions/:sessionId', async (req, res, next) => {
+  try {
+    const session = await ExamSession.findOne({
+      _id: req.params.sessionId,
+      tenantId: req.user.tenantId,
+    });
+    if (!session) {
+      return res.status(404).json({ error: 'Session not found' });
+    }
+
+    const action = String(req.body?.action || '').trim().toLowerCase();
+    const nextEndTimeRaw = req.body?.endTime;
+    const now = new Date();
+
+    if (action === 'end') {
+      session.isActive = false;
+      if (session.endTime > now) {
+        session.endTime = now;
+      }
+    } else if (nextEndTimeRaw) {
+      const exam = await Exam.findById(session.examId);
+      if (!exam) {
+        return res.status(404).json({ error: 'Exam not found' });
+      }
+
+      let nextEndTime;
+      let durationOverride;
+      try {
+        ({ end: nextEndTime, durationOverride } = resolveSessionEndTime({
+          exam,
+          start: session.startTime,
+          endTime: nextEndTimeRaw,
+          overrideEndTime: req.body?.overrideEndTime,
+          overrideReason: req.body?.overrideReason,
+        }));
+      } catch (resolveError) {
+        return res.status(resolveError.status || 400).json({ error: resolveError.message });
+      }
+
+      if (nextEndTime <= session.startTime) {
+        return res.status(400).json({ error: 'End time must be after start time' });
+      }
+      session.endTime = nextEndTime;
+      session.durationOverride = durationOverride || { applied: false };
+    } else {
+      return res.status(400).json({ error: 'Nothing to update. Provide action="end" or a valid endTime.' });
+    }
+
+    await session.save();
+    await session.populate('examId', 'title duration gracePeriod');
+    await session.populate('questionPaperId', 'setName');
+    await session.populate('questionPaperIds', 'setName');
+    await session.populate('createdBy', 'name email');
+
+    await logAuditEvent(AUDIT_ACTIONS.SESSION_UPDATED, {
+      userId: req.user._id,
+      userRole: req.user.role,
+      tenantId: session.tenantId,
+      resourceType: 'ExamSession',
+      resourceId: session._id,
+      method: req.method,
+      path: req.path,
+    });
+
+    res.json({
+      message: action === 'end' ? 'Session ended successfully' : 'Session updated successfully',
+      session,
     });
   } catch (error) {
     next(error);

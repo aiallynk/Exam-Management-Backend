@@ -44,6 +44,25 @@ const ExamSchema = new mongoose.Schema(
       type: Boolean,
       default: false,
     },
+    // Controls whether AI/rule scores are immediately final or stay
+    // provisional pending examiner (and optionally moderator) verification.
+    // Default 'AUTOMATIC' preserves today's behavior for every existing exam.
+    evaluationMode: {
+      type: String,
+      enum: ['AUTOMATIC', 'AI_OPTIONAL_REVIEW', 'AI_MANDATORY_REVIEW', 'MANUAL', 'HYBRID'],
+      default: 'AUTOMATIC',
+    },
+    // Null (the default for every exam that predates and every exam that
+    // doesn't opt into this) means candidate responses are never
+    // auto-distributed among evaluators — assignment stays whatever an admin
+    // does manually via /api/exams/:examId/evaluators. Set only when the
+    // exam creator explicitly registers evaluators for automatic
+    // distribution (see services/responseDistributionService.js).
+    evaluatorDistributionStrategy: {
+      type: String,
+      enum: ['RANDOM_BALANCED', 'ROUND_ROBIN', 'WORKLOAD_BASED', null],
+      default: null,
+    },
     gracePeriod: {
       type: Number,
       default: 0,

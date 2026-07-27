@@ -7,6 +7,7 @@ import {
   sanitizeQuestionOptions,
 } from '../utils/questionOptionSanitizer.js';
 import { extractCodingFields, getSupportedCodingLanguages } from '../utils/codingQuestions.js';
+import { validateGeneratedQuestionShape } from '../utils/questionTypeRegistry.js';
 
 const client = config.openaiApiKey
   ? new OpenAI({ apiKey: config.openaiApiKey })
@@ -1084,11 +1085,23 @@ const enforceQuestionDistribution = ({ questions, typeDistribution, count, topic
     poolsByType[type] = [];
   });
 
+  // Candidates whose own claimed type is structurally broken (e.g. a
+  // MULTIPLE_OPTIONS with only one correct answer, a NUMBER with a
+  // non-numeric answer) are discarded entirely here — never pooled for
+  // their claimed type, and never reused as overflow filler for another
+  // type either, since content that's already wrong-shaped for ITS OWN
+  // type cannot become right-shaped for a different one. This is what
+  // used to let a badly-shaped AI candidate get silently relabeled onto
+  // a type it never resembled in the first place.
   const overflowPool = [];
   (Array.isArray(questions) ? questions : []).forEach((question, index) => {
     const normalized = normalizeQuestionObject(question, index + 1);
     if (!normalized) return;
     const type = sanitizeString(normalized.questionType).toUpperCase();
+    const shapeCheck = validateGeneratedQuestionShape(normalized);
+    if (!shapeCheck.valid) {
+      return;
+    }
     if (!targetByType[type]) {
       overflowPool.push(normalized);
       return;
@@ -1661,6 +1674,13 @@ For each question, provide:
 - questionType: MUST be one of ONLY these types: ${questionTypes.join(', ')}. DO NOT use any other types.
 - options: Array of options (for MULTIPLE_CHOICE, MULTIPLE_OPTIONS, TRUE_FALSE). For harder difficulties, make distractors more plausible and challenging.
 - correctAnswer: The correct answer (string) for non-coding questions. Use an empty string for CODING questions.
+
+PER-TYPE SHAPE RULES (MANDATORY — do not substitute one type's shape for another's):
+- MULTIPLE_CHOICE: provide exactly 4 plausible options; correctAnswer is a single string matching ONE option exactly.
+- MULTIPLE_OPTIONS (multi-select): provide at least 4 plausible options; correctAnswer MUST be a JSON array of AT LEAST 2 exact option strings (never a single scalar string, never only 1 correct option). Do NOT generate this as if it were single-choice.
+- TRUE_FALSE: options MUST be exactly ["True", "False"]; correctAnswer is "True" or "False".
+- NUMBER (numeric): do NOT include an options field at all; correctAnswer MUST be a plain numeric value (e.g. "42" or "3.5"), never option text like "Option A" and never a units-only or descriptive string.
+- FILL_IN_THE_BLANK, SHORT_ANSWER, PARAGRAPH, ESSAY, ESSAY_LETTER, ESSAY_STORY: do NOT include an options field.
 - For FILL_IN_THE_BLANK, place exactly one blank in questionText and return the exact missing text as correctAnswer.
 - For MATCHING, return matchingPairs as an array of at least 3 objects, each with non-empty left and right fields; correctAnswer must be the same pair mapping serialized as JSON.
 - passage: For PARAGRAPH questions, include the supporting passage students must read. Use an empty string for other question types unless contextual text is explicitly required.
@@ -1687,6 +1707,9 @@ ${typeDistribution.map(item => `  - Generate EXACTLY ${item.count} ${item.type} 
 - DO NOT generate any question types that are NOT in the list: ${questionTypes.join(', ')}
 - Each question's questionType field MUST be exactly one of: ${questionTypes.join(', ')}
 - IMPORTANT: The distribution above is EXACT - generate exactly the specified number for each type, no more, no less
+- Do NOT substitute one type for another. Do NOT convert numeric questions into MCQs. Do NOT convert multiple-select questions into single-choice questions.
+- MULTIPLE_OPTIONS questions MUST return correctAnswer as an array with at least 2 correct option strings — never a single scalar answer.
+- NUMBER questions MUST NOT have an options array and correctAnswer MUST be a plain number, never option-style text.
 ${existingQuestionsText ? `\n- IMPORTANT: Do NOT create questions similar to the existing ones listed above. Generate completely new and unique questions covering different aspects of the topic.` : ''}
 
 Difficulty:

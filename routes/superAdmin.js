@@ -73,6 +73,7 @@ import {
   resolveExtraCreditUnitPrice,
   resolveTenantExtraCreditFieldByType,
 } from '../utils/creditSystem.js';
+import { CONTROL_CATEGORY_DEFINITIONS, TENANT_CAPABILITIES } from '../services/tenantFeatureService.js';
 
 const router = express.Router();
 
@@ -1684,6 +1685,47 @@ const buildTenantSubscriptionSummary = async (tenant) => {
 // All Super Admin routes require SUPER_ADMIN role
 router.use(requireAuth);
 router.use(requireRole('SUPER_ADMIN'));
+
+// Platform controls use the same capability catalogue that resolves tenant
+// controls.  This prevents the platform overview from drifting into a static
+// marketing count while still avoiding a tenant-specific assumption.
+router.get('/controls/overview', async (_req, res, next) => {
+  try {
+    const controls = Object.entries(TENANT_CAPABILITIES).map(([key, definition]) => ({
+      key,
+      group: definition.group,
+      releaseStatus: definition.releaseStatus || 'RELEASED',
+      planFeature: definition.planFeature || null,
+    }));
+    const categories = CONTROL_CATEGORY_DEFINITIONS.map((category) => {
+      const categoryControls = category.groups
+        ? controls.filter((control) => category.groups.includes(control.group))
+        : controls;
+      const counts = categoryControls.reduce(
+        (value, control) => {
+          if (control.releaseStatus === 'UNRELEASED') value.unreleased += 1;
+          else if (control.releaseStatus === 'BETA') value.beta += 1;
+          else value.enabled += 1;
+          return value;
+        },
+        { enabled: 0, disabled: 0, locked: 0, beta: 0, unreleased: 0, enforced: 0 }
+      );
+      return { ...category, counts, totalControls: categoryControls.length };
+    });
+    const [tenantCount, activeTenantCount] = await Promise.all([
+      Tenant.countDocuments({}),
+      Tenant.countDocuments({ status: { $ne: 'INACTIVE' } }),
+    ]);
+    return res.json({
+      categories,
+      platform: {
+        tenantCount,
+        activeTenantCount,
+        planCount: Object.keys(SUBSCRIPTION_PLANS).length,
+      },
+    });
+  } catch (error) { return next(error); }
+});
 
 /**
  * SUBSCRIPTION PLAN CATALOG

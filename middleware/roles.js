@@ -1,9 +1,17 @@
+import { hasAnyRole, normalizeRoles } from '../utils/userRoles.js';
+
 /**
  * Role-Based Access Control Middleware
- * 
- * Supports 4 roles: SUPER_ADMIN, TENANT_ADMIN, EXAM_CREATOR, CANDIDATE
- * 
- * For exam-level permissions, use examPermissions.js middleware instead
+ *
+ * Supports 5 roles: SUPER_ADMIN, TENANT_ADMIN, EXAM_CREATOR, CANDIDATE,
+ * EVALUATOR. A user may hold more than one role (e.g. an EXAM_CREATOR who is
+ * additionally an EVALUATOR) — matching is against the user's full role set
+ * (req.user.roles, falling back to [req.user.role] for legacy tokens/users),
+ * not just their single primary `role`. This means every existing
+ * `requireRole('X', 'Y')` call site keeps working unchanged for
+ * single-role users, and additionally now also matches multi-role users.
+ *
+ * For exam-level permissions, use examPermissions.js middleware instead.
  */
 export const requireRole = (...allowedRoles) => {
   return (req, res, next) => {
@@ -11,27 +19,27 @@ export const requireRole = (...allowedRoles) => {
       return res.status(401).json({ error: 'Authentication required' });
     }
 
-    const userRole = req.user.role;
-
     // SUPER_ADMIN can access everything
-    if (userRole === 'SUPER_ADMIN') {
+    if (normalizeRoles(req.user).includes('SUPER_ADMIN')) {
       return next();
     }
 
-    // Check if user's role is in allowed roles
-    const isAllowed = allowedRoles.includes(userRole);
-
-    if (!isAllowed) {
+    if (!hasAnyRole(req.user, allowedRoles)) {
       return res.status(403).json({
         error: 'Forbidden - Insufficient permissions',
         required: allowedRoles,
-        current: userRole,
+        current: req.user.role,
+        currentRoles: normalizeRoles(req.user),
       });
     }
 
     next();
   };
 };
+
+// Array-accepting variant of requireRole, matching the naming used in the
+// evaluator-role correction spec (`requireAnyRole(['A', 'B'])`).
+export const requireAnyRole = (allowedRoles = []) => requireRole(...allowedRoles);
 
 // Convenience middleware for SUPER_ADMIN-only routes
 export const superAdminOnly = requireRole('SUPER_ADMIN');

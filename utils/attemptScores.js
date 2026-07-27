@@ -21,13 +21,14 @@ const buildAnswersQuery = (attemptId, { includeQuestionDetails } = {}) => {
 
 export const ensureScoreSummary = async (
   attempt,
-  { includeAnswers = false, includeQuestionDetails = false } = {}
+  { includeAnswers = false, includeQuestionDetails = false, force = false } = {}
 ) => {
   if (!attempt) {
     throw new Error('Attempt is required to compute score summary');
   }
 
   const hasCachedSummary =
+    !force &&
     attempt.scoreSummary &&
     isFiniteNumber(attempt.scoreSummary.totalScore) &&
     isFiniteNumber(attempt.scoreSummary.maxScore) &&

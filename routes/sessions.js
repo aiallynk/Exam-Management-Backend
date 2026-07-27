@@ -38,7 +38,7 @@ const END_TIME_TOLERANCE_MS = 60 * 1000; // allow ~1 minute of rounding drift
  * duration. Returns `{ end, durationOverride }` or throws an Error with a
  * `.status` for the route to translate into an HTTP response.
  */
-const resolveSessionEndTime = ({ exam, start, endTime, overrideEndTime, overrideReason }) => {
+export const resolveSessionEndTime = ({ exam, start, endTime, overrideEndTime, overrideReason }) => {
   const effectiveDurationMinutes = getEffectiveExamDurationMinutes(exam);
   if (!effectiveDurationMinutes) {
     const err = new Error("This exam's duration is not configured correctly.");

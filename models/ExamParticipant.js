@@ -40,7 +40,7 @@ const ExamParticipantSchema = new mongoose.Schema(
     },
     examRole: {
       type: String,
-      enum: ['CREATOR', 'CANDIDATE', 'EVALUATOR'],
+      enum: ['CREATOR', 'CANDIDATE', 'EVALUATOR', 'MODERATOR'],
       required: true,
     },
     permissions: {
@@ -57,6 +57,10 @@ const ExamParticipantSchema = new mongoose.Schema(
         default: false,
       },
       REVIEW_ANSWERS: {
+        type: Boolean,
+        default: false,
+      },
+      MODERATE_EVALUATIONS: {
         type: Boolean,
         default: false,
       },
@@ -121,6 +125,15 @@ ExamParticipantSchema.pre('save', function (next) {
         this.permissions.VIEW_RESULTS = true;
         this.permissions.ATTEMPT_EXAM = false;
         this.permissions.REVIEW_ANSWERS = true;
+        this.permissions.MODERATE_EVALUATIONS = false;
+        break;
+      case 'MODERATOR':
+        // Moderators review flagged/examiner-scored evaluations and results
+        this.permissions.CREATE_SESSION = false;
+        this.permissions.VIEW_RESULTS = true;
+        this.permissions.ATTEMPT_EXAM = false;
+        this.permissions.REVIEW_ANSWERS = true;
+        this.permissions.MODERATE_EVALUATIONS = true;
         break;
     }
   }
