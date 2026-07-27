@@ -1991,10 +1991,14 @@ export const submitAttemptHandler = async (req, res, next) => {
       const isOfflineSubmission =
         Boolean(attempt.offlineMode) ||
         isOfflineSubmissionSource(existingSubmissionSource || '');
+      const attemptPayload = attempt.toObject();
+      if (!scoringVisible) {
+        attemptPayload.scoreSummary = null;
+      }
       return res.json({
         success: true,
         alreadySubmitted: true,
-        attempt,
+        attempt: attemptPayload,
         attemptStatus: 'COMPLETED',
         submittedAt: attempt.submittedAt || attempt.submitTime || null,
         clientSubmissionId: attempt.submitMeta?.clientSubmissionId || null,
@@ -2748,9 +2752,14 @@ export const submitAttemptHandler = async (req, res, next) => {
       `[ATTEMPT_SUBMIT] attempt=${attempt._id} source=${submissionSource || 'unknown'} mode=${isOfflineSubmission ? 'offline' : 'online'} user=${req.user?._id || 'unknown'}`
     );
 
+    const attemptPayload = attempt.toObject();
+    if (!scoringVisible) {
+      attemptPayload.scoreSummary = null;
+    }
+
     res.json({
       success: true,
-      attempt,
+      attempt: attemptPayload,
       attemptStatus: 'COMPLETED',
       submittedAt: submitTime.toISOString(),
       clientSubmissionId: attempt.submitMeta?.clientSubmissionId || null,
