@@ -22,6 +22,8 @@ import {
   isFreePlan,
   isTrialRestrictedPlan,
   resolveSubscriptionStatus,
+  resolveSubscriptionPlanType,
+  resolveEffectivePlanType,
   SUBSCRIPTION_STATUSES,
   SUBSCRIPTION_STATUS_MESSAGES,
 } from '../config/planLimits.js';
@@ -828,6 +830,12 @@ router.post(
       let tenantSecuritySnapshot = null;
       let subscriptionStatus = SUBSCRIPTION_STATUSES.ACTIVE;
       let subscriptionWarning = '';
+      // Defaults to the user's own stored planType; overwritten below with
+      // the tenant's actual subscription plan when the user belongs to a
+      // tenant, so the client caches the plan that really gates features
+      // (a tenant-scoped user's own `planType` field is not kept in sync
+      // with their organization's subscription).
+      let effectivePlanType = user.planType;
 
       if (tenantId && user.role !== 'SUPER_ADMIN') {
         loginProfiler.mark('tenant_access_validation_start');
@@ -865,6 +873,10 @@ router.post(
         try {
           const subscription = tenantSecuritySnapshot?.subscription || {};
           subscriptionStatus = resolveSubscriptionStatus(subscription);
+          const subscriptionPlanType = resolveSubscriptionPlanType(
+            subscription.planType || user.planType
+          );
+          effectivePlanType = resolveEffectivePlanType(subscriptionPlanType, subscriptionStatus);
 
           const persistedStatus = String(subscription?.status || '')
             .trim()
@@ -983,7 +995,7 @@ router.post(
           email: user.email,
           role: user.role,
           roles: user.roles && user.roles.length ? user.roles : [user.role],
-          planType: user.planType,
+          planType: effectivePlanType,
           examsCreated: user.examsCreated ?? 0,
           tenantId: tenant?._id || null,
           tenant: tenant || null,
@@ -1207,6 +1219,10 @@ router.post('/refresh', async (req, res, next) => {
       let tenantSecuritySnapshot = null;
       let subscriptionStatus = SUBSCRIPTION_STATUSES.ACTIVE;
       let subscriptionWarning = '';
+      // Defaults to the user's own stored planType; overwritten below with
+      // the tenant's actual subscription plan when the user belongs to a
+      // tenant — see the matching comment in the /login handler.
+      let effectivePlanType = user.planType;
 
       if (tenantId && user.role !== 'SUPER_ADMIN') {
         const tenantAccessState = await validateTenantAccessState({
@@ -1226,6 +1242,10 @@ router.post('/refresh', async (req, res, next) => {
         try {
           const subscription = tenantSecuritySnapshot?.subscription || {};
           subscriptionStatus = resolveSubscriptionStatus(subscription);
+          const subscriptionPlanType = resolveSubscriptionPlanType(
+            subscription.planType || user.planType
+          );
+          effectivePlanType = resolveEffectivePlanType(subscriptionPlanType, subscriptionStatus);
 
           if (subscriptionStatus === SUBSCRIPTION_STATUSES.CANCELLED) {
             return res.status(403).json({
@@ -1281,7 +1301,7 @@ router.post('/refresh', async (req, res, next) => {
           email: user.email,
           role: user.role,
           roles: user.roles && user.roles.length ? user.roles : [user.role],
-          planType: user.planType,
+          planType: effectivePlanType,
           examsCreated: user.examsCreated ?? 0,
           tenantId: tenant?._id || null,
           tenant: tenant || null,
