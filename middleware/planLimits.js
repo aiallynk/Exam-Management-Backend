@@ -13,6 +13,7 @@ import {
 import ExamAttempt from '../models/ExamAttempt.js';
 import User from '../models/User.js';
 import Tenant from '../models/Tenant.js';
+import ContextSource from '../models/ContextSource.js';
 import { emitTenantQuotaExceededAlert } from '../services/systemAlertService.js';
 import {
   getExamByIdForPlan,
@@ -104,7 +105,7 @@ const resolveRoleQueryFilter = (role) => {
 
 const isValidObjectId = (value) => /^[a-fA-F0-9]{24}$/.test(String(value || '').trim());
 
-const resolveTenantSubscriptionContext = async (tenantId, fallbackPlanType) => {
+export const resolveTenantSubscriptionContext = async (tenantId, fallbackPlanType) => {
   if (!tenantId) {
     return {
       planType: fallbackPlanType || null,
@@ -178,7 +179,7 @@ const resolvePlanLimitWithOverride = ({
   return resolveFinitePlanLimit(baseValue);
 };
 
-const resolvePlanLimits = (planType, tenant = null) => {
+export const resolvePlanLimits = (planType, tenant = null) => {
   const plan = getSubscriptionPlanDefinition(planType);
   const baseLimits = { ...(plan?.limits || {}) };
 
@@ -212,6 +213,16 @@ const resolvePlanLimits = (planType, tenant = null) => {
       legacyValue: null,
       baseValue: baseLimits?.maxImportFiles,
     }),
+    // Source-Grounded AI Question Generation — distinct quota from
+    // maxImportFiles (question-import files feed a different feature).
+    // Same override precedence chain as every other limit here: tenant
+    // customLimits -> plan default -> unlimited if undefined.
+    maxContextSourcesPerMonth: resolvePlanLimitWithOverride({
+      customLimits,
+      key: 'maxContextSourcesPerMonth',
+      legacyValue: null,
+      baseValue: baseLimits?.maxContextSourcesPerMonth,
+    }),
     maxQuestionsPerExam: resolvePlanLimitWithOverride({
       customLimits,
       key: 'maxQuestionsPerExam',
@@ -223,6 +234,15 @@ const resolvePlanLimits = (planType, tenant = null) => {
       key: 'maxCandidates',
       legacyValue: null,
       baseValue: baseLimits?.maxCandidates,
+    }),
+    // WizKids Phase 3 — Batch/Grade. Same override precedence as every other
+    // limit here: per-tenant customLimits.maxWizKidsBatches (Super-Admin-set,
+    // -1 = explicitly unlimited) -> plan default -> unlimited if undefined.
+    maxWizKidsBatches: resolvePlanLimitWithOverride({
+      customLimits,
+      key: 'maxWizKidsBatches',
+      legacyValue: null,
+      baseValue: baseLimits?.maxWizKidsBatches,
     }),
   };
 
@@ -793,3 +813,41 @@ export const checkCandidateAttemptLimit = async (req, res, next) => {
 // Backward-compatible aliases for existing imports/routes.
 export const checkExamLimit = checkExamCreationLimit;
 export const checkCandidateLimit = checkCandidateAttemptLimit;
+
+// Source-Grounded AI Question Generation — monthly quota on context
+// sources (files/URLs ingested for grounding), distinct from
+// maxImportFiles (a different feature: question-import files). Follows
+// the same resolvePlanLimits override-precedence chain as every other
+// limit in this file (tenant customLimits -> plan default -> unlimited).
+export const enforceContextSourceLimit = async (req, res, next) => {
+  try {
+    const tenantId = req.user?.tenantId;
+    if (!tenantId) return next();
+
+    const subscriptionContext = await resolveTenantSubscriptionContext(tenantId, req.user?.planType);
+    const planLimits = resolvePlanLimits(subscriptionContext.planType, subscriptionContext.tenant);
+    const maxContextSourcesPerMonth = resolveFinitePlanLimit(planLimits?.maxContextSourcesPerMonth);
+
+    if (maxContextSourcesPerMonth === null) return next(); // unlimited
+
+    const { start, end } = getCurrentMonthRange();
+    const usedThisMonth = await ContextSource.countDocuments({
+      tenantId,
+      createdAt: { $gte: start, $lt: end },
+    });
+
+    if (usedThisMonth >= maxContextSourcesPerMonth) {
+      return sendLimitResponse(
+        res,
+        { contextSources: { used: usedThisMonth, limit: maxContextSourcesPerMonth } },
+        {},
+        `You have reached your monthly limit of ${maxContextSourcesPerMonth} source-grounded context files/URLs.`,
+        { req, limitType: 'contextSource' }
+      );
+    }
+
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+};

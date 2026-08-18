@@ -324,6 +324,64 @@ export const createTrackedChatCompletion = async ({
   return completion;
 };
 
+// Source-Grounded AI Question Generation — mirrors createTrackedChatCompletion
+// above so embedding calls land in the same ai_token_usage collection/
+// reporting/quota system rather than opening a third accounting path
+// (generation already has its own path via createTrackedChatCompletion,
+// grading has its own via aiGradingUsageService.js — this feature must not
+// add a fourth).
+export const createTrackedEmbedding = async ({
+  client,
+  request,
+  feature = 'source_grounded_context_embedding',
+  tenantId,
+  userId,
+}) => {
+  if (!client?.embeddings?.create) {
+    throw new Error('OpenAI client is not initialized');
+  }
+
+  const requestedModel = normalizeModelName(request?.model) || 'unknown';
+  let response;
+
+  try {
+    response = await client.embeddings.create(request);
+  } catch (error) {
+    await trackAITokenUsage({
+      usage: null,
+      feature,
+      tenantId,
+      userId,
+      model: requestedModel,
+      usageCount: 1,
+      questionCount: 0,
+      requestStatus: 'FAILED',
+      errorMessage: error?.message || 'AI embedding request failed',
+    });
+    throw error;
+  }
+
+  const resolvedModel = normalizeModelName(response?.model || requestedModel) || 'unknown';
+  const resolvedUsage = {
+    prompt_tokens: response?.usage?.prompt_tokens || 0,
+    completion_tokens: 0,
+    total_tokens: response?.usage?.total_tokens || response?.usage?.prompt_tokens || 0,
+  };
+
+  await trackAITokenUsage({
+    usage: resolvedUsage,
+    feature,
+    tenantId,
+    userId,
+    model: resolvedModel,
+    usageCount: 1,
+    questionCount: 0,
+    requestStatus: 'SUCCESS',
+  });
+
+  return response;
+};
+
 export const createTrackedImageGeneration = async ({
   client,
   request,

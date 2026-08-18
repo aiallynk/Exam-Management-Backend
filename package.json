@@ -8,13 +8,15 @@
     "start": "node server.js",
     "dev": "node --watch server.js",
     "test": "node --test tests/*.test.js",
-    "build": "node --check server.js && node --check routes/tenantFeatures.js && node --check routes/superAdmin.js && node --check routes/tenantEvaluators.js && node --check routes/examEvaluators.js && node --check services/evaluatorAssignmentService.js && node --check models/ExaminerAssignment.js && node --check scripts/migrateEvaluatorAssignmentIndexes.js && python3 -c \"from pathlib import Path; compile(Path('services/omr/omr.py').read_text(), 'services/omr/omr.py', 'exec')\" && echo 'Server build checks complete'",
+    "build": "node --check server.js && node --check routes/tenantFeatures.js && node --check routes/superAdmin.js && node --check routes/tenantEvaluators.js && node --check routes/examEvaluators.js && node --check services/evaluatorAssignmentService.js && node --check models/ExaminerAssignment.js && node --check scripts/migrateEvaluatorAssignmentIndexes.js && node --check routes/ai.js && node --check services/contextIngestionService.js && node --check services/secureUrlFetchService.js && node --check services/googleDriveSourceProvider.js && node --check services/contextRetrievalService.js && node --check services/groundedGenerationService.js && node --check services/groundingValidatorService.js && node --check services/noveltyService.js && node --check services/candidatePoolOrchestratorService.js && node --check scripts/migrateSourceGroundedIndexes.js && node --check scripts/backfillHistoricalQuestionSignatures.js && python3 -c \"from pathlib import Path; compile(Path('services/omr/omr.py').read_text(), 'services/omr/omr.py', 'exec')\" && echo 'Server build checks complete'",
     "seed": "node scripts/seed.js",
     "migrate:evaluator-assignment-indexes": "node scripts/migrateEvaluatorAssignmentIndexes.js",
     "backfill:exam-packages": "node scripts/backfillExamPackages.js",
     "backfill:question-paper-questions": "node scripts/backfillQuestionPaperQuestions.js",
     "backup:worker": "node workers/backupWorker.js",
-    "backup:migrate-legacy": "node scripts/migrateLegacyBackupsToS3.js"
+    "backup:migrate-legacy": "node scripts/migrateLegacyBackupsToS3.js",
+    "migrate:source-grounded-indexes": "node scripts/migrateSourceGroundedIndexes.js",
+    "backfill:historical-question-signatures": "node scripts/backfillHistoricalQuestionSignatures.js"
   },
   "dependencies": {
     "@aws-sdk/client-kms": "^3.1093.0",

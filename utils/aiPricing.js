@@ -4,6 +4,11 @@ const MODEL_PRICING_USD_PER_1M = Object.freeze({
   'gpt-4.1': { input: 2, output: 8 },
   'gpt-4.1-mini': { input: 0.4, output: 1.6 },
   'gpt-4.1-nano': { input: 0.1, output: 0.4 },
+  // Embeddings have no output tokens; `input` doubles as the flat per-token
+  // rate (see estimateCostUsd's totalTokens branch, used for embeddings
+  // since they never report completion tokens).
+  'text-embedding-3-small': { input: 0.02, output: 0.02 },
+  'text-embedding-3-large': { input: 0.13, output: 0.13 },
 });
 
 const KNOWN_MODEL_PREFIXES = Object.freeze([
@@ -12,6 +17,8 @@ const KNOWN_MODEL_PREFIXES = Object.freeze([
   'gpt-4.1-mini',
   'gpt-4.1-nano',
   'gpt-4.1',
+  'text-embedding-3-small',
+  'text-embedding-3-large',
 ]);
 
 const DEFAULT_PRICING_USD_PER_1M = Object.freeze({

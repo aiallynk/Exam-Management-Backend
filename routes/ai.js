@@ -2,8 +2,27 @@ import express from 'express';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { requireTenant } from '../middleware/multiTenant.js';
-import { aiRateLimiter } from '../middleware/rateLimiter.js';
+import { aiRateLimiter, uploadRateLimiter } from '../middleware/rateLimiter.js';
+import { enforceContextSourceLimit } from '../middleware/planLimits.js';
 import { generateQuestions, extractQuestionsFromContent } from '../services/aiService.js';
+import {
+  requireTenantFeature,
+  resolveTenantFeature,
+  assertImageGenerationAllowed,
+} from '../services/tenantFeatureService.js';
+import {
+  ingestFileSource,
+  ingestUrlSource,
+  getOrCreateContextSet,
+} from '../services/contextIngestionService.js';
+import { generateWithNoveltyAndGrounding } from '../services/candidatePoolOrchestratorService.js';
+import { buildTenantOwnedSourceFilter } from '../services/contextRetrievalService.js';
+import { resolveGenerationStrategy } from '../services/groundedGenerationService.js';
+import ContextSet from '../models/ContextSet.js';
+import ContextSource from '../models/ContextSource.js';
+import ContextChunk from '../models/ContextChunk.js';
+import AIGenerationRun from '../models/AIGenerationRun.js';
+import sourceGroundedConfig from '../config/sourceGroundedConfig.js';
 import {
   parseQuestionImportFile,
   attachImagesToImportedQuestions,
@@ -40,6 +59,9 @@ import {
   resolveUserEffectivePlanType,
   sendPlanRestriction,
 } from '../middleware/planRestrictions.js';
+import { prepareWizKidsExamInput, WizKidsExamError } from '../services/wizKidsExamService.js';
+import { findUnsupportedJuniorQuestionType } from '../utils/juniorQuestionPolicy.js';
+import { generateJuniorDeterministicNumberQuestions } from '../services/juniorAiQuestionService.js';
 import {
   CREDIT_REQUEST_TYPES,
   normalizeTenantExtraCredits,
@@ -90,6 +112,26 @@ const imageUpload = multer({
       cb(null, true);
     } else {
       cb(new Error('Invalid file type. Allowed: PDF, Excel, JPG, JPEG, PNG'));
+    }
+  },
+});
+
+// Source-Grounded AI Question Generation — one file per upload request
+// (the 10-source cap is enforced per contextSetId inside
+// contextIngestionService, not by multer's `files` count, since sources
+// are uploaded one at a time with independent per-row progress in the UI).
+const contextSourceUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // 10MB
+  },
+  fileFilter: (req, file, cb) => {
+    const allowedExtensions = ['.pdf', '.txt', '.csv', '.xlsx', '.xls', '.docx', '.png', '.jpg', '.jpeg'];
+    const ext = path.extname(file.originalname || '').toLowerCase();
+    if (allowedExtensions.includes(ext)) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Allowed: PDF, TXT, CSV, XLSX, XLS, DOCX, PNG, JPG, JPEG'));
     }
   },
 });
@@ -736,6 +778,12 @@ router.post(
         rowEmbeddedArtifacts: importData.rowEmbeddedArtifacts,
         extractionErrors: importData.extractionErrors,
         importSessionId: importData.importSessionId,
+        // Question import must only ever use images that genuinely exist
+        // in the uploaded file (mapped/extracted artifacts, handled
+        // above this flag inside attachImagesToImportedQuestions) — never
+        // synthesize a new AI-generated or fallback-SVG diagram for a
+        // question whose text merely mentions one.
+        generateMissingDiagrams: false,
       });
 
       if (Array.isArray(imageAttachmentResult?.report?.extractionErrors) && imageAttachmentResult.report.extractionErrors.length) {
@@ -971,6 +1019,169 @@ router.post(
   }
 );
 
+// ---------------------------------------------------------------------
+// Source-Grounded AI Question Generation — context source ingestion.
+// Gated behind the SOURCE_GROUNDED_GENERATION capability (UNRELEASED at
+// introduction, see services/tenantFeatureService.js), so these routes
+// exist in production but return 403 for every tenant until the platform
+// capability is deliberately flipped to BETA/RELEASED.
+// ---------------------------------------------------------------------
+
+router.post(
+  '/context-sources',
+  uploadRateLimiter,
+  requireAuth,
+  requireTenant,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
+  requireTenantFeature('SOURCE_GROUNDED_GENERATION'),
+  enforceContextSourceLimit,
+  contextSourceUpload.single('file'),
+  handleMulterUploadError,
+  [body('contextSetId').optional().isMongoId().withMessage('Invalid contextSetId')],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
+
+      const tenantId = req.user.tenantId;
+      const contextSet = await getOrCreateContextSet({
+        tenantId,
+        userId: req.user._id,
+        contextSetId: req.body.contextSetId,
+      });
+
+      // 10-source cap: authoritative check, done server-side against the
+      // real count before any parse/embed work — never trust a
+      // client-side count (master prompt §5, §27).
+      const existingCount = await ContextSource.countDocuments({ tenantId, contextSetId: contextSet._id });
+      if (existingCount >= sourceGroundedConfig.MAX_CONTEXT_SOURCES_PER_SET) {
+        return res.status(400).json({
+          error: `A generation session may include at most ${sourceGroundedConfig.MAX_CONTEXT_SOURCES_PER_SET} sources.`,
+        });
+      }
+
+      const source = await ingestFileSource({
+        tenantId,
+        userId: req.user._id,
+        contextSetId: contextSet._id,
+        file: req.file,
+      });
+
+      return res.status(source.status === 'READY' ? 201 : 200).json({
+        contextSetId: contextSet._id,
+        source,
+      });
+    } catch (error) {
+      if (error?.code === 'SOURCE_CAP_EXCEEDED') {
+        return res.status(400).json({ error: error.message });
+      }
+      next(error);
+    }
+  }
+);
+
+router.post(
+  '/context-sources/url',
+  uploadRateLimiter,
+  requireAuth,
+  requireTenant,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
+  requireTenantFeature('SOURCE_GROUNDED_GENERATION'),
+  enforceContextSourceLimit,
+  [
+    body('url').isURL({ protocols: ['http', 'https'], require_protocol: true }).withMessage('A valid http(s) URL is required'),
+    body('contextSetId').optional().isMongoId().withMessage('Invalid contextSetId'),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+
+      const tenantId = req.user.tenantId;
+      const contextSet = await getOrCreateContextSet({
+        tenantId,
+        userId: req.user._id,
+        contextSetId: req.body.contextSetId,
+      });
+
+      const existingCount = await ContextSource.countDocuments({ tenantId, contextSetId: contextSet._id });
+      if (existingCount >= sourceGroundedConfig.MAX_CONTEXT_SOURCES_PER_SET) {
+        return res.status(400).json({
+          error: `A generation session may include at most ${sourceGroundedConfig.MAX_CONTEXT_SOURCES_PER_SET} sources.`,
+        });
+      }
+
+      const source = await ingestUrlSource({
+        tenantId,
+        userId: req.user._id,
+        contextSetId: contextSet._id,
+        url: req.body.url,
+      });
+
+      return res.status(source.status === 'READY' ? 201 : 200).json({
+        contextSetId: contextSet._id,
+        source,
+      });
+    } catch (error) {
+      if (error?.code === 'SOURCE_CAP_EXCEEDED') {
+        return res.status(400).json({ error: error.message });
+      }
+      next(error);
+    }
+  }
+);
+
+router.get(
+  '/context-sources',
+  requireAuth,
+  requireTenant,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
+  requireTenantFeature('SOURCE_GROUNDED_GENERATION'),
+  async (req, res, next) => {
+    try {
+      const tenantId = req.user.tenantId;
+      const { contextSetId } = req.query;
+      const filter = { tenantId };
+      if (contextSetId) filter.contextSetId = contextSetId;
+      // Never returns chunk text/embeddings — only status metadata for the
+      // source-selection UI (master prompt §17: no internal chunk IDs
+      // exposed to the frontend).
+      const sources = await ContextSource.find(filter)
+        .select('sourceType originalFilename sourceUrl status failureReason errorCode sourceProvider chunkCount extractedCharCount createdAt')
+        .sort({ createdAt: -1 })
+        .lean();
+      return res.json({ sources });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
+router.delete(
+  '/context-sources/:id',
+  requireAuth,
+  requireTenant,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
+  requireTenantFeature('SOURCE_GROUNDED_GENERATION'),
+  async (req, res, next) => {
+    try {
+      const tenantId = req.user.tenantId;
+      // tenantId baked directly into the filter — never fetch-then-check.
+      const deleted = await ContextSource.findOneAndDelete({ _id: req.params.id, tenantId });
+      if (!deleted) return res.status(404).json({ error: 'Source not found.' });
+      await ContextChunk.deleteMany({ tenantId, sourceId: deleted._id });
+      await ContextSet.updateOne(
+        { _id: deleted.contextSetId, tenantId },
+        { $inc: { sourceCount: -1 } }
+      );
+      return res.json({ success: true });
+    } catch (error) {
+      next(error);
+    }
+  }
+);
+
 router.post(
   '/generate-questions',
   aiRateLimiter, // Rate limit AI operations
@@ -978,7 +1189,23 @@ router.post(
   requireTenant,
   requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can generate questions
   [
-    body('topic').trim().notEmpty().withMessage('Topic/Domain is required'), // Universal: clarified as Topic/Domain
+    // Topic is required for STANDARD generation but optional for
+    // Source-Grounded generation (master prompt §15/§24/§41) — the
+    // uploaded/linked source material itself is sufficient context there,
+    // so forcing a Topic just to satisfy validation would be an
+    // artificial requirement that previously blocked legitimate
+    // "generate broadly from this document" requests.
+    body('topic')
+      .trim()
+      .custom((value, { req }) => {
+        const isSourceGroundedRequest =
+          String(req.body?.generationMode || '').toUpperCase() === 'SOURCE_GROUNDED';
+        if (!isSourceGroundedRequest && !value) {
+          throw new Error('Topic/Domain is required');
+        }
+        return true;
+      }),
+    body('instructions').optional().isString().withMessage('Instructions must be a string'),
     body('count').isInt({ min: 1, max: 50 }).withMessage('Count must be between 1 and 50'),
     body('difficulty').isIn(['easy', 'medium', 'hard', 'ultra_hard']).withMessage('Invalid difficulty'),
     body('questionTypes').isArray().withMessage('Question types must be an array'),
@@ -994,6 +1221,12 @@ router.post(
     body('scenarioQuestionTypes').optional().isArray().withMessage('scenarioQuestionTypes must be an array'),
     body('imageQuestionMode').optional().isIn(['percentage', 'per_count']).withMessage('Invalid imageQuestionMode'),
     body('imageQuestionTypes').optional().isArray().withMessage('imageQuestionTypes must be an array'),
+    body('productModule').optional().isIn(['STANDARD', 'WIZKIDS']),
+    body('juniorContext').optional().isObject().withMessage('juniorContext must be an object'),
+    body('generationMode').optional().isIn(['STANDARD', 'SOURCE_GROUNDED']).withMessage('Invalid generationMode'),
+    body('contextSetId').optional().isMongoId().withMessage('Invalid contextSetId'),
+    body('contextSourceIds').optional().isArray({ max: 10 }).withMessage('contextSourceIds must be an array of at most 10 items'),
+    body('contextSourceIds.*').optional().isMongoId().withMessage('Invalid contextSourceIds entry'),
   ],
   async (req, res, next) => {
     try {
@@ -1004,6 +1237,7 @@ router.post(
 
       const {
         topic,
+        instructions,
         count,
         difficulty,
         questionTypes,
@@ -1024,8 +1258,138 @@ router.post(
         scenarioQuestionTypes,
         imageQuestionMode,
         imageQuestionTypes,
+        productModule,
+        juniorContext,
+        generationMode,
+        contextSetId,
+        contextSourceIds,
       } = req.body;
+      // Deliberately keyed only on generationMode, not productModule — see
+      // resolveGenerationStrategy's doc comment. This is what makes
+      // STANDARD and WIZKIDS share one Source-Grounded pipeline.
+      const isSourceGrounded = resolveGenerationStrategy({ generationMode }) === 'SOURCE_GROUNDED';
       const effectivePlanType = await resolveUserEffectivePlanType(req.user);
+      const isJuniorGeneration = String(productModule || 'STANDARD').toUpperCase() === 'WIZKIDS';
+      let preparedJuniorContext = null;
+      if (isJuniorGeneration) {
+        try {
+          preparedJuniorContext = await prepareWizKidsExamInput({
+            tenantId: req.user.tenantId,
+            mode: juniorContext?.mode || 'TEST',
+            gradeLevel: juniorContext?.gradeLevel,
+            domains: juniorContext?.domains,
+            interactionMode: juniorContext?.interactionMode || 'STANDARD',
+            flashMaths: juniorContext?.flashMaths,
+          });
+        } catch (juniorError) {
+          if (juniorError instanceof WizKidsExamError) {
+            return res.status(juniorError.status).json({ error: juniorError.message });
+          }
+          throw juniorError;
+        }
+        const normalizedJuniorTypes = Array.isArray(questionTypes)
+          ? questionTypes.map(normalizeAiQuestionType).filter(Boolean)
+          : [];
+        const unsupportedType = findUnsupportedJuniorQuestionType(normalizedJuniorTypes);
+        if (unsupportedType) {
+          return res.status(400).json({ error: `Question type ${unsupportedType} is not supported for Junior AI authoring.` });
+        }
+      }
+
+      // Source-Grounded AI Question Generation — feature-flag + tenant-
+      // ownership validation. This check is inline (not static route
+      // middleware) because it depends on request-body content
+      // (generationMode), matching the same productModule branching
+      // pattern used for isJuniorGeneration above. Shared by STANDARD and
+      // WIZKIDS productModule alike (master prompt §32-34).
+      let verifiedContextSourceIds = [];
+      if (isSourceGrounded) {
+        const capability = await resolveTenantFeature(req.user.tenantId, 'SOURCE_GROUNDED_GENERATION');
+        if (!capability?.effectiveEnabled) {
+          return res.status(403).json({ error: 'Source-Grounded AI generation is not enabled for this tenant.' });
+        }
+        const requestedSourceIds = Array.isArray(contextSourceIds) ? contextSourceIds : [];
+        if (requestedSourceIds.length === 0) {
+          return res.status(400).json({ error: 'At least one context source must be selected for Source-Grounded generation.' });
+        }
+        // The exact tenant-isolation / IDOR guard: every requested source
+        // ID must belong to THIS tenant and be READY. A cross-tenant or
+        // unknown ID silently fails this count-equality check rather than
+        // ever being fetched/compared after the fact.
+        const readyOwnedCount = await ContextSource.countDocuments(
+          buildTenantOwnedSourceFilter({
+            tenantId: req.user.tenantId,
+            sourceIds: requestedSourceIds,
+            status: 'READY',
+          })
+        );
+        if (readyOwnedCount !== requestedSourceIds.length) {
+          return res.status(403).json({
+            error: 'One or more selected sources are unavailable, still processing, or do not belong to this tenant.',
+          });
+        }
+        verifiedContextSourceIds = requestedSourceIds;
+      }
+
+      const normalizedDistribution = Array.isArray(questionTypeDistribution)
+        ? questionTypeDistribution.map((item) => ({
+          type: normalizeAiQuestionType(item?.type),
+          count: toNonNegativeInt(item?.count, 0),
+        })).filter((item) => item.type && item.count > 0)
+        : [];
+      const normalizedRequestedTypes = Array.isArray(questionTypes)
+        ? questionTypes.map(normalizeAiQuestionType).filter(Boolean)
+        : [];
+      if (isJuniorGeneration && preparedJuniorContext?.interactionMode === 'FLASH_MATHS') {
+        const requestedFlashTypes = new Set([
+          ...normalizedRequestedTypes,
+          ...normalizedDistribution.map((item) => item.type),
+        ]);
+        if ([...requestedFlashTypes].some((type) => type !== 'NUMBER')) {
+          return res.status(400).json({ error: 'Flash Maths generation supports deterministic NUMBER rounds only.' });
+        }
+      }
+      if (isJuniorGeneration && normalizedRequestedTypes.includes('NUMBER') && normalizedRequestedTypes.length > 1 && normalizedDistribution.length === 0) {
+        return res.status(400).json({ error: 'A questionTypeDistribution is required when NUMBER is mixed with other Junior AI question types.' });
+      }
+      const deterministicNumberCount = isJuniorGeneration
+        ? (normalizedDistribution.find((item) => item.type === 'NUMBER')?.count ||
+          (normalizedRequestedTypes.length === 1 && normalizedRequestedTypes[0] === 'NUMBER' ? toNonNegativeInt(count, 0) : 0))
+        : 0;
+      const providerQuestionCount = Math.max(0, toNonNegativeInt(count, 0) - deterministicNumberCount);
+
+      // AI-generated image questions — platform-wide kill switch (master
+      // prompt §36-37, Rule 10). Checked for EVERY plan, not only free:
+      // this supersedes the previous free-plan-only ad-hoc block, because
+      // AI_IMAGE_QUESTION_GENERATION defaults UNRELEASED for every tenant
+      // regardless of plan tier (see services/tenantFeatureService.js).
+      // Manually authored image questions on existing exams are entirely
+      // unaffected — this only ever gates a call that would invoke the AI
+      // image-generation provider.
+      const imageGenerationRequested =
+        enableImageQuestions === true || toNonNegativeInt(imageQuestionCount, 0) > 0;
+      if (imageGenerationRequested) {
+        const imageGate = await assertImageGenerationAllowed({
+          tenantId: req.user?.tenantId,
+          effectivePlanType,
+          featureOverrides: req.user?.subscriptionCustomFeatures || null,
+        });
+        if (!imageGate.allowed) {
+          return sendPlanRestriction(res, imageGate.reason || FREE_PLAN_MESSAGES.QUESTION_TYPE_LOCKED);
+        }
+      }
+
+      // Source-Grounded image questions are out of scope for this initial
+      // pass (grounding an AI-generated diagram/image in retrieved source
+      // text is a separate, larger feature) — reject explicitly rather
+      // than silently mishandling the request. Since
+      // AI_IMAGE_QUESTION_GENERATION is UNRELEASED platform-wide anyway,
+      // this branch is presently unreachable for any tenant regardless.
+      if (isSourceGrounded && imageGenerationRequested) {
+        return res.status(400).json({
+          error: 'AI-generated image questions are not supported in Source-Grounded generation mode.',
+        });
+      }
 
       if (isFreePlan(effectivePlanType)) {
         const normalizeList = (list) =>
@@ -1035,12 +1399,6 @@ router.post(
         const normalizedScenarioTypes = includesParagraphType
           ? normalizeList(scenarioQuestionTypes)
           : [];
-        const imageGenerationRequested =
-          enableImageQuestions === true || toNonNegativeInt(imageQuestionCount, 0) > 0;
-
-        if (imageGenerationRequested) {
-          return sendPlanRestriction(res, FREE_PLAN_MESSAGES.QUESTION_TYPE_LOCKED);
-        }
 
         const allTypes = [
           ...normalizedQuestionTypes,
@@ -1059,7 +1417,7 @@ router.post(
       }
 
       const tenantId = req.user?.tenantId || null;
-      const requestedQuestionCount = toNonNegativeInt(count, 0);
+      const requestedQuestionCount = providerQuestionCount;
       if (tenantId && requestedQuestionCount > 0) {
         const usageSummary = await resolveTenantAiUsageSummary({
           tenantId,
@@ -1113,32 +1471,128 @@ router.post(
         generatedAt: new Date(),
       };
 
-      const questions = await generateQuestions({
-        topic,
-        count,
-        difficulty,
-        questionTypes,
-        questionTypeDistribution: Array.isArray(questionTypeDistribution) ? questionTypeDistribution : undefined,
-        questionSorting,
-        questionSortPattern: Array.isArray(questionSortPattern) ? questionSortPattern : undefined,
-        duration,
-        uploadedContent,
-        examTitle,
-        examDescription,
-        existingQuestions: Array.isArray(existingQuestions) ? existingQuestions : [],
-        enableImageQuestions: enableImageQuestions === true,
-        imageQuestionCount,
-        imageQuestionRatio,
-        imageQuestionPerCount,
-        imageQuestionsPerImage,
-        questionsPerParagraph,
-        scenarioQuestionTypes: Array.isArray(scenarioQuestionTypes) ? scenarioQuestionTypes : undefined,
-        imageQuestionMode,
-        imageQuestionTypes: Array.isArray(imageQuestionTypes) ? imageQuestionTypes : [],
-        tenantId,
-        userId: req.user?._id || null,
-        metadata: aiMetadata, // Pass metadata to AI service for logging
-      });
+      const deterministicQuestions = deterministicNumberCount > 0
+        ? generateJuniorDeterministicNumberQuestions({
+          count: deterministicNumberCount,
+          difficulty,
+          juniorContext: preparedJuniorContext,
+          topic,
+          seedBase: `${tenantId}:${req.user?._id}:${Date.now()}`,
+        })
+        : [];
+      const providerTypes = normalizedRequestedTypes.filter((type) => type !== 'NUMBER');
+      const providerDistribution = normalizedDistribution.filter((item) => item.type !== 'NUMBER');
+
+      // Source-Grounded AI Question Generation — shared entry point for
+      // BOTH productModule STANDARD and WIZKIDS (master prompt §32-34: one
+      // pipeline, not a parallel WizKids-only implementation). Never falls
+      // through to generateQuestions()'s unconstrained/general-knowledge
+      // path below.
+      let providerQuestions = [];
+      let sourceGroundedRun = null;
+      let sourceGroundedDiagnostics = null;
+      if (isSourceGrounded && providerQuestionCount > 0) {
+        sourceGroundedRun = await AIGenerationRun.create({
+          tenantId,
+          userId: req.user._id,
+          generationMode: 'SOURCE_GROUNDED',
+          productModule: isJuniorGeneration ? 'WIZKIDS' : 'STANDARD',
+          contextSetId: contextSetId || null,
+          requestedSourceIds: verifiedContextSourceIds,
+          requestedCount: providerQuestionCount,
+          status: 'RUNNING',
+        });
+
+        try {
+          const result = await generateWithNoveltyAndGrounding({
+            tenantId,
+            userId: req.user._id,
+            generationRunId: sourceGroundedRun._id,
+            sourceIds: verifiedContextSourceIds,
+            topic,
+            // Prefer the dedicated "Instructions for AI" field (distinct
+            // from Topic — master prompt §16/§63: Topic is WHAT to focus
+            // on, Instructions is HOW to construct the questions); fall
+            // back to examDescription for older callers that predate this
+            // field.
+            instructions: instructions || examDescription || '',
+            difficulty,
+            questionTypes: isJuniorGeneration ? providerTypes : questionTypes,
+            targetCount: providerQuestionCount,
+            examTitle,
+            examDescription,
+            juniorContext: preparedJuniorContext,
+          });
+
+          providerQuestions = result.questions;
+          sourceGroundedDiagnostics = {
+            insufficientSourceMaterial: result.insufficientSourceMaterial,
+            // Distinguishes WHY generation fell short (master prompt
+            // §29/§30/§44) so the frontend can show a specific message
+            // instead of one generic "insufficient" string regardless of
+            // cause: retrieval found nothing at all, the model itself
+            // judged the material insufficient for the requested count,
+            // or candidates were produced but rejected by grounding/
+            // novelty validation.
+            insufficientReason: result.insufficientReason,
+            dominantRejectionReason: result.dominantRejectionReason,
+            requestedCount: providerQuestionCount,
+            acceptedCount: result.acceptedCount,
+            rejectedCount: result.rejectedCount,
+            rejectionReasons: result.rejectionReasons,
+            attempts: result.attempts,
+          };
+
+          sourceGroundedRun.acceptedCount = result.acceptedCount;
+          sourceGroundedRun.rejectedCount = result.rejectedCount;
+          sourceGroundedRun.rejectionReasons = result.rejectionReasons;
+          sourceGroundedRun.insufficientSourceMaterial = result.insufficientSourceMaterial;
+          sourceGroundedRun.status =
+            result.acceptedCount >= providerQuestionCount
+              ? 'COMPLETED'
+              : result.acceptedCount > 0
+                ? 'PARTIAL'
+                : 'FAILED';
+          sourceGroundedRun.completedAt = new Date();
+          await sourceGroundedRun.save();
+        } catch (groundedError) {
+          sourceGroundedRun.status = 'FAILED';
+          sourceGroundedRun.errorMessage = groundedError?.message || 'Source-grounded generation failed.';
+          sourceGroundedRun.completedAt = new Date();
+          await sourceGroundedRun.save();
+          throw groundedError;
+        }
+      } else if (providerQuestionCount > 0) {
+        providerQuestions = await generateQuestions({
+          topic,
+          count: providerQuestionCount,
+          difficulty,
+          questionTypes: isJuniorGeneration ? providerTypes : questionTypes,
+          questionTypeDistribution: isJuniorGeneration ? providerDistribution : (Array.isArray(questionTypeDistribution) ? questionTypeDistribution : undefined),
+          questionSorting,
+          questionSortPattern: Array.isArray(questionSortPattern) ? questionSortPattern : undefined,
+          duration,
+          uploadedContent,
+          examTitle,
+          examDescription,
+          existingQuestions: Array.isArray(existingQuestions) ? existingQuestions : [],
+          enableImageQuestions: enableImageQuestions === true,
+          imageQuestionCount,
+          imageQuestionRatio,
+          imageQuestionPerCount,
+          imageQuestionsPerImage,
+          questionsPerParagraph,
+          scenarioQuestionTypes: Array.isArray(scenarioQuestionTypes) ? scenarioQuestionTypes : undefined,
+          imageQuestionMode,
+          imageQuestionTypes: Array.isArray(imageQuestionTypes) ? imageQuestionTypes : [],
+          tenantId,
+          userId: req.user?._id || null,
+          metadata: aiMetadata,
+          juniorContext: preparedJuniorContext,
+        });
+      }
+      const questions = [...deterministicQuestions, ...providerQuestions]
+        .map((question, index) => ({ ...question, order: index + 1 }));
 
       // Requested-vs-generated distribution diagnostics: compares the exact
       // per-type counts the caller asked for against what actually came
@@ -1153,6 +1607,7 @@ router.post(
         generatedDistribution: distributionDiagnostics.generated,
         totalQuestions: Array.isArray(questions) ? questions.length : 0,
         validationStatus: distributionDiagnostics.validationStatus,
+        ...(sourceGroundedDiagnostics ? { sourceGrounded: sourceGroundedDiagnostics } : {}),
       });
     } catch (error) {
       next(error);

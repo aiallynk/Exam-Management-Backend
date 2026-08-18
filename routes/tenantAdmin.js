@@ -521,7 +521,16 @@ const normalizeBulkImportRow = (row) => {
   const normalizedRole = requestedRole.replace(/[\s-]+/g, '_');
   const role = normalizedRole || 'CANDIDATE';
 
-  return { name, email, password, role };
+  const rawGrade = toTrimmedString(getBulkRowValue(row, 'Grade'));
+  const gradeLevel = rawGrade === '' ? null : Number(rawGrade);
+  const academicProfile = {
+    gradeLevel,
+    className: toTrimmedString(getBulkRowValue(row, 'Class')),
+    division: toTrimmedString(getBulkRowValue(row, 'Division')),
+    rollNumber: toTrimmedString(getBulkRowValue(row, 'Roll Number')),
+  };
+
+  return { name, email, password, role, academicProfile };
 };
 
 const ensureTenantAdminBulkAccess = (req, res) => {
@@ -627,6 +636,7 @@ const toPreviewRow = (preparedRow) => ({
     name: preparedRow.name,
     email: preparedRow.email,
     role: preparedRow.role,
+    academicProfile: preparedRow.academicProfile,
   },
   errors: preparedRow.errors,
   warning: preparedRow.warning,
@@ -693,6 +703,13 @@ const prepareBulkImportRows = async (rows, req) => {
 
     if (!BULK_IMPORT_ALLOWED_ROLES.has(row.role)) {
       row.errors.push('Role must be EXAM_CREATOR or CANDIDATE.');
+    }
+    if (
+      row.role === 'CANDIDATE' &&
+      row.academicProfile?.gradeLevel !== null &&
+      (!Number.isInteger(row.academicProfile.gradeLevel) || row.academicProfile.gradeLevel < 1 || row.academicProfile.gradeLevel > 7)
+    ) {
+      row.errors.push('Grade must be an integer from 1 to 7 when provided.');
     }
 
     if (row.errors.length > 0) {
@@ -1715,9 +1732,9 @@ router.get('/users/bulk-import/template', (req, res) => {
   if (!ensureTenantAdminBulkAccess(req, res)) return;
 
   const templateRows = [
-    'Name,Email,Password,Role',
-    'Aarav Sharma,aarav.sharma@example.com,Test@12345,CANDIDATE',
-    'Neha Singh,neha.singh@example.com,Test@12345,EXAM_CREATOR',
+    'Name,Email,Password,Role,Grade,Class,Division,Roll Number',
+    'Aarav Sharma,aarav.sharma@example.com,Test@12345,CANDIDATE,5,5,A,17',
+    'Neha Singh,neha.singh@example.com,Test@12345,EXAM_CREATOR,,,,',
   ];
 
   res.setHeader('Content-Type', 'text/csv; charset=utf-8');
@@ -1780,6 +1797,7 @@ router.post('/users/bulk-import', async (req, res, next) => {
           role: row.role,
           tenantId: req.user.tenantId,
           status: 'ACTIVE',
+          ...(row.role === 'CANDIDATE' ? { academicProfile: row.academicProfile } : {}),
         });
 
         await user.save();
@@ -1862,6 +1880,8 @@ router.post(
       .custom((value) => value === null || value === '' || /^[a-fA-F0-9]{24}$/.test(String(value).trim()))
       .withMessage('subTenantId must be a valid id when provided'),
     body('accessExpiresAt').optional({ nullable: true }).isISO8601(),
+    body('academicProfile').optional().isObject(),
+    body('academicProfile.gradeLevel').optional({ nullable: true }).isInt({ min: 1, max: 7 }),
   ],
   checkTenantLimits,
   async (req, res, next) => {
@@ -1871,7 +1891,7 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { name, email, password, role, mobile, subTenantId, accessExpiresAt } = req.body;
+      const { name, email, password, role, mobile, subTenantId, accessExpiresAt, academicProfile } = req.body;
 
       let resolvedSubTenantId = null;
       if (subTenantId !== undefined) {
@@ -1915,6 +1935,7 @@ router.post(
           subTenantId: resolvedSubTenantId,
           actorId: req.user._id,
           evaluatorAccess: role === 'EVALUATOR' ? { accessExpiresAt: accessExpiresAt || null } : undefined,
+          academicProfile: role === 'CANDIDATE' ? academicProfile : undefined,
         });
       } catch (roleError) {
         if (roleError instanceof UserRoleError) {
@@ -1959,6 +1980,8 @@ router.put(
       .optional({ nullable: true })
       .custom((value) => value === null || value === '' || /^[a-fA-F0-9]{24}$/.test(String(value).trim()))
       .withMessage('subTenantId must be a valid id when provided'),
+    body('academicProfile').optional().isObject(),
+    body('academicProfile.gradeLevel').optional({ nullable: true }).isInt({ min: 1, max: 7 }),
   ],
   checkTenantLimits,
   async (req, res, next) => {
@@ -1992,7 +2015,7 @@ router.put(
         subTenantId: user.subTenantId ? String(user.subTenantId) : null,
       };
 
-      const { name, email, password, role, status, mobile, subTenantId } = req.body;
+      const { name, email, password, role, status, mobile, subTenantId, academicProfile } = req.body;
 
       if (name) user.name = name;
       if (email) {
@@ -2018,6 +2041,14 @@ router.put(
       }
       if (status) user.status = status;
       if (mobile !== undefined) user.mobile = mobile;
+      if (academicProfile !== undefined && (role || user.role) === 'CANDIDATE') {
+        user.academicProfile = {
+          gradeLevel: academicProfile?.gradeLevel || null,
+          className: String(academicProfile?.className || '').trim(),
+          division: String(academicProfile?.division || '').trim(),
+          rollNumber: String(academicProfile?.rollNumber || '').trim(),
+        };
+      }
       if (subTenantId !== undefined) {
         const effectivePlanType = await resolveUserEffectivePlanType(req.user);
         const normalizedSubTenantId = String(subTenantId || '').trim();
@@ -2940,8 +2971,12 @@ router.get('/results/exams', async (req, res, next) => {
     const ExamAttempt = (await import('../models/ExamAttempt.js')).default;
     const Answer = (await import('../models/Answer.js')).default;
 
-    // Get all exams in tenant
-    const exams = await Exam.find({ tenantId: req.user.tenantId })
+    const normalizedProduct = req.query.productModule ? String(req.query.productModule).trim().toUpperCase() : '';
+    if (normalizedProduct && !['STANDARD', 'WIZKIDS'].includes(normalizedProduct)) {
+      return res.status(400).json({ error: 'productModule must be STANDARD or WIZKIDS.' });
+    }
+    // Get all exams in tenant, optionally filtered by the shared product discriminator.
+    const exams = await Exam.find({ tenantId: req.user.tenantId, ...(normalizedProduct ? { productModule: normalizedProduct } : {}) })
       .populate('createdBy', 'name email')
       .sort({ createdAt: -1 });
 
@@ -2961,6 +2996,7 @@ router.get('/results/exams', async (req, res, next) => {
             title: exam.title,
             description: exam.description,
             createdAt: exam.createdAt,
+            productModule: exam.productModule || 'STANDARD',
             totalCandidates: 0,
             overallPercentage: 0,
             averageScore: 0,
@@ -3012,6 +3048,7 @@ router.get('/results/exams', async (req, res, next) => {
           title: exam.title,
           description: exam.description,
           createdAt: exam.createdAt,
+          productModule: exam.productModule || 'STANDARD',
           totalCandidates: attempts.length,
           overallPercentage: Math.round(overallPercentage * 100) / 100,
           averageScore: Math.round(averageScore * 100) / 100,

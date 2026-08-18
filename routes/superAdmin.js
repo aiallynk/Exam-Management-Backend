@@ -20,6 +20,7 @@ import CreditRequest from '../models/CreditRequest.js';
 import AuditLog from '../models/AuditLog.js';
 import BackupHistory from '../models/BackupHistory.js';
 import SystemAlert from '../models/SystemAlert.js';
+import TenantFeatureSetting from '../models/TenantFeatureSetting.js';
 import { deleteUserAndCleanup } from '../services/userDeletionService.js';
 import { logAuditEvent, AUDIT_ACTIONS } from '../utils/auditLogger.js';
 import {
@@ -73,7 +74,12 @@ import {
   resolveExtraCreditUnitPrice,
   resolveTenantExtraCreditFieldByType,
 } from '../utils/creditSystem.js';
-import { CONTROL_CATEGORY_DEFINITIONS, TENANT_CAPABILITIES } from '../services/tenantFeatureService.js';
+import {
+  CONTROL_CATEGORY_DEFINITIONS,
+  TENANT_CAPABILITIES,
+  WIZKIDS_CAPABILITY_KEYS,
+  WIZKIDS_PLAN_FEATURE_KEYS,
+} from '../services/tenantFeatureService.js';
 
 const router = express.Router();
 
@@ -275,10 +281,18 @@ const parseOptionalLimitValue = (value) => {
   return Math.floor(parsed);
 };
 
+// A negative value (conventionally -1) is the established "unlimited"
+// sentinel throughout this file's own resolution logic
+// (parseOptionalLimitValue above, and resolvePlanLimitWithOverride in
+// middleware/planLimits.js, and resolveFiniteLimit in routes/ai.js all
+// special-case `parsed < 0` -> unlimited) — this validator must accept
+// the same values it will later be asked to resolve, or an admin setting
+// -1 for "unlimited" gets rejected before it's ever saved, silently
+// leaving the previous (finite) limit in effect.
 const isValidLimitInput = (value) => {
   if (value === null || value === undefined || value === '') return true;
   const parsed = Number(value);
-  return Number.isFinite(parsed) && parsed >= 0;
+  return Number.isFinite(parsed);
 };
 
 const normalizeAiTypeKey = (value) => {
@@ -311,22 +325,30 @@ const normalizeAiTypesAllowedInput = (value) => {
   );
 };
 
+// Keys that accept -1 as an explicit "unlimited" sentinel. maxImportFiles/
+// importQuestionsPerMonth (the same limit under its two historical
+// aliases — see resolveTenantImportFileLimit in routes/ai.js) belongs
+// here alongside the AI limits: parseOptionalLimitValue below already
+// treats any negative value as unlimited for every key, so restricting
+// which keys are allowed to actually SUBMIT -1 to only the AI limits was
+// an inconsistent, narrower gate than the resolver it feeds.
+const UNLIMITED_SENTINEL_LIMIT_KEYS = new Set([
+  'maxAiGradingsPerMonth',
+  'maxAiQuestionsPerMonth',
+  'maxImportFiles',
+  'importQuestionsPerMonth',
+]);
+
 const isValidPlanLimitInput = (limitKey, value) => {
   if (value === null || value === undefined || value === '') return true;
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return false;
   if (parsed >= 0) return true;
-  return (
-    parsed === -1 &&
-    (limitKey === 'maxAiGradingsPerMonth' || limitKey === 'maxAiQuestionsPerMonth')
-  );
+  return parsed === -1 && UNLIMITED_SENTINEL_LIMIT_KEYS.has(limitKey);
 };
 
 const parsePlanLimitInputValue = (limitKey, value) => {
-  if (
-    (limitKey === 'maxAiGradingsPerMonth' || limitKey === 'maxAiQuestionsPerMonth') &&
-    Number(value) === -1
-  ) {
+  if (UNLIMITED_SENTINEL_LIMIT_KEYS.has(limitKey) && Number(value) === -1) {
     return null;
   }
   return parseOptionalLimitValue(value);
@@ -1933,10 +1955,9 @@ router.put('/subscriptions/plans/:planType', async (req, res, next) => {
         const incomingValue = mergedIncomingLimits[key];
         if (!isValidPlanLimitInput(key, incomingValue)) {
           return res.status(400).json({
-            error:
-              key === 'maxAiGradingsPerMonth' || key === 'maxAiQuestionsPerMonth'
-                ? `${key} must be a non-negative number, -1 (unlimited), or null.`
-                : `${key} must be a non-negative number or null.`,
+            error: UNLIMITED_SENTINEL_LIMIT_KEYS.has(key)
+              ? `${key} must be a non-negative number, -1 (unlimited), or null.`
+              : `${key} must be a non-negative number or null.`,
           });
         }
 
@@ -3616,6 +3637,92 @@ router.get('/tenants/:tenantId/features', async (req, res, next) => {
 
     const tenantFeatures = await buildTenantFeaturePayload(tenant);
     return res.json({ tenantFeatures });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+/**
+ * ENABLE COMPLETE WIZKIDS PACKAGE FOR ONE TENANT
+ * POST /api/super-admin/tenants/:tenantId/wizkids/enable
+ *
+ * This is deliberately a Super-Admin-only, explicit activation action. It
+ * grants every WizKids plan capability and re-enables the corresponding tenant
+ * preferences in one auditable operation. Granular controls remain available
+ * through the normal tenant-feature update endpoint afterwards.
+ */
+router.post('/tenants/:tenantId/wizkids/enable', async (req, res, next) => {
+  try {
+    const tenantId = req.params.tenantId;
+    if (!isValidMongoId(tenantId)) {
+      return res.status(400).json({ error: 'Invalid tenantId' });
+    }
+
+    const tenant = await Tenant.findById(tenantId);
+    if (!tenant) {
+      return res.status(404).json({ error: 'Tenant not found' });
+    }
+
+    const tenantObject = tenant.toObject ? tenant.toObject() : tenant;
+    const subscription = normalizeOptionalObject(tenantObject?.subscription);
+    const previousCustomFeatures = extractActiveCustomFeatureOverrides(subscription.customFeatures);
+    const nextCustomFeatures = { ...previousCustomFeatures };
+    WIZKIDS_PLAN_FEATURE_KEYS.forEach((featureKey) => {
+      nextCustomFeatures[featureKey] = true;
+    });
+
+    const now = new Date();
+    // Store an explicit enabled tenant preference too. This repairs a previous
+    // local "off" preference, which otherwise would keep the parent disabled
+    // even after its Super Admin entitlement was granted.
+    await TenantFeatureSetting.bulkWrite(
+      WIZKIDS_CAPABILITY_KEYS.map((featureKey) => ({
+        updateOne: {
+          filter: { tenantId: tenant._id, featureKey },
+          update: {
+            $set: {
+              requestedEnabled: true,
+              superAdminEnforced: false,
+              enforcedEnabled: true,
+              effectiveEnabled: true,
+              planEntitled: true,
+              disabledReason: '',
+              configuredBy: req.user._id,
+              configuredAt: now,
+            },
+            $inc: { version: 1 },
+            $setOnInsert: { tenantId: tenant._id, featureKey },
+          },
+          upsert: true,
+        },
+      }))
+    );
+
+    tenant.subscription = tenant.subscription || {};
+    tenant.subscription.customFeatures = nextCustomFeatures;
+    tenant.subscription.updatedAt = now;
+    await tenant.save();
+
+    await logAuditEvent(AUDIT_ACTIONS.TENANT_UPDATED, {
+      ...buildActorAuditDetails(req),
+      tenantId: tenant._id,
+      tenantName: tenant.name,
+      resourceType: 'Tenant',
+      resourceId: tenant._id,
+      details: {
+        type: 'WIZKIDS_PACKAGE_ENABLED',
+        enabledCapabilities: WIZKIDS_CAPABILITY_KEYS,
+        enabledPlanFeatures: WIZKIDS_PLAN_FEATURE_KEYS,
+        previousCustomFeatures,
+        nextCustomFeatures,
+      },
+    });
+
+    const tenantFeatures = await buildTenantFeaturePayload(tenant);
+    return res.json({
+      tenantFeatures,
+      enabledCapabilities: WIZKIDS_CAPABILITY_KEYS,
+    });
   } catch (error) {
     return next(error);
   }
@@ -5340,15 +5447,15 @@ router.post(
     body('examLimit')
       .optional({ nullable: true })
       .custom((value) => isValidLimitInput(value))
-      .withMessage('examLimit must be a non-negative number or null'),
+      .withMessage('examLimit must be a number (-1 for unlimited) or null'),
     body('attemptLimit')
       .optional({ nullable: true })
       .custom((value) => isValidLimitInput(value))
-      .withMessage('attemptLimit must be a non-negative number or null'),
+      .withMessage('attemptLimit must be a number (-1 for unlimited) or null'),
     body('aiUsageLimit')
       .optional({ nullable: true })
       .custom((value) => isValidLimitInput(value))
-      .withMessage('aiUsageLimit must be a non-negative number or null'),
+      .withMessage('aiUsageLimit must be a number (-1 for unlimited) or null'),
     body('customLimits')
       .optional()
       .custom((value) => {
@@ -5358,7 +5465,7 @@ router.post(
           (key) => hasOwn(value, key) && !isValidLimitInput(value[key])
         );
       })
-      .withMessage('customLimits must contain non-negative values or null'),
+      .withMessage('customLimits must contain numbers (-1 for unlimited) or null'),
     body('customFeatures')
       .optional()
       .custom((value) => {
@@ -5712,15 +5819,15 @@ router.put(
     body('examLimit')
       .optional({ nullable: true })
       .custom((value) => isValidLimitInput(value))
-      .withMessage('examLimit must be a non-negative number or null'),
+      .withMessage('examLimit must be a number (-1 for unlimited) or null'),
     body('attemptLimit')
       .optional({ nullable: true })
       .custom((value) => isValidLimitInput(value))
-      .withMessage('attemptLimit must be a non-negative number or null'),
+      .withMessage('attemptLimit must be a number (-1 for unlimited) or null'),
     body('aiUsageLimit')
       .optional({ nullable: true })
       .custom((value) => isValidLimitInput(value))
-      .withMessage('aiUsageLimit must be a non-negative number or null'),
+      .withMessage('aiUsageLimit must be a number (-1 for unlimited) or null'),
     body('customLimits')
       .optional()
       .custom((value) => {
@@ -5730,7 +5837,7 @@ router.put(
           (key) => hasOwn(value, key) && !isValidLimitInput(value[key])
         );
       })
-      .withMessage('customLimits must contain non-negative values or null'),
+      .withMessage('customLimits must contain numbers (-1 for unlimited) or null'),
     body('customFeatures')
       .optional()
       .custom((value) => {

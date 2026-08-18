@@ -13,7 +13,17 @@ export const requestTimeout = (timeoutMs = 30000) => {
     // Routes that need longer timeouts (in milliseconds)
     const extendedTimeoutRoutes = {
       '/api/exams/generate-questions': 300000, // 5 minutes for AI question generation
+      '/api/ai/generate-questions': 300000, // same endpoint, mounted at both base paths
       '/api/exams/import-questions': 300000,    // 5 minutes for AI question extraction from files
+      // Source-Grounded context-source ingestion (parse + chunk + embed)
+      // runs synchronously inside the request — a large document (e.g. a
+      // 200-300 page book) can take well over the default 30s to embed
+      // every chunk, so this needs the same allowance as the other
+      // AI-heavy endpoints above rather than the default.
+      '/api/ai/context-sources': 300000,
+      '/api/exams/context-sources': 300000,
+      '/api/ai/context-sources/url': 300000,
+      '/api/exams/context-sources/url': 300000,
       '/api/omr/extract-id': 90000, // 90 seconds for OCR-based identity extraction
       '/api/super-admin/backups': 600000, // 10 minutes for large backup creation
       '/api/super-admin/backups/restore-upload': 600000, // 10 minutes for upload + restore

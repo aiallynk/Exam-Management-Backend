@@ -30,6 +30,21 @@ const ExamSchema = new mongoose.Schema(
       default: 'ONLINE',
       index: true,
     },
+    // Which product this exam belongs to. Deliberately kept separate from
+    // examType (delivery mechanism: online vs OMR) — product module and
+    // delivery mechanism are independent concerns (master prompt §17).
+    // Default 'STANDARD' preserves today's behavior for every existing exam
+    // unchanged; only WizKids-created exams ever set this to 'WIZKIDS'.
+    // WizKids-specific configuration (mode, grade, domains, batches, timing
+    // behavior) lives entirely outside this model in WizKidsExamConfig
+    // (master prompt §18) — this field is the only thing core Exam needs to
+    // know about WizKids.
+    productModule: {
+      type: String,
+      enum: ['STANDARD', 'WIZKIDS'],
+      default: 'STANDARD',
+      index: true,
+    },
     duration: {
       type: Number,
       required: true,
@@ -326,6 +341,7 @@ ExamSchema.index({ createdBy: 1, createdAt: -1 });
 ExamSchema.index({ tenantId: 1, isActive: 1 });
 ExamSchema.index({ tenantId: 1, examType: 1, createdAt: -1 });
 ExamSchema.index({ tenantId: 1, subTenantId: 1, createdAt: -1 });
+ExamSchema.index({ tenantId: 1, productModule: 1, createdAt: -1 });
 
 export default mongoose.model('Exam', ExamSchema);
 

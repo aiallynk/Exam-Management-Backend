@@ -83,6 +83,12 @@ const UserSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+    academicProfile: {
+      gradeLevel: { type: Number, min: 1, max: 7, default: null },
+      className: { type: String, trim: true, maxlength: 80, default: '' },
+      division: { type: String, trim: true, maxlength: 40, default: '' },
+      rollNumber: { type: String, trim: true, maxlength: 80, default: '' },
+    },
     // Status management
     status: {
       type: String,
@@ -133,6 +139,7 @@ UserSchema.index({ tenantId: 1, subTenantId: 1, role: 1 });
 UserSchema.index({ status: 1 });
 UserSchema.index({ planType: 1 });
 UserSchema.index({ tenantId: 1, roles: 1 });
+UserSchema.index({ tenantId: 1, role: 1, 'academicProfile.gradeLevel': 1 });
 
 // Keep `roles` populated and guaranteed to contain the primary `role`.
 // Documents saved before this field existed have no `roles` at all — this

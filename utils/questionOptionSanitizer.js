@@ -1,5 +1,13 @@
 const OPTION_LABELS = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ'.split('');
 
+// Teacher editions often encode a visually highlighted answer into the PDF
+// text layer as a trailing tag (for example, "B. Hesitant [CORRECT]"). That
+// tag is metadata for the importer, never part of what a candidate should
+// see as an option. Keep this deliberately narrow so a legitimate option
+// containing the word "correct" is not changed.
+const TRAILING_ANSWER_MARKER_PATTERN =
+  /\s*(?:\[\s*(?:correct(?:\s+answer)?|right\s+answer|answer)\s*\]|\(\s*(?:correct(?:\s+answer)?|right\s+answer)\s*\))\s*$/i;
+
 const normalizeWhitespace = (value) => {
   if (value === undefined || value === null) {
     return '';
@@ -63,7 +71,8 @@ const shouldStripIndexedOptionLabels = (options) => {
   return labeledCount >= Math.min(2, list.length);
 };
 
-export const sanitizeQuestionOptionText = (value) => normalizeWhitespace(value);
+export const sanitizeQuestionOptionText = (value) =>
+  normalizeWhitespace(value).replace(TRAILING_ANSWER_MARKER_PATTERN, '').trim();
 
 export const sanitizeIndexedQuestionOptionText = (value, index) =>
   sanitizeQuestionOptionText(stripIndexedOptionLabel(value, index));

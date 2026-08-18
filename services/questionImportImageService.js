@@ -1815,6 +1815,22 @@ const extractQuestionsFromScannedBlocks = async ({
   }));
 };
 
+// Resolves a model-reported option letter/text into one of the extracted
+// option strings, tolerant of the model answering with "A", "Option A",
+// or the option's own text.
+const resolveCorrectAnswerFromOptions = (rawAnswer, options) => {
+  const answer = sanitizeString(rawAnswer);
+  if (!answer || !Array.isArray(options) || !options.length) return '';
+  const letterMatch = answer.match(/^[ABCD]$/i) || answer.match(/^option\s*([ABCD])$/i);
+  if (letterMatch) {
+    const index = letterMatch[1].toUpperCase().charCodeAt(0) - 'A'.charCodeAt(0);
+    if (options[index]) return options[index];
+  }
+  const exactMatch = options.find((option) => sanitizeString(option).toLowerCase() === answer.toLowerCase());
+  if (exactMatch) return exactMatch;
+  return '';
+};
+
 const extractQuestionsFromPdfVisionDirect = async ({
   pdfBuffer,
   extractionErrors,
@@ -1842,14 +1858,28 @@ const extractQuestionsFromPdfVisionDirect = async ({
           {
             role: 'system',
             content:
-              'Extract MCQ questions from scanned exam pages. Return JSON with {"questions":[{questionText, options:{A,B,C,D}, questionNumber}]}. Keep source wording concise.',
+              'Extract MCQ questions from these exam pages, reading the actual rendered page — not just the text layer — ' +
+              'so you can see visual formatting. Return JSON with {"questions":[{questionText, options:{A,B,C,D}, ' +
+              'questionNumber, correctAnswerLetter, correctAnswerConfidence}]}. ' +
+              'For correctAnswerLetter: identify which option (A, B, C, or D) is visually marked as the correct answer — ' +
+              'this may be shown via a colored/yellow highlight background behind the option, bold or colored option text, ' +
+              'an underline, a circled/boxed option, a checkmark, or an asterisk next to the option. ' +
+              'If no option is visually marked, leave correctAnswerLetter empty rather than guessing from content alone. ' +
+              'Set correctAnswerConfidence to "high" when a clear visual marking (highlight/bold/circle/checkmark) is present, ' +
+              '"low" if you are inferring from wording only, or omit it if correctAnswerLetter is empty. ' +
+              'Each options value must contain only the candidate-visible option wording: omit option labels, answer markers ' +
+              '(such as [CORRECT]), page headers/footers, document titles, instructions, section headings, and text from the next question. ' +
+              'Keep source wording concise.',
           },
           {
             role: 'user',
             content: [
               {
                 type: 'text',
-                text: 'Read this scanned PDF and extract all visible MCQ questions with options.',
+                text:
+                  'Read this PDF and extract all visible MCQ questions with options. Pay close attention to any ' +
+                  'highlighted, bolded, colored, circled, or checkmarked option — that marks the correct answer. Do not copy ' +
+                  'the visual marker, a [CORRECT] text-layer tag, page chrome, or section headings into the option text.',
               },
               {
                 type: 'image_url',
@@ -1873,6 +1903,15 @@ const extractQuestionsFromPdfVisionDirect = async ({
             normalizeOptionValue(optionsObj?.[key] || optionsObj?.[key.toLowerCase()] || '', index)
           )
           .filter(Boolean);
+        // Only trust a visually-marked correct answer (high confidence) —
+        // a low-confidence content-only guess is not what "highlighted
+        // answer" detection promises and would just be a coin-flip fed
+        // into the exam.
+        const confidence = sanitizeString(item?.correctAnswerConfidence).toLowerCase();
+        const correctAnswer =
+          confidence === 'high'
+            ? resolveCorrectAnswerFromOptions(item?.correctAnswerLetter, options)
+            : '';
         return {
           questionNumber: Number.isFinite(Number(item?.questionNumber))
             ? Number(item.questionNumber)
@@ -1880,7 +1919,7 @@ const extractQuestionsFromPdfVisionDirect = async ({
           questionText,
           questionType: options.length >= 2 ? 'MULTIPLE_CHOICE' : 'SHORT_ANSWER',
           options: options.length >= 2 ? options : undefined,
-          correctAnswer: '',
+          correctAnswer,
           points: 1,
           order: index,
           sourceRowIndex: index,
@@ -1964,8 +2003,31 @@ export const parseQuestionImportFile = async (file) => {
       });
     }
 
+    // Every PDF import (not only scanned/no-text-layer ones) is routed
+    // through vision-based structured extraction: plain pdf-parse text
+    // strips all visual formatting before it ever reaches the AI, so a
+    // highlighted/bolded/circled "correct answer" is invisible unless the
+    // model actually sees the rendered page. This costs a vision call per
+    // PDF import; it takes priority over the plain-text extraction for
+    // building structuredRows (see extractQuestionsFromContent, which
+    // returns structuredRows as-is, including whatever correctAnswer this
+    // step found, without a second blind text-only re-extraction pass).
+    const directVisionQuestions = await extractQuestionsFromPdfVisionDirect({
+      pdfBuffer: file.buffer,
+      extractionErrors,
+    });
+    if (directVisionQuestions.length > 0) {
+      structuredRows = directVisionQuestions;
+      if (!text) {
+        text = directVisionQuestions.map((q) => q.questionText).join('\n\n');
+      }
+    }
+
     // Scanned PDF fallback: render pages -> detect blocks -> extract question text with vision.
-    if (!text) {
+    // Only reached when there is no text layer AND the lighter whole-PDF
+    // vision pass above didn't produce anything — this heavier
+    // page-rendering/block-detection pipeline is reserved as a last resort.
+    if (!text && (!Array.isArray(structuredRows) || structuredRows.length === 0)) {
       const scanned = await runScannedPdfProcessor({
         sourceBuffer: file.buffer,
         inputExtension: extension,
@@ -1989,17 +2051,6 @@ export const parseQuestionImportFile = async (file) => {
           })
           .join('\n\n');
         text = synthesizedText;
-      }
-
-      if (!Array.isArray(structuredRows) || structuredRows.length === 0) {
-        const directVisionQuestions = await extractQuestionsFromPdfVisionDirect({
-          pdfBuffer: file.buffer,
-          extractionErrors,
-        });
-        if (directVisionQuestions.length > 0) {
-          structuredRows = directVisionQuestions;
-          text = directVisionQuestions.map((q) => q.questionText).join('\n\n');
-        }
       }
 
       // If pages were rendered but text extraction did not succeed, keep import editable.
@@ -2205,6 +2256,13 @@ export const attachImagesToImportedQuestions = async ({
   rowEmbeddedArtifacts,
   extractionErrors,
   importSessionId,
+  // When false, only images actually present in the uploaded file
+  // (mapped/extracted artifacts) are attached — no AI-generated diagram
+  // and no local-SVG-fallback diagram is ever created for a question
+  // whose text merely mentions a diagram/chart. Defaults to true to
+  // preserve prior behavior for any other future caller; the
+  // /import-questions route explicitly passes false.
+  generateMissingDiagrams = true,
 }) => {
   const safeQuestions = Array.isArray(questions) ? questions.map((question) => ({ ...question })) : [];
   const safeRows = Array.isArray(structuredRows) ? structuredRows : [];
@@ -2472,35 +2530,37 @@ export const attachImagesToImportedQuestions = async ({
     }
   }
 
-  for (let index = 0; index < safeQuestions.length; index += 1) {
-    const question = safeQuestions[index];
-    if (sanitizeString(question.imageUrl)) continue;
-    if (!DIAGRAM_KEYWORD_REGEX.test(sanitizeString(question.questionText))) continue;
+  if (generateMissingDiagrams) {
+    for (let index = 0; index < safeQuestions.length; index += 1) {
+      const question = safeQuestions[index];
+      if (sanitizeString(question.imageUrl)) continue;
+      if (!DIAGRAM_KEYWORD_REGEX.test(sanitizeString(question.questionText))) continue;
 
-    const diagramType = detectDiagramType(question.questionText);
-    let cached = aiDiagramCache.get(diagramType);
-    if (!cached) {
-      cached = await generateDiagramArtifact({
-        diagramType,
-        questionText: question.questionText,
-        extractionErrors: errors,
+      const diagramType = detectDiagramType(question.questionText);
+      let cached = aiDiagramCache.get(diagramType);
+      if (!cached) {
+        cached = await generateDiagramArtifact({
+          diagramType,
+          questionText: question.questionText,
+          extractionErrors: errors,
+        });
+        if (cached) aiDiagramCache.set(diagramType, cached);
+      }
+      if (!cached) continue;
+
+      question.imageUrl = await persistArtifactSafely({
+        artifact: cached,
+        questionIndex: index,
+        fileStem: cached.generatedByAI ? `ai-${diagramType}` : `fallback-${diagramType}`,
+        stage: cached.generatedByAI ? 'persist-ai-generated-image' : 'persist-fallback-generated-image',
       });
-      if (cached) aiDiagramCache.set(diagramType, cached);
-    }
-    if (!cached) continue;
+      if (!question.imageUrl) continue;
 
-    question.imageUrl = await persistArtifactSafely({
-      artifact: cached,
-      questionIndex: index,
-      fileStem: cached.generatedByAI ? `ai-${diagramType}` : `fallback-${diagramType}`,
-      stage: cached.generatedByAI ? 'persist-ai-generated-image' : 'persist-fallback-generated-image',
-    });
-    if (!question.imageUrl) continue;
-
-    if (cached.generatedByAI) {
-      aiGeneratedCount += 1;
-    } else {
-      fallbackGeneratedCount += 1;
+      if (cached.generatedByAI) {
+        aiGeneratedCount += 1;
+      } else {
+        fallbackGeneratedCount += 1;
+      }
     }
   }
 

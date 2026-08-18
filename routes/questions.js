@@ -2,6 +2,7 @@ import express from 'express';
 import Question from '../models/Question.js';
 import QuestionPaper from '../models/QuestionPaper.js';
 import Exam from '../models/Exam.js';
+import WizKidsExamConfig from '../models/WizKidsExamConfig.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole, requireOwnershipOrAdmin } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
@@ -29,8 +30,45 @@ import {
   hasCodingConfiguration,
 } from '../utils/codingQuestions.js';
 import { queueExamPackageRegeneration } from '../services/examPackageRegenerationService.js';
+import { canCandidateAccessExam } from '../middleware/examPermissions.js';
+import { hasRole } from '../utils/userRoles.js';
+import { findUnsupportedJuniorQuestionType } from '../utils/juniorQuestionPolicy.js';
+import { resolveTenantFeature } from '../services/tenantFeatureService.js';
 
 const router = express.Router();
+
+const validateJuniorQuestionPayloads = async ({ exam, payloads = [] }) => {
+  if (exam?.productModule !== 'WIZKIDS') return null;
+
+  const juniorConfig = await WizKidsExamConfig.findOne({
+    tenantId: exam.tenantId,
+    examId: exam._id,
+  }).select('interactionMode').lean();
+  if (juniorConfig?.interactionMode === 'FLASH_MATHS') {
+    return 'Flash Maths rounds must be created through the dedicated deterministic Flash Maths generator.';
+  }
+
+  const normalizedPayloads = Array.isArray(payloads) ? payloads : [];
+  const unsupportedType = findUnsupportedJuniorQuestionType(
+    normalizedPayloads.map((payload) => normalizeQuestionTypeAlias(payload?.questionType || payload?.type))
+  );
+  if (unsupportedType) {
+    return `Question type ${unsupportedType} is not supported for Junior Exam authoring.`;
+  }
+
+  const includesVisualQuestion = normalizedPayloads.some((payload) => {
+    const format = normalizeQuestionFormatAlias(payload?.questionFormat || payload?.question_type || payload?.type);
+    return ['IMAGE', 'IMAGE_BASED'].includes(format);
+  });
+  if (includesVisualQuestion) {
+    const visualCapability = await resolveTenantFeature(exam.tenantId, 'WIZKIDS_VISUAL_QUESTIONS');
+    if (!visualCapability?.effectiveEnabled) {
+      return 'Visual Junior questions are not enabled for this tenant.';
+    }
+  }
+
+  return null;
+};
 
 const queueExamPackageRegenerationForContentChange = async ({
   examId,
@@ -665,6 +703,42 @@ const isCodingQuestionPayload = (payload = {}) => {
 
 const isDataImageSource = (value) => /^data:/i.test(String(value || '').trim());
 
+const isValidObjectIdString = (value) => /^[a-fA-F0-9]{24}$/.test(String(value || '').trim());
+
+// Source-Grounded AI Question Generation — light structural sanitization
+// for client-echoed provenance data (the frontend receives this from
+// generate-questions and passes it back unmodified when the exam is
+// saved). Provenance is internal/examiner-facing metadata only, never
+// used for any security or grading decision, so this whitelists the
+// expected shape rather than performing a full DB round-trip
+// verification — proportionate to the risk (a forged value could at
+// most mislead the exam creator's own "View source evidence" display,
+// never another tenant or a candidate).
+const sanitizeQuestionProvenance = (provenance) => {
+  if (!provenance || typeof provenance !== 'object' || Array.isArray(provenance)) return undefined;
+  const generationRunId = isValidObjectIdString(provenance.generationRunId) ? provenance.generationRunId : undefined;
+  const sourceIds = Array.isArray(provenance.sourceIds)
+    ? provenance.sourceIds.filter(isValidObjectIdString).slice(0, 20)
+    : undefined;
+  const chunkIds = Array.isArray(provenance.chunkIds)
+    ? provenance.chunkIds.filter(isValidObjectIdString).slice(0, 50)
+    : undefined;
+  const evidenceSnippet =
+    typeof provenance.evidenceSnippet === 'string' ? provenance.evidenceSnippet.trim().slice(0, 500) : undefined;
+  const noveltySignatures =
+    provenance.noveltySignatures && typeof provenance.noveltySignatures === 'object'
+      ? {
+          exact: typeof provenance.noveltySignatures.exact === 'string' ? provenance.noveltySignatures.exact.slice(0, 128) : undefined,
+          near: typeof provenance.noveltySignatures.near === 'string' ? provenance.noveltySignatures.near.slice(0, 128) : undefined,
+          blueprint: typeof provenance.noveltySignatures.blueprint === 'string' ? provenance.noveltySignatures.blueprint.slice(0, 128) : undefined,
+        }
+      : undefined;
+  if (!generationRunId && !sourceIds?.length && !chunkIds?.length && !evidenceSnippet && !noveltySignatures) {
+    return undefined;
+  }
+  return { generationRunId, sourceIds, chunkIds, evidenceSnippet, noveltySignatures };
+};
+
 const createQuestionWithManagedImage = async ({
   examId,
   questionPaperId,
@@ -705,6 +779,7 @@ const createQuestionWithManagedImage = async ({
   codingFields,
   matchingPairs,
   evaluationConfig,
+  provenance,
 }) => {
   const inlineImage = typeof image === 'string' ? image.trim() : '';
   const normalizedImageUrlCandidate =
@@ -824,6 +899,7 @@ const createQuestionWithManagedImage = async ({
     points: Number.isFinite(Number(points ?? max_marks)) ? Number(points ?? max_marks) : 1,
     order: Number.isFinite(Number(order)) ? Number(order) : 0,
     sectionId: sectionId || undefined,
+    provenance: sanitizeQuestionProvenance(provenance),
   });
 
   await question.save();
@@ -903,6 +979,11 @@ router.get('/:examId/question-papers/:paperId/questions', requireAuth, requireTe
       return res.status(400).json({ error: 'Question paper does not belong to this exam' });
     }
 
+    const isCandidate = hasRole(req.user, 'CANDIDATE');
+    if (isCandidate && !(await canCandidateAccessExam(req.user._id, examId))) {
+      return res.status(403).json({ error: 'You do not have access to this exam.' });
+    }
+
     // Get questions for this question paper
     const questions = await Question.find({
       questionPaperId: paperId,
@@ -926,6 +1007,25 @@ router.get('/:examId/question-papers/:paperId/questions', requireAuth, requireTe
     const examResponseQuestions = questions.map((questionDoc) => {
       const serializedQuestion =
         typeof questionDoc?.toObject === 'function' ? questionDoc.toObject() : questionDoc;
+
+      if (isCandidate) {
+        // Candidate delivery must never disclose objective answers or WizKids
+        // instant-feedback metadata before a permitted Practice check. For
+        // MATCHING, expose prompts plus a shared set of choices, not the
+        // persisted left/right mapping that is itself the answer key.
+        const { correctAnswer, evaluationConfig, matchingPairs, options, ...candidateQuestion } = serializedQuestion;
+        const sourcePairs = Array.isArray(matchingPairs) ? matchingPairs : [];
+        const leftPairs = sourcePairs.map((pair) => ({ left: pair?.left || pair?.term || pair?.prompt || '' }));
+        const matchingChoices = sourcePairs
+          .map((pair) => pair?.right || pair?.match || pair?.answer || '')
+          .filter(Boolean);
+        return {
+          ...candidateQuestion,
+          options: serializedQuestion.questionType === 'MATCHING' ? matchingChoices : options,
+          matchingPairs: serializedQuestion.questionType === 'MATCHING' ? leftPairs : matchingPairs,
+          question_type: resolveQuestionTypeTokenForExamResponse(serializedQuestion),
+        };
+      }
 
       return {
         ...serializedQuestion,
@@ -1181,6 +1281,14 @@ router.post(
         }
       }
 
+      const juniorPolicyError = await validateJuniorQuestionPayloads({
+        exam,
+        payloads: normalizedCreatePayloads,
+      });
+      if (juniorPolicyError) {
+        return res.status(400).json({ error: juniorPolicyError });
+      }
+
       const planContext = await resolveExamPlanContext(exam._id);
       if (planContext?.planType && isFreePlan(planContext.planType)) {
         for (const payloadRecord of normalizedCreatePayloads) {
@@ -1263,6 +1371,7 @@ router.post(
           memoryLimit: payloadRecord.memoryLimit ?? memoryLimit,
           codingFields: payloadRecord.codingFields ?? codingFields,
           matchingPairs: payloadRecord.matchingPairs ?? matchingPairs,
+          provenance: payloadRecord.provenance,
         });
         createdQuestions.push(createdQuestion);
       }
@@ -1443,7 +1552,7 @@ router.put(
         return res.status(404).json({ error: 'Question not found for this exam' });
       }
 
-      const exam = await Exam.findById(questionPaper.examId).select('_id createdBy');
+      const exam = await Exam.findById(questionPaper.examId).select('_id createdBy tenantId productModule');
       if (exam) {
         const planContext = await resolveExamPlanContext(exam._id);
         if (planContext?.planType && isFreePlan(planContext.planType)) {
@@ -1546,6 +1655,11 @@ router.put(
           ? { languages: languages ?? language }
           : {}),
       };
+
+      const juniorPolicyError = await validateJuniorQuestionPayloads({ exam, payloads: [normalizedPayload] });
+      if (juniorPolicyError) {
+        return res.status(400).json({ error: juniorPolicyError });
+      }
 
       const codingPayloadError = validateCodingQuestionPayload(normalizedPayload);
       if (codingPayloadError) {
@@ -1935,7 +2049,7 @@ router.post(
         return res.status(404).json({ error: 'Question paper not found' });
       }
 
-      const exam = await Exam.findById(req.params.examId).select('_id createdBy tenantId');
+      const exam = await Exam.findById(req.params.examId).select('_id createdBy tenantId productModule');
       let freePlanRestriction = null;
       if (exam) {
         const planContext = await resolveExamPlanContext(exam._id);
@@ -1963,9 +2077,20 @@ router.post(
         console.log('[questions/import] Payload sample row:', importRecords[0] || null);
       }
 
+      const preparedImportRecords = importRecords.map((record, index) =>
+        prepareImportedQuestionRecordForInsert(record || {}, index)
+      );
+      const juniorPolicyError = await validateJuniorQuestionPayloads({
+        exam,
+        payloads: preparedImportRecords,
+      });
+      if (juniorPolicyError) {
+        return res.status(400).json({ error: juniorPolicyError });
+      }
+
       for (let index = 0; index < importRecords.length; index += 1) {
         const record = importRecords[index] || {};
-        const preparedRecord = prepareImportedQuestionRecordForInsert(record, index);
+        const preparedRecord = preparedImportRecords[index];
         const rowNumber = Number.isFinite(Number(record?._rowIndex))
           ? Number(record._rowIndex)
           : index + 1;

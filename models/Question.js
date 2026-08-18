@@ -219,6 +219,65 @@ const QuestionSchema = new mongoose.Schema(
       },
       default: new Map(),
     },
+    // Source-Grounded AI Question Generation — entirely optional/additive.
+    // Absent on every pre-existing question, so existing rendering, export,
+    // grading, and translation code paths are unaffected. Only populated for
+    // questions accepted out of a generationMode: 'SOURCE_GROUNDED' run.
+    // Internal/examiner-facing only — never exposed to candidates.
+    provenance: {
+      type: new mongoose.Schema(
+        {
+          generationRunId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'AIGenerationRun',
+            default: undefined,
+          },
+          sourceIds: {
+            type: [mongoose.Schema.Types.ObjectId],
+            ref: 'ContextSource',
+            default: undefined,
+          },
+          chunkIds: {
+            type: [mongoose.Schema.Types.ObjectId],
+            ref: 'ContextChunk',
+            default: undefined,
+          },
+          // Short excerpt for the "View source evidence" reviewer affordance
+          // — never the full chunk text.
+          evidenceSnippet: {
+            type: String,
+            trim: true,
+            default: undefined,
+          },
+          noveltySignatures: {
+            type: new mongoose.Schema(
+              {
+                exact: { type: String, default: undefined },
+                near: { type: String, default: undefined },
+                blueprint: { type: String, default: undefined },
+              },
+              { _id: false }
+            ),
+            default: undefined,
+          },
+        },
+        { _id: false }
+      ),
+      default: undefined,
+    },
+    // Historical-question novelty backfill only (scripts/backfillHistoricalQuestionSignatures.js).
+    // Kept separate from provenance.noveltySignatures so it's obvious in
+    // review which signatures came from real generation-time grounding vs.
+    // a lexical-only approximation computed after the fact for pre-existing
+    // questions that have no source/chunk provenance to reconstruct.
+    legacySignature: {
+      type: String,
+      default: undefined,
+    },
+    legacySignatureComputedAt: {
+      type: Date,
+      default: undefined,
+    },
   },
   {
     timestamps: true,

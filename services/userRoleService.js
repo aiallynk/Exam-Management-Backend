@@ -60,6 +60,7 @@ export async function createTenantUser({
   status,
   actorId,
   evaluatorAccess,
+  academicProfile,
 }) {
   if (!ALL_ROLES.includes(role)) {
     throw new UserRoleError(422, `Unsupported role: ${role}`);
@@ -87,6 +88,7 @@ export async function createTenantUser({
     mobile,
     subTenantId: subTenantId || null,
     status: status || 'ACTIVE',
+    ...(role === 'CANDIDATE' && academicProfile ? { academicProfile } : {}),
   });
 
   if (role === 'EVALUATOR') {

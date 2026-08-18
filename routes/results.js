@@ -194,6 +194,7 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
       userId,
       isCompleted,
       isDisqualified,
+      productModule,
     } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
@@ -205,6 +206,18 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
     if (userId) filter.userId = userId;
     if (isCompleted !== undefined) filter.isCompleted = isCompleted === 'true';
     if (isDisqualified !== undefined) filter.isDisqualified = isDisqualified === 'true';
+    if (productModule !== undefined) {
+      const normalizedProduct = String(productModule).trim().toUpperCase();
+      if (!['STANDARD', 'WIZKIDS'].includes(normalizedProduct)) {
+        return res.status(400).json({ error: 'productModule must be STANDARD or WIZKIDS.' });
+      }
+      const productExamIds = await Exam.find({ tenantId: req.user.tenantId, productModule: normalizedProduct }).distinct('_id');
+      if (examId && !productExamIds.some((id) => String(id) === String(examId))) {
+        filter.examId = { $in: [] };
+      } else if (!examId) {
+        filter.examId = { $in: productExamIds };
+      }
+    }
 
     // Candidates/non-privileged users can only query their own results.
     if (!isPrivilegedUser) {
@@ -212,7 +225,7 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
     }
 
     const attempts = await ExamAttempt.find(filter)
-      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt')
+      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt productModule')
       .populate('sessionId', 'startTime endTime')
       .populate('userId', 'name email')
       .populate('questionPaperId', 'setName')

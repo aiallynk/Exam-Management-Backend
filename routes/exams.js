@@ -36,6 +36,12 @@ import { sanitizeQuestionOptions } from '../utils/questionOptionSanitizer.js';
 import { sanitizeExamAccessControlPayload } from '../utils/examSecurity.js';
 import { queueExamPackageRegeneration } from '../services/examPackageRegenerationService.js';
 import { resolveAttemptExhaustedExamIds } from '../utils/attemptAvailability.js';
+import WizKidsExamConfig from '../models/WizKidsExamConfig.js';
+import {
+  createWizKidsExamArtifacts,
+  prepareWizKidsExamInput,
+  WizKidsExamError,
+} from '../services/wizKidsExamService.js';
 
 const router = express.Router();
 const SECTION_BASED_EXAM_TYPE = 'SECTION_BASED';
@@ -937,7 +943,7 @@ const runContextAutoAssign = (questions, sections, options = {}) => {
 // Universal: Shows exams based on exam context roles, not user system role
 router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, sanitizePagination, async (req, res, next) => {
   try {
-    const { page, limit, isActive, filterBy, examType } = req.query;
+    const { page, limit, isActive, filterBy, examType, productModule } = req.query;
     const skip = (page - 1) * limit;
 
     let filter = { ...req.tenantFilter };
@@ -947,6 +953,10 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, sanitizePag
       [ONLINE_EXAM_TYPE, OMR_EXAM_TYPE].includes(normalizedExamType)
     ) {
       filter.examType = normalizedExamType;
+    }
+    const normalizedProductModule = String(productModule || '').trim().toUpperCase();
+    if (['STANDARD', 'WIZKIDS'].includes(normalizedProductModule)) {
+      filter.productModule = normalizedProductModule;
     }
 
     // SUPER_ADMIN, TENANT_ADMIN, and EXAM_CREATOR see all exams in their scope
@@ -1002,9 +1012,25 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, sanitizePag
       .limit(limit);
 
     const total = await Exam.countDocuments(filter);
+    const juniorExamIds = exams
+      .filter((exam) => exam.productModule === 'WIZKIDS')
+      .map((exam) => exam._id);
+    const juniorConfigs = juniorExamIds.length
+      ? await WizKidsExamConfig.find({ tenantId: req.user.tenantId, examId: { $in: juniorExamIds } })
+        .select('examId mode gradeLevel domains interactionMode')
+        .lean()
+      : [];
+    const juniorConfigByExamId = new Map(
+      juniorConfigs.map((config) => [String(config.examId), config])
+    );
 
     res.json({
-      exams: exams.map((exam) => withExamCode(exam)),
+      exams: exams.map((exam) => ({
+        ...withExamCode(exam),
+        ...(exam.productModule === 'WIZKIDS'
+          ? { juniorConfig: juniorConfigByExamId.get(String(exam._id)) || null }
+          : {}),
+      })),
       pagination: {
         page,
         limit,
@@ -1439,6 +1465,8 @@ router.post(
       .optional()
       .isIn(['replace'])
       .withMessage('candidateAssignmentMode must be replace when provided during creation'),
+    body('productModule').optional().isIn(['STANDARD', 'WIZKIDS']),
+    body('juniorConfig').optional().isObject().withMessage('juniorConfig must be an object'),
   ],
   async (req, res, next) => {
     try {
@@ -1483,8 +1511,37 @@ router.post(
         totalMarks,
         subTenantId,
         accessControl,
+        productModule,
+        juniorConfig,
       } =
         req.body;
+
+      const normalizedProductModule = String(productModule || 'STANDARD').trim().toUpperCase();
+      if (normalizedProductModule === 'WIZKIDS' && normalizeExamType(examType) === OMR_EXAM_TYPE) {
+        return res.status(400).json({ error: 'Junior Exam is available only for online exams.' });
+      }
+      let preparedJuniorInput = null;
+      if (normalizedProductModule === 'WIZKIDS') {
+        try {
+          preparedJuniorInput = await prepareWizKidsExamInput({
+            tenantId: resolvedTenantId,
+            mode: juniorConfig?.mode || 'TEST',
+            gradeLevel: juniorConfig?.gradeLevel,
+            domains: juniorConfig?.domains,
+            batchIds: juniorConfig?.batchIds,
+            autoAdvance: juniorConfig?.autoAdvance,
+            allowBackNavigation: juniorConfig?.allowBackNavigation,
+            questionTimerSeconds: juniorConfig?.questionTimerSeconds,
+            interactionMode: juniorConfig?.interactionMode,
+            flashMaths: juniorConfig?.flashMaths,
+          });
+        } catch (juniorError) {
+          if (juniorError instanceof WizKidsExamError) {
+            return res.status(juniorError.status).json({ error: juniorError.message });
+          }
+          throw juniorError;
+        }
+      }
 
       const duplicateExam = await findDuplicateExamByTitle({
         title,
@@ -1670,6 +1727,7 @@ router.post(
         totalMarks: Number.isFinite(Number(totalMarks)) ? Math.max(0, Number(totalMarks)) : 0,
         createdBy: req.user._id,
         tenantId: resolvedTenantId,
+        productModule: normalizedProductModule,
       };
 
       if (resolvedSubTenantId) {
@@ -1723,6 +1781,16 @@ router.post(
         req.user._id
       );
 
+      let juniorArtifacts = null;
+      if (preparedJuniorInput) {
+        juniorArtifacts = await createWizKidsExamArtifacts({
+          exam,
+          tenantId: resolvedTenantId,
+          createdBy: req.user._id,
+          preparedInput: preparedJuniorInput,
+        });
+      }
+
       // Keep denormalized creator counters in sync for plan enforcement.
       await syncUserExamCount(req.user._id);
 
@@ -1767,7 +1835,12 @@ router.post(
         });
       }
 
-      res.status(201).json({ exam: withExamCode(exam) });
+      res.status(201).json({
+        exam: withExamCode(exam),
+        ...(juniorArtifacts
+          ? { questionPaper: juniorArtifacts.questionPaper, juniorConfig: juniorArtifacts.config }
+          : {}),
+      });
     } catch (error) {
       next(error);
     }
@@ -2594,4 +2667,3 @@ router.post(
 );
 
 export default router;
-

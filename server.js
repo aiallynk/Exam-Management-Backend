@@ -47,6 +47,18 @@ import compilerRoutes from './routes/compiler.js';
 import notificationRoutes from './routes/notifications.js';
 import systemAlertRoutes from './routes/systemAlerts.js';
 import publicRoutes from './routes/public.js';
+import wizKidsRoutes from './routes/wizKids.js';
+import wizKidsBatchesRoutes from './routes/wizKidsBatches.js';
+import wizKidsExamsRoutes from './routes/wizKidsExams.js';
+import wizKidsQuestionBankRoutes from './routes/wizKidsQuestionBank.js';
+import wizKidsPracticeRoutes from './routes/wizKidsPractice.js';
+import wizKidsSpeedRoutes from './routes/wizKidsSpeed.js';
+import wizKidsGeneratorRoutes from './routes/wizKidsGenerator.js';
+import wizKidsAnalyticsRoutes from './routes/wizKidsAnalytics.js';
+import wizKidsGamificationRoutes from './routes/wizKidsGamification.js';
+import wizKidsCandidateRoutes from './routes/wizKidsCandidate.js';
+import wizKidsTestCompletionRoutes from './routes/wizKidsTestCompletion.js';
+import wizKidsFlashMathsRoutes from './routes/wizKidsFlashMaths.js';
 import { startSubscriptionExpiryScheduler } from './services/subscriptionLifecycleService.js';
 import { startAutoTenantBackupScheduler } from './services/autoBackupSchedulerService.js';
 import { startIncrementalBackupScheduler } from './services/incrementalBackupSchedulerService.js';
@@ -309,6 +321,18 @@ const registerApiRoutes = (basePath) => {
   app.use(`${basePath}/compiler`, compilerRoutes);
   app.use(`${basePath}/code`, compilerRoutes);
   app.use(`${basePath}/notifications`, notificationRoutes);
+  app.use(`${basePath}/wizkids`, wizKidsRoutes);
+  app.use(`${basePath}/wizkids/batches`, wizKidsBatchesRoutes);
+  app.use(`${basePath}/wizkids/exams`, wizKidsExamsRoutes);
+  app.use(`${basePath}/wizkids/question-bank`, wizKidsQuestionBankRoutes);
+  app.use(`${basePath}/wizkids/attempts`, wizKidsPracticeRoutes);
+  app.use(`${basePath}/wizkids/attempts`, wizKidsSpeedRoutes);
+  app.use(`${basePath}/wizkids/attempts`, wizKidsTestCompletionRoutes);
+  app.use(`${basePath}/wizkids/generator`, wizKidsGeneratorRoutes);
+  app.use(`${basePath}/wizkids/analytics`, wizKidsAnalyticsRoutes);
+  app.use(`${basePath}/wizkids/gamification`, wizKidsGamificationRoutes);
+  app.use(`${basePath}/wizkids/candidate`, wizKidsCandidateRoutes);
+  app.use(`${basePath}/wizkids/flash-maths`, wizKidsFlashMathsRoutes);
 
   // New backup/restore APIs are intentionally canonical and v1-only. Legacy local-file
   // endpoints remain mounted above only as a temporary migration compatibility path.

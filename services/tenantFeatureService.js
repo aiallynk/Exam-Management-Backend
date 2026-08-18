@@ -11,10 +11,80 @@ export const TENANT_CAPABILITIES = Object.freeze({
   MODERATOR_WORKFLOW: { group: 'Evaluation & Verification', planFeature: 'moderatorWorkflow', dependsOn: ['EVALUATOR_REVIEW'], description: 'Moderation of flagged evaluations.', releaseStatus: 'BETA' },
   BLIND_EVALUATION: { group: 'Evaluation & Verification', planFeature: 'mandatoryVerification', dependsOn: ['EVALUATOR_REVIEW'], description: 'Hide candidate identity in evaluator review.', releaseStatus: 'RELEASED' },
   OMR_EXAMS: { group: 'Examination Modes', planFeature: 'omr', description: 'OMR examination creation and processing.', releaseStatus: 'RELEASED' },
+
+  // --- Source-Grounded AI Question Generation --------------------------
+  // Generation constrained strictly to selected uploaded/URL source
+  // material — files+URLs ingestion, retrieval, grounding, and novelty
+  // enforcement, shared between STANDARD and WIZKIDS via
+  // generate-questions' generationMode field. Flipped from UNRELEASED to
+  // RELEASED once validated — still gated per-tenant by the
+  // sourceGroundedGeneration plan-feature entitlement (Pro/Ultimate/Legend
+  // by default; Free plan does not have it) and requires
+  // NOVELTY_SIGNATURE_SECRET to be configured for actual generation calls.
+  SOURCE_GROUNDED_GENERATION: {
+    group: 'AI & Automation',
+    planFeature: 'sourceGroundedGeneration',
+    description: 'Generate exam questions strictly grounded in uploaded files or web URL source material.',
+    releaseStatus: 'RELEASED',
+  },
+  // Hard platform-wide kill switch for AI-GENERATED image questions (not
+  // manually authored ones, which are unaffected). Per the master spec:
+  // "AI-generated image questions must be OFF by default" — UNRELEASED
+  // means resolveCapabilityEffectiveState() returns UNRELEASED for every
+  // tenant regardless of plan/customFeatures overrides, so no tenant or
+  // Super Admin per-tenant setting can turn this on until the platform
+  // default is deliberately changed. See assertImageGenerationAllowed()
+  // below for the two call sites this guards (existing + source-grounded
+  // image generation).
+  AI_IMAGE_QUESTION_GENERATION: {
+    group: 'AI & Automation',
+    planFeature: 'imageQuestions',
+    description: 'Platform-wide switch for AI-generated (not manually authored) image-based questions.',
+    releaseStatus: 'UNRELEASED',
+  },
   REMOTE_PROCTORING: { group: 'Monitoring & Proctoring', planFeature: 'advancedProctoring', dependsOn: ['ONLINE_EXAMS'], description: 'Remote online proctoring.', releaseStatus: 'BETA' },
   ONLINE_EXAMS: { group: 'Examination Modes', platformAvailable: true, planFeature: null, description: 'Online examinations.', releaseStatus: 'RELEASED' },
   RESULT_APPROVAL_WORKFLOW: { group: 'Reporting & Administration', planFeature: 'mandatoryVerification', dependsOn: ['EVALUATOR_REVIEW'], description: 'Result approval before publication.', releaseStatus: 'RELEASED' },
+
+  // --- WizKids ---------------------------------------------------------
+  // Parent capability. planFeature 'wizKids' defaults to false on every plan
+  // (config/planLimits.js), so every tenant is LOCKED_BY_PLAN until a Super
+  // Admin explicitly grants entitlement via a per-tenant
+  // Tenant.subscription.customFeatures.wizKids=true override (routes/superAdmin.js
+  // PUT /tenants/:tenantId/features). Only once entitled can a Tenant Admin
+  // enable/disable it for their organization via the existing
+  // PATCH /tenant/features/WIZKIDS endpoint (routes/tenantFeatures.js).
+  WIZKIDS: { group: 'WizKids', planFeature: 'wizKids', description: 'WizKids — specialized mathematics and reasoning experience for Grade 1-7 students.', releaseStatus: 'RELEASED' },
+  // Child capabilities each depend on WIZKIDS (so parent OFF => every child
+  // unavailable regardless of its own entitlement/preference) and each carry
+  // their own planFeature so a Super Admin can grant/deny individual sections
+  // per tenant independently (e.g. Olympiad NOT ALLOWED while others ALLOWED).
+  WIZKIDS_MENTAL_MATHS: { group: 'WizKids', planFeature: 'wizKidsMentalMaths', dependsOn: ['WIZKIDS'], description: 'Mental Maths practice and tests.', releaseStatus: 'RELEASED' },
+  WIZKIDS_VEDIC_MATHS: { group: 'WizKids', planFeature: 'wizKidsVedicMaths', dependsOn: ['WIZKIDS'], description: 'Vedic Maths practice and tests.', releaseStatus: 'RELEASED' },
+  WIZKIDS_SUPER_MATHS: { group: 'WizKids', planFeature: 'wizKidsSuperMaths', dependsOn: ['WIZKIDS'], description: 'Super Maths practice and tests.', releaseStatus: 'RELEASED' },
+  WIZKIDS_LOGIC: { group: 'WizKids', planFeature: 'wizKidsLogic', dependsOn: ['WIZKIDS'], description: 'Logical Reasoning practice and tests.', releaseStatus: 'RELEASED' },
+  WIZKIDS_OLYMPIAD: { group: 'WizKids', planFeature: 'wizKidsOlympiad', dependsOn: ['WIZKIDS'], description: 'Olympiad Mathematics practice and tests.', releaseStatus: 'RELEASED' },
+  WIZKIDS_PRACTICE: { group: 'WizKids', planFeature: 'wizKidsPractice', dependsOn: ['WIZKIDS'], description: 'Practice Mode with instant per-question feedback.', releaseStatus: 'RELEASED' },
+  WIZKIDS_SPEED_MODE: { group: 'WizKids', planFeature: 'wizKidsSpeedMode', dependsOn: ['WIZKIDS'], description: 'Speed Mode with per-question timing and auto-advance.', releaseStatus: 'RELEASED' },
+  WIZKIDS_GENERATED_QUESTIONS: { group: 'WizKids', planFeature: 'wizKidsGeneratedQuestions', dependsOn: ['WIZKIDS'], description: 'Deterministic generated maths questions.', releaseStatus: 'RELEASED' },
+  WIZKIDS_VISUAL_QUESTIONS: { group: 'WizKids', planFeature: 'wizKidsVisualQuestions', dependsOn: ['WIZKIDS'], description: 'Visual / image-based maths and logic questions.', releaseStatus: 'RELEASED' },
 });
+
+// A complete tenant activation must grant the parent and every currently
+// released WizKids section together. Keeping these derived from the catalogue
+// prevents a new capability from silently being omitted from the one-click
+// Super Admin activation flow.
+export const WIZKIDS_CAPABILITY_KEYS = Object.freeze(
+  Object.entries(TENANT_CAPABILITIES)
+    .filter(([, definition]) => definition.group === 'WizKids')
+    .map(([featureKey]) => featureKey)
+);
+
+export const WIZKIDS_PLAN_FEATURE_KEYS = Object.freeze(
+  WIZKIDS_CAPABILITY_KEYS
+    .map((featureKey) => TENANT_CAPABILITIES[featureKey]?.planFeature)
+    .filter(Boolean)
+);
 
 export const CONTROL_CATEGORY_DEFINITIONS = Object.freeze([
   { id: 'features', name: 'Features and Capabilities', description: 'All controls available to this tenant.', groups: null },
@@ -23,6 +93,7 @@ export const CONTROL_CATEGORY_DEFINITIONS = Object.freeze([
   { id: 'examinations', name: 'Examination Controls', description: 'Exam delivery and evaluation mode controls.', groups: ['Examination Modes'] },
   { id: 'security', name: 'Security Controls', description: 'Monitoring, proctoring, and approval controls.', groups: ['Monitoring & Proctoring', 'Reporting & Administration'] },
   { id: 'plan', name: 'Plan and Entitlements', description: 'Capabilities included with the current subscription.', groups: null },
+  { id: 'wizkids', name: 'WizKids', description: 'WizKids product access and section-level capabilities.', groups: ['WizKids'] },
 ]);
 
 const keyOf = (key) => String(key || '').trim().toUpperCase();
@@ -34,7 +105,15 @@ export const getTenantFeatureSnapshot = async (tenantId) => {
   ]);
   if (!tenant) return null;
   const planType = resolveEffectivePlanType(tenant.subscription?.planType, resolveSubscriptionStatus(tenant.subscription || {}));
-  return { tenant, planType, settingsByKey: new Map(settings.map((setting) => [keyOf(setting.featureKey), setting])) };
+  return {
+    tenant,
+    planType,
+    // Per-tenant Super-Admin-set overrides (Tenant.subscription.customFeatures),
+    // e.g. { wizKids: true }. Passed into isPlanFeatureEnabled() below so a
+    // capability's plan entitlement can be granted per tenant, not only per plan tier.
+    featureOverrides: tenant.subscription?.customFeatures || null,
+    settingsByKey: new Map(settings.map((setting) => [keyOf(setting.featureKey), setting])),
+  };
 };
 
 export const resolveCapabilityEffectiveState = ({
@@ -81,7 +160,9 @@ export const resolveTenantCapabilities = async (tenantId) => {
     resolving.add(key);
     const releaseStatus = definition.releaseStatus || 'RELEASED';
     const platformAvailable = definition.platformAvailable !== false && releaseStatus !== 'UNRELEASED';
-    const planEntitled = definition.planFeature ? isPlanFeatureEnabled(snapshot.planType, definition.planFeature) : true;
+    const planEntitled = definition.planFeature
+      ? isPlanFeatureEnabled(snapshot.planType, definition.planFeature, snapshot.featureOverrides)
+      : true;
     const setting = snapshot.settingsByKey.get(key);
     const superAdminEnforced = setting?.superAdminEnforced === true;
     const tenantEnabled = superAdminEnforced
@@ -165,4 +246,29 @@ export const requireTenantFeature = (featureKey) => async (req, res, next) => {
   } catch (error) {
     return next(error);
   }
+};
+
+// Guards every path that would invoke an AI image-generation provider call
+// (existing attachImageBasedQuestions flow AND the new Source-Grounded
+// image path) — never just the frontend. Composes two independent checks
+// so this is a real gate, not the currently-dead imageQuestions plan flag
+// on its own:
+//   1. The AI_IMAGE_QUESTION_GENERATION platform capability (hard kill
+//      switch — UNRELEASED blocks unconditionally, see the catalogue
+//      entry above).
+//   2. The per-plan `imageQuestions` feature flag via isPlanFeatureEnabled
+//      (previously defined in config/planLimits.js but never read
+//      anywhere — this is the wiring that makes it real).
+// Both must pass. Returns { allowed: boolean, reason: string } rather than
+// throwing, so callers in both the request/response route path and a
+// service-layer function can handle the negative case their own way.
+export const assertImageGenerationAllowed = async ({ tenantId, effectivePlanType, featureOverrides = null } = {}) => {
+  const capability = await resolveTenantFeature(tenantId, 'AI_IMAGE_QUESTION_GENERATION');
+  if (!capability?.effectiveEnabled) {
+    return { allowed: false, reason: 'AI-generated image questions are not enabled on this platform.' };
+  }
+  if (!isPlanFeatureEnabled(effectivePlanType, 'imageQuestions', featureOverrides)) {
+    return { allowed: false, reason: 'AI-generated image questions are not included in this plan.' };
+  }
+  return { allowed: true, reason: '' };
 };

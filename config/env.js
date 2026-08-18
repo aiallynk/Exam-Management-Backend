@@ -43,7 +43,18 @@ See server/env.example for reference.
   if (process.env.JWT_REFRESH_SECRET === 'change-me-too' || process.env.JWT_REFRESH_SECRET === 'secret') {
     console.warn('⚠️  WARNING: JWT_REFRESH_SECRET appears to be using a default/weak value. Please change it in production!');
   }
-  
+
+  // NOVELTY_SIGNATURE_SECRET is NOT in REQUIRED_ENV_VARS on purpose: the
+  // Source-Grounded AI feature it backs ships behind an UNRELEASED
+  // capability flag (see services/tenantFeatureService.js), so no request
+  // can reach it yet. Requiring it at boot would fail every existing
+  // deployment's startup the moment this code ships, for a feature nobody
+  // can use yet. services/noveltyService.js throws a clear error the first
+  // time it's actually invoked without this set, instead.
+  if (process.env.NOVELTY_SIGNATURE_SECRET === 'change-me-too' || process.env.NOVELTY_SIGNATURE_SECRET === 'secret') {
+    console.warn('⚠️  WARNING: NOVELTY_SIGNATURE_SECRET appears to be using a default/weak value. Please change it before enabling Source-Grounded generation in production!');
+  }
+
   // Validate MongoDB URI format (basic check)
   if (process.env.MONGODB_URI && !process.env.MONGODB_URI.startsWith('mongodb://') && !process.env.MONGODB_URI.startsWith('mongodb+srv://')) {
     console.warn('⚠️  WARNING: MONGODB_URI format may be incorrect. Expected mongodb:// or mongodb+srv://');
@@ -69,6 +80,17 @@ const config = {
   refreshTtlDays: parseInt(process.env.REFRESH_TTL_DAYS || '7', 10),
   openaiApiKey: process.env.OPENAI_API_KEY,
   openaiModel: resolveOpenAiModel(),
+  openaiEmbeddingModel: process.env.OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small',
+  // Source-Grounded AI Question Generation novelty ledger HMAC key. Not in
+  // REQUIRED_ENV_VARS — see the boot-time warning above for why.
+  noveltySignatureSecret: process.env.NOVELTY_SIGNATURE_SECRET || '',
+  // Optional. When set, Google Drive FILE sources (see
+  // services/googleDriveSourceProvider.js) are fetched via the official
+  // Drive v3 files.get?alt=media endpoint instead of the public
+  // uc?export=download page trick — more reliable for large/binary files.
+  // Never required: publicly-shared ("Anyone with the link") files are
+  // still readable without it.
+  googleDriveApiKey: process.env.GOOGLE_DRIVE_API_KEY || '',
   uploadDir: process.env.UPLOAD_DIR || './uploads',
   corsOrigin:
     process.env.CORS_ORIGIN || 'https://exam-management-frontend-psi.vercel.app',

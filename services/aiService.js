@@ -13,6 +13,11 @@ const client = config.openaiApiKey
   ? new OpenAI({ apiKey: config.openaiApiKey })
   : null;
 const OPENAI_MODEL = config.openaiModel || 'gpt-4o-mini';
+
+// Exposed so other services (e.g. Source-Grounded ingestion/generation)
+// reuse this single client instance rather than constructing their own —
+// keeps API-key handling and null-when-unconfigured behavior in one place.
+export const getOpenAIClient = () => client;
 const IMPORT_EXTRACTION_MODEL = 'gpt-4o-mini';
 const MAX_IMPORT_AI_CHUNKS = 120;
 const MAX_IMPORT_CHUNK_PREVIEW_LENGTH = 8000;
@@ -173,7 +178,11 @@ const parseMultiAnswer = (value) => {
     .filter(Boolean);
 };
 
-const normalizeQuestionObject = (question, index = 0) => {
+// Exported for reuse by services/groundedGenerationService.js so
+// Source-Grounded candidates go through the exact same per-type shape
+// normalization as every other AI-generated question, instead of a
+// second, divergent implementation.
+export const normalizeQuestionObject = (question, index = 0) => {
   if (!question || typeof question !== 'object') {
     return null;
   }
@@ -1494,6 +1503,7 @@ export const generateQuestions = async (params) => {
     metadata = null,
     tenantId = null,
     userId = null,
+    juniorContext = null,
   } = params;
 
   const trackingContext = resolveTrackingContext({ tenantId, userId, metadata });
@@ -1523,8 +1533,9 @@ export const generateQuestions = async (params) => {
 
   // Validate count
   const questionCount = parseInt(count, 10);
-  if (isNaN(questionCount) || questionCount < 5 || questionCount > 50) {
-    throw new Error('Question count must be between 5 and 50');
+  const minimumQuestionCount = juniorContext ? 1 : 5;
+  if (isNaN(questionCount) || questionCount < minimumQuestionCount || questionCount > 50) {
+    throw new Error(`Question count must be between ${minimumQuestionCount} and 50`);
   }
   const normalizedQuestionsPerParagraph = normalizeQuestionsPerParagraph(
     questionsPerParagraph,
@@ -1632,7 +1643,11 @@ These questions should be at the highest difficulty level, suitable for expert-l
       ? existingQuestions.slice(0, 50).map((q, idx) => `${idx + 1}. ${String(q).substring(0, 200)}`).join('\n')
       : '';
 
-    let systemPrompt = `You are an expert exam question generator specializing in creating questions at precise difficulty levels. Generate high-quality exam questions in JSON format.
+    const juniorPromptContext = juniorContext
+      ? `\nJUNIOR EXAM CONTEXT (MANDATORY):\n- Grade: ${Number(juniorContext.gradeLevel)}\n- Enabled domains: ${(juniorContext.domains || []).join(', ')}\n- Use child-appropriate language and examples for this grade.\n- Do not introduce content outside the enabled domains.\n- Arithmetic operands and answers are generated separately by deterministic code; do not invent NUMBER arithmetic questions in this provider response.\n`
+      : '';
+
+    let systemPrompt = `You are an expert exam question generator specializing in creating questions at precise difficulty levels. Generate high-quality exam questions in JSON format.${juniorPromptContext}
 
 CRITICAL REQUIREMENTS:
 - Generate exactly ${questionCount} questions
@@ -2385,6 +2400,43 @@ const normalizeImportTextToSingleLine = (content) =>
     .replace(/\s+/g, ' ')
     .trim();
 
+// PDF text extraction flattens page headers, footers and section dividers
+// into neighbouring options. Remove only standalone document chrome before
+// lines are collapsed; option lines themselves always retain their A./B./…
+// prefix and are therefore left intact.
+const isStandaloneImportChromeLine = (line) => {
+  const normalized = normalizeImportLine(line);
+  if (!normalized) return false;
+  if (/^(?:.*\|\s*)?page\s+\d+(?:\s*(?:of|\/)\s*\d+)?\s*$/i.test(normalized)) {
+    return true;
+  }
+  if (
+    /^(?:sample|practice|demo|educational)\b.*\b(?:not an official|all rights reserved|copyright|for demonstration purposes)\b/i.test(
+      normalized
+    )
+  ) {
+    return true;
+  }
+
+  if (/^(?:q(?:uestion)?\s*)?\d+\s*[\).:\-]\s*/i.test(normalized)) return false;
+  if (/^[A-D]\s*[\).:\-]\s*/i.test(normalized)) return false;
+
+  // Section dividers such as "MATHEMATICS" and "HISTORY & CIVICS" are
+  // visually separate lines in papers but otherwise become part of the
+  // preceding D option after pdf-parse normalizes whitespace.
+  return (
+    /^[A-Z][A-Z0-9 &/,'’\-]{2,}$/.test(normalized) &&
+    normalized.split(/\s+/).length <= 6
+  );
+};
+
+const stripImportDocumentChrome = (content) =>
+  String(content || '')
+    .replace(/\r\n?/g, '\n')
+    .split('\n')
+    .filter((line) => !isStandaloneImportChromeLine(line))
+    .join('\n');
+
 const stripLeadingQuestionNumberToken = (value) =>
   sanitizeString(value).replace(/^\s*(?:q(?:uestion)?\s*)?\d+\s*[\).:\-]\s*/i, '');
 
@@ -2449,6 +2501,27 @@ const extractRawAnswerFromText = (text) => {
   return sanitizeString(answerMatch?.[1] || '');
 };
 
+// Some teacher editions expose a visual answer highlight as a text-layer tag
+// (for example, "B. Hesitant [CORRECT]"). The tag must not reach the option
+// wording, but it is still reliable answer metadata for a text-only fallback.
+const extractMarkedOptionAnswerFromText = (text, options) => {
+  const normalized = normalizeImportTextToSingleLine(text);
+  if (!normalized || !Array.isArray(options) || !options.length) return '';
+
+  const optionRegex =
+    /(?:^|\s)([A-D])[\).:\-]\s*(.*?)(?=(?:\s+[A-D][\).:\-]\s*)|(?:\s+(?:answer|ans|correct\s*answer)\s*[:\-])|$)/gis;
+  let match;
+  while ((match = optionRegex.exec(normalized))) {
+    if (!/\[\s*(?:correct(?:\s+answer)?|right\s+answer|answer)\s*\]|\(\s*(?:correct(?:\s+answer)?|right\s+answer)\s*\)/i.test(match[2])) {
+      continue;
+    }
+    const optionIndex = match[1].toUpperCase().charCodeAt(0) - 65;
+    return sanitizeString(options[optionIndex] || '');
+  }
+
+  return '';
+};
+
 const buildQuestionTextFromParsedBlock = (blockText) => {
   const withoutNumber = normalizeImportTextToSingleLine(
     stripLeadingQuestionNumberToken(blockText)
@@ -2476,8 +2549,8 @@ const buildQuestionTextFromParsedBlock = (blockText) => {
   return sanitizeString(withoutAnswer.slice(0, splitIndex).replace(/\s+/g, ' '));
 };
 
-const normalizeImportTextForParsing = (content) => {
-  const normalized = normalizeImportTextToSingleLine(content)
+export const normalizeImportTextForParsing = (content) => {
+  const normalized = normalizeImportTextToSingleLine(stripImportDocumentChrome(content))
     .replace(/(^|\s)(?:q(?:uestion)?\s*)?(\d+)\)\s+/gi, '$1$2. ')
     .replace(/(^|\s)(?:q(?:uestion)?\s*)(\d+)\s*[:\-]\s+/gi, '$1$2. ')
     .replace(/\b(\d+)\)\s*/g, '$1. ')
@@ -2973,7 +3046,9 @@ const normalizeParsedQuestionFromBlock = ({ block, index }) => {
   }
 
   let options = extractLabeledOptionsFromText(withoutNumber);
-  const rawAnswer = extractRawAnswerFromText(withoutNumber);
+  const rawAnswer =
+    extractRawAnswerFromText(withoutNumber) ||
+    extractMarkedOptionAnswerFromText(withoutNumber, options);
   const fallbackType = detectImportQuestionType(withoutNumber);
 
   let questionType = 'SHORT_ANSWER';
@@ -3018,7 +3093,7 @@ const normalizeParsedQuestionFromBlock = ({ block, index }) => {
   return normalizedQuestion;
 };
 
-const extractQuestionsFromNumberedText = (content) => {
+export const extractQuestionsFromNumberedText = (content) => {
   const blocks = splitNumberedQuestionBlocks(content);
   console.log('[question-import-debug] QUESTION BLOCKS:', blocks.length);
   console.log('[question-import] Total blocks:', blocks.length);

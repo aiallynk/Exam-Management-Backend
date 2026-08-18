@@ -70,6 +70,8 @@ import {
   incrementTenantAiGradingUsage,
   toAiUsageResponsePayload,
 } from '../services/aiGradingUsageService.js';
+import { assertExamProductAccess, WizKidsAccessError } from '../services/wizKidsAccessService.js';
+import { completeWizKidsObjectiveAttempt, WizKidsCompletionError } from '../services/wizKidsCompletionService.js';
 
 const parseArrayAnswer = (value) => {
   if (Array.isArray(value)) {
@@ -1193,6 +1195,14 @@ router.post(
       if (!exam) {
         return res.status(404).json({ error: 'Exam not found' });
       }
+      try {
+        await assertExamProductAccess({ tenantId: req.user.tenantId, exam });
+      } catch (accessError) {
+        if (accessError instanceof WizKidsAccessError) {
+          return res.status(accessError.status).json({ error: accessError.message });
+        }
+        throw accessError;
+      }
 
       // Verify session belongs to exam
       if (session.examId._id.toString() !== examId) {
@@ -1846,12 +1856,43 @@ export const submitAttemptHandler = async (req, res, next) => {
     let attempt = await ExamAttempt.findById(req.params.attemptId)
       .populate(
         'examId',
-        'title duration showResultsImmediately resultsReleasedAt accessControl markingRules evaluationMode'
+        'title duration showResultsImmediately resultsReleasedAt accessControl markingRules evaluationMode productModule'
       )
       .populate('sessionId');
 
     if (!attempt) {
       return res.status(404).json({ error: 'Attempt not found' });
+    }
+
+    // Defense in depth: a user who reaches the legacy generic exam player
+    // with a WizKids session must still never trigger semantic/AI grading for
+    // deterministic arithmetic. The WizKids completion service validates
+    // tenant, ownership, mode, feature tree, and objective-only question set.
+    if (attempt.examId?.productModule === 'WIZKIDS') {
+      try {
+        const completion = await completeWizKidsObjectiveAttempt({
+          tenantId: attempt.tenantId || req.user?.tenantId,
+          userId: req.user?._id,
+          attemptId: attempt._id,
+          expectedMode: ['TEST', 'WORKSHEET', 'COMPETITION', 'OLYMPIAD', 'PRACTICE', 'SPEED'],
+          answers: req.body?.answers,
+        });
+        return res.json({
+          success: true,
+          alreadySubmitted: completion.alreadyCompleted,
+          attempt: completion.attempt,
+          attemptStatus: 'COMPLETED',
+          submittedAt: completion.attempt?.submittedAt || completion.attempt?.submitTime || null,
+          score: completion.score || completion.attempt?.scoreSummary || null,
+          resultsAvailable: true,
+          message: 'WizKids attempt submitted successfully',
+        });
+      } catch (error) {
+        if (error instanceof WizKidsCompletionError) {
+          return res.status(error.status).json({ error: error.message });
+        }
+        throw error;
+      }
     }
 
     const examId = attempt.examId?._id || attempt.examId;
