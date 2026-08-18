@@ -26,6 +26,23 @@ describe('buildQueryText — topic is optional', () => {
     const text = buildQueryText({ topic: '', instructions: 'cover the whole chapter evenly', questionTypes: [] });
     assert.match(text, /cover the whole chapter evenly/);
   });
+
+  test('broadenFocus drops the topic from the retrieval query even when one was given', () => {
+    // Regression coverage: a narrow/generic Topic (e.g. "Science and
+    // Technology") can embed poorly against specific source passages,
+    // causing retrieval to surface weak matches and the model to
+    // (wrongly) report insufficient material even though the document is
+    // clearly on-topic. On a broadened retry the topic is dropped from
+    // the QUERY (though still shown to the model in the user prompt) so
+    // retrieval searches for general coverage instead.
+    const text = buildQueryText({ topic: 'Science and Technology', instructions: '', questionTypes: [], broadenFocus: true });
+    assert.ok(!text.includes('Science and Technology'));
+  });
+
+  test('broadenFocus with no instructions falls back to the broad-coverage query, not an empty one', () => {
+    const text = buildQueryText({ topic: 'Science and Technology', instructions: '', questionTypes: [], broadenFocus: true });
+    assert.match(text, /broad/i);
+  });
 });
 
 describe('buildUserPrompt — topic is optional', () => {
@@ -48,6 +65,23 @@ describe('buildUserPrompt — topic is optional', () => {
   test('omits the instructions line entirely when none were given', () => {
     const prompt = buildUserPrompt({ topic: 'Fractions', instructions: '', count: 5, questionTypes: ['MULTIPLE_CHOICE'] });
     assert.ok(!prompt.includes('Creator instructions'));
+  });
+
+  test('broadenFocus still shows the original topic to the model but adds the broaden-interpretation nudge', () => {
+    const prompt = buildUserPrompt({
+      topic: 'Science and Technology',
+      instructions: '',
+      count: 10,
+      questionTypes: ['MULTIPLE_CHOICE'],
+      broadenFocus: true,
+    });
+    assert.match(prompt, /Topic\/focus: Science and Technology/);
+    assert.match(prompt, /interpret the topic broadly/i);
+  });
+
+  test('omits the broaden-interpretation nudge on a normal (non-retry) attempt', () => {
+    const prompt = buildUserPrompt({ topic: 'Fractions', instructions: '', count: 5, questionTypes: ['MULTIPLE_CHOICE'] });
+    assert.ok(!prompt.toLowerCase().includes('interpret the topic broadly'));
   });
 });
 

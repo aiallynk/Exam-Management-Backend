@@ -49,6 +49,15 @@ export const generateWithNoveltyAndGrounding = async ({
   let insufficientReason = null;
   let attempts = 0;
   let consecutiveEmptyAttempts = 0;
+  // Flips on once an attempt comes back LLM_REPORTED_INSUFFICIENT — which
+  // only ever happens when chunks WERE retrieved but the model still
+  // refused (see generateGroundedCandidates) — most often because a
+  // narrow/generic Topic was interpreted too literally against specific
+  // source passages. Every subsequent attempt in this loop then drops the
+  // Topic from the retrieval query and asks the model to interpret it
+  // broadly, instead of repeating the exact same request and getting the
+  // same refusal again.
+  let broadenFocus = false;
 
   while (
     accepted.length < targetCount &&
@@ -76,11 +85,15 @@ export const generateWithNoveltyAndGrounding = async ({
       examDescription,
       juniorContext,
       excludeQuestionTexts: accepted.map((question) => question.questionText),
+      broadenFocus,
     });
 
     if (attemptInsufficient) {
       insufficientSourceMaterial = true;
       insufficientReason = insufficientReason || attemptInsufficientReason || null;
+      if (attemptInsufficientReason === 'LLM_REPORTED_INSUFFICIENT') {
+        broadenFocus = true;
+      }
     }
 
     if (!candidates.length) {

@@ -40,10 +40,16 @@ const BROAD_COVERAGE_QUERY_TEXT =
   'Provide broad, representative coverage of the key facts, concepts, and topics in this source material.';
 
 // Exported for direct pure-function unit testing (no DB/network) — see
-// tests/groundedGenerationPrompting.test.js.
-export const buildQueryText = ({ topic, instructions, questionTypes, juniorContext }) => {
+// tests/groundedGenerationPrompting.test.js. When broadenFocus is true
+// (set by the orchestrator after a prior attempt came back
+// LLM_REPORTED_INSUFFICIENT despite chunks actually being retrieved —
+// see candidatePoolOrchestratorService.js), the Topic is dropped from the
+// retrieval query so the embedding search isn't anchored to a possibly
+// too-narrow/generic phrase and instead surfaces the source's best
+// general-coverage material.
+export const buildQueryText = ({ topic, instructions, questionTypes, juniorContext, broadenFocus = false }) => {
   const text = [
-    topic,
+    broadenFocus ? '' : topic,
     instructions,
     Array.isArray(questionTypes) ? questionTypes.join(' ') : '',
     juniorContext?.gradeLevel ? `grade ${juniorContext.gradeLevel}` : '',
@@ -92,18 +98,32 @@ const buildSystemPrompt = ({ retrievedChunks, difficulty, juniorContext }) => {
       ? `5. Audience is grade ${juniorContext.gradeLevel} students — use age-appropriate language while staying strictly within rule 1.`
       : '',
     '',
+    'TOPIC MATCHING: treat "Topic/focus" below as a loose steering hint, not an exact keyword or',
+    'phrase that must literally appear in the source. If the provided source material is from the',
+    'same general subject area as the topic (even if it uses different wording, covers a related',
+    'sub-topic, or the topic is broad/generic), you MUST still use it and generate real questions',
+    'from it — do not require an exact match between the topic phrase and the source text.',
+    '',
     'Respond with a JSON object: { "questions": [ { "questionText", "questionType", "options"',
     '(if applicable), "correctAnswer", "evidenceSnippet" (a short verbatim quote from the source',
     'material that supports this question) } ], "insufficientMaterial": boolean }.',
-    'Set insufficientMaterial to true (and return as many valid questions as you honestly can,',
-    'even zero) if the source material cannot support the requested count without violating the',
-    'hard rules above.',
+    'Only set insufficientMaterial to true if the source material genuinely cannot support ANY',
+    'valid question without violating the hard rules above — not merely because it does not match',
+    'the topic phrase exactly. Prefer generating fewer questions over returning zero.',
   ]
     .filter(Boolean)
     .join('\n');
 };
 
-export const buildUserPrompt = ({ topic, instructions, count, questionTypes, examTitle, excludeQuestionTexts }) => {
+export const buildUserPrompt = ({
+  topic,
+  instructions,
+  count,
+  questionTypes,
+  examTitle,
+  excludeQuestionTexts,
+  broadenFocus = false,
+}) => {
   const exclusions = (excludeQuestionTexts || []).slice(0, 50);
   return [
     topic ? `Topic/focus: ${topic}` : 'Topic/focus: (none specified — cover the source material broadly and evenly)',
@@ -114,6 +134,13 @@ export const buildUserPrompt = ({ topic, instructions, count, questionTypes, exa
     instructions ? `Creator instructions for how to construct the questions: ${instructions}` : '',
     examTitle ? `Exam title: ${examTitle}` : '',
     `Generate up to ${count} questions of type(s): ${(questionTypes || []).join(', ') || 'MULTIPLE_CHOICE'}.`,
+    // Set only on a retry after a prior attempt reported insufficient
+    // material despite chunks actually being retrieved (see
+    // candidatePoolOrchestratorService.js) — nudges the model away from
+    // over-literal topic matching without weakening the grounding rules.
+    broadenFocus
+      ? 'A previous attempt with this topic returned no questions even though relevant source material was retrieved. Interpret the topic broadly and generate questions from any of the source material below that is reasonably related to it.'
+      : '',
     exclusions.length
       ? `Do not repeat or closely rephrase any of these already-used questions:\n${exclusions
           .map((text, index) => `${index + 1}. ${text}`)
@@ -144,13 +171,14 @@ export const generateGroundedCandidates = async ({
   examDescription,
   juniorContext = null,
   excludeQuestionTexts = [],
+  broadenFocus = false,
 }) => {
   const client = getOpenAIClient();
   if (!client) {
     throw new InsufficientSourceMaterialError('AI generation is not configured on this deployment.');
   }
 
-  const queryText = buildQueryText({ topic, instructions, questionTypes, juniorContext });
+  const queryText = buildQueryText({ topic, instructions, questionTypes, juniorContext, broadenFocus });
   const queryEmbedding = await embedSingleText(queryText, { tenantId, userId });
   const retrievedChunks = await retrieveGroundingChunks({
     tenantId,
@@ -181,7 +209,7 @@ export const generateGroundedCandidates = async ({
         { role: 'system', content: buildSystemPrompt({ retrievedChunks, difficulty, juniorContext }) },
         {
           role: 'user',
-          content: buildUserPrompt({ topic, instructions, count, questionTypes, examTitle, excludeQuestionTexts }),
+          content: buildUserPrompt({ topic, instructions, count, questionTypes, examTitle, excludeQuestionTexts, broadenFocus }),
         },
       ],
       temperature: 0.7,
