@@ -39,6 +39,15 @@ const SectionSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    // Authoritative per-question mark value for this section. Assigning or
+    // moving a question into this section sets Question.points from here, so
+    // this is the single source of truth for "how many marks per question in
+    // this section" — `marks` above is kept only as a legacy total snapshot.
+    marksPerQuestion: {
+      type: Number,
+      default: 1,
+      min: 0,
+    },
     negativeMarking: {
       type: Number,
       default: 0,

@@ -60,12 +60,17 @@ export const getExamUsageSnapshot = async (exam) => {
 export const syncExamQuestionCount = async (examId) => {
   if (!examId) return 0;
   const paperIds = await QuestionPaper.find({ examId }).distinct('_id');
+  // isIncludedInExam: { $ne: false } matches `true` and legacy documents
+  // missing the field (pre-existing questions, no-section exams), so only
+  // questions explicitly pooled/unassigned (isIncludedInExam === false) are
+  // excluded from the exam's question count and total marks.
+  const includedMatch = { questionPaperId: { $in: paperIds }, isIncludedInExam: { $ne: false } };
   const count = paperIds.length
-    ? asNonNegativeInt(await Question.countDocuments({ questionPaperId: { $in: paperIds } }))
+    ? asNonNegativeInt(await Question.countDocuments(includedMatch))
     : 0;
   const marksAggregation = paperIds.length
     ? await Question.aggregate([
-        { $match: { questionPaperId: { $in: paperIds } } },
+        { $match: includedMatch },
         {
           $group: {
             _id: null,

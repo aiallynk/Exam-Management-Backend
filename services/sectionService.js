@@ -14,6 +14,7 @@ import {
   normalizeNavigationRule,
   isNoFreeNavigationRule,
 } from '../config/sectionTimers.js';
+import { syncExamQuestionCount } from '../utils/planUsage.js';
 
 const toIdString = (value) => {
   if (!value) return null;
@@ -472,9 +473,11 @@ export const createSection = async (sectionData) => {
     order,
     duration,
     marks,
+    marksPerQuestion,
     negativeMarking,
     navigationRule,
     instructions,
+    expectedQuestions,
   } = sectionData;
 
   const questionPaper = await QuestionPaper.findById(questionPaperId);
@@ -482,17 +485,23 @@ export const createSection = async (sectionData) => {
     throw new Error('Question paper not found');
   }
 
+  const resolvedMarksPerQuestion = toNonNegativeInt(marksPerQuestion, 1);
+
   const section = new Section({
     questionPaperId,
     name,
     description: description || '',
     order: order !== undefined ? order : 0,
     duration: duration || 60,
+    // `marks` is kept only as a legacy total snapshot; marksPerQuestion is
+    // the source of truth going forward (see getSectionsWithStats).
     marks: marks || 0,
+    marksPerQuestion: resolvedMarksPerQuestion,
     negativeMarking: negativeMarking || 0,
     navigationRule: navigationRule || SECTION_NAVIGATION_RULES.FREE,
     instructions: instructions || '',
     isActive: true,
+    ...(expectedQuestions !== undefined ? { expectedQuestions: toNonNegativeInt(expectedQuestions, 25) } : {}),
   });
 
   const savedSection = await section.save();
@@ -522,6 +531,8 @@ export const updateSection = async (sectionId, updateData) => {
     throw new Error('Section not found');
   }
 
+  const previousMarksPerQuestion = section.marksPerQuestion;
+
   const allowedFields = [
     'name',
     'description',
@@ -530,6 +541,8 @@ export const updateSection = async (sectionId, updateData) => {
     'expectedQuestions',
     'navigationRule',
     'isActive',
+    'marksPerQuestion',
+    'negativeMarking',
   ];
 
   allowedFields.forEach((field) => {
@@ -542,9 +555,31 @@ export const updateSection = async (sectionId, updateData) => {
       section.duration = duration;
       return;
     }
+    if (field === 'marksPerQuestion' || field === 'negativeMarking') {
+      section[field] = toNonNegativeInt(updateData[field], section[field]);
+      return;
+    }
     section[field] = updateData[field];
   });
   const savedSection = await section.save();
+
+  // Keep every already-assigned question's points in lockstep with the
+  // section's configured marksPerQuestion — this is what "Points" reflects
+  // in the builder, preview, candidate exam, scoring, evaluator, and results.
+  if (savedSection.marksPerQuestion !== previousMarksPerQuestion) {
+    await Question.updateMany(
+      { sectionId: savedSection._id },
+      { $set: { points: savedSection.marksPerQuestion } }
+    );
+    try {
+      const questionPaper = await QuestionPaper.findById(savedSection.questionPaperId).select('examId');
+      if (questionPaper?.examId) {
+        await syncExamQuestionCount(questionPaper.examId);
+      }
+    } catch (error) {
+      console.error('Failed to sync exam totals after section marksPerQuestion update:', error);
+    }
+  }
 
   try {
     await syncExamDurationFromQuestionPaper(section.questionPaperId);
@@ -964,13 +999,25 @@ export const getSectionsWithStats = async (questionPaperId) => {
 
   const sectionsWithStats = await Promise.all(
     sections.map(async (section) => {
-      const questionCount = await Question.countDocuments({
-        sectionId: section._id,
-      });
+      const [questionCount, marksAgg] = await Promise.all([
+        Question.countDocuments({ sectionId: section._id }),
+        Question.aggregate([
+          { $match: { sectionId: section._id } },
+          { $group: { _id: null, totalMarks: { $sum: { $ifNull: ['$points', 0] } } } },
+        ]),
+      ]);
+      const assignedMarks = Number.isFinite(Number(marksAgg?.[0]?.totalMarks))
+        ? Math.max(0, Number(marksAgg[0].totalMarks))
+        : 0;
 
       return {
         ...section.toObject(),
         questionCount,
+        // Live totals — the authoritative "Section A · 10/10 assigned" and
+        // marks figures. `marks` (legacy stored total) is kept for backward
+        // compatibility only; consumers should prefer these live fields.
+        assignedMarks,
+        isOverCapacity: section.expectedQuestions > 0 && questionCount > section.expectedQuestions,
       };
     })
   );

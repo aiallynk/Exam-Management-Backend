@@ -17,6 +17,7 @@ import {
   loadExamAndEvaluator,
   createEvaluatorAssignment,
   getScopedQuestionIds,
+  deriveReviewStatus,
 } from '../services/evaluatorAssignmentService.js';
 
 const router = express.Router();
@@ -266,20 +267,37 @@ router.get('/:assignmentId/attempts', requireAuth, requireEvaluatorAccess(), val
       .sort({ submitTime: -1 })
       .lean();
 
-    const pendingCounts = await Answer.aggregate([
-      { $match: { attemptId: { $in: attempts.map((a) => a._id) }, evaluationStatus: { $in: ['PENDING_REVIEW', 'UNDER_REVIEW', 'FLAGGED'] } } },
-      { $group: { _id: '$attemptId', count: { $sum: 1 } } },
+    // "reviewable" (pending ∪ completed) distinguishes "never entered the
+    // review pipeline" from "genuinely reviewed" — see deriveReviewStatus.
+    const reviewCounts = await Answer.aggregate([
+      {
+        $match: {
+          attemptId: { $in: attempts.map((a) => a._id) },
+          evaluationStatus: { $in: ['PENDING_REVIEW', 'UNDER_REVIEW', 'FLAGGED', 'REVIEWED', 'FINALIZED', 'MODERATED'] },
+        },
+      },
+      {
+        $group: {
+          _id: '$attemptId',
+          pending: { $sum: { $cond: [{ $in: ['$evaluationStatus', ['PENDING_REVIEW', 'UNDER_REVIEW', 'FLAGGED']] }, 1, 0] } },
+          reviewable: { $sum: 1 },
+        },
+      },
     ]);
-    const pendingByAttempt = new Map(pendingCounts.map((p) => [String(p._id), p.count]));
+    const reviewByAttempt = new Map(reviewCounts.map((r) => [String(r._id), r]));
 
     res.json({
-      attempts: attempts.map((attempt) => ({
-        _id: attempt._id,
-        submitTime: attempt.submitTime,
-        scoreSummary: attempt.scoreSummary,
-        candidate: assignment.canViewStudentIdentity ? attempt.userId : null,
-        pendingReviewCount: pendingByAttempt.get(String(attempt._id)) || 0,
-      })),
+      attempts: attempts.map((attempt) => {
+        const review = reviewByAttempt.get(String(attempt._id)) || { pending: 0, reviewable: 0 };
+        return {
+          _id: attempt._id,
+          submitTime: attempt.submitTime,
+          scoreSummary: attempt.scoreSummary,
+          candidate: assignment.canViewStudentIdentity ? attempt.userId : null,
+          pendingReviewCount: review.pending,
+          reviewStatus: deriveReviewStatus(review),
+        };
+      }),
     });
   } catch (error) {
     next(error);

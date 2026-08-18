@@ -1,6 +1,7 @@
 import express from 'express';
 import Question from '../models/Question.js';
 import QuestionPaper from '../models/QuestionPaper.js';
+import Section from '../models/Section.js';
 import Exam from '../models/Exam.js';
 import WizKidsExamConfig from '../models/WizKidsExamConfig.js';
 import { requireAuth } from '../middleware/auth.js';
@@ -33,7 +34,10 @@ import { queueExamPackageRegeneration } from '../services/examPackageRegeneratio
 import { canCandidateAccessExam } from '../middleware/examPermissions.js';
 import { hasRole } from '../utils/userRoles.js';
 import { findUnsupportedJuniorQuestionType } from '../utils/juniorQuestionPolicy.js';
-import { resolveTenantFeature } from '../services/tenantFeatureService.js';
+import {
+  assertImageGenerationAllowed,
+  resolveTenantFeature,
+} from '../services/tenantFeatureService.js';
 
 const router = express.Router();
 
@@ -739,6 +743,35 @@ const sanitizeQuestionProvenance = (provenance) => {
   return { generationRunId, sourceIds, chunkIds, evidenceSnippet, noveltySignatures };
 };
 
+// Single source of truth for "does this question belong to a section, and
+// what does it score". A question assigned to a real section always takes
+// that section's marksPerQuestion and is included in the exam. A question
+// left unassigned in a paper that already has sections is a pool question
+// ("Unassigned — Not included in exam") and must not affect exam totals. A
+// question with no section in a paper that has no sections at all (a
+// no-section exam) stays fully included, preserving existing behaviour.
+const resolveQuestionAssignment = async ({ questionPaperId, sectionId, requestedPoints }) => {
+  const normalizedSectionId = sectionId ? String(sectionId).trim() : '';
+  if (normalizedSectionId) {
+    const section = await Section.findOne({ _id: normalizedSectionId, questionPaperId });
+    if (!section) {
+      throw new Error('Section does not belong to this question paper');
+    }
+    return {
+      sectionId: section._id,
+      points: Number.isFinite(Number(section.marksPerQuestion)) ? Number(section.marksPerQuestion) : 1,
+      isIncludedInExam: true,
+    };
+  }
+
+  const hasSections = await Section.exists({ questionPaperId });
+  return {
+    sectionId: undefined,
+    points: Number.isFinite(Number(requestedPoints)) ? Number(requestedPoints) : 1,
+    isIncludedInExam: !hasSections,
+  };
+};
+
 const createQuestionWithManagedImage = async ({
   examId,
   questionPaperId,
@@ -856,6 +889,12 @@ const createQuestionWithManagedImage = async ({
     codingFields,
   });
 
+  const assignment = await resolveQuestionAssignment({
+    questionPaperId,
+    sectionId,
+    requestedPoints: points ?? max_marks,
+  });
+
   const question = new Question({
     questionPaperId,
     questionText: normalizedQuestionText || normalizedTitle,
@@ -896,9 +935,10 @@ const createQuestionWithManagedImage = async ({
       normalizedStorageQuestionType === 'CODING' || normalizedQuestionFormat === 'CODING'
         ? normalizedCodingFields
         : undefined,
-    points: Number.isFinite(Number(points ?? max_marks)) ? Number(points ?? max_marks) : 1,
+    points: assignment.points,
     order: Number.isFinite(Number(order)) ? Number(order) : 0,
-    sectionId: sectionId || undefined,
+    sectionId: assignment.sectionId,
+    isIncludedInExam: assignment.isIncludedInExam,
     provenance: sanitizeQuestionProvenance(provenance),
   });
 
@@ -1795,21 +1835,23 @@ router.put(
         question.generatedImage = normalized.length ? normalized : '';
       }
       if (sectionId !== undefined) {
-        const normalizedSectionId =
-          typeof sectionId === 'string' ? sectionId.trim() : sectionId;
-        if (!normalizedSectionId) {
-          question.sectionId = undefined;
-        } else {
-          const Section = (await import('../models/Section.js')).default;
-          const section = await Section.findOne({
-            _id: normalizedSectionId,
+        // Moving/assigning/unassigning a question always re-derives points
+        // and inclusion from the target section (or the pool) — this is the
+        // single place a question's section, points, and exam-inclusion can
+        // change together, so they can't drift apart again.
+        let assignment;
+        try {
+          assignment = await resolveQuestionAssignment({
             questionPaperId: questionPaper._id,
+            sectionId: typeof sectionId === 'string' ? sectionId.trim() : sectionId,
+            requestedPoints: question.points,
           });
-          if (!section) {
-            return res.status(400).json({ error: 'Section does not belong to this question paper' });
-          }
-          question.sectionId = normalizedSectionId;
+        } catch (assignmentError) {
+          return res.status(400).json({ error: assignmentError.message });
         }
+        question.sectionId = assignment.sectionId;
+        question.points = assignment.points;
+        question.isIncludedInExam = assignment.isIncludedInExam;
       }
       if (passage !== undefined) {
         const normalizedPassage = typeof passage === 'string' ? passage.trim() : '';
@@ -1867,6 +1909,9 @@ router.put(
       }
 
       await question.save();
+      // Points/section/inclusion may have changed above — keep the exam's
+      // cached question count and total marks in sync.
+      await syncExamQuestionCount(req.params.examId);
       await ensureQuestionImageAvailability({
         question,
         examId: req.params.examId,
@@ -1948,11 +1993,29 @@ router.post(
         return res.status(404).json({ error: 'Question not found for this exam' });
       }
 
+      const forceGenerate = Boolean(req.body?.forceGenerate);
+      let allowGeneratedImageCreation = false;
+      if (forceGenerate) {
+        const planContext = await resolveExamPlanContext(req.params.examId);
+        const imageGate = await assertImageGenerationAllowed({
+          tenantId: planContext?.tenantId || req.user?.tenantId,
+          effectivePlanType: planContext?.planType || req.user?.planType,
+        });
+        if (!imageGate.allowed) {
+          return res.status(403).json({
+            error: imageGate.reason || 'AI-generated question images are disabled.',
+            code: 'AI_IMAGE_GENERATION_DISABLED',
+          });
+        }
+        allowGeneratedImageCreation = true;
+      }
+
       const result = await ensureQuestionImageAvailability({
         question,
         examId: req.params.examId,
         persist: true,
-        forceGenerate: Boolean(req.body?.forceGenerate),
+        forceGenerate,
+        allowGeneratedImageCreation,
       });
 
       await question.populate('questionPaperId', 'setName');

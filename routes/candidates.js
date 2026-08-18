@@ -17,7 +17,7 @@ import bcrypt from 'bcryptjs';
 import { ensureScoreSummary } from '../utils/attemptScores.js';
 import { hasExamPermission } from '../middleware/examPermissions.js';
 import { resolveTenantSnapshot } from '../utils/tenantResolver.js';
-import { TAB_SWITCH_DISQUALIFY_STATUS } from '../services/proctoringService.js';
+import { canCandidateViewScore } from '../utils/resultVisibility.js';
 
 const router = express.Router();
 
@@ -151,6 +151,7 @@ router.get('/results', requireAuth, async (req, res, next) => {
     // Candidates should see their own results only after release.
     // Reviewers/admins may see results immediately.
     const filteredAttempts = [];
+    const scoreVisibleByAttemptId = new Map();
     const privilegedRoles = new Set(['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR']);
     const userIsPrivileged = privilegedRoles.has(req.user.role);
     for (const attempt of attempts) {
@@ -162,27 +163,31 @@ router.get('/results', requireAuth, async (req, res, next) => {
       const canReviewAnswers = userIsPrivileged
         ? true
         : await hasExamPermission(req.user._id, attempt.examId._id, 'REVIEW_ANSWERS');
-      const resultsReleased =
-        Boolean(attempt.examId.showResultsImmediately) ||
-        (attempt.examId.resultsReleasedAt && attempt.examId.resultsReleasedAt <= new Date());
       const certificatesReleased =
         Boolean(attempt.examId.certificatesSentAt) &&
         new Date(attempt.examId.certificatesSentAt) <= new Date();
-      const disqualifiedByTabSwitch =
-        Boolean(attempt.isDisqualified) &&
-        String(attempt.disqualifyStatus || '').trim().toUpperCase() === TAB_SWITCH_DISQUALIFY_STATUS;
+      // Score visibility never depends on the disqualification reason — see
+      // resultVisibility.js. A disqualified candidate still sees the row
+      // (with its status), just not the score, until release.
+      const scoreVisible = canCandidateViewScore({
+        exam: attempt.examId,
+        isPrivileged: userIsPrivileged,
+        canReviewAnswers,
+      });
 
-      if (canReviewAnswers || resultsReleased || certificatesReleased || disqualifiedByTabSwitch) {
+      if (canReviewAnswers || scoreVisible || certificatesReleased || Boolean(attempt.isDisqualified)) {
         filteredAttempts.push(attempt);
+        scoreVisibleByAttemptId.set(String(attempt._id), scoreVisible || canReviewAnswers);
       }
     }
 
     const results = await Promise.all(
       filteredAttempts.map(async (attempt) => {
         const { summary } = await ensureScoreSummary(attempt);
+        const scoreVisible = scoreVisibleByAttemptId.get(String(attempt._id));
         return {
           attempt,
-          score: summary,
+          score: scoreVisible ? summary : null,
           // Include results release info for frontend
           resultsReleasedAt: attempt.examId?.resultsReleasedAt || null,
           showResultsImmediately: attempt.examId?.showResultsImmediately || false,

@@ -159,22 +159,35 @@ const sanitizeQuestionTranslations = (translations) => {
   return Object.fromEntries(entries);
 };
 
-const sanitizeSectionForPackage = (section) => {
+// `questions` should be the package's already-filtered (isIncludedInExam,
+// tenant-safe) question list — `Section.marks` is only a legacy write-once
+// snapshot that goes stale as questions are added/moved, so the live sum of
+// assigned questions' points is the source of truth for the shipped total.
+const sanitizeSectionForPackage = (section, questions = []) => {
   const source = toPlainObject(section);
+  const sectionId = source?._id ? String(source._id) : '';
+  const assignedQuestions = sectionId
+    ? questions.filter((q) => String(q?.sectionId || '') === sectionId)
+    : [];
+  const liveMarks = assignedQuestions.reduce((sum, q) => sum + (Number(q?.points) || 0), 0);
   return {
-    id: source?._id ? String(source._id) : '',
+    id: sectionId,
     uniqueId: toSafeText(source?.uniqueId, 64),
     name: toSafeText(source?.name, 200),
     description: toSafeText(source?.description, 500),
     order: Number.isFinite(Number(source?.order)) ? Number(source.order) : 0,
     duration: Number.isFinite(Number(source?.duration)) ? Number(source.duration) : 0,
-    marks: Number.isFinite(Number(source?.marks)) ? Number(source.marks) : 0,
+    marks: liveMarks,
+    marksPerQuestion: Number.isFinite(Number(source?.marksPerQuestion))
+      ? Number(source.marksPerQuestion)
+      : 1,
     negativeMarking: Boolean(source?.negativeMarking),
     navigationRule: toSafeText(source?.navigationRule, 64),
     instructions: toSafeText(source?.instructions, 600),
     expectedQuestions: Number.isFinite(Number(source?.expectedQuestions))
       ? Number(source.expectedQuestions)
       : 0,
+    assignedQuestionCount: assignedQuestions.length,
   };
 };
 
@@ -255,6 +268,9 @@ const buildQuestionFetchFilter = (questionPaperId) => ({
   questionPaperId,
   // Some historical records may not have isActive. Include those + explicit true.
   $or: [{ isActive: { $exists: false } }, { isActive: true }],
+  // Pool questions (generated but not assigned to a section) must never
+  // reach a candidate paper, offline or online.
+  isIncludedInExam: { $ne: false },
 });
 
 const splitEncryptedPayload = (encryptedData, context = 'ExamPackageService') => {
@@ -554,7 +570,7 @@ export const generateExamPackage = async (examId, questionPaperId, userId, expir
       startTime: packageStartTime.toISOString(),
       endTime: packageEndTime.toISOString(),
     },
-    sections: sections.map((section) => sanitizeSectionForPackage(section)),
+    sections: sections.map((section) => sanitizeSectionForPackage(section, packageQuestions)),
     questions: packageQuestions,
     metadata: {
       createdAt: packageCreatedAt.toISOString(),

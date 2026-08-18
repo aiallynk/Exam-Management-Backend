@@ -2,6 +2,7 @@ import sourceGroundedConfig from '../config/sourceGroundedConfig.js';
 import { generateGroundedCandidates } from './groundedGenerationService.js';
 import { isQuestionGrounded } from './groundingValidatorService.js';
 import { createBatchNoveltyTracker, probeNovelty, reserveNovelty } from './noveltyService.js';
+import { normalizeQuestionType } from '../utils/questionTypeRegistry.js';
 
 // Source-Grounded AI Question Generation — the candidate-pool pipeline
 // (master prompt §25-26): oversample -> grounding-validate ->
@@ -21,6 +22,30 @@ const bumpReason = (reasons, key) => {
   reasons[key] = (reasons[key] || 0) + 1;
 };
 
+const normalizeDistribution = (distribution = []) => {
+  const counts = {};
+  (Array.isArray(distribution) ? distribution : []).forEach((item) => {
+    const type = normalizeQuestionType(item?.type);
+    const count = Math.max(0, Number.parseInt(item?.count, 10) || 0);
+    if (type && count > 0) counts[type] = (counts[type] || 0) + count;
+  });
+  return Object.entries(counts).map(([type, count]) => ({ type, count }));
+};
+
+const resolveMissingDistribution = (requestedDistribution, acceptedByType) =>
+  requestedDistribution
+    .map(({ type, count }) => ({
+      type,
+      count: Math.max(count - (acceptedByType[type] || 0), 0),
+    }))
+    .filter((item) => item.count > 0);
+
+const oversampleDistribution = (distribution) =>
+  distribution.map(({ type, count }) => ({
+    type,
+    count: Math.max(count, Math.ceil(count * sourceGroundedConfig.CANDIDATE_POOL_OVERSAMPLE_FACTOR)),
+  }));
+
 /**
  * Runs the full oversample -> validate -> accept loop for one
  * generate-questions call. `generatorFn` defaults to
@@ -35,16 +60,27 @@ export const generateWithNoveltyAndGrounding = async ({
   instructions,
   difficulty,
   questionTypes,
+  questionTypeDistribution = [],
   targetCount,
   examTitle,
   examDescription,
   juniorContext,
   blueprintTopic,
   generatorFn = generateGroundedCandidates,
+  groundingFn = isQuestionGrounded,
+  noveltyProbeFn = probeNovelty,
+  noveltyReserveFn = reserveNovelty,
+  batchTrackerFactory = createBatchNoveltyTracker,
 }) => {
   const accepted = [];
+  const acceptedByType = {};
+  const requestedDistribution = normalizeDistribution(questionTypeDistribution);
+  const exactDistributionRequested = requestedDistribution.length > 0;
+  const effectiveTargetCount = exactDistributionRequested
+    ? requestedDistribution.reduce((sum, item) => sum + item.count, 0)
+    : targetCount;
   const rejectionReasons = {};
-  const batchTracker = createBatchNoveltyTracker();
+  const batchTracker = batchTrackerFactory();
   let insufficientSourceMaterial = false;
   let insufficientReason = null;
   let attempts = 0;
@@ -60,13 +96,24 @@ export const generateWithNoveltyAndGrounding = async ({
   let broadenFocus = false;
 
   while (
-    accepted.length < targetCount &&
+    accepted.length < effectiveTargetCount &&
     attempts < sourceGroundedConfig.CANDIDATE_POOL_MAX_ATTEMPTS &&
     consecutiveEmptyAttempts < 2
   ) {
     attempts += 1;
-    const remaining = targetCount - accepted.length;
-    const requestCount = Math.ceil(remaining * sourceGroundedConfig.CANDIDATE_POOL_OVERSAMPLE_FACTOR);
+    const missingDistribution = exactDistributionRequested
+      ? resolveMissingDistribution(requestedDistribution, acceptedByType)
+      : [];
+    const attemptDistribution = exactDistributionRequested
+      ? oversampleDistribution(missingDistribution)
+      : [];
+    const remaining = effectiveTargetCount - accepted.length;
+    const requestCount = exactDistributionRequested
+      ? attemptDistribution.reduce((sum, item) => sum + item.count, 0)
+      : Math.ceil(remaining * sourceGroundedConfig.CANDIDATE_POOL_OVERSAMPLE_FACTOR);
+    const attemptQuestionTypes = exactDistributionRequested
+      ? missingDistribution.map((item) => item.type)
+      : questionTypes;
 
     const {
       candidates,
@@ -79,7 +126,8 @@ export const generateWithNoveltyAndGrounding = async ({
       topic,
       instructions,
       difficulty,
-      questionTypes,
+      questionTypes: attemptQuestionTypes,
+      questionTypeDistribution: attemptDistribution,
       count: requestCount,
       examTitle,
       examDescription,
@@ -103,10 +151,26 @@ export const generateWithNoveltyAndGrounding = async ({
     consecutiveEmptyAttempts = 0;
 
     for (const candidate of candidates) {
-      if (accepted.length >= targetCount) break;
+      if (accepted.length >= effectiveTargetCount) break;
 
       if (!candidate?.questionText || !candidate?.questionType) {
         bumpReason(rejectionReasons, REJECTION_REASONS.INVALID_SHAPE);
+        continue;
+      }
+
+      const candidateType = normalizeQuestionType(candidate.questionType);
+      if (!candidateType) {
+        bumpReason(rejectionReasons, REJECTION_REASONS.INVALID_SHAPE);
+        continue;
+      }
+      // A valid but over-produced type is not allowed to consume another
+      // type's quota. Ignore it before grounding/novelty reservation and
+      // let the next attempt request only the still-missing type(s).
+      if (
+        exactDistributionRequested &&
+        (acceptedByType[candidateType] || 0) >=
+          (requestedDistribution.find((item) => item.type === candidateType)?.count || 0)
+      ) {
         continue;
       }
 
@@ -115,7 +179,7 @@ export const generateWithNoveltyAndGrounding = async ({
         continue;
       }
 
-      const grounding = await isQuestionGrounded({
+      const grounding = await groundingFn({
         questionText: candidate.questionText,
         correctAnswer: candidate.correctAnswer,
         retrievedChunks: candidate.retrievedChunksForValidation || [],
@@ -135,13 +199,13 @@ export const generateWithNoveltyAndGrounding = async ({
         difficulty,
       };
 
-      const probe = await probeNovelty({ tenantId, question: candidate, blueprint });
+      const probe = await noveltyProbeFn({ tenantId, question: candidate, blueprint });
       if (probe.likelyDuplicate) {
         bumpReason(rejectionReasons, REJECTION_REASONS.DUPLICATE_NOVELTY);
         continue;
       }
 
-      const reservation = await reserveNovelty({ tenantId, question: candidate, blueprint, generationRunId });
+      const reservation = await noveltyReserveFn({ tenantId, question: candidate, blueprint, generationRunId });
       if (!reservation.novel) {
         bumpReason(rejectionReasons, REJECTION_REASONS.DUPLICATE_NOVELTY);
         continue;
@@ -162,6 +226,7 @@ export const generateWithNoveltyAndGrounding = async ({
           },
         },
       });
+      acceptedByType[candidateType] = (acceptedByType[candidateType] || 0) + 1;
     }
   }
 
@@ -175,18 +240,25 @@ export const generateWithNoveltyAndGrounding = async ({
   // prompt §44) instead of one generic "insufficient" string for every
   // distinct failure mode.
   let dominantRejectionReason = null;
-  if (accepted.length < targetCount && !insufficientReason && rejectedCount > 0) {
+  if (accepted.length < effectiveTargetCount && !insufficientReason && rejectedCount > 0) {
     dominantRejectionReason = Object.entries(rejectionReasons).sort((a, b) => b[1] - a[1])[0][0];
   }
+
+  const missingDistribution = exactDistributionRequested
+    ? resolveMissingDistribution(requestedDistribution, acceptedByType)
+    : [];
 
   return {
     questions: accepted.map((question, index) => ({ ...question, order: index + 1 })),
     acceptedCount: accepted.length,
     rejectedCount,
     rejectionReasons,
-    insufficientSourceMaterial: insufficientSourceMaterial && accepted.length < targetCount,
-    insufficientReason: accepted.length < targetCount ? insufficientReason : null,
+    insufficientSourceMaterial: insufficientSourceMaterial && accepted.length < effectiveTargetCount,
+    insufficientReason: accepted.length < effectiveTargetCount ? insufficientReason : null,
     dominantRejectionReason,
     attempts,
+    requestedDistribution: Object.fromEntries(requestedDistribution.map(({ type, count }) => [type, count])),
+    generatedDistribution: { ...acceptedByType },
+    missingDistribution,
   };
 };

@@ -83,6 +83,24 @@ describe('buildUserPrompt — topic is optional', () => {
     const prompt = buildUserPrompt({ topic: 'Fractions', instructions: '', count: 5, questionTypes: ['MULTIPLE_CHOICE'] });
     assert.ok(!prompt.toLowerCase().includes('interpret the topic broadly'));
   });
+
+  test('states an exact per-type distribution and forbids substitution', () => {
+    const prompt = buildUserPrompt({
+      topic: 'Fractions',
+      instructions: '',
+      count: 15,
+      questionTypes: ['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'FILL_IN_THE_BLANK'],
+      questionTypeDistribution: [
+        { type: 'MULTIPLE_CHOICE', count: 7 },
+        { type: 'MULTIPLE_OPTIONS', count: 4 },
+        { type: 'FILL_IN_THE_BLANK', count: 4 },
+      ],
+    });
+    assert.match(prompt, /MULTIPLE_CHOICE: exactly 7/);
+    assert.match(prompt, /MULTIPLE_OPTIONS: exactly 4/);
+    assert.match(prompt, /FILL_IN_THE_BLANK: exactly 4/);
+    assert.match(prompt, /Do not substitute/i);
+  });
 });
 
 describe('resolveGenerationStrategy', () => {

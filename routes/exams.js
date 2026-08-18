@@ -33,6 +33,7 @@ import { ensureScoreSummary } from '../utils/attemptScores.js';
 import { syncUserExamCount } from '../utils/planUsage.js';
 import { ensureQuestionsImageAvailability } from '../services/questionImportImageService.js';
 import { sanitizeQuestionOptions } from '../utils/questionOptionSanitizer.js';
+import { normalizeQuestionType } from '../utils/questionTypeRegistry.js';
 import { sanitizeExamAccessControlPayload } from '../utils/examSecurity.js';
 import { queueExamPackageRegeneration } from '../services/examPackageRegenerationService.js';
 import { resolveAttemptExhaustedExamIds } from '../utils/attemptAvailability.js';
@@ -489,18 +490,8 @@ const tokenizeAutoAssign = (value) => {
 const normalizeQuestionTypeKey = (value) => {
   const raw = normalizeAutoAssignText(value).toUpperCase();
   if (!raw) return '';
-  if (['MCQ', 'SINGLE_CHOICE', 'MULTIPLE_CHOICE'].includes(raw)) return 'MULTIPLE_CHOICE';
-  if (['MULTI_SELECT', 'MULTIPLE_OPTIONS', 'MULTI_CHOICE', 'MULTI_SELECT_MCQ'].includes(raw)) return 'MULTIPLE_OPTIONS';
-  if (['TRUE_FALSE', 'TRUEFALSE', 'TF'].includes(raw)) return 'TRUE_FALSE';
-  if (['SHORT', 'SHORT_ANSWER'].includes(raw)) return 'SHORT_ANSWER';
-  if (['LONG_ANSWER', 'DESCRIPTIVE', 'PARAGRAPH'].includes(raw)) return 'PARAGRAPH';
-  if (['ESSAY'].includes(raw)) return 'ESSAY';
-  if (['ESSAY_LETTER', 'LETTER_WRITING', 'LETTER'].includes(raw)) return 'ESSAY_LETTER';
-  if (['ESSAY_STORY', 'STORY_WRITING', 'STORY'].includes(raw)) return 'ESSAY_STORY';
-  if (['NUMERIC', 'NUMBER'].includes(raw)) return 'NUMBER';
-  if (['CODING', 'CODE'].includes(raw)) return 'CODING';
   if (['IMAGE', 'IMAGE_BASED'].includes(raw)) return 'IMAGE_BASED';
-  return raw;
+  return normalizeQuestionType(value) || '';
 };
 
 const normalizeDifficultyKey = (value) => {
@@ -1179,9 +1170,15 @@ router.get('/:examId/preview', requireAuth, requireTenant, enforceTenantBoundari
         .sort({ order: 1 })
         .lean();
 
-      const questions = await Question.find({ questionPaperId: qp._id })
+      const allQuestions = await Question.find({ questionPaperId: qp._id })
         .select('-correctAnswer') // Exclude correct answer
         .sort({ order: 1 });
+
+      // Pool questions (isIncludedInExam: false) are not part of the
+      // published paper — exclude them from the preview, same as what a
+      // candidate would actually see, and surface the count separately.
+      const questions = allQuestions.filter((q) => q.isIncludedInExam !== false);
+      const unassignedCount = allQuestions.length - questions.length;
 
       await ensureQuestionsImageAvailability({
         questions,
@@ -1189,18 +1186,37 @@ router.get('/:examId/preview', requireAuth, requireTenant, enforceTenantBoundari
         persist: true,
       });
 
+      // Live per-section counts/marks — Section.marks is only a legacy
+      // write-once snapshot and goes stale as questions are added/moved.
+      const questionsBySection = new Map();
+      questions.forEach((q) => {
+        const key = q.sectionId ? String(q.sectionId) : null;
+        if (!key) return;
+        const bucket = questionsBySection.get(key) || { count: 0, marks: 0 };
+        bucket.count += 1;
+        bucket.marks += Number(q.points) || 0;
+        questionsBySection.set(key, bucket);
+      });
+
       previewData.questionPapers.push({
         _id: qp._id,
         setName: qp.setName,
-        sections: sections.map(s => ({
-          _id: s._id,
-          name: s.name,
-          description: s.description,
-          order: s.order,
-          duration: s.duration,
-          marks: s.marks,
-          negativeMarking: s.negativeMarking,
-        })),
+        unassignedCount,
+        sections: sections.map(s => {
+          const stats = questionsBySection.get(String(s._id)) || { count: 0, marks: 0 };
+          return {
+            _id: s._id,
+            name: s.name,
+            description: s.description,
+            order: s.order,
+            duration: s.duration,
+            marks: stats.marks,
+            marksPerQuestion: s.marksPerQuestion,
+            expectedQuestions: s.expectedQuestions,
+            assignedQuestionCount: stats.count,
+            negativeMarking: s.negativeMarking,
+          };
+        }),
         questions: questions.map((q) => {
           const sanitizedOptions = sanitizeQuestionOptions(q.options);
           return {

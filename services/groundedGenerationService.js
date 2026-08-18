@@ -4,6 +4,10 @@ import { createTrackedChatCompletion } from './aiTokenUsageService.js';
 import { embedSingleText } from './contextIngestionService.js';
 import { retrieveGroundingChunks } from './contextRetrievalService.js';
 import sourceGroundedConfig from '../config/sourceGroundedConfig.js';
+import {
+  normalizeQuestionType,
+  validateGeneratedQuestionShape,
+} from '../utils/questionTypeRegistry.js';
 
 // Source-Grounded AI Question Generation — the generationMode:
 // 'SOURCE_GROUNDED' entry point, shared by productModule STANDARD and
@@ -120,6 +124,7 @@ export const buildUserPrompt = ({
   instructions,
   count,
   questionTypes,
+  questionTypeDistribution = [],
   examTitle,
   excludeQuestionTexts,
   broadenFocus = false,
@@ -134,6 +139,15 @@ export const buildUserPrompt = ({
     instructions ? `Creator instructions for how to construct the questions: ${instructions}` : '',
     examTitle ? `Exam title: ${examTitle}` : '',
     `Generate up to ${count} questions of type(s): ${(questionTypes || []).join(', ') || 'MULTIPLE_CHOICE'}.`,
+    Array.isArray(questionTypeDistribution) && questionTypeDistribution.length > 0
+      ? [
+          'EXACT TYPE DISTRIBUTION FOR THIS ATTEMPT:',
+          ...questionTypeDistribution.map((item) =>
+            `- ${item.type}: exactly ${item.count}`
+          ),
+          'Do not substitute, relabel, or overproduce one type to fill another type.',
+        ].join('\n')
+      : '',
     // Set only on a retry after a prior attempt reported insufficient
     // material despite chunks actually being retrieved (see
     // candidatePoolOrchestratorService.js) — nudges the model away from
@@ -166,6 +180,7 @@ export const generateGroundedCandidates = async ({
   instructions = '',
   difficulty = 'medium',
   questionTypes = ['MULTIPLE_CHOICE'],
+  questionTypeDistribution = [],
   count,
   examTitle,
   examDescription,
@@ -209,7 +224,16 @@ export const generateGroundedCandidates = async ({
         { role: 'system', content: buildSystemPrompt({ retrievedChunks, difficulty, juniorContext }) },
         {
           role: 'user',
-          content: buildUserPrompt({ topic, instructions, count, questionTypes, examTitle, excludeQuestionTexts, broadenFocus }),
+          content: buildUserPrompt({
+            topic,
+            instructions,
+            count,
+            questionTypes,
+            questionTypeDistribution,
+            examTitle,
+            excludeQuestionTexts,
+            broadenFocus,
+          }),
         },
       ],
       temperature: 0.7,
@@ -230,8 +254,18 @@ export const generateGroundedCandidates = async ({
   const rawQuestions = Array.isArray(parsed?.questions) ? parsed.questions : [];
   const candidates = rawQuestions
     .map((raw, index) => {
+      // Preserve the provider's claimed type long enough to reject unknown
+      // values. normalizeQuestionObject intentionally has a legacy
+      // SHORT_ANSWER fallback for import callers, which must not silently
+      // reinterpret an invalid AI generation type here.
+      const claimedType = normalizeQuestionType(
+        raw?.questionType || raw?.type || raw?.question_type
+      );
+      if (!claimedType) return null;
       const normalized = normalizeQuestionObject(raw, index);
       if (!normalized) return null;
+      const shapeCheck = validateGeneratedQuestionShape(normalized);
+      if (!shapeCheck.valid) return null;
       return {
         ...normalized,
         provenance: {

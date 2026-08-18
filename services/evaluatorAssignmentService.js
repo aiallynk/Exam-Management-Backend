@@ -258,6 +258,19 @@ export async function getScopedQuestionIds(assignment) {
   return null;
 }
 
+// An answer that never entered the human-review pipeline (e.g. AUTOMATIC
+// evaluation mode, or an objective question that was never flagged) has
+// pending=0 without ever having been reviewed. Treating "0 pending" alone as
+// "Reviewed" is exactly the bug where an untouched attempt shows Reviewed —
+// "reviewable" (pending ∪ completed) tells the two cases apart:
+//   reviewable === 0        -> NOT_REQUIRED (nothing for a human to do)
+//   pending > 0              -> PENDING_REVIEW
+//   pending === 0, reviewable > 0 -> REVIEWED
+export const deriveReviewStatus = ({ pending = 0, reviewable = 0 }) => {
+  if (reviewable === 0) return 'NOT_REQUIRED';
+  return pending > 0 ? 'PENDING_REVIEW' : 'REVIEWED';
+};
+
 /**
  * Compute pending/completed answer counts for a list of assignments on the
  * same exam, respecting each assignment's scope (FULL_EXAM/SECTION/
@@ -280,7 +293,7 @@ export async function computeAssignmentProgress(assignments) {
         const scopedQuestionIds = await getScopedQuestionIds(assignment);
         if (scopedQuestionIds !== null) {
           if (!scopedQuestionIds.length) {
-            progress.set(String(assignment._id), { pending: 0, completed: 0 });
+            progress.set(String(assignment._id), { pending: 0, completed: 0, reviewable: 0, reviewStatus: 'NOT_REQUIRED' });
             return;
           }
           baseMatch.questionId = { $in: scopedQuestionIds };
@@ -302,7 +315,14 @@ export async function computeAssignmentProgress(assignments) {
         },
       ]);
 
-      progress.set(String(assignment._id), counts[0] ? { pending: counts[0].pending, completed: counts[0].completed } : { pending: 0, completed: 0 });
+      const pending = counts[0]?.pending || 0;
+      const completed = counts[0]?.completed || 0;
+      progress.set(String(assignment._id), {
+        pending,
+        completed,
+        reviewable: pending + completed,
+        reviewStatus: deriveReviewStatus({ pending, reviewable: pending + completed }),
+      });
     })
   );
 

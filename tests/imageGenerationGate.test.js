@@ -52,3 +52,24 @@ describe('assertImageGenerationAllowed', () => {
     assert.equal(assertImageGenerationAllowed.constructor.name, 'AsyncFunction');
   });
 });
+
+describe('question image recovery is fail-closed', () => {
+  test('forceGenerate cannot invoke image creation without an explicit authorized service flag', async () => {
+    const { ensureQuestionImageAvailability } = await import('../services/questionImportImageService.js');
+    const question = {
+      _id: 'question-1',
+      questionText: 'Study the graph and answer the question.',
+    };
+
+    const result = await ensureQuestionImageAvailability({
+      question,
+      examId: 'exam-1',
+      persist: false,
+      forceGenerate: true,
+    });
+
+    assert.equal(result.regenerated, false);
+    assert.equal(question.generatedImage, undefined);
+    assert.match(result.warnings[0]?.message || '', /disabled/i);
+  });
+});

@@ -2813,6 +2813,7 @@ export const ensureQuestionImageAvailability = async ({
   questionId = null,
   persist = true,
   forceGenerate = false,
+  allowGeneratedImageCreation = false,
   allowKeywordInference = true,
 }) => {
   if (!question || typeof question !== 'object') {
@@ -2826,6 +2827,13 @@ export const ensureQuestionImageAvailability = async ({
   }
 
   const warnings = [];
+  const effectiveForceGenerate = Boolean(forceGenerate && allowGeneratedImageCreation);
+  if (forceGenerate && !allowGeneratedImageCreation) {
+    warnings.push({
+      stage: 'question-image-recovery',
+      message: 'AI image generation is disabled for this recovery request.',
+    });
+  }
   const resolvedQuestionId = sanitizeString(
     questionId ||
       question._id ||
@@ -2860,7 +2868,7 @@ export const ensureQuestionImageAvailability = async ({
   let imageBase64 = rawImageBase64IsPlaceholder ? '' : rawImageBase64;
 
   const shouldManageImage =
-    forceGenerate ||
+    effectiveForceGenerate ||
     questionRequiresImageSupport(question, { allowKeywordInference });
 
   if (!shouldManageImage) {
@@ -2878,7 +2886,7 @@ export const ensureQuestionImageAvailability = async ({
     };
   }
 
-  if (!forceGenerate && safeExamId && resolvedQuestionId && imageUrl) {
+  if (!effectiveForceGenerate && safeExamId && resolvedQuestionId && imageUrl) {
     const relocatedImageUrl = await relocateImportedQuestionImage({
       imageUrl,
       examId: safeExamId,
@@ -2893,11 +2901,11 @@ export const ensureQuestionImageAvailability = async ({
   const normalizedGeneratedUploadUrl = normalizeUploadUrl(generatedImage);
 
   const imageUrlExists =
-    !forceGenerate &&
+    !effectiveForceGenerate &&
     Boolean(normalizedImageUploadUrl) &&
     (await uploadUrlExists(normalizedImageUploadUrl));
   const generatedImageExists =
-    !forceGenerate &&
+    !effectiveForceGenerate &&
     Boolean(normalizedGeneratedUploadUrl) &&
     (await uploadUrlExists(normalizedGeneratedUploadUrl));
 
@@ -2927,16 +2935,16 @@ export const ensureQuestionImageAvailability = async ({
   const resolvedImageUploadUrl = normalizeUploadUrl(imageUrl);
   const resolvedGeneratedUploadUrl = normalizeUploadUrl(generatedImage);
   const hasRemoteImageUrl =
-    !forceGenerate && Boolean(imageUrl) && !resolvedImageUploadUrl;
+    !effectiveForceGenerate && Boolean(imageUrl) && !resolvedImageUploadUrl;
   const hasRemoteGeneratedImage =
-    !forceGenerate && Boolean(generatedImage) && !resolvedGeneratedUploadUrl;
+    !effectiveForceGenerate && Boolean(generatedImage) && !resolvedGeneratedUploadUrl;
   const hasResolvedImage =
     hasRemoteImageUrl ||
     hasRemoteGeneratedImage ||
-    (!forceGenerate && Boolean(resolvedImageUploadUrl) && (await uploadUrlExists(resolvedImageUploadUrl))) ||
-    (!forceGenerate && Boolean(resolvedGeneratedUploadUrl) && (await uploadUrlExists(resolvedGeneratedUploadUrl)));
+    (!effectiveForceGenerate && Boolean(resolvedImageUploadUrl) && (await uploadUrlExists(resolvedImageUploadUrl))) ||
+    (!effectiveForceGenerate && Boolean(resolvedGeneratedUploadUrl) && (await uploadUrlExists(resolvedGeneratedUploadUrl)));
 
-  if (!hasResolvedImage && forceGenerate) {
+  if (!hasResolvedImage && effectiveForceGenerate) {
     const artifact = await generateDiagramArtifact({
       diagramType: detectDiagramType(question.questionText || question.question_text || ''),
       questionText: sanitizeString(question.questionText || question.question_text || ''),
@@ -3002,6 +3010,7 @@ export const ensureQuestionsImageAvailability = async ({
   examId,
   persist = true,
   forceGenerate = false,
+  allowGeneratedImageCreation = false,
   allowKeywordInference = true,
 }) => {
   const safeQuestions = Array.isArray(questions) ? questions : [];
@@ -3013,6 +3022,7 @@ export const ensureQuestionsImageAvailability = async ({
       examId,
       persist,
       forceGenerate,
+      allowGeneratedImageCreation,
       allowKeywordInference,
     });
     if (Array.isArray(result.warnings) && result.warnings.length > 0) {

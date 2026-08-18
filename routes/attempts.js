@@ -57,6 +57,11 @@ import {
   TAB_SWITCH_DISQUALIFY_STATUS,
 } from '../services/proctoringService.js';
 import {
+  isExamResultsReleased,
+  canCandidateViewScore,
+  buildAttemptStatusOnlyPayload,
+} from '../utils/resultVisibility.js';
+import {
   FREE_PLAN_MESSAGES,
   getSubscriptionPlanDefinition,
   isFreePlan,
@@ -519,12 +524,6 @@ const enforceAttemptIpLock = async ({ attempt, req, planType }) => {
 
   return { allowed: true };
 };
-
-const isTabSwitchDisqualifiedAttempt = (attempt) =>
-  Boolean(
-    attempt?.isDisqualified &&
-    normalizeStatusValue(attempt?.disqualifyStatus) === TAB_SWITCH_DISQUALIFY_STATUS
-  );
 
 const appendAttemptViolationLog = (attempt, violationType, details = {}) => {
   const normalizedType = normalizeStatusValue(violationType) || 'OTHER';
@@ -1017,13 +1016,9 @@ const scheduleDeferredCodingEvaluation = ({
 
 const ADMIN_VIEWER_ROLES = new Set(['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR']);
 
-const isExamResultsReleased = (exam) => {
-  if (!exam) return false;
-  if (Boolean(exam.showResultsImmediately)) return true;
-  if (!exam.resultsReleasedAt) return false;
-  const releasedAt = new Date(exam.resultsReleasedAt);
-  return !Number.isNaN(releasedAt.getTime()) && releasedAt <= new Date();
-};
+// isExamResultsReleased is imported from ../utils/resultVisibility.js — the
+// single source of truth shared with routes/candidates.js and
+// routes/results.js (previously three drifted implementations).
 
 const isCertificatesReleased = (exam) => {
   if (!exam?.certificatesSentAt) return false;
@@ -1395,6 +1390,19 @@ router.post(
             },
           }
         );
+        // An ExaminerAssignment scoped to a static list of attempt IDs
+        // (scopeType: 'ATTEMPTS') would otherwise never see this reattempt,
+        // since its scopeData.attemptIds only names the original attempt.
+        // Extend any such assignment so the evaluator's queue still covers
+        // the candidate's new attempt for this exam.
+        try {
+          await ExaminerAssignment.updateMany(
+            { examId, scopeType: 'ATTEMPTS', 'scopeData.attemptIds': hasReAttemptAllowed._id },
+            { $addToSet: { 'scopeData.attemptIds': attempt._id } }
+          );
+        } catch (assignmentScopeError) {
+          console.error('[EXAMINER_ASSIGNMENT] Failed to extend ATTEMPTS scope for reattempt:', assignmentScopeError?.message || assignmentScopeError);
+        }
       }
       if (req.planLimitContext?.shouldIncrementCandidateCount) {
         await syncExamCandidateCount(examId);
@@ -1704,6 +1712,7 @@ const updateAttemptProgressHandler = async (req, res, next) => {
       const questions = await Question.find({
         _id: { $in: validQuestionIds },
         questionPaperId: assignedQuestionPaperId,
+        isIncludedInExam: { $ne: false },
       }).select('_id questionType');
 
       const questionMap = new Map(
@@ -2014,14 +2023,14 @@ export const submitAttemptHandler = async (req, res, next) => {
         examId,
         'REVIEW_ANSWERS'
       );
-      const scoringVisibleForTabSwitch =
-        attempt.userId.toString() === req.user._id.toString() &&
-        isTabSwitchDisqualifiedAttempt(attempt);
-      const scoringVisible =
-        canBypassReleaseWindow({
-          userRole: req.user.role,
-          canReviewAnswers,
-        }) || isExamResultsReleased(attempt.examId) || scoringVisibleForTabSwitch;
+      // Disqualification is never a shortcut to see score/answers early —
+      // visibility follows the exam's own release policy regardless of why
+      // (or whether) the attempt was disqualified.
+      const scoringVisible = canCandidateViewScore({
+        exam: attempt.examId,
+        isPrivileged: ADMIN_VIEWER_ROLES.has(req.user.role),
+        canReviewAnswers,
+      });
       const summary = {
         totalScore: Number(attempt.scoreSummary?.totalScore) || 0,
         maxScore: Number(attempt.scoreSummary?.maxScore) || 0,
@@ -2134,9 +2143,12 @@ export const submitAttemptHandler = async (req, res, next) => {
       return res.status(400).json({ error: 'No question paper assigned for this attempt.' });
     }
 
-    // Get all questions for this session's question paper
+    // Get all questions for this session's question paper. Pool questions
+    // (generated but never assigned to a section, isIncludedInExam: false)
+    // must never reach the candidate paper or contribute to scoring.
     const questions = await Question.find({
       questionPaperId: assignedQuestionPaperId,
+      isIncludedInExam: { $ne: false },
     }).sort({ order: 1 });
 
     if (
@@ -2768,13 +2780,13 @@ export const submitAttemptHandler = async (req, res, next) => {
       examId,
       'REVIEW_ANSWERS'
     );
-    const scoringVisible =
-      canBypassReleaseWindow({
-        userRole: req.user.role,
-        canReviewAnswers,
-      }) ||
-      isExamResultsReleased(attempt.examId) ||
-      isTabSwitchDisqualifiedAttempt(attempt);
+    // Disqualification is never a shortcut to see score/answers early — see
+    // resultVisibility.js.
+    const scoringVisible = canCandidateViewScore({
+      exam: attempt.examId,
+      isPrivileged: ADMIN_VIEWER_ROLES.has(req.user.role),
+      canReviewAnswers,
+    });
     const savedAnswers = scoringVisible ? await Answer.find({ attemptId: attempt._id }) : [];
     const responseScore = scoringVisible
       ? {
@@ -2908,14 +2920,31 @@ router.get('/:attemptId/results', requireAuth, validateObjectId('attemptId'), as
       return res.status(403).json({ error: 'Forbidden - You can only view your own results' });
     }
 
-    // For candidate-owned attempts, enforce release window.
-    if (
-      isOwnAttempt &&
-      !canViewAnyAttempt &&
-      attempt.examId &&
-      !isExamResultsReleased(attempt.examId) &&
-      !isTabSwitchDisqualifiedAttempt(attempt)
-    ) {
+    const questionPaperId = attempt.questionPaperId?._id || attempt.questionPaperId;
+    const totalQuestions = questionPaperId
+      ? await Question.countDocuments({ questionPaperId, isIncludedInExam: { $ne: false } })
+      : 0;
+    const attemptedQuestions = await countAttemptedQuestionsForAttempt(attempt._id);
+    const integrity = buildAttemptIntegritySummary(attempt);
+
+    // For candidate-owned attempts, score/answers follow the exam's release
+    // policy regardless of disqualification reason (or lack thereof). A
+    // disqualified candidate may still see their disqualification status —
+    // just not the score, answers, or correct answers — before release.
+    const scoringVisible = canViewAnyAttempt || (isOwnAttempt && isExamResultsReleased(attempt.examId));
+
+    if (isOwnAttempt && !canViewAnyAttempt && attempt.examId && !scoringVisible) {
+      if (attempt.isDisqualified) {
+        return res.json({
+          attempt: buildAttemptStatusOnlyPayload(attempt),
+          resultsAvailable: false,
+          attemptedQuestions,
+          totalQuestions,
+          progressPercentage:
+            totalQuestions > 0 ? Math.round((attemptedQuestions / totalQuestions) * 100) : 0,
+          message: 'Your results will be available once released by the exam administrator.',
+        });
+      }
       return res.status(403).json({ error: 'Results are not yet available for this exam.' });
     }
 
@@ -2923,12 +2952,6 @@ router.get('/:attemptId/results', requireAuth, validateObjectId('attemptId'), as
       includeAnswers: true,
       includeQuestionDetails: true,
     });
-    const questionPaperId = attempt.questionPaperId?._id || attempt.questionPaperId;
-    const totalQuestions = questionPaperId
-      ? await Question.countDocuments({ questionPaperId })
-      : 0;
-    const attemptedQuestions = await countAttemptedQuestionsForAttempt(attempt._id);
-    const integrity = buildAttemptIntegritySummary(attempt);
 
     res.json({
       attempt,
@@ -3323,7 +3346,15 @@ router.get(
         return res.status(403).json({ error: 'Evaluator role required to review this attempt.' });
       }
       const allAnswers = await Answer.find({ attemptId: attempt._id })
-        .populate('questionId', 'questionText questionType options correctAnswer points sectionId order evaluationConfig');
+        .populate({
+          path: 'questionId',
+          select: 'questionText questionType options correctAnswer points sectionId order evaluationConfig',
+          populate: { path: 'sectionId', select: 'name order' },
+        });
+      // Answer.questionId.order is only known after population, so sort
+      // in-memory rather than at the query level (for a stable answer-book
+      // question order in the review UI).
+      allAnswers.sort((a, b) => (Number(a.questionId?.order) || 0) - (Number(b.questionId?.order) || 0));
 
       let examinerAssignment = null;
       let answers = allAnswers;
@@ -3455,6 +3486,14 @@ router.put(
       }
 
       const previousMarks = Number(answer.pointsEarned) || 0;
+      const marksChanged = Math.abs(requestedMarks - previousMarks) > 0.001;
+      if (marksChanged && !normalizeString(req.body.feedback)) {
+        return res.status(400).json({
+          error: 'Please add feedback explaining the marks change.',
+          field: 'feedback',
+          answerId: answer._id,
+        });
+      }
       const priorEvaluation = answer.aiEvaluation && typeof answer.aiEvaluation === 'object'
         ? answer.aiEvaluation
         : {};
@@ -3612,6 +3651,14 @@ router.put(
           return res.status(400).json({ error: `Marks cannot exceed the question maximum of ${maximumMarks}` });
         }
         const previousMarks = Number(answer.pointsEarned) || 0;
+        const marksChanged = Math.abs(requestedMarks - previousMarks) > 0.001;
+        if (marksChanged && !feedback) {
+          return res.status(400).json({
+            error: 'Please add feedback explaining the marks change.',
+            field: 'feedback',
+            answerId: answer._id,
+          });
+        }
         answer.pointsEarned = Number(requestedMarks.toFixed(2));
         answer.isCorrect = maximumMarks > 0 && answer.pointsEarned >= maximumMarks;
         answer.examinerScore = answer.pointsEarned;
@@ -4006,7 +4053,7 @@ router.get(
           let totalQuestions = 0;
           if (attempt.questionPaperId) {
             const questionPaperId = attempt.questionPaperId._id || attempt.questionPaperId;
-            totalQuestions = await Question.countDocuments({ questionPaperId });
+            totalQuestions = await Question.countDocuments({ questionPaperId, isIncludedInExam: { $ne: false } });
           }
 
           // Count attempted questions (questions with answers)

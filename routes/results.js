@@ -7,15 +7,14 @@ import Submission from '../models/Submission.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { hasExamPermission } from '../middleware/examPermissions.js';
+import { isExamResultsReleased, canCandidateViewScore } from '../utils/resultVisibility.js';
 
 const router = express.Router();
 const PRIVILEGED_ROLES = new Set(['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR']);
-const isResultsReleased = (exam) => {
-  if (!exam) return false;
-  if (exam.showResultsImmediately) return true;
-  if (!exam.resultsReleasedAt) return false;
-  return new Date(exam.resultsReleasedAt) <= new Date();
-};
+// isResultsReleased is now isExamResultsReleased, imported from
+// ../utils/resultVisibility.js — the single source of truth shared with
+// routes/attempts.js and routes/candidates.js (previously three drifted
+// implementations).
 
 const toNonNegativeInt = (value, fallback = 0) => {
   const parsed = Number(value);
@@ -161,7 +160,7 @@ router.get(
         }));
 
       const visibleLeaderboard =
-        !isPrivilegedUser && !isResultsReleased(exam)
+        !isPrivilegedUser && !isExamResultsReleased(exam)
           ? leaderboard.filter(
               (entry) => String(entry.userId?._id || entry.userId) === String(req.user._id)
             )
@@ -173,7 +172,7 @@ router.get(
           title: exam.title,
         },
         leaderboard: visibleLeaderboard.slice(0, limit),
-        totalEntries: !isPrivilegedUser && !isResultsReleased(exam)
+        totalEntries: !isPrivilegedUser && !isExamResultsReleased(exam)
           ? visibleLeaderboard.length
           : leaderboard.length,
       });
@@ -233,21 +232,32 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
       .skip(skip)
       .limit(parseInt(limit));
 
+    // Non-privileged users only query their own attempts (filter.userId is
+    // forced above), so it's safe to always include their disqualified
+    // attempts here — they just won't get a score attached until visible.
     const visibleAttempts = isPrivilegedUser
       ? attempts
       : attempts.filter((attempt) => {
         const exam = attempt.examId;
         if (!exam) return false;
-        if (exam.showResultsImmediately) return true;
-        if (!exam.resultsReleasedAt) return false;
-        return new Date(exam.resultsReleasedAt) <= new Date();
+        return isExamResultsReleased(exam) || Boolean(attempt.isDisqualified);
       });
 
     // Calculate scores for each attempt
     const results = await Promise.all(
       visibleAttempts.map(async (attempt) => {
-        const answers = await Answer.find({ attemptId: attempt._id })
-          .populate('questionId', 'points sectionId');
+        // Score/answer-derived data is restricted result information — a
+        // disqualified-but-unreleased attempt still appears in the list
+        // (with attempted/total counts and violation info), but never with
+        // score/section marks, regardless of the disqualification reason.
+        const scoreVisible = canCandidateViewScore({
+          exam: attempt.examId,
+          isPrivileged: isPrivilegedUser,
+        });
+
+        const answers = scoreVisible
+          ? await Answer.find({ attemptId: attempt._id }).populate('questionId', 'points sectionId')
+          : [];
         const totalScore = answers.reduce((sum, a) => sum + (a.pointsEarned || 0), 0);
         const maxScore = answers.reduce((sum, a) => sum + (a.questionId?.points || 0), 0);
         const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
@@ -258,7 +268,7 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
 
         if (attempt.questionPaperId) {
           const questionPaperId = attempt.questionPaperId._id || attempt.questionPaperId;
-          totalQuestions = await Question.countDocuments({ questionPaperId });
+          totalQuestions = await Question.countDocuments({ questionPaperId, isIncludedInExam: { $ne: false } });
 
           // Count attempted questions (questions with non-empty answers)
           attemptedQuestions = await Answer.countDocuments({
@@ -299,15 +309,20 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
 
         return {
           attempt,
-          score: {
-            totalScore,
-            maxScore,
-            percentage,
-            normalizedScore: attempt.normalizedScore || null,
-            percentile: attempt.percentile || null,
-            sessionPercentile: attempt.sessionPercentile || null,
-          },
-          sectionBreakdown,
+          resultsAvailable: scoreVisible,
+          isDisqualified: Boolean(attempt.isDisqualified),
+          disqualifyReason: attempt.disqualifyReason || null,
+          score: scoreVisible
+            ? {
+              totalScore,
+              maxScore,
+              percentage,
+              normalizedScore: attempt.normalizedScore || null,
+              percentile: attempt.percentile || null,
+              sessionPercentile: attempt.sessionPercentile || null,
+            }
+            : null,
+          sectionBreakdown: scoreVisible ? sectionBreakdown : {},
           attemptedQuestions,
           totalQuestions,
           progressPercentage: totalQuestions > 0

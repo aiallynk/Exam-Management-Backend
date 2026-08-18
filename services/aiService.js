@@ -7,7 +7,12 @@ import {
   sanitizeQuestionOptions,
 } from '../utils/questionOptionSanitizer.js';
 import { extractCodingFields, getSupportedCodingLanguages } from '../utils/codingQuestions.js';
-import { validateGeneratedQuestionShape } from '../utils/questionTypeRegistry.js';
+import {
+  STORABLE_TYPE_IDS,
+  computeDistributionDiagnostics,
+  normalizeQuestionType,
+  validateGeneratedQuestionShape,
+} from '../utils/questionTypeRegistry.js';
 
 const client = config.openaiApiKey
   ? new OpenAI({ apiKey: config.openaiApiKey })
@@ -28,20 +33,7 @@ const IMPORT_HEADER_BLOCK_HINT_REGEX = /\b(?:quiz|name|date|section)\b/i;
 const IMPORT_NUMBERED_SPLIT_REGEX = /(?=\d+\.\s)/g;
 const IMPORT_TRUE_FALSE_REGEX = /\b(?:true\s*(?:\/|\s+or\s+)\s*false|t\s*\/\s*f)\b/i;
 
-const VALID_QUESTION_TYPES = [
-  'MULTIPLE_CHOICE',
-  'MULTIPLE_OPTIONS',
-  'TRUE_FALSE',
-  'SHORT_ANSWER',
-  'FILL_IN_THE_BLANK',
-  'MATCHING',
-  'PARAGRAPH',
-  'ESSAY',
-  'ESSAY_LETTER',
-  'ESSAY_STORY',
-  'NUMBER',
-  'CODING',
-];
+const VALID_QUESTION_TYPES = STORABLE_TYPE_IDS;
 const WRITING_QUESTION_TYPES = new Set(['ESSAY', 'ESSAY_LETTER', 'ESSAY_STORY']);
 
 const IMAGE_BASED_GENERATION_MODES = new Set(['percentage', 'per_count']);
@@ -72,49 +64,10 @@ const sanitizeString = (value) => {
 const normalizeQuestionTypeToken = (value) => {
   const normalized = sanitizeString(value).toUpperCase();
   if (!normalized) return '';
-  if (['MCQ', 'MULTIPLE CHOICE', 'SINGLE_CHOICE'].includes(normalized)) {
-    return 'MULTIPLE_CHOICE';
-  }
-  if (['MULTI_SELECT_MCQ', 'MULTI_SELECT MCQ'].includes(normalized)) {
-    return 'MULTIPLE_OPTIONS';
-  }
-  if (['MULTI_SELECT', 'MULTISELECT', 'MULTI_CHOICE'].includes(normalized)) {
-    return 'MULTIPLE_OPTIONS';
-  }
-  if (['TRUEFALSE', 'TRUE_FALSE', 'TF', 'TRUE/FALSE'].includes(normalized)) {
-    return 'TRUE_FALSE';
-  }
-  if (['SHORT', 'SHORTANSWER', 'SHORT_ANSWER'].includes(normalized)) {
-    return 'SHORT_ANSWER';
-  }
-  if (['FILL_BLANK', 'FILL_IN_BLANK', 'FILLINTHEBLANK', 'FIB'].includes(normalized)) {
-    return 'FILL_IN_THE_BLANK';
-  }
-  if (['MATCH', 'MATCH_THE_FOLLOWING', 'MATCHING_PAIRS'].includes(normalized)) {
-    return 'MATCHING';
-  }
-  if (['LONG_ANSWER', 'LONGANSWER', 'DESCRIPTIVE', 'ESSAY'].includes(normalized)) {
-    return 'ESSAY';
-  }
-  if (['ESSAY_LETTER', 'LETTER_WRITING', 'LETTER'].includes(normalized)) {
-    return 'ESSAY_LETTER';
-  }
-  if (['ESSAY_STORY', 'STORY_WRITING', 'STORY'].includes(normalized)) {
-    return 'ESSAY_STORY';
-  }
   if (['IMAGE_BASED', 'IMAGE', 'IMAGE-BASED'].includes(normalized)) {
     return 'MULTIPLE_CHOICE';
   }
-  if (['SCENARIO'].includes(normalized)) {
-    return 'PARAGRAPH';
-  }
-  if (['NUMERIC'].includes(normalized)) {
-    return 'NUMBER';
-  }
-  if (['CODE'].includes(normalized)) {
-    return 'CODING';
-  }
-  return normalized;
+  return normalizeQuestionType(value) || '';
 };
 
 const resolveTrackingContext = ({ tenantId = null, userId = null, metadata = null } = {}) => {
@@ -644,7 +597,7 @@ const buildSharedFallbackImagePrompt = ({ topic, questions, imageType }) => {
 const buildQuestionTypeDistribution = ({ questionTypes, questionTypeDistribution, count }) => {
   const safeTypes = Array.isArray(questionTypes)
     ? questionTypes
-      .map((type) => sanitizeString(type).toUpperCase())
+      .map(normalizeQuestionType)
       .filter((type) => VALID_QUESTION_TYPES.includes(type))
     : [];
 
@@ -661,7 +614,7 @@ const buildQuestionTypeDistribution = ({ questionTypes, questionTypeDistribution
 
   if (Array.isArray(questionTypeDistribution) && questionTypeDistribution.length > 0) {
     questionTypeDistribution.forEach((item) => {
-      const type = sanitizeString(item?.type).toUpperCase();
+      const type = normalizeQuestionType(item?.type);
       const typeCount = Math.max(0, parseCount(item?.count, 0));
       if (safeTypes.includes(type)) {
         distributionMap[type] += typeCount;
@@ -681,26 +634,9 @@ const buildQuestionTypeDistribution = ({ questionTypes, questionTypeDistribution
   }
 
   if (total !== safeCount) {
-    if (total < safeCount) {
-      distributionMap[safeTypes[0]] += safeCount - total;
-    } else {
-      let overflow = total - safeCount;
-      const orderedTypes = [...safeTypes].sort((a, b) => distributionMap[b] - distributionMap[a]);
-      for (const type of orderedTypes) {
-        if (overflow <= 0) break;
-        const removable = Math.min(distributionMap[type], overflow);
-        distributionMap[type] -= removable;
-        overflow -= removable;
-      }
-
-      if (overflow > 0) {
-        const perType = Math.floor(safeCount / safeTypes.length);
-        const remainder = safeCount % safeTypes.length;
-        safeTypes.forEach((type, idx) => {
-          distributionMap[type] = perType + (idx < remainder ? 1 : 0);
-        });
-      }
-    }
+    throw new Error(
+      `Question type distribution totals ${total}; it must equal the requested count ${safeCount}.`
+    );
   }
 
   const distribution = safeTypes
@@ -709,11 +645,6 @@ const buildQuestionTypeDistribution = ({ questionTypes, questionTypeDistribution
 
   if (!distribution.length) {
     return [{ type: safeTypes[0], count: safeCount }];
-  }
-
-  const finalTotal = distribution.reduce((sum, item) => sum + item.count, 0);
-  if (finalTotal !== safeCount) {
-    distribution[0].count += safeCount - finalTotal;
   }
 
   return distribution;
@@ -897,7 +828,8 @@ const buildFallbackQuestionForType = ({ type, index, topic }) => {
   };
 };
 
-const normalizeToRequestedType = ({ question, type, index, topic }) => {
+// Exported for direct unit testing (pure data transform, no AI/network calls).
+export const normalizeToRequestedType = ({ question, type, index, topic }) => {
   const fallback = buildFallbackQuestionForType({ type, index, topic });
   const source = question && typeof question === 'object' ? question : fallback;
   const normalized =
@@ -1005,8 +937,22 @@ const normalizeToRequestedType = ({ question, type, index, topic }) => {
   }
 
   if (type === 'PARAGRAPH') {
-    const answer = sanitizeString(normalized.correctAnswer) || 'Refer to passage';
     const passage = sanitizeString(normalized.passage) || fallback.passage;
+    // IMPORTANT: this must always return questionType: 'PARAGRAPH', never a
+    // different type. enforceQuestionDistribution's outer loop iterates
+    // `targetCount` times per requested type and pushes whatever this
+    // function returns — it does NOT re-tally by the returned questionType.
+    // Earlier this branch returned 'MULTIPLE_CHOICE' when options were
+    // present, which silently shifted that slot's count from PARAGRAPH's
+    // tally into MULTIPLE_CHOICE's tally as soon as anything counts
+    // questions by questionType (the distribution summary UI, the
+    // request-vs-generated validation) — producing exactly the
+    // "requested 4 MCQ / 3 Paragraph, got 5 MCQ / 2 Paragraph" bug. A
+    // paragraph question with real options is shown WITH those options
+    // (see CreateExamEnhanced.jsx's QuestionReviewCard/inventory list) but
+    // stays graded as PARAGRAPH (semantic/manual evaluation) so its count
+    // never leaks into another type's bucket.
+    const answer = sanitizeString(normalized.correctAnswer) || 'Refer to passage';
     return attachScenarioContext({
       questionText,
       questionType: type,
@@ -1070,11 +1016,30 @@ const normalizeToRequestedType = ({ question, type, index, topic }) => {
   });
 };
 
-const enforceQuestionDistribution = ({ questions, typeDistribution, count, topic }) => {
+export class QuestionDistributionError extends Error {
+  constructor({ requested, generated, missing, message } = {}) {
+    const missingText = (Array.isArray(missing) ? missing : [])
+      .map((item) => `${item.type} requires ${item.expected}; only ${item.actual} valid question${item.actual === 1 ? '' : 's'} were available`)
+      .join('; ');
+    super(message || `Unable to produce the exact question-type distribution${missingText ? `: ${missingText}` : '.'}`);
+    this.name = 'QuestionDistributionError';
+    this.status = 422;
+    this.statusCode = 422;
+    this.code = 'QUESTION_DISTRIBUTION_MISMATCH';
+    this.requestedDistribution = requested || {};
+    this.generatedDistribution = generated || {};
+    this.missingDistribution = Array.isArray(missing) ? missing : [];
+  }
+}
+
+// Pure selection pass: accept only valid questions whose own canonical type
+// fills that same requested bucket. Overflow from MCQ can never be relabeled
+// as Fill Blank (or any other type), and invalid shapes are never converted.
+export const selectQuestionsForExactDistribution = ({ questions, typeDistribution, count, topic }) => {
   const safeDistribution = Array.isArray(typeDistribution)
     ? typeDistribution
       .map((item) => ({
-        type: sanitizeString(item?.type).toUpperCase(),
+        type: normalizeQuestionType(item?.type),
         count: Math.max(0, parseCount(item?.count, 0)),
       }))
       .filter((item) => VALID_QUESTION_TYPES.includes(item.type) && item.count > 0)
@@ -1082,9 +1047,12 @@ const enforceQuestionDistribution = ({ questions, typeDistribution, count, topic
 
   const safeCount = Math.max(1, parseCount(count, 5));
   if (!safeDistribution.length) {
-    return Array.from({ length: safeCount }, (_, idx) =>
-      buildFallbackQuestionForType({ type: 'MULTIPLE_CHOICE', index: idx, topic })
-    );
+    return {
+      questions: [],
+      missing: [{ type: 'MULTIPLE_CHOICE', expected: safeCount, actual: 0, count: safeCount }],
+      requested: { MULTIPLE_CHOICE: safeCount },
+      generated: {},
+    };
   }
 
   const targetByType = {};
@@ -1102,58 +1070,84 @@ const enforceQuestionDistribution = ({ questions, typeDistribution, count, topic
   // type cannot become right-shaped for a different one. This is what
   // used to let a badly-shaped AI candidate get silently relabeled onto
   // a type it never resembled in the first place.
-  const overflowPool = [];
   (Array.isArray(questions) ? questions : []).forEach((question, index) => {
+    // A paragraph-group sub-question (flattenGroupedQuestionContainers
+    // stamps questionFormat on it) keeps its own answer-format questionType
+    // for grading — e.g. SHORT_ANSWER or MULTIPLE_CHOICE — but was actually
+    // generated to fill the caller's PARAGRAPH quota. Pooling it by its raw
+    // questionType silently displaces genuinely-requested SHORT_ANSWER/etc.
+    // candidates AND leaves PARAGRAPH's own slots to be backfilled with
+    // generic fallback filler instead of this real content — the exact
+    // mechanism behind "requested N PARAGRAPH, got filler" and "requested N
+    // SHORT_ANSWER, got more than N".
+    const rawFormat = sanitizeString(
+      question?.questionFormat || question?.question_format
+    ).toUpperCase();
+    const isParagraphGrouped = rawFormat === 'PARAGRAPH' && Boolean(targetByType.PARAGRAPH);
+    const claimedType = normalizeQuestionType(
+      question?.questionType || question?.type || question?.question_type
+    );
+    if (!isParagraphGrouped && !claimedType) return;
     const normalized = normalizeQuestionObject(question, index + 1);
     if (!normalized) return;
-    const type = sanitizeString(normalized.questionType).toUpperCase();
+    const type = isParagraphGrouped
+      ? 'PARAGRAPH'
+      : claimedType;
     const shapeCheck = validateGeneratedQuestionShape(normalized);
     if (!shapeCheck.valid) {
       return;
     }
     if (!targetByType[type]) {
-      overflowPool.push(normalized);
       return;
     }
     if (poolsByType[type].length < targetByType[type]) {
       poolsByType[type].push(normalized);
-    } else {
-      overflowPool.push(normalized);
     }
   });
 
   const result = [];
+  const missing = [];
   safeDistribution.forEach(({ type, count: targetCount }) => {
-    for (let i = 0; i < targetCount; i += 1) {
-      let candidate = poolsByType[type].shift();
-      if (!candidate && overflowPool.length > 0) {
-        candidate = overflowPool.shift();
-      }
-      result.push(
-        normalizeToRequestedType({
-          question: candidate,
-          type,
-          index: result.length,
-          topic,
-        })
-      );
+    const accepted = poolsByType[type].slice(0, targetCount);
+    accepted.forEach((question) => {
+      result.push(normalizeToRequestedType({
+        question,
+        type,
+        index: result.length,
+        topic,
+      }));
+    });
+    if (accepted.length < targetCount) {
+      missing.push({
+        type,
+        expected: targetCount,
+        actual: accepted.length,
+        count: targetCount - accepted.length,
+      });
     }
   });
 
-  while (result.length < safeCount) {
-    result.push(
-      normalizeToRequestedType({
-        question: null,
-        type: safeDistribution[0].type,
-        index: result.length,
-        topic,
-      })
-    );
-  }
+  const diagnostics = computeDistributionDiagnostics(safeDistribution, result);
+  return {
+    questions: result.slice(0, safeCount),
+    missing,
+    requested: diagnostics.requested,
+    generated: diagnostics.generated,
+  };
+};
 
-  return result
-    .slice(0, safeCount)
-    .map((question, index) => ({ ...question, order: index + 1 }));
+// Exported for direct unit testing (pure data transform, no AI/network calls).
+export const enforceQuestionDistribution = ({ questions, typeDistribution, count, topic }) => {
+  const selection = selectQuestionsForExactDistribution({
+    questions,
+    typeDistribution,
+    count,
+    topic,
+  });
+  if (selection.missing.length > 0 || selection.questions.length !== Math.max(1, parseCount(count, 5))) {
+    throw new QuestionDistributionError(selection);
+  }
+  return selection.questions.map((question, index) => ({ ...question, order: index + 1 }));
 };
 
 const buildFallbackParagraphScenarioGroups = ({
@@ -1504,6 +1498,8 @@ export const generateQuestions = async (params) => {
     tenantId = null,
     userId = null,
     juniorContext = null,
+    requireProviderExactDistribution = false,
+    distributionFillDepth = 0,
   } = params;
 
   const trackingContext = resolveTrackingContext({ tenantId, userId, metadata });
@@ -1533,7 +1529,7 @@ export const generateQuestions = async (params) => {
 
   // Validate count
   const questionCount = parseInt(count, 10);
-  const minimumQuestionCount = juniorContext ? 1 : 5;
+  const minimumQuestionCount = juniorContext || distributionFillDepth > 0 ? 1 : 5;
   if (isNaN(questionCount) || questionCount < minimumQuestionCount || questionCount > 50) {
     throw new Error(`Question count must be between ${minimumQuestionCount} and 50`);
   }
@@ -1567,6 +1563,13 @@ export const generateQuestions = async (params) => {
 
   // Validate OpenAI API key
   if (!client) {
+    if (requireProviderExactDistribution) {
+      const providerError = new Error('AI question generation is unavailable because the provider is not configured. No questions were added.');
+      providerError.status = 503;
+      providerError.statusCode = 503;
+      providerError.code = 'AI_PROVIDER_UNAVAILABLE';
+      throw providerError;
+    }
     console.warn('OpenAI API key not configured, using fallback templates');
     await trackFallbackUsage({
       feature: 'question_generation',
@@ -1790,13 +1793,86 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
           .map((q, index) => normalizeQuestionObject(q, index + 1))
           .filter(Boolean);
 
-        // Enforce exact requested type distribution and total count.
-        const distributedQuestions = enforceQuestionDistribution({
+        // Keep only valid candidates in their own requested type bucket. If
+        // the provider missed a type, call the same generation mechanism for
+        // only that deficit; never relabel overflow from another type.
+        const selection = selectQuestionsForExactDistribution({
           questions: normalizedQuestions,
           typeDistribution,
           count: questionCount,
           topic: sanitizedTopic,
         });
+        let distributedQuestions = selection.questions;
+        if (selection.missing.length > 0) {
+          if (distributionFillDepth > 0) {
+            throw new QuestionDistributionError(selection);
+          }
+
+          const missingDistribution = selection.missing.map(({ type, count: missingCount }) => ({
+            type,
+            count: missingCount,
+          }));
+          const missingCount = missingDistribution.reduce((sum, item) => sum + item.count, 0);
+          let supplementalQuestions;
+          try {
+            supplementalQuestions = await generateQuestions({
+              ...params,
+              count: missingCount,
+              questionTypes: missingDistribution.map((item) => item.type),
+              questionTypeDistribution: missingDistribution,
+              questionSorting: 'GROUP_BY_TYPE',
+              questionSortPattern: missingDistribution.map((item) => item.type),
+              existingQuestions: [
+                ...(Array.isArray(existingQuestions) ? existingQuestions : []),
+                ...selection.questions.map((question) => question.questionText).filter(Boolean),
+              ],
+              enableImageQuestions: false,
+              imageQuestionCount: 0,
+              distributionFillDepth: distributionFillDepth + 1,
+              requireProviderExactDistribution,
+            });
+          } catch (fillError) {
+            if (fillError instanceof QuestionDistributionError) {
+              const combinedGenerated = { ...selection.generated };
+              Object.entries(fillError.generatedDistribution || {}).forEach(([type, generatedCount]) => {
+                combinedGenerated[type] = (combinedGenerated[type] || 0) + generatedCount;
+              });
+              const missing = Object.entries(selection.requested)
+                .filter(([type, expected]) => (combinedGenerated[type] || 0) < expected)
+                .map(([type, expected]) => ({
+                  type,
+                  expected,
+                  actual: combinedGenerated[type] || 0,
+                  count: expected - (combinedGenerated[type] || 0),
+                }));
+              const combinedError = new QuestionDistributionError({
+                requested: selection.requested,
+                generated: combinedGenerated,
+                missing,
+              });
+              combinedError.noFullRetry = true;
+              throw combinedError;
+            }
+            throw fillError;
+          }
+          distributedQuestions = enforceQuestionDistribution({
+            questions: [...selection.questions, ...supplementalQuestions],
+            typeDistribution,
+            count: questionCount,
+            topic: sanitizedTopic,
+          });
+        } else {
+          distributedQuestions = enforceQuestionDistribution({
+            questions: selection.questions,
+            typeDistribution,
+            count: questionCount,
+            topic: sanitizedTopic,
+          });
+        }
+
+        if (distributionFillDepth > 0) {
+          return distributedQuestions;
+        }
         const paragraphEnhancedQuestions = await enhanceParagraphScenarioQuestions({
           questions: distributedQuestions,
           questionsPerParagraph: normalizedQuestionsPerParagraph,
@@ -1822,14 +1898,29 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
           tenantId: trackingContext.tenantId,
           userId: trackingContext.userId,
         });
-        return applyQuestionSorting({
+        const finalQuestions = applyQuestionSorting({
           questions: imageEnhancedQuestions,
           questionSorting,
           questionSortPattern,
           questionTypes,
         });
+        const finalDiagnostics = computeDistributionDiagnostics(typeDistribution, finalQuestions);
+        if (finalQuestions.length !== questionCount || finalDiagnostics.validationStatus !== 'valid') {
+          const finalSelection = selectQuestionsForExactDistribution({
+            questions: finalQuestions,
+            typeDistribution,
+            count: questionCount,
+            topic: sanitizedTopic,
+          });
+          throw new QuestionDistributionError(finalSelection);
+        }
+        return finalQuestions;
       } catch (error) {
         lastError = error;
+
+        if (error?.noFullRetry) {
+          throw error;
+        }
         
         // Don't retry on certain errors (authentication, invalid request, etc.)
         if (error.status === 401 || error.status === 403 || error.status === 400) {
@@ -1845,8 +1936,25 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
       }
     }
     
-    // All retries failed - fall back to template questions
+    if (lastError instanceof QuestionDistributionError) {
+      lastError.noFullRetry = distributionFillDepth > 0;
+      throw lastError;
+    }
+
+    // All provider/network retries failed - retain the existing local
+    // fallback only for callers that have not requested provider-strict
+    // behavior. The exam-generation route opts into strict behavior.
     console.error('OpenAI API call failed after all retries:', lastError?.message || 'Unknown error');
+    if (requireProviderExactDistribution) {
+      const providerError = lastError || new Error('AI question generation failed after all retries.');
+      providerError.status = Number(providerError.status) || 502;
+      providerError.statusCode = Number(providerError.statusCode) || providerError.status;
+      providerError.code = providerError.code || 'AI_PROVIDER_GENERATION_FAILED';
+      if (!providerError.message) {
+        providerError.message = 'The AI provider could not generate the requested questions after all retries. No questions were added.';
+      }
+      throw providerError;
+    }
     return generateFallbackQuestions({
       ...params,
       scenarioQuestionTypes,
@@ -1861,6 +1969,9 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
     });
   } catch (error) {
     console.error('OpenAI question generation error:', error);
+    if (error instanceof QuestionDistributionError || requireProviderExactDistribution) {
+      throw error;
+    }
     // Check if it's a network/connection error
     if (error.code === 'ECONNRESET' || error.code === 'ETIMEDOUT' || error.message?.includes('timeout')) {
       console.warn('Network error during AI generation, using fallback questions');

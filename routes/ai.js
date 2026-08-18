@@ -4,7 +4,11 @@ import { requireRole } from '../middleware/roles.js';
 import { requireTenant } from '../middleware/multiTenant.js';
 import { aiRateLimiter, uploadRateLimiter } from '../middleware/rateLimiter.js';
 import { enforceContextSourceLimit } from '../middleware/planLimits.js';
-import { generateQuestions, extractQuestionsFromContent } from '../services/aiService.js';
+import {
+  QuestionDistributionError,
+  generateQuestions,
+  extractQuestionsFromContent,
+} from '../services/aiService.js';
 import {
   requireTenantFeature,
   resolveTenantFeature,
@@ -37,7 +41,10 @@ import readXlsxFile from 'read-excel-file/node';
 import OpenAI from 'openai';
 import config from '../config/env.js';
 import { normalizeQuestionFormat } from '../utils/questionTypes.js';
-import { computeDistributionDiagnostics } from '../utils/questionTypeRegistry.js';
+import {
+  computeDistributionDiagnostics,
+  normalizeQuestionType,
+} from '../utils/questionTypeRegistry.js';
 import {
   createTrackedChatCompletion,
   getAIQuestionCountForTenantByWindow,
@@ -141,31 +148,8 @@ const OPENAI_MODEL = config.openaiModel || 'gpt-4o-mini';
 
 const normalizeAiQuestionType = (value) => {
   const normalized = String(value || '').trim().toUpperCase();
-  if (['MCQ', 'MULTIPLE_CHOICE', 'MULTIPLE CHOICE'].includes(normalized)) {
-    return 'MULTIPLE_CHOICE';
-  }
-  if (['TRUE_FALSE', 'TRUEFALSE'].includes(normalized)) return 'TRUE_FALSE';
-  if (['SHORT_ANSWER', 'SHORTANSWER'].includes(normalized)) return 'SHORT_ANSWER';
   if (['IMAGE', 'IMAGE_BASED', 'IMAGE-BASED'].includes(normalized)) return 'IMAGE';
-  if (['MULTI_SELECT_MCQ', 'MULTI_SELECT MCQ'].includes(normalized)) {
-    return 'MULTIPLE_OPTIONS';
-  }
-  if (['MULTIPLE_OPTIONS', 'MULTI_SELECT', 'MULTISELECT'].includes(normalized)) {
-    return 'MULTIPLE_OPTIONS';
-  }
-  if (['PARAGRAPH', 'SCENARIO'].includes(normalized)) return normalized;
-  if (['ESSAY', 'LONG_ANSWER', 'LONGANSWER', 'DESCRIPTIVE'].includes(normalized)) {
-    return 'ESSAY';
-  }
-  if (['ESSAY_LETTER', 'LETTER_WRITING', 'LETTER'].includes(normalized)) {
-    return 'ESSAY_LETTER';
-  }
-  if (['ESSAY_STORY', 'STORY_WRITING', 'STORY'].includes(normalized)) {
-    return 'ESSAY_STORY';
-  }
-  if (['CODING', 'CODE'].includes(normalized)) return 'CODING';
-  if (['NUMBER', 'NUMERIC'].includes(normalized)) return 'NUMBER';
-  return normalized;
+  return normalizeQuestionType(value);
 };
 
 const FREE_PLAN_ALLOWED_AI_TYPES = new Set([
@@ -1340,6 +1324,38 @@ router.post(
       const normalizedRequestedTypes = Array.isArray(questionTypes)
         ? questionTypes.map(normalizeAiQuestionType).filter(Boolean)
         : [];
+      if (
+        Array.isArray(questionTypes) &&
+        normalizedRequestedTypes.length !== questionTypes.length
+      ) {
+        return res.status(400).json({
+          error: 'One or more requested question types are invalid.',
+        });
+      }
+      if (Array.isArray(questionTypeDistribution) && questionTypeDistribution.length > 0) {
+        if (normalizedDistribution.length !== questionTypeDistribution.length) {
+          return res.status(400).json({
+            error: 'One or more question-type distribution entries are invalid.',
+          });
+        }
+        const distributionTotal = normalizedDistribution.reduce(
+          (sum, item) => sum + item.count,
+          0
+        );
+        if (distributionTotal !== toNonNegativeInt(count, 0)) {
+          return res.status(400).json({
+            error: `Question type distribution totals ${distributionTotal}; it must equal the requested count ${count}.`,
+          });
+        }
+        const unexpectedDistributionType = normalizedDistribution.find(
+          (item) => !normalizedRequestedTypes.includes(item.type)
+        );
+        if (unexpectedDistributionType) {
+          return res.status(400).json({
+            error: `Question type ${unexpectedDistributionType.type} is present in the distribution but not in questionTypes.`,
+          });
+        }
+      }
       if (isJuniorGeneration && preparedJuniorContext?.interactionMode === 'FLASH_MATHS') {
         const requestedFlashTypes = new Set([
           ...normalizedRequestedTypes,
@@ -1517,7 +1533,10 @@ router.post(
             // field.
             instructions: instructions || examDescription || '',
             difficulty,
-            questionTypes: isJuniorGeneration ? providerTypes : questionTypes,
+            questionTypes: isJuniorGeneration ? providerTypes : normalizedRequestedTypes,
+            questionTypeDistribution: isJuniorGeneration
+              ? providerDistribution
+              : normalizedDistribution,
             targetCount: providerQuestionCount,
             examTitle,
             examDescription,
@@ -1541,6 +1560,9 @@ router.post(
             rejectedCount: result.rejectedCount,
             rejectionReasons: result.rejectionReasons,
             attempts: result.attempts,
+            requestedDistribution: result.requestedDistribution,
+            generatedDistribution: result.generatedDistribution,
+            missingDistribution: result.missingDistribution,
           };
 
           sourceGroundedRun.acceptedCount = result.acceptedCount;
@@ -1555,6 +1577,19 @@ router.post(
                 : 'FAILED';
           sourceGroundedRun.completedAt = new Date();
           await sourceGroundedRun.save();
+
+          if (result.missingDistribution.length > 0) {
+            throw new QuestionDistributionError({
+              requested: result.requestedDistribution,
+              generated: result.generatedDistribution,
+              missing: result.missingDistribution.map((item) => ({
+                type: item.type,
+                expected: result.requestedDistribution[item.type] || 0,
+                actual: result.generatedDistribution[item.type] || 0,
+                count: item.count,
+              })),
+            });
+          }
         } catch (groundedError) {
           sourceGroundedRun.status = 'FAILED';
           sourceGroundedRun.errorMessage = groundedError?.message || 'Source-grounded generation failed.';
@@ -1567,8 +1602,10 @@ router.post(
           topic,
           count: providerQuestionCount,
           difficulty,
-          questionTypes: isJuniorGeneration ? providerTypes : questionTypes,
-          questionTypeDistribution: isJuniorGeneration ? providerDistribution : (Array.isArray(questionTypeDistribution) ? questionTypeDistribution : undefined),
+          questionTypes: isJuniorGeneration ? providerTypes : normalizedRequestedTypes,
+          questionTypeDistribution: isJuniorGeneration
+            ? providerDistribution
+            : (normalizedDistribution.length ? normalizedDistribution : undefined),
           questionSorting,
           questionSortPattern: Array.isArray(questionSortPattern) ? questionSortPattern : undefined,
           duration,
@@ -1589,6 +1626,7 @@ router.post(
           userId: req.user?._id || null,
           metadata: aiMetadata,
           juniorContext: preparedJuniorContext,
+          requireProviderExactDistribution: true,
         });
       }
       const questions = [...deterministicQuestions, ...providerQuestions]
@@ -1598,7 +1636,10 @@ router.post(
       // per-type counts the caller asked for against what actually came
       // back, so the frontend can show a distribution-mismatch warning
       // instead of silently trusting the count.
-      const distributionDiagnostics = computeDistributionDiagnostics(questionTypeDistribution, questions);
+      const distributionDiagnostics = computeDistributionDiagnostics(
+        normalizedDistribution.length ? normalizedDistribution : questionTypeDistribution,
+        questions
+      );
 
       res.json({
         questions,

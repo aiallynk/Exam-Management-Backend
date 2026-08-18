@@ -1,3 +1,9 @@
 node_modules/
 .env
 
+# Runtime-generated data must stay local / in configured object storage.
+/backups/
+/uploads/
+
+# macOS metadata
+.DS_Store

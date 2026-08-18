@@ -6,6 +6,7 @@
 import AnswerKey from '../models/AnswerKey.js';
 import Question from '../models/Question.js';
 import Exam from '../models/Exam.js';
+import { syncExamQuestionCount } from '../utils/planUsage.js';
 import { extractQuestionsFromContent } from './aiService.js';
 import pdfParse from 'pdf-parse';
 import readXlsxFile from 'read-excel-file/node';
@@ -391,7 +392,13 @@ export const applyAnswerKey = async (answerKeyId, questionIds = null) => {
       updated++;
     }
   }
-  
+
+  if (updated > 0 && answerKey.examId) {
+    // Applying the key can change Question.points — keep the exam's cached
+    // question count / total marks in sync (previously this went stale).
+    await syncExamQuestionCount(answerKey.examId);
+  }
+
   return {
     totalQuestions: questions.length,
     updated,

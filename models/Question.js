@@ -210,6 +210,14 @@ const QuestionSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Section',
     },
+    // false only for a question generated into a sectioned exam's pool but
+    // never assigned to a section ("Unassigned — Not included in exam").
+    // Default true preserves every pre-existing question and every
+    // no-section exam (where sectionId is legitimately always empty).
+    isIncludedInExam: {
+      type: Boolean,
+      default: true,
+    },
     translations: {
       type: Map,
       of: {
