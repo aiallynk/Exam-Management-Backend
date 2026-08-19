@@ -1884,6 +1884,10 @@ export const submitAttemptHandler = async (req, res, next) => {
           userId: req.user?._id,
           attemptId: attempt._id,
           expectedMode: ['TEST', 'WORKSHEET', 'COMPETITION', 'OLYMPIAD', 'PRACTICE', 'SPEED'],
+          // A Flash Maths interaction question may be mixed into an otherwise
+          // STANDARD-interaction Junior paper; both must be completable through
+          // this generic submit path without falling back to semantic/AI grading.
+          expectedInteractionMode: ['STANDARD', 'FLASH_MATHS'],
           answers: req.body?.answers,
         });
         return res.json({

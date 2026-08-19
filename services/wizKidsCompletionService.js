@@ -62,8 +62,9 @@ const assertCompletableAttempt = async ({ tenantId, userId, attemptId, expectedM
   if (!exam || !config || !expectedModes.includes(config.mode)) {
     throw new WizKidsCompletionError(403, `This completion endpoint is only available for WizKids ${expectedModes.join(', ')} attempts.`);
   }
-  if (String(config.interactionMode || 'STANDARD') !== expectedInteractionMode) {
-    throw new WizKidsCompletionError(403, `This completion endpoint is only available for ${expectedInteractionMode} WizKids interactions.`);
+  const expectedInteractionModes = Array.isArray(expectedInteractionMode) ? expectedInteractionMode : [expectedInteractionMode];
+  if (!expectedInteractionModes.includes(String(config.interactionMode || 'STANDARD'))) {
+    throw new WizKidsCompletionError(403, `This completion endpoint is only available for ${expectedInteractionModes.join(', ')} WizKids interactions.`);
   }
   const requiredCapabilities = new Set(['WIZKIDS']);
   if (MODE_CAPABILITY[config.mode]) requiredCapabilities.add(MODE_CAPABILITY[config.mode]);

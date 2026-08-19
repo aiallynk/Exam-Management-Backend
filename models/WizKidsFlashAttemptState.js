@@ -7,6 +7,7 @@ const RoundTimingSchema = new mongoose.Schema({
   submittedAt: { type: Date, required: true },
   responseTimeMs: { type: Number, min: 0, required: true },
   isCorrect: { type: Boolean, required: true },
+  timedOut: { type: Boolean, default: false },
 }, { _id: false });
 
 const WizKidsFlashAttemptStateSchema = new mongoose.Schema({

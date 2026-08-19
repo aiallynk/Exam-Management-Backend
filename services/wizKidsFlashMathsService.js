@@ -65,15 +65,28 @@ const loadFlashExam = async ({ tenantId, examId }) => {
   return { exam, config };
 };
 
+const fingerprintFlashSequence = (entry) => `${(entry.operands || []).join(',')}|${(entry.operators || []).join(',')}`;
+const MAX_FLASH_SEQUENCE_RETRIES = 5;
+
 export const createFlashRounds = async ({ tenantId, examId, questionPaperId, count, seedBase, createdBy }) => {
   const { exam, config } = await loadFlashExam({ tenantId, examId });
   const paper = await QuestionPaper.findOne({ _id: questionPaperId, examId: exam._id, isActive: true }).lean();
   if (!paper) throw new WizKidsFlashMathsError(404, 'Question paper not found for this Junior Exam.');
   const existingCount = await Question.countDocuments({ questionPaperId });
+  const existingRounds = await WizKidsFlashRound.find({ questionPaperId }).select('operands operators').lean();
+  const seenFingerprints = new Set(existingRounds.map(fingerprintFlashSequence));
   const created = [];
   for (let index = 0; index < count; index += 1) {
-    const seed = `${seedBase}:${existingCount + index + 1}`;
-    const generated = generateFlashSequence({ config: config.flashMaths, seed });
+    let seed = `${seedBase}:${existingCount + index + 1}`;
+    let generated = generateFlashSequence({ config: config.flashMaths, seed });
+    // Guarantee (best-effort) that no two rounds in the same paper share an identical sequence:
+    // retry with a bumped seed suffix a bounded number of times, then accept a rare residual
+    // collision rather than fail the whole generation request.
+    for (let retry = 1; retry < MAX_FLASH_SEQUENCE_RETRIES && seenFingerprints.has(fingerprintFlashSequence(generated)); retry += 1) {
+      seed = `${seedBase}:${existingCount + index + 1}:retry${retry}`;
+      generated = generateFlashSequence({ config: config.flashMaths, seed });
+    }
+    seenFingerprints.add(fingerprintFlashSequence(generated));
     // eslint-disable-next-line no-await-in-loop
     const question = await Question.create({
       questionPaperId,
@@ -127,6 +140,27 @@ export const buildCandidateFlashState = ({ state, rounds, config, now = new Date
   if (!current) {
     return { completed: true, progress: { completed: completedCount, total: rounds.length } };
   }
+  const currentQuestionId = current.questionId._id;
+  // Once the active round has been answered, hold here (do not compute reveal/answer timing for
+  // it again) until the candidate explicitly advances via advanceFlashRound — this is what
+  // enforces "no auto-next" for Flash Maths in both Practice and Test mode.
+  const alreadyAnswered = (state.submittedQuestionIds || []).some((id) => String(id) === String(currentQuestionId));
+  if (alreadyAnswered) {
+    const timing = [...(state.roundTimings || [])].reverse().find((entry) => String(entry.questionId) === String(currentQuestionId));
+    return {
+      completed: false,
+      phase: 'ANSWERED',
+      round: {
+        questionId: currentQuestionId,
+        currentItem: null,
+        operandCount: current.operands.length,
+      },
+      feedback: timing ? { isCorrect: timing.isCorrect === true, timedOut: timing.timedOut === true } : null,
+      progress: { completed: completedCount, total: rounds.length },
+      isLastRound: completedCount >= rounds.length,
+      assessmentPurpose: config.mode,
+    };
+  }
   const startedAt = new Date(state.roundStartedAt);
   const elapsedMs = Math.max(0, now.getTime() - startedAt.getTime());
   const revealCycleMs = current.flashDurationMs + current.gapDurationMs;
@@ -145,7 +179,7 @@ export const buildCandidateFlashState = ({ state, rounds, config, now = new Date
     completed: false,
     phase: answerOpen ? 'ANSWER' : 'REVEAL',
     round: {
-      questionId: current.questionId._id,
+      questionId: currentQuestionId,
       currentItem: item,
       operandCount: current.operands.length,
       flashDurationMs: current.flashDurationMs,
@@ -198,19 +232,15 @@ export const submitFlashAnswer = async ({ tenantId, userId, attemptId, questionI
     { $setOnInsert: { answerText: submittedAnswer, isCorrect: score.isCorrect, pointsEarned: score.isCorrect ? Number(question.points || 0) : 0, timeSpent: Math.ceil(responseTimeMs / 1000), needsReview: false, evaluationStatus: 'AUTO_EVALUATED', finalScoreSource: 'RULE_ENGINE' } },
     { upsert: true, new: true, setDefaultsOnInsert: true }
   );
-  const currentIndex = context.rounds.findIndex((entry) => String(entry.questionId._id) === String(questionId));
-  const nextRound = context.rounds[currentIndex + 1] || null;
+  // Record the answer only. Advancing to the next round (or completing the attempt) is a
+  // separate, explicit step — see advanceFlashRound — so the candidate always sees this round's
+  // feedback and must click "Next" themselves, in both Practice and Test mode.
   const updatedState = await WizKidsFlashAttemptState.findOneAndUpdate(
     { _id: state._id, tenantId, currentQuestionId: questionId, submittedQuestionIds: { $ne: questionId } },
     {
       $push: {
         submittedQuestionIds: questionId,
-        roundTimings: { questionId, startedAt: state.roundStartedAt, answerOpenedAt, submittedAt: now, responseTimeMs: Math.max(0, Number(persistedAnswer.timeSpent || 0) * 1000), isCorrect: persistedAnswer.isCorrect === true },
-      },
-      $set: {
-        currentQuestionId: nextRound?.questionId?._id || null,
-        roundStartedAt: nextRound ? now : null,
-        ...(!nextRound ? { completedAt: now } : {}),
+        roundTimings: { questionId, startedAt: state.roundStartedAt, answerOpenedAt, submittedAt: now, responseTimeMs: Math.max(0, Number(persistedAnswer.timeSpent || 0) * 1000), isCorrect: persistedAnswer.isCorrect === true, timedOut },
       },
     },
     { new: true }
@@ -219,10 +249,38 @@ export const submitFlashAnswer = async ({ tenantId, userId, attemptId, questionI
     const latestState = await WizKidsFlashAttemptState.findOne({ tenantId, attemptId });
     return { duplicate: true, ...buildCandidateFlashState({ state: latestState.toObject(), rounds: context.rounds, config: context.config, now }) };
   }
-  return {
-    ...(context.config.mode === 'PRACTICE' ? { feedback: { isCorrect: persistedAnswer.isCorrect === true, timedOut } } : {}),
-    ...buildCandidateFlashState({ state: updatedState.toObject(), rounds: context.rounds, config: context.config, now }),
-  };
+  return buildCandidateFlashState({ state: updatedState.toObject(), rounds: context.rounds, config: context.config, now });
+};
+
+export const advanceFlashRound = async ({ tenantId, userId, attemptId, now = new Date() }) => {
+  const context = await loadAttemptContext({ tenantId, userId, attemptId });
+  const state = await WizKidsFlashAttemptState.findOne({ tenantId, attemptId });
+  if (!state) throw new WizKidsFlashMathsError(409, 'Start the Flash Maths attempt before advancing.');
+  const currentQuestionId = state.currentQuestionId;
+  if (!currentQuestionId) {
+    // Already fully advanced (attempt is complete) — return current state rather than erroring,
+    // so a repeated/late "Next" click is harmless.
+    return buildCandidateFlashState({ state: state.toObject(), rounds: context.rounds, config: context.config, now });
+  }
+  const isAnswered = (state.submittedQuestionIds || []).some((id) => String(id) === String(currentQuestionId));
+  if (!isAnswered) {
+    throw new WizKidsFlashMathsError(409, 'Answer the current Flash Maths round before moving on.');
+  }
+  const currentIndex = context.rounds.findIndex((entry) => String(entry.questionId._id) === String(currentQuestionId));
+  const nextRound = context.rounds[currentIndex + 1] || null;
+  const updatedState = await WizKidsFlashAttemptState.findOneAndUpdate(
+    { _id: state._id, tenantId, currentQuestionId },
+    {
+      $set: {
+        currentQuestionId: nextRound?.questionId?._id || null,
+        roundStartedAt: nextRound ? now : null,
+        ...(!nextRound ? { completedAt: now } : {}),
+      },
+    },
+    { new: true }
+  );
+  const finalState = updatedState || (await WizKidsFlashAttemptState.findOne({ tenantId, attemptId }));
+  return buildCandidateFlashState({ state: finalState.toObject(), rounds: context.rounds, config: context.config, now });
 };
 
 export const completeFlashAttempt = async ({ tenantId, userId, attemptId, now = new Date() }) => {

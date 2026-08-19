@@ -11,6 +11,7 @@ import { syncExamQuestionCount } from '../utils/planUsage.js';
 import { AUDIT_ACTIONS, logAuditEvent } from '../utils/auditLogger.js';
 import {
   WizKidsFlashMathsError,
+  advanceFlashRound,
   completeFlashAttempt,
   createFlashRounds,
   getOrStartFlashAttempt,
@@ -103,6 +104,14 @@ router.post(
     } catch (error) { return respond(error, res, next); }
   }
 );
+
+router.post('/attempts/:attemptId/next', ...baseGuards, requireRole('CANDIDATE'), validateObjectId('attemptId'), async (req, res, next) => {
+  try {
+    const payload = await advanceFlashRound({ tenantId: req.user.tenantId, userId: req.user._id, attemptId: req.params.attemptId });
+    await logAuditEvent(AUDIT_ACTIONS.WIZKIDS_FLASH_ROUND_ADVANCED, { userId: req.user._id, userRole: req.user.role, tenantId: req.user.tenantId, resourceType: 'ExamAttempt', resourceId: req.params.attemptId, details: { progress: payload.progress || null } });
+    return res.json(payload);
+  } catch (error) { return respond(error, res, next); }
+});
 
 router.post('/attempts/:attemptId/complete', ...baseGuards, requireRole('CANDIDATE'), validateObjectId('attemptId'), async (req, res, next) => {
   try {

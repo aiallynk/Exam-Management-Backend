@@ -1064,6 +1064,11 @@ router.get('/:examId/question-papers/:paperId/questions', requireAuth, requireTe
           options: serializedQuestion.questionType === 'MATCHING' ? matchingChoices : options,
           matchingPairs: serializedQuestion.questionType === 'MATCHING' ? leftPairs : matchingPairs,
           question_type: resolveQuestionTypeTokenForExamResponse(serializedQuestion),
+          // Safe to disclose: only the interaction/presentation mode, never the
+          // stripped evaluationConfig/correctAnswer it was derived from. This is
+          // how the candidate renderer knows to play the Flash Maths sequence
+          // instead of showing a plain number input.
+          ...(evaluationConfig?.flashMaths ? { interactionType: 'FLASH_MATHS' } : {}),
         };
       }
 

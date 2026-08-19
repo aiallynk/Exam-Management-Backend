@@ -50,6 +50,53 @@ test('candidate Flash payload opens answering only after all value and gap cycle
   assert.equal(payload.round.currentItem, null);
 });
 
+test('candidate Flash payload holds on ANSWERED phase with feedback, no leaked fields, and does not drift with time until advanced', () => {
+  const startedAt = new Date('2026-01-01T00:00:00.000Z');
+  const roundOne = { questionId: { _id: 'question-1', order: 0 }, operands: [25, 14], operators: ['+'], flashDurationMs: 500, gapDurationMs: 100, answerWindowMs: 10000 };
+  const roundTwo = { questionId: { _id: 'question-2', order: 1 }, operands: [8, 3], operators: ['-'], flashDurationMs: 500, gapDurationMs: 100, answerWindowMs: 10000 };
+  const state = {
+    currentQuestionId: 'question-1',
+    roundStartedAt: startedAt,
+    submittedQuestionIds: ['question-1'],
+    roundTimings: [{ questionId: 'question-1', startedAt, answerOpenedAt: startedAt, submittedAt: startedAt, responseTimeMs: 1200, isCorrect: true, timedOut: false }],
+  };
+  const payload = buildCandidateFlashState({ state, rounds: [roundOne, roundTwo], config: { mode: 'TEST' }, now: startedAt });
+  assert.equal(payload.phase, 'ANSWERED');
+  assert.deepEqual(payload.feedback, { isCorrect: true, timedOut: false });
+  assert.equal(payload.round.currentItem, null);
+  assert.equal(payload.isLastRound, false);
+  const serialized = JSON.stringify(payload);
+  for (const forbidden of ['operands', 'operators', 'correctAnswer', 'solution', 'seed']) assert.equal(serialized.includes(forbidden), false);
+  // Elapsed time alone must never move the state off ANSWERED — only an explicit advance call does.
+  assert.deepEqual(buildCandidateFlashState({ state, rounds: [roundOne, roundTwo], config: { mode: 'TEST' }, now: new Date(startedAt.getTime() + 60000) }), payload);
+});
+
+test('Flash feedback is present in TEST mode too (no longer Practice-only) and isLastRound is set on the final round', () => {
+  const startedAt = new Date('2026-01-01T00:00:00.000Z');
+  const round = { questionId: { _id: 'question-1', order: 0 }, operands: [10, 2], operators: ['+'], flashDurationMs: 500, gapDurationMs: 100, answerWindowMs: 10000 };
+  const state = {
+    currentQuestionId: 'question-1',
+    roundStartedAt: startedAt,
+    submittedQuestionIds: ['question-1'],
+    roundTimings: [{ questionId: 'question-1', startedAt, answerOpenedAt: startedAt, submittedAt: startedAt, responseTimeMs: 900, isCorrect: false, timedOut: false }],
+  };
+  const payload = buildCandidateFlashState({ state, rounds: [round], config: { mode: 'TEST' }, now: startedAt });
+  assert.equal(payload.phase, 'ANSWERED');
+  assert.deepEqual(payload.feedback, { isCorrect: false, timedOut: false });
+  assert.equal(payload.isLastRound, true);
+});
+
+test('Flash "next" advance route and sequence-uniqueness retry exist and are guarded', () => {
+  const routeSource = readFileSync(new URL('../routes/wizKidsFlashMaths.js', import.meta.url), 'utf8');
+  const serviceSource = readFileSync(new URL('../services/wizKidsFlashMathsService.js', import.meta.url), 'utf8');
+  assert.match(routeSource, /attempts\/:attemptId\/next/);
+  assert.match(routeSource, /advanceFlashRound/);
+  assert.match(serviceSource, /export const advanceFlashRound/);
+  assert.match(serviceSource, /Answer the current Flash Maths round before moving on\./);
+  assert.match(serviceSource, /MAX_FLASH_SEQUENCE_RETRIES/);
+  assert.match(serviceSource, /fingerprintFlashSequence/);
+});
+
 test('duplicate Flash submissions are recognized before scoring', () => {
   assert.equal(isFlashQuestionSubmitted({ submittedQuestionIds: ['one'] }, 'one'), true);
   assert.equal(isFlashQuestionSubmitted({ submittedQuestionIds: ['one'] }, 'two'), false);
@@ -91,4 +138,27 @@ test('Flash routes are tenant, role, product, interaction, and capability guarde
   assert.match(serviceSource, /ExamAttempt\.findOne\(\{ _id: attemptId, tenantId, userId \}\)/);
   assert.match(serviceSource, /productModule: 'WIZKIDS'/);
   assert.match(serviceSource, /interactionMode !== 'FLASH_MATHS'/);
+});
+
+test('candidate question delivery discloses Flash Maths interaction type without leaking evaluationConfig/correctAnswer', () => {
+  const questionsSource = readFileSync(new URL('../routes/questions.js', import.meta.url), 'utf8');
+  assert.match(questionsSource, /const \{ correctAnswer, evaluationConfig, matchingPairs, options, \.\.\.candidateQuestion \} = serializedQuestion;/);
+  assert.match(questionsSource, /evaluationConfig\?\.flashMaths \? \{ interactionType: 'FLASH_MATHS' \} : \{\}/);
+});
+
+test('generic exam submission completes Flash Maths (mixed-paper) attempts deterministically, not just STANDARD WizKids attempts', () => {
+  const completionSource = readFileSync(new URL('../services/wizKidsCompletionService.js', import.meta.url), 'utf8');
+  const flashServiceSource = readFileSync(new URL('../services/wizKidsFlashMathsService.js', import.meta.url), 'utf8');
+  const attemptsSource = readFileSync(new URL('../routes/attempts.js', import.meta.url), 'utf8');
+  // assertCompletableAttempt must accept an array of expected interaction modes, mirroring
+  // the existing expectedMode array support, so both plain and Flash-configured WizKids
+  // exams can complete through the same generic submit path.
+  assert.match(completionSource, /const expectedInteractionModes = Array\.isArray\(expectedInteractionMode\) \? expectedInteractionMode : \[expectedInteractionMode\];/);
+  assert.match(completionSource, /expectedInteractionModes\.includes\(String\(config\.interactionMode \|\| 'STANDARD'\)\)/);
+  // The dedicated Flash completion endpoint keeps its own narrow guard.
+  assert.match(flashServiceSource, /expectedInteractionMode: 'FLASH_MATHS'/);
+  // The generic /exams/submit handler must widen its own request to allow FLASH_MATHS,
+  // not just STANDARD, so a Flash question rendered inside the normal Take Exam page can
+  // still be submitted (previously this threw a 403 before scoring even started).
+  assert.match(attemptsSource, /expectedInteractionMode: \['STANDARD', 'FLASH_MATHS'\]/);
 });
