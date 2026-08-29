@@ -6,15 +6,10 @@ import util from 'util';
 import crypto from 'crypto';
 import { execFile } from 'child_process';
 import { fileURLToPath } from 'url';
-import OpenAI from 'openai';
-import pdfParse from 'pdf-parse';
-import readXlsxFile from 'read-excel-file/node';
-import { parse as parseCsv } from 'csv-parse/sync';
 import config from '../config/env.js';
-import {
-  createTrackedChatCompletion,
-  createTrackedImageGeneration,
-} from './aiTokenUsageService.js';
+import { runEngineChatCompletion, runEngineImageGeneration, isOpenAIEngineConfigured, isImageGenerationEngineConfigured } from './aiEngine/aiEngineClient.js';
+import { AI_OPERATIONS } from './aiEngine/aiOperations.js';
+import { getModelForOperation } from './aiEngine/aiConfigService.js';
 import {
   sanitizeIndexedQuestionOptionText,
   sanitizeQuestionOptions,
@@ -55,10 +50,16 @@ const GENERATED_IMAGE_UPLOAD_SEGMENT = '/uploads/generated_images/';
 const AI_PLACEHOLDER_MARKER = 'AI Diagram Placeholder';
 const AI_PLACEHOLDER_MARKER_LOWER = AI_PLACEHOLDER_MARKER.toLowerCase();
 
-const openAiImageClient = config.openaiApiKey
-  ? new OpenAI({ apiKey: config.openaiApiKey })
-  : null;
+const isVisionConfigured = () => isOpenAIEngineConfigured();
+const isImageGenConfigured = () => isImageGenerationEngineConfigured();
 const OPENAI_MODEL = config.openaiModel || 'gpt-4o-mini';
+
+const engineImportChat = (request, feature = 'question_import_ocr', context = {}) => runEngineChatCompletion({
+  operation: AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE,
+  feature,
+  ...context,
+  request: { model: OPENAI_MODEL, ...request },
+});
 
 let artifactSequence = 0;
 let unzipperModuleCache = null;
@@ -708,7 +709,7 @@ const extractStructuredQuestionWithVision = async ({
   blockIndex,
   extractionErrors,
 }) => {
-  if (!openAiImageClient) return null;
+  if (!isVisionConfigured()) return null;
 
   const primaryDataUri = primaryDataUriOverride || (await filePathToDataUri(primaryImagePath));
   const fallbackDataUri =
@@ -719,29 +720,24 @@ const extractStructuredQuestionWithVision = async ({
   // Stage 1: OCR-like raw text extraction from the block.
   let ocrQuestion = null;
   try {
-    const ocrCompletion = await createTrackedChatCompletion({
-      client: openAiImageClient,
-      feature: 'question_import_ocr',
-      request: {
-        model: OPENAI_MODEL,
-        temperature: 0,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text:
-                  'Read this scanned question block and return only the visible text with original line breaks, including options.',
-              },
-              {
-                type: 'image_url',
-                image_url: { url: payloadImage },
-              },
-            ],
-          },
-        ],
-      },
+    const ocrCompletion = await engineImportChat({
+      temperature: 0,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text:
+                'Read this scanned question block and return only the visible text with original line breaks, including options.',
+            },
+            {
+              type: 'image_url',
+              image_url: { url: payloadImage },
+            },
+          ],
+        },
+      ],
     });
 
     const ocrText = sanitizeString(ocrCompletion?.choices?.[0]?.message?.content || '');
@@ -761,11 +757,7 @@ const extractStructuredQuestionWithVision = async ({
 
   // Stage 2: AI structured fallback if OCR text is weak.
   try {
-    const completion = await createTrackedChatCompletion({
-      client: openAiImageClient,
-      feature: 'question_import_ocr',
-      request: {
-        model: OPENAI_MODEL,
+    const completion = await engineImportChat({
         temperature: 0.1,
         response_format: { type: 'json_object' },
         messages: [
@@ -788,7 +780,6 @@ const extractStructuredQuestionWithVision = async ({
             ],
           },
         ],
-      },
     });
 
     const parsed = JSON.parse(completion?.choices?.[0]?.message?.content || '{}');
@@ -1569,14 +1560,13 @@ const generateDiagramArtifact = async ({
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const safeRetries = Math.max(1, Number.isFinite(Number(maxRetries)) ? Number(maxRetries) : 3);
 
-  if (openAiImageClient) {
+  if (isImageGenConfigured()) {
     for (let attempt = 0; attempt < safeRetries; attempt += 1) {
       try {
-        const response = await createTrackedImageGeneration({
-          client: openAiImageClient,
+        const response = await runEngineImageGeneration({
           feature: 'question_image_generation',
           request: {
-            model: 'gpt-image-1',
+            model: getModelForOperation(AI_OPERATIONS.QUESTION_IMAGE_GENERATION),
             prompt: buildDiagramPrompt(diagramType, sanitizeString(questionText).slice(0, 500)),
             size: '1536x1024',
             background: 'opaque',
@@ -1904,7 +1894,7 @@ const extractQuestionsFromPdfVisionDirect = async ({
   pdfBuffer,
   extractionErrors,
 }) => {
-  if (!openAiImageClient) return [];
+  if (!isVisionConfigured()) return [];
   if (!Buffer.isBuffer(pdfBuffer) || !pdfBuffer.length) return [];
   if (pdfBuffer.length > 8 * 1024 * 1024) {
     extractionErrors.push({
@@ -1916,11 +1906,7 @@ const extractQuestionsFromPdfVisionDirect = async ({
 
   try {
     const dataUri = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`;
-    const completion = await createTrackedChatCompletion({
-      client: openAiImageClient,
-      feature: 'question_import_ocr',
-      request: {
-        model: OPENAI_MODEL,
+    const completion = await engineImportChat({
         temperature: 0.1,
         response_format: { type: 'json_object' },
         messages: [
@@ -1957,7 +1943,6 @@ const extractQuestionsFromPdfVisionDirect = async ({
             ],
           },
         ],
-      },
     });
 
     const parsed = JSON.parse(completion?.choices?.[0]?.message?.content || '{}');
@@ -2705,7 +2690,7 @@ export const extractTextFromImageArtifacts = async ({
     return { text: '', warnings };
   }
 
-  if (!openAiImageClient) {
+  if (!isVisionConfigured()) {
     warnings.push({
       stage: 'ocr-images',
       message: 'OpenAI API key is not configured for OCR fallback.',
@@ -2723,13 +2708,9 @@ export const extractTextFromImageArtifacts = async ({
     if (!dataUri) continue;
 
     try {
-      const response = await createTrackedChatCompletion({
-        client: openAiImageClient,
-        feature: 'question_import_ocr',
-        request: {
-          model: OPENAI_MODEL,
-          temperature: 0,
-          messages: [
+      const response = await engineImportChat({
+        temperature: 0,
+        messages: [
             {
               role: 'user',
               content: [
@@ -2745,7 +2726,6 @@ export const extractTextFromImageArtifacts = async ({
               ],
             },
           ],
-        },
       });
 
       const extracted = sanitizeString(response?.choices?.[0]?.message?.content || '');
@@ -2775,7 +2755,7 @@ export const extractTextFromPdfBufferWithVision = async ({
     return { text: '', warnings };
   }
 
-  if (!openAiImageClient) {
+  if (!isVisionConfigured()) {
     warnings.push({
       stage: 'ocr-pdf',
       message: 'OpenAI API key is not configured for scanned PDF OCR fallback.',
@@ -2793,11 +2773,7 @@ export const extractTextFromPdfBufferWithVision = async ({
 
   try {
     const dataUri = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`;
-    const response = await createTrackedChatCompletion({
-      client: openAiImageClient,
-      feature: 'question_import_ocr',
-      request: {
-        model: OPENAI_MODEL,
+    const response = await engineImportChat({
         temperature: 0,
         messages: [
           {
@@ -2815,7 +2791,6 @@ export const extractTextFromPdfBufferWithVision = async ({
             ],
           },
         ],
-      },
     });
 
     return {

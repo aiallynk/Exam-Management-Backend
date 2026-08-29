@@ -95,6 +95,7 @@ const config = {
   // question semantic similarity falls back to an in-application cosine
   // comparison — see services/questionEmbeddingService.js.
   questionVectorSearchIndex: process.env.QUESTION_VECTOR_SEARCH_INDEX || '',
+  contentVectorSearchIndex: process.env.CONTENT_VECTOR_SEARCH_INDEX || '',
   // Source-Grounded AI Question Generation novelty ledger HMAC key. Not in
   // REQUIRED_ENV_VARS — see the boot-time warning above for why.
   noveltySignatureSecret: process.env.NOVELTY_SIGNATURE_SECRET || '',

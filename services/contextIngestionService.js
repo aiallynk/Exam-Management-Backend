@@ -1,7 +1,8 @@
 import config from '../config/env.js';
 import sourceGroundedConfig from '../config/sourceGroundedConfig.js';
-import { getOpenAIClient } from './aiService.js';
-import { createTrackedEmbedding } from './aiTokenUsageService.js';
+import { runEngineEmbedding, isEmbeddingEngineConfigured } from './aiEngine/aiEngineClient.js';
+import { getModelForOperation } from './aiEngine/aiConfigService.js';
+import { AI_OPERATIONS } from './aiEngine/aiOperations.js';
 import { parseQuestionImportFile } from './questionImportImageService.js';
 import { fetchUrlSourceSafely, SecureUrlFetchError } from './secureUrlFetchService.js';
 import { isGoogleDriveUrl } from './googleDriveSourceProvider.js';
@@ -16,7 +17,7 @@ import ContextChunk from '../models/ContextChunk.js';
 // reuses services/questionImportImageService.js's parseQuestionImportFile
 // verbatim rather than reimplementing PDF/DOCX/XLSX/CSV/OCR extraction.
 
-const EMBEDDING_MODEL = config.openaiEmbeddingModel;
+const EMBEDDING_MODEL = () => getModelForOperation(AI_OPERATIONS.EMBEDDING);
 
 class ContextIngestionError extends Error {
   constructor(message, code) {
@@ -53,23 +54,18 @@ export const chunkText = (
   return chunks;
 };
 
-const getClientOrThrow = () => {
-  const client = getOpenAIClient();
-  if (!client) {
+const ensureEmbeddingEngineOrThrow = () => {
+  if (!isEmbeddingEngineConfigured()) {
     throw new ContextIngestionError(
       'AI embeddings are not configured on this deployment (missing OPENAI_API_KEY).',
       'EMBEDDINGS_NOT_CONFIGURED'
     );
   }
-  return client;
 };
 
-// Embeds a batch of texts with bounded concurrency, each call individually
-// tracked in the shared AITokenUsage accounting collection (via
-// createTrackedEmbedding) so this feature never opens a separate/parallel
-// usage-accounting path.
+// Embeds a batch of texts with bounded concurrency through the AI Engine.
 export const embedTexts = async (texts, { tenantId, userId }) => {
-  const client = getClientOrThrow();
+  ensureEmbeddingEngineOrThrow();
   const results = new Array(texts.length);
   let cursor = 0;
 
@@ -77,14 +73,13 @@ export const embedTexts = async (texts, { tenantId, userId }) => {
     while (cursor < texts.length) {
       const index = cursor;
       cursor += 1;
-      const response = await createTrackedEmbedding({
-        client,
-        request: { model: EMBEDDING_MODEL, input: texts[index] },
-        feature: 'source_grounded_context_embedding',
+      const embedding = await runEngineEmbedding({
+        texts: texts[index],
         tenantId,
         userId,
+        feature: 'source_grounded_context_embedding',
       });
-      results[index] = response?.data?.[0]?.embedding || [];
+      results[index] = embedding || [];
     }
   };
 
@@ -112,7 +107,7 @@ export const persistChunks = async ({ tenantId, contextSetId, sourceId, texts, e
     text,
     charCount: text.length,
     embedding: embeddings[index],
-    embeddingModel: EMBEDDING_MODEL,
+    embeddingModel: EMBEDDING_MODEL(),
   }));
   if (docs.length) await ContextChunk.insertMany(docs, { ordered: false });
   return docs.length;

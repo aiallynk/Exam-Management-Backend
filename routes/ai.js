@@ -23,6 +23,7 @@ import { generateWithNoveltyAndGrounding } from '../services/candidatePoolOrches
 import { buildTenantOwnedSourceFilter } from '../services/contextRetrievalService.js';
 import { assertContentSourcesSelectable, ContentLibraryError } from '../services/contentLibraryService.js';
 import { resolveLibraryResourcesToContextSourceIds } from '../services/libraryResourceService.js';
+import { buildGenerationContext, CONTEXT_MODES, InsufficientContextError } from '../services/generationContextOrchestrator.js';
 import { resolveGenerationStrategy } from '../services/groundedGenerationService.js';
 import { qualityGateQuestionsAgainstSpecification, resolveAssessmentSpecification } from '../services/assessmentSpecificationResolver.js';
 import ContextSet from '../models/ContextSet.js';
@@ -41,8 +42,9 @@ import multer from 'multer';
 import path from 'path';
 import pdfParse from 'pdf-parse';
 import readXlsxFile from 'read-excel-file/node';
-import OpenAI from 'openai';
 import config from '../config/env.js';
+import { runEngineChatCompletion, isOpenAIEngineConfigured } from '../services/aiEngine/aiEngineClient.js';
+import { AI_OPERATIONS } from '../services/aiEngine/aiOperations.js';
 import { normalizeQuestionFormat } from '../utils/questionTypes.js';
 import {
   computeDistributionDiagnostics,
@@ -55,7 +57,6 @@ import {
   computeCognitiveDemandDiagnostics,
 } from '../utils/cognitiveDemand.js';
 import {
-  createTrackedChatCompletion,
   getAIQuestionCountForTenantByWindow,
   getAIUsageCountForTenantByWindow,
   trackAIUsageEvent,
@@ -1254,6 +1255,7 @@ router.post(
         contextSetId,
         contextSourceIds,
         libraryResourceIds,
+        contextMode,
         cognitiveDemandDistribution: requestedCognitiveDemandDistribution,
       } = req.body;
       const suppliedSpecification = req.body?.resolvedSpecification || null;
@@ -1298,8 +1300,35 @@ router.post(
         }
       }
 
-      const isSourceGrounded = resolveGenerationStrategy({ generationMode }) === 'SOURCE_GROUNDED';
+      const isSourceGrounded = resolveGenerationStrategy({ generationMode }) === 'SOURCE_GROUNDED'
+        || [CONTEXT_MODES.AUTO_CONTEXT, CONTEXT_MODES.SELECTED_CONTEXT, CONTEXT_MODES.STRICT_SOURCE].includes(String(contextMode || '').toUpperCase());
       const effectivePlanType = await resolveUserEffectivePlanType(req.user);
+
+      let orchestratedContext = null;
+      const normalizedContextMode = String(contextMode || CONTEXT_MODES.STANDARD).toUpperCase();
+      if (normalizedContextMode !== CONTEXT_MODES.STANDARD) {
+        try {
+          orchestratedContext = await buildGenerationContext({
+            user: req.user,
+            creationMode: req.body.creationMode || 'STANDARD',
+            academicContext: req.body.academicContext || governedSpecification?.academicContext || {},
+            assessmentPurpose: req.body.assessmentPurpose || governedSpecification?.purpose || null,
+            resolvedSpecification: governedSpecification?.specification || suppliedSpecification || null,
+            topic,
+            questionBlueprint: { questionTypes },
+            selectedLibraryResourceIds: libraryResourceIds,
+            selectedContextSourceIds: contextSourceIds,
+            contextMode: normalizedContextMode,
+            creatorInstructions: instructions,
+            instructions,
+          });
+        } catch (contextError) {
+          if (contextError instanceof InsufficientContextError) {
+            return res.status(400).json({ error: contextError.message, code: contextError.code });
+          }
+          throw contextError;
+        }
+      }
 
       // Source-Grounded AI Question Generation — feature-flag + tenant-
       // ownership validation. This check is inline because it depends on
@@ -1312,13 +1341,16 @@ router.post(
         }
         const requestedSourceIds = Array.isArray(contextSourceIds) ? contextSourceIds : [];
         const requestedLibraryResourceIds = Array.isArray(libraryResourceIds) ? libraryResourceIds : [];
-        if (requestedSourceIds.length === 0 && requestedLibraryResourceIds.length === 0) {
+        const orchestratedSourceIds = orchestratedContext?.selectedContextSourceIds || [];
+        const orchestratedLibraryIds = orchestratedContext?.selectedLibraryResourceIds || [];
+        if (requestedSourceIds.length === 0 && requestedLibraryResourceIds.length === 0 && orchestratedSourceIds.length === 0) {
           return res.status(400).json({ error: 'At least one content library resource or source must be selected for Source-Grounded generation.' });
         }
         let resolvedFromLibrary = [];
-        if (requestedLibraryResourceIds.length) {
+        const libraryIdsToResolve = orchestratedLibraryIds.length ? orchestratedLibraryIds : requestedLibraryResourceIds;
+        if (libraryIdsToResolve.length) {
           try {
-            resolvedFromLibrary = await resolveLibraryResourcesToContextSourceIds(req.user, requestedLibraryResourceIds);
+            resolvedFromLibrary = await resolveLibraryResourcesToContextSourceIds(req.user, libraryIdsToResolve);
           } catch (resolveError) {
             if (resolveError instanceof ContentLibraryError) {
               return res.status(resolveError.status).json({ error: resolveError.message, code: resolveError.code });
@@ -1326,7 +1358,11 @@ router.post(
             throw resolveError;
           }
         }
-        const mergedSourceIds = [...new Set([...requestedSourceIds.map(String), ...resolvedFromLibrary.map(String)])];
+        const mergedSourceIds = [...new Set([
+          ...requestedSourceIds.map(String),
+          ...resolvedFromLibrary.map(String),
+          ...orchestratedSourceIds.map(String),
+        ])];
         if (mergedSourceIds.length > 10) {
           return res.status(400).json({ error: 'At most 10 context sources may be selected for Source-Grounded generation.' });
         }
@@ -1746,26 +1782,24 @@ router.post(
       } else if (['.jpg', '.jpeg', '.png'].includes(fileExtension)) {
         // For images, we'll use OpenAI Vision API if available
         // Otherwise, return error suggesting to convert to PDF
-        if (!config.openaiApiKey) {
+        if (!isOpenAIEngineConfigured()) {
           return res.status(400).json({ 
             error: 'Image OCR requires OpenAI API key. Please convert image to PDF or use Excel format.' 
           });
         }
-
-        const client = new OpenAI({ apiKey: config.openaiApiKey });
         
         // Convert image buffer to base64
         const base64Image = req.file.buffer.toString('base64');
         const mimeType = fileExtension === '.png' ? 'image/png' : 'image/jpeg';
         
         try {
-          const response = await createTrackedChatCompletion({
-            client,
+          const response = await runEngineChatCompletion({
+            operation: AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE,
             feature: 'answer_key_generation',
             tenantId: req.user?.tenantId,
             userId: req.user?._id,
             request: {
-              model: OPENAI_MODEL,
+              model: config.openaiModel,
               messages: [
                 {
                   role: 'user',
@@ -1814,22 +1848,20 @@ Format: { "answers": { "q1": { "questionText": "...", "correctAnswer": "...", "p
 
       const userPrompt = `Extract the answer key from the following content:\n\n${extractedContent.substring(0, 15000)}`;
 
-      if (!config.openaiApiKey) {
+      if (!isOpenAIEngineConfigured()) {
         return res.status(500).json({ 
           error: 'OpenAI API key not configured. Cannot generate answer key.' 
         });
       }
 
-      const client = new OpenAI({ apiKey: config.openaiApiKey });
-
       try {
-        const completion = await createTrackedChatCompletion({
-          client,
+        const completion = await runEngineChatCompletion({
+          operation: AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE,
           feature: 'answer_key_generation',
           tenantId: req.user?.tenantId,
           userId: req.user?._id,
           request: {
-            model: OPENAI_MODEL,
+            model: config.openaiModel,
             messages: [
               { role: 'system', content: systemPrompt },
               { role: 'user', content: userPrompt },

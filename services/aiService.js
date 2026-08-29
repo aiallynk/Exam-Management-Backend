@@ -1,9 +1,11 @@
-import OpenAI from 'openai';
 import config from '../config/env.js';
 import { evaluateAnswerWithGemini } from './aiEngine/geminiEvaluationAdapter.js';
 import { getDefaultEvaluationProvider } from './aiEngine/aiConfigService.js';
+import { runEngineChatCompletion, isOpenAIEngineConfigured } from './aiEngine/aiEngineClient.js';
+import { AI_OPERATIONS } from './aiEngine/aiOperations.js';
+import { getOpenAIClient } from './aiEngine/openaiClient.js';
 import { createGeneratedQuestionImage } from './questionImportImageService.js';
-import { createTrackedChatCompletion, trackAIUsageEvent } from './aiTokenUsageService.js';
+import { trackAIUsageEvent } from './aiTokenUsageService.js';
 import {
   normalizeQuestionCorrectAnswer,
   sanitizeQuestionOptions,
@@ -27,15 +29,10 @@ const sanitizeBloomLevel = (value) => {
   return BLOOM_LEVELS.includes(token) ? token : undefined;
 };
 
-const client = config.openaiApiKey
-  ? new OpenAI({ apiKey: config.openaiApiKey })
-  : null;
 const OPENAI_MODEL = config.openaiModel || 'gpt-4o-mini';
 
-// Exposed so other services (e.g. Source-Grounded ingestion/generation)
-// reuse this single client instance rather than constructing their own —
-// keeps API-key handling and null-when-unconfigured behavior in one place.
-export const getOpenAIClient = () => client;
+// Re-export for backward compatibility — canonical client lives in aiEngine/openaiClient.js
+export { getOpenAIClient };
 const IMPORT_EXTRACTION_MODEL = 'gpt-4o-mini';
 const MAX_IMPORT_AI_CHUNKS = 120;
 const MAX_IMPORT_CHUNK_PREVIEW_LENGTH = 8000;
@@ -1308,7 +1305,7 @@ const enhanceParagraphScenarioQuestions = async ({
     scenarioQuestionTypes: normalizedScenarioQuestionTypes,
   });
 
-  if (!client) {
+  if (!isOpenAIEngineConfigured()) {
     return applyParagraphScenarioGroups({
       questions: safeQuestions,
       groupIndexes,
@@ -1340,8 +1337,8 @@ const enhanceParagraphScenarioQuestions = async ({
     : '';
 
   try {
-    const completion = await createTrackedChatCompletion({
-      client,
+    const completion = await runEngineChatCompletion({
+      operation: AI_OPERATIONS.QUESTION_REGENERATION,
       feature: 'question_generation',
       tenantId,
       userId,
@@ -1584,7 +1581,7 @@ export const generateQuestions = async (params) => {
     : imageQuestionConfig;
 
   // Validate OpenAI API key
-  if (!client) {
+  if (!isOpenAIEngineConfigured()) {
     if (requireProviderExactDistribution) {
       const providerError = new Error('AI question generation is unavailable because the provider is not configured. No questions were added.');
       providerError.status = 503;
@@ -1780,8 +1777,8 @@ ${bloomTargets.length ? `\nCognitive demand (independent of difficulty — a HOT
     
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
-        const completion = await createTrackedChatCompletion({
-          client,
+        const completion = await runEngineChatCompletion({
+          operation: AI_OPERATIONS.QUESTION_GENERATION,
           feature: 'question_generation',
           tenantId: trackingContext.tenantId,
           userId: trackingContext.userId,
@@ -2064,7 +2061,7 @@ export const extractQuestionsFromContent = async (params) => {
     throw new Error('No content provided to extract questions');
   }
 
-  if (!client) {
+  if (!isOpenAIEngineConfigured()) {
     console.warn('OpenAI API key not configured, using fallback question extraction');
     await trackFallbackUsage({
       feature: 'question_import',
@@ -2253,7 +2250,7 @@ export const evaluateAnswer = async (params) => {
     });
   }
 
-  if (!client) {
+  if (!isOpenAIEngineConfigured()) {
     await trackFallbackUsage({
       feature: 'evaluation',
       tenantId: trackingContext.tenantId,
@@ -2343,8 +2340,8 @@ Partial-marking configuration: ${JSON.stringify(config.partialMarking || {})}
 Numerical configuration: ${JSON.stringify(config.numerical || {})}
 Rubric (score only these criteria): ${JSON.stringify(effectiveRubric.map(({ criterion, description, maxScore, mandatory, keyPoints, acceptableAlternatives }) => ({ criterion, description, maxScore, mandatory, keyPoints, acceptableAlternatives })))} `;
 
-    const completion = await createTrackedChatCompletion({
-      client,
+    const completion = await runEngineChatCompletion({
+      operation: AI_OPERATIONS.ANSWER_RUBRIC_EVALUATION,
       feature: 'evaluation',
       tenantId: trackingContext.tenantId,
       userId: trackingContext.userId,
@@ -3018,8 +3015,8 @@ const parseSingleChunkWithAi = async ({
     return null;
   }
 
-  const completion = await createTrackedChatCompletion({
-    client,
+  const completion = await runEngineChatCompletion({
+    operation: AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE,
     feature: 'question_import',
     tenantId: trackingContext.tenantId,
     userId: trackingContext.userId,
@@ -3489,7 +3486,7 @@ const generateImageBasedQuestionVariant = async ({
     imageType,
   });
 
-  if (!client) {
+  if (!isOpenAIEngineConfigured()) {
     return fallbackVariant;
   }
 
@@ -3549,8 +3546,8 @@ ${JSON.stringify(baseQuestionPayload)}
 Create one improved image-based variant now.`;
 
   try {
-    const completion = await createTrackedChatCompletion({
-      client,
+    const completion = await runEngineChatCompletion({
+      operation: AI_OPERATIONS.QUESTION_REGENERATION,
       feature: 'question_generation',
       tenantId,
       userId,
@@ -3659,7 +3656,7 @@ const generateImageBasedQuestionGroup = async ({
     imageType: safeImageType,
   });
 
-  if (!client) {
+  if (!isOpenAIEngineConfigured()) {
     return fallbackGroup;
   }
 
@@ -3727,8 +3724,8 @@ Base questions in required order:
 ${JSON.stringify(baseQuestionPayload)}`;
 
   try {
-    const completion = await createTrackedChatCompletion({
-      client,
+    const completion = await runEngineChatCompletion({
+      operation: AI_OPERATIONS.QUESTION_REGENERATION,
       feature: 'question_generation',
       tenantId,
       userId,

@@ -1,6 +1,7 @@
 import config from '../config/env.js';
-import { getOpenAIClient } from './aiService.js';
-import { createTrackedEmbedding } from './aiTokenUsageService.js';
+import { runEngineEmbedding, isEmbeddingEngineConfigured } from './aiEngine/aiEngineClient.js';
+import { getModelForOperation } from './aiEngine/aiConfigService.js';
+import { AI_OPERATIONS } from './aiEngine/aiOperations.js';
 import QuestionEmbedding from '../models/QuestionEmbedding.js';
 import { logError } from '../utils/logger.js';
 
@@ -12,23 +13,20 @@ import { logError } from '../utils/logger.js';
 // never need to know which path ran — governed generation and the question
 // memory endpoint must keep working identically either way.
 
-const EMBEDDING_MODEL = config.openaiEmbeddingModel;
+const EMBEDDING_MODEL = () => getModelForOperation(AI_OPERATIONS.EMBEDDING);
 const MIN_SEMANTIC_SCORE = 0.82;
 const FALLBACK_SCAN_LIMIT = 500;
 
-export const isQuestionEmbeddingConfigured = () => Boolean(getOpenAIClient());
+export const isQuestionEmbeddingConfigured = () => isEmbeddingEngineConfigured();
 
 const embedOne = async (text, { tenantId, userId, feature }) => {
-  const client = getOpenAIClient();
-  if (!client) return null;
-  const response = await createTrackedEmbedding({
-    client,
-    request: { model: EMBEDDING_MODEL, input: String(text || '').slice(0, 8000) },
-    feature,
+  if (!isEmbeddingEngineConfigured()) return null;
+  return runEngineEmbedding({
+    texts: String(text || '').slice(0, 8000),
     tenantId,
     userId,
+    feature,
   });
-  return response?.data?.[0]?.embedding || null;
 };
 
 // Best-effort, shared by both subject types below. Never throws — an
@@ -42,7 +40,7 @@ const recordSubjectEmbedding = async ({ tenantId, subjectField, subjectId, quest
     if (!embedding || !embedding.length) return;
     await QuestionEmbedding.findOneAndUpdate(
       { tenantId, [subjectField]: subjectId },
-      { $set: { embedding, embeddingModel: EMBEDDING_MODEL, questionType: questionType || null, difficulty: difficulty || null, computedAt: new Date() } },
+      { $set: { embedding, embeddingModel: EMBEDDING_MODEL(), questionType: questionType || null, difficulty: difficulty || null, computedAt: new Date() } },
       { upsert: true }
     );
   } catch (error) {

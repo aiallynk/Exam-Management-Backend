@@ -1,10 +1,12 @@
 import config from '../../../config/env.js';
-import { getOpenAIClient } from '../../aiService.js';
-import { createTrackedChatCompletion, createTrackedEmbedding } from '../../aiTokenUsageService.js';
+import { createTrackedChatCompletion, createTrackedEmbedding, createTrackedImageGeneration } from '../../aiTokenUsageService.js';
 import { AI_OPERATIONS } from '../aiOperations.js';
+import { getModelForOperation } from '../aiConfigService.js';
+import { getOpenAIClient } from '../openaiClient.js';
 
 const SUPPORTED = new Set([
   AI_OPERATIONS.QUESTION_GENERATION,
+  AI_OPERATIONS.CONTENT_GROUNDED_QUESTION_GENERATION,
   AI_OPERATIONS.QUESTION_REGENERATION,
   AI_OPERATIONS.QUESTION_REPAIR,
   AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE,
@@ -14,6 +16,10 @@ const SUPPORTED = new Set([
   AI_OPERATIONS.QUESTION_EXPLANATION_GENERATION,
   AI_OPERATIONS.QUESTION_IMAGE_GENERATION,
   AI_OPERATIONS.EMBEDDING,
+  AI_OPERATIONS.GUIDELINE_INTERPRETATION,
+  AI_OPERATIONS.CONTENT_METADATA_ENRICHMENT,
+  AI_OPERATIONS.ANSWER_TEXT_EVALUATION,
+  AI_OPERATIONS.ANSWER_RUBRIC_EVALUATION,
 ]);
 
 export const createOpenAIProvider = () => ({
@@ -27,26 +33,23 @@ export const createOpenAIProvider = () => ({
       configured,
       status: configured ? 'CONFIGURED' : 'UNAVAILABLE',
       models: {
-        question: config.openaiQuestionModel || config.openaiModel,
-        classification: config.openaiClassificationModel || config.openaiModel,
-        embedding: config.openaiEmbeddingModel,
-        image: config.openaiImageModel || config.openaiModel,
+        question: getModelForOperation(AI_OPERATIONS.QUESTION_GENERATION),
+        classification: getModelForOperation(AI_OPERATIONS.QUESTION_CLASSIFICATION),
+        embedding: getModelForOperation(AI_OPERATIONS.EMBEDDING),
+        image: getModelForOperation(AI_OPERATIONS.QUESTION_IMAGE_GENERATION),
       },
     };
   },
   async generateStructured({ operation, request, context = {} }) {
     const client = getOpenAIClient();
     if (!client) throw new Error('OpenAI is not configured.');
-    const model = context.model || (
-      operation === AI_OPERATIONS.QUESTION_CLASSIFICATION || operation === AI_OPERATIONS.COGNITIVE_CLASSIFICATION || operation === AI_OPERATIONS.BLOOM_CLASSIFICATION
-        ? (config.openaiClassificationModel || config.openaiModel)
-        : (config.openaiQuestionModel || config.openaiModel)
-    );
+    const model = context.model || request.model || getModelForOperation(operation);
     const completion = await createTrackedChatCompletion({
       client,
       feature: context.feature || operation.toLowerCase(),
       tenantId: context.tenantId,
       userId: context.userId,
+      questionCount: context.questionCount,
       request: {
         model,
         ...request,
@@ -66,18 +69,39 @@ export const createOpenAIProvider = () => ({
   async embed({ texts, context = {} }) {
     const client = getOpenAIClient();
     if (!client) throw new Error('OpenAI is not configured.');
+    const model = getModelForOperation(AI_OPERATIONS.EMBEDDING);
     const embeddings = await createTrackedEmbedding({
       client,
       feature: context.feature || 'embedding',
       tenantId: context.tenantId,
       userId: context.userId,
-      model: config.openaiEmbeddingModel,
+      model,
       input: texts,
     });
     return {
       provider: 'openai',
-      model: config.openaiEmbeddingModel,
+      model,
       embeddings: embeddings?.data?.map((item) => item.embedding) || [],
+    };
+  },
+  async generateImage({ operation, request, context = {} }) {
+    const client = getOpenAIClient();
+    if (!client) throw new Error('OpenAI is not configured.');
+    const model = context.model || request.model || getModelForOperation(operation);
+    const response = await createTrackedImageGeneration({
+      client,
+      feature: context.feature || 'question_image_generation',
+      tenantId: context.tenantId,
+      userId: context.userId,
+      usageCount: request.n,
+      request: { ...request, model },
+    });
+    return {
+      provider: 'openai',
+      model,
+      operation,
+      raw: response,
+      images: response?.data || [],
     };
   },
 });

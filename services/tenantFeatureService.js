@@ -28,6 +28,30 @@ export const TENANT_CAPABILITIES = Object.freeze({
     releaseStatus: 'RELEASED',
   },
 
+  AI_CONTENT_INDEXING: {
+    group: 'AI & Automation',
+    platformAvailable: true,
+    planFeature: 'sourceGroundedGeneration',
+    description: 'Embed and index Content Library sources for AI retrieval (independent of question generation).',
+    releaseStatus: 'RELEASED',
+  },
+
+  AI_QUESTION_GENERATION: {
+    group: 'AI & Automation',
+    platformAvailable: true,
+    planFeature: 'sourceGroundedGeneration',
+    description: 'AI-assisted question generation (standard and source-grounded modes).',
+    releaseStatus: 'RELEASED',
+  },
+
+  AI_GUIDELINE_INTERPRETATION: {
+    group: 'AI & Automation',
+    platformAvailable: true,
+    planFeature: 'sourceGroundedGeneration',
+    description: 'AI-assisted interpretation of assessment guideline documents into reviewable framework drafts.',
+    releaseStatus: 'RELEASED',
+  },
+
   // --- Source-Grounded AI Question Generation --------------------------
   // Generation constrained strictly to selected uploaded/URL source
   // material — files+URLs ingestion, retrieval, grounding, and novelty

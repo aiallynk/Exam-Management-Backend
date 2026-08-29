@@ -97,7 +97,7 @@ const resolveUploadMetadata = async (user, { contentType, visibility, academicSc
 // the original is retained, only the embed/index step is skipped (see
 // ingestFileSource/ingestUrlSource's skipEmbedding param).
 const isAiIndexingEnabled = async (tenantId) => {
-  const feature = await resolveTenantFeature(tenantId, 'SOURCE_GROUNDED_GENERATION');
+  const feature = await resolveTenantFeature(tenantId, 'AI_CONTENT_INDEXING');
   return feature?.effectiveEnabled === true;
 };
 

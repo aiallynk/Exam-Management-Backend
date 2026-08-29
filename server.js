@@ -55,6 +55,7 @@ import answerScriptsRoutes from './routes/answerScripts.js';
 import assessmentGovernanceRoutes from './routes/assessmentGovernance.js';
 import contentLibraryRoutes from './routes/contentLibrary.js';
 import libraryResourcesRoutes from './routes/libraryResources.js';
+import guidelineRoutes from './routes/guidelines.js';
 import formativeRoutes from './routes/formative.js';
 import { startSubscriptionExpiryScheduler } from './services/subscriptionLifecycleService.js';
 import { startAutoTenantBackupScheduler } from './services/autoBackupSchedulerService.js';
@@ -338,6 +339,7 @@ const registerApiRoutes = (basePath) => {
   app.use(`${basePath}/assessment-governance`, assessmentGovernanceRoutes);
   app.use(`${basePath}/content-library`, contentLibraryRoutes);
   app.use(`${basePath}/library-resources`, libraryResourcesRoutes);
+  app.use(`${basePath}/guidelines`, guidelineRoutes);
   app.use(`${basePath}/formative`, formativeRoutes);
   app.use(`${basePath}/languages`, languageRoutes);
   app.use(`${basePath}/sections`, sectionRoutes);

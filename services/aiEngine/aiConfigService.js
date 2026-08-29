@@ -4,6 +4,7 @@ import { AI_OPERATIONS } from './aiOperations.js';
 
 export const AI_OPERATION_ROUTING_CONFIG_KEY = 'platform.ai.operationRouting';
 export const AI_RUNTIME_SETTINGS_CONFIG_KEY = 'platform.ai.runtimeSettings';
+export const AI_MODEL_CONFIG_KEY = 'platform.ai.models';
 
 const ALLOWED_PROVIDERS = new Set(['openai', 'gemini']);
 
@@ -21,6 +22,7 @@ export const buildEnvBootstrapOperationRouting = ({
   const evaluation = normalizeProviderId(evaluationProvider, 'gemini');
   return {
     [AI_OPERATIONS.QUESTION_GENERATION]: question,
+    [AI_OPERATIONS.CONTENT_GROUNDED_QUESTION_GENERATION]: question,
     [AI_OPERATIONS.QUESTION_REGENERATION]: question,
     [AI_OPERATIONS.QUESTION_REPAIR]: question,
     [AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE]: question,
@@ -40,6 +42,8 @@ export const buildEnvBootstrapOperationRouting = ({
     [AI_OPERATIONS.FORMATIVE_ANSWER_FEEDBACK]: evaluation,
     [AI_OPERATIONS.MISCONCEPTION_ANALYSIS]: evaluation,
     [AI_OPERATIONS.EVALUATION_EXPLANATION]: evaluation,
+    [AI_OPERATIONS.GUIDELINE_INTERPRETATION]: question,
+    [AI_OPERATIONS.CONTENT_METADATA_ENRICHMENT]: question,
   };
 };
 
@@ -53,6 +57,42 @@ export const buildEnvRuntimeSettings = () => ({
 let cachedRouting = null;
 let cachedSource = 'env';
 let cachedRuntime = null;
+let cachedModels = null;
+
+const ENV_MODEL_BY_OPERATION = Object.freeze({
+  [AI_OPERATIONS.QUESTION_GENERATION]: () => config.openaiQuestionModel || config.openaiModel,
+  [AI_OPERATIONS.CONTENT_GROUNDED_QUESTION_GENERATION]: () => config.openaiQuestionModel || config.openaiModel,
+  [AI_OPERATIONS.QUESTION_REGENERATION]: () => config.openaiQuestionModel || config.openaiModel,
+  [AI_OPERATIONS.QUESTION_REPAIR]: () => config.openaiQuestionModel || config.openaiModel,
+  [AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE]: () => config.openaiQuestionModel || config.openaiModel,
+  [AI_OPERATIONS.QUESTION_CLASSIFICATION]: () => config.openaiClassificationModel || config.openaiModel,
+  [AI_OPERATIONS.COGNITIVE_CLASSIFICATION]: () => config.openaiClassificationModel || config.openaiModel,
+  [AI_OPERATIONS.BLOOM_CLASSIFICATION]: () => config.openaiClassificationModel || config.openaiModel,
+  [AI_OPERATIONS.QUESTION_EXPLANATION_GENERATION]: () => config.openaiQuestionModel || config.openaiModel,
+  [AI_OPERATIONS.QUESTION_IMAGE_GENERATION]: () => config.openaiImageModel || config.openaiModel,
+  [AI_OPERATIONS.EMBEDDING]: () => config.openaiEmbeddingModel,
+  [AI_OPERATIONS.HANDWRITING_EXTRACTION]: () => config.geminiHandwritingModel,
+  [AI_OPERATIONS.ANSWER_SCRIPT_VISION]: () => config.geminiVisionModel,
+  [AI_OPERATIONS.ANSWER_TEXT_EVALUATION]: () => config.geminiEvaluationModel,
+  [AI_OPERATIONS.ANSWER_RUBRIC_EVALUATION]: () => config.geminiEvaluationModel,
+  [AI_OPERATIONS.ANSWER_IMAGE_EVALUATION]: () => config.geminiVisionModel,
+  [AI_OPERATIONS.DIAGRAM_RESPONSE_EVALUATION]: () => config.geminiVisionModel,
+  [AI_OPERATIONS.VISUAL_RESPONSE_EVALUATION]: () => config.geminiVisionModel,
+  [AI_OPERATIONS.FORMATIVE_ANSWER_FEEDBACK]: () => config.geminiFeedbackModel,
+  [AI_OPERATIONS.MISCONCEPTION_ANALYSIS]: () => config.geminiEvaluationModel,
+  [AI_OPERATIONS.EVALUATION_EXPLANATION]: () => config.geminiEvaluationModel,
+  [AI_OPERATIONS.GUIDELINE_INTERPRETATION]: () => config.openaiClassificationModel || config.openaiModel,
+  [AI_OPERATIONS.CONTENT_METADATA_ENRICHMENT]: () => config.openaiClassificationModel || config.openaiModel,
+});
+
+export const getModelForOperation = (operation) => {
+  const fromDb = cachedModels?.[operation];
+  if (fromDb) return fromDb;
+  const resolver = ENV_MODEL_BY_OPERATION[operation];
+  return resolver ? resolver() : config.openaiModel;
+};
+
+export const getCachedModelConfig = () => cachedModels || {};
 
 const parseDbJsonObject = (raw) => {
   if (!raw) return null;
@@ -107,9 +147,20 @@ const loadRuntimeFromDatabase = async () => {
   }
 };
 
+const loadModelsFromDatabase = async () => {
+  try {
+    const record = await SystemConfig.findOne({ key: AI_MODEL_CONFIG_KEY }).lean();
+    const dbModels = parseDbJsonObject(record?.value);
+    return dbModels && Object.keys(dbModels).length ? dbModels : null;
+  } catch {
+    return null;
+  }
+};
+
 export const bootstrapAiConfig = async () => {
   const bootstrap = buildEnvBootstrapOperationRouting();
   cachedRuntime = await loadRuntimeFromDatabase();
+  cachedModels = await loadModelsFromDatabase();
 
   if (config.aiConfigSource !== 'database') {
     cachedRouting = bootstrap;
@@ -140,6 +191,29 @@ export const resetAiConfigCacheForTests = () => {
   cachedRouting = null;
   cachedSource = 'env';
   cachedRuntime = null;
+  cachedModels = null;
+};
+
+export const saveModelConfigToDatabase = async (models, updatedBy) => {
+  const allowed = new Set(Object.values(AI_OPERATIONS));
+  const nextModels = {};
+  Object.entries(models || {}).forEach(([operation, model]) => {
+    if (!allowed.has(operation)) return;
+    const normalized = String(model || '').trim();
+    if (normalized) nextModels[operation] = normalized;
+  });
+  await SystemConfig.findOneAndUpdate(
+    { key: AI_MODEL_CONFIG_KEY },
+    {
+      key: AI_MODEL_CONFIG_KEY,
+      value: JSON.stringify(nextModels),
+      description: 'Platform AI model selection per operation (secrets remain env-only).',
+      ...(updatedBy ? { updatedBy } : {}),
+    },
+    { upsert: true, new: true, setDefaultsOnInsert: true }
+  );
+  cachedModels = nextModels;
+  return nextModels;
 };
 
 export const saveOperationRoutingToDatabase = async (routing, updatedBy) => {

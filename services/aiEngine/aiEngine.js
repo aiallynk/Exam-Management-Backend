@@ -24,6 +24,8 @@ const dispatch = async (operation, payload, context, provider) => {
   switch (operation) {
     case AI_OPERATIONS.EMBEDDING:
       return provider.embed({ texts: payload.texts, context });
+    case AI_OPERATIONS.QUESTION_IMAGE_GENERATION:
+      return provider.generateImage({ operation, request: payload.request, context });
     case AI_OPERATIONS.HANDWRITING_EXTRACTION:
     case AI_OPERATIONS.ANSWER_SCRIPT_VISION:
     case AI_OPERATIONS.ANSWER_IMAGE_EVALUATION:

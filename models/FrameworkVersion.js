@@ -8,6 +8,13 @@ const FrameworkVersionSchema = new mongoose.Schema({
   status: { type: String, enum: ['DRAFT', 'PUBLISHED', 'RETIRED'], default: 'DRAFT', index: true },
   publishedAt: { type: Date, default: null },
   publishedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  guidelineProvenance: {
+    guidelineDocumentId: { type: mongoose.Schema.Types.ObjectId, ref: 'GuidelineDocument', default: null },
+    sourceEvidence: { type: [mongoose.Schema.Types.Mixed], default: [] },
+    aiOperationMetadata: { type: mongoose.Schema.Types.Mixed, default: {} },
+    createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    reviewedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+  },
 }, { timestamps: true, minimize: false });
 FrameworkVersionSchema.index({ tenantId: 1, frameworkId: 1, version: 1 }, { unique: true });
 FrameworkVersionSchema.pre('save', function immutablePublishedVersion(next) {

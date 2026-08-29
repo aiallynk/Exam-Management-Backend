@@ -238,7 +238,7 @@ export const deleteLibraryResource = async (user, resourceId) => {
 // ingestion entirely to the already-shipped, already-tested function.
 export const addFileToLibraryResource = async (user, resourceId, uploadFields) => {
   const { doc } = await getLibraryResourceForWrite(user, resourceId);
-  return uploadContentLibraryFile(user, {
+  const source = await uploadContentLibraryFile(user, {
     ...uploadFields,
     visibility: uploadFields.visibility ?? doc.visibility,
     academicScope: uploadFields.academicScope ?? doc.academicScope,
@@ -247,11 +247,14 @@ export const addFileToLibraryResource = async (user, resourceId, uploadFields) =
     topic: uploadFields.topic ?? doc.topic,
     libraryResourceId: doc._id,
   });
+  const { onLibraryAssetUploaded } = await import('./knowledgeMemoryService.js');
+  void onLibraryAssetUploaded({ tenantId: doc.tenantId, userId: user._id, resourceId: doc._id, sourceId: source._id });
+  return source;
 };
 
 export const addUrlToLibraryResource = async (user, resourceId, uploadFields) => {
   const { doc } = await getLibraryResourceForWrite(user, resourceId);
-  return uploadContentLibraryUrl(user, {
+  const source = await uploadContentLibraryUrl(user, {
     ...uploadFields,
     visibility: uploadFields.visibility ?? doc.visibility,
     academicScope: uploadFields.academicScope ?? doc.academicScope,
@@ -260,6 +263,9 @@ export const addUrlToLibraryResource = async (user, resourceId, uploadFields) =>
     topic: uploadFields.topic ?? doc.topic,
     libraryResourceId: doc._id,
   });
+  const { onLibraryAssetUploaded } = await import('./knowledgeMemoryService.js');
+  void onLibraryAssetUploaded({ tenantId: doc.tenantId, userId: user._id, resourceId: doc._id, sourceId: source._id });
+  return source;
 };
 
 // Aggregated AI readiness across all ContextSource assets under a resource.

@@ -19,6 +19,7 @@ test('AI operation routing defaults', async () => {
 test('env bootstrap routing maps question vs evaluation domains', () => {
   const routing = buildEnvBootstrapOperationRouting({ questionProvider: 'openai', evaluationProvider: 'gemini' });
   assert.equal(routing[AI_OPERATIONS.QUESTION_GENERATION], 'openai');
+  assert.equal(routing[AI_OPERATIONS.CONTENT_GROUNDED_QUESTION_GENERATION], 'openai');
   assert.equal(routing[AI_OPERATIONS.EMBEDDING], 'openai');
   assert.equal(routing[AI_OPERATIONS.HANDWRITING_EXTRACTION], 'gemini');
   assert.equal(routing[AI_OPERATIONS.ANSWER_RUBRIC_EVALUATION], 'gemini');

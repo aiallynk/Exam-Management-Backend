@@ -16,6 +16,7 @@ import { getProviderHealthSnapshot } from './providerRegistry.js';
 
 const OPERATION_META = Object.freeze({
   [AI_OPERATIONS.QUESTION_GENERATION]: { label: 'Question generation', group: 'question' },
+  [AI_OPERATIONS.CONTENT_GROUNDED_QUESTION_GENERATION]: { label: 'Content-grounded question generation', group: 'question' },
   [AI_OPERATIONS.QUESTION_REGENERATION]: { label: 'Question regeneration', group: 'question' },
   [AI_OPERATIONS.QUESTION_REPAIR]: { label: 'Question repair', group: 'question' },
   [AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE]: { label: 'Question import assistance', group: 'question' },
@@ -35,6 +36,8 @@ const OPERATION_META = Object.freeze({
   [AI_OPERATIONS.FORMATIVE_ANSWER_FEEDBACK]: { label: 'Formative answer feedback', group: 'evaluation' },
   [AI_OPERATIONS.MISCONCEPTION_ANALYSIS]: { label: 'Misconception analysis', group: 'evaluation' },
   [AI_OPERATIONS.EVALUATION_EXPLANATION]: { label: 'Evaluation explanation', group: 'evaluation' },
+  [AI_OPERATIONS.GUIDELINE_INTERPRETATION]: { label: 'Guideline interpretation', group: 'governance' },
+  [AI_OPERATIONS.CONTENT_METADATA_ENRICHMENT]: { label: 'Content metadata enrichment', group: 'knowledge' },
 });
 
 const sanitizeRouting = (routing = {}) => {

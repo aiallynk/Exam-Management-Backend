@@ -1,6 +1,7 @@
 import config from '../config/env.js';
-import { getOpenAIClient, normalizeQuestionObject } from './aiService.js';
-import { createTrackedChatCompletion } from './aiTokenUsageService.js';
+import { normalizeQuestionObject } from './aiService.js';
+import { runEngineChatCompletion, isOpenAIEngineConfigured } from './aiEngine/aiEngineClient.js';
+import { AI_OPERATIONS } from './aiEngine/aiOperations.js';
 import { embedSingleText } from './contextIngestionService.js';
 import { retrieveGroundingChunks } from './contextRetrievalService.js';
 import sourceGroundedConfig from '../config/sourceGroundedConfig.js';
@@ -177,7 +178,7 @@ export const generateGroundedCandidates = async ({
   excludeQuestionTexts = [],
   broadenFocus = false,
 }) => {
-  const client = getOpenAIClient();
+  const client = isOpenAIEngineConfigured();
   if (!client) {
     throw new InsufficientSourceMaterialError('AI generation is not configured on this deployment.');
   }
@@ -204,8 +205,11 @@ export const generateGroundedCandidates = async ({
     };
   }
 
-  const completion = await createTrackedChatCompletion({
-    client,
+  const completion = await runEngineChatCompletion({
+    operation: AI_OPERATIONS.CONTENT_GROUNDED_QUESTION_GENERATION,
+    feature: 'source_grounded_generation',
+    tenantId,
+    userId,
     request: {
       model: config.openaiModel,
       response_format: { type: 'json_object' },
