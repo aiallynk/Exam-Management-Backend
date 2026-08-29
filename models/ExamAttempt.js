@@ -263,6 +263,16 @@ const ExamAttemptSchema = new mongoose.Schema(
         default: Date.now,
       },
     }],
+    // Master Phase 4 — set only when this ExamAttempt was materialized
+    // from a scanned answer script rather than a candidate typing online.
+    // Distinct from offlineMode below, which is the pre-existing
+    // PWA-offline-continuity flag for an ONLINE attempt that lost
+    // connectivity — not related to scanned paper evaluation.
+    sourceAnswerScriptId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'AnswerScript',
+      default: null,
+    },
     // Offline exam attempt fields
     offlineMode: {
       type: Boolean,

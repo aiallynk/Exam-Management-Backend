@@ -17,7 +17,11 @@ import os
 import sys
 
 import cv2
-import fitz
+import pymupdf as fitz  # `import fitz` triggers a deprecation notice on stdout in
+                         # current PyMuPDF, which corrupts this script's JSON-on-
+                         # stdout contract with its Node.js caller — see
+                         # docs/XAMIGO_V2_MASTER_PHASE_4_OFFLINE_EVALUATION.md.
+                         # Same API, canonical import name, no output side effect.
 import numpy as np
 
 

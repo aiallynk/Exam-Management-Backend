@@ -11,6 +11,7 @@ import { enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { body, validationResult } from 'express-validator';
 import { checkTenantLimits } from '../middleware/planLimits.js';
 import Tenant from '../models/Tenant.js';
+import { OrganizationUnit } from '../models/academic/index.js';
 import User from '../models/User.js';
 import Exam from '../models/Exam.js';
 import ExamAttempt from '../models/ExamAttempt.js';
@@ -77,9 +78,8 @@ import {
 import {
   CONTROL_CATEGORY_DEFINITIONS,
   TENANT_CAPABILITIES,
-  WIZKIDS_CAPABILITY_KEYS,
-  WIZKIDS_PLAN_FEATURE_KEYS,
 } from '../services/tenantFeatureService.js';
+import { getAiEngineAdminSnapshot, updateAiEngineAdminConfig } from '../services/aiEngine/aiAdminService.js';
 
 const router = express.Router();
 
@@ -1748,6 +1748,46 @@ router.get('/controls/overview', async (_req, res, next) => {
     });
   } catch (error) { return next(error); }
 });
+
+router.get('/ai-engine/config', async (_req, res, next) => {
+  try {
+    const configSnapshot = await getAiEngineAdminSnapshot();
+    return res.json({ config: configSnapshot });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.put(
+  '/ai-engine/config',
+  [
+    body('defaultQuestionProvider').optional().isIn(['openai', 'gemini']),
+    body('defaultEvaluationProvider').optional().isIn(['openai', 'gemini']),
+    body('operationRouting').optional().isObject(),
+    body('runtime').optional().isObject(),
+    body('runtime.requestTimeoutMs').optional().isInt({ min: 5000, max: 300000 }),
+    body('runtime.maxRetries').optional().isInt({ min: 0, max: 5 }),
+    body('runtime.strictProviderRouting').optional().isBoolean(),
+    body('runtime.enableProviderFallback').optional().isBoolean(),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const configSnapshot = await updateAiEngineAdminConfig(req.body, req.user._id);
+      await logAuditEvent(AUDIT_ACTIONS.AI_ENGINE_CONFIG_UPDATED, {
+        userId: req.user._id,
+        userEmail: req.user.email,
+        userName: req.user.name,
+        userRole: req.user.role,
+        resourceType: 'AIEngineConfig',
+      });
+      return res.json({ config: configSnapshot });
+    } catch (error) {
+      return next(error);
+    }
+  }
+);
 
 /**
  * SUBSCRIPTION PLAN CATALOG
@@ -3643,92 +3683,6 @@ router.get('/tenants/:tenantId/features', async (req, res, next) => {
 });
 
 /**
- * ENABLE COMPLETE WIZKIDS PACKAGE FOR ONE TENANT
- * POST /api/super-admin/tenants/:tenantId/wizkids/enable
- *
- * This is deliberately a Super-Admin-only, explicit activation action. It
- * grants every WizKids plan capability and re-enables the corresponding tenant
- * preferences in one auditable operation. Granular controls remain available
- * through the normal tenant-feature update endpoint afterwards.
- */
-router.post('/tenants/:tenantId/wizkids/enable', async (req, res, next) => {
-  try {
-    const tenantId = req.params.tenantId;
-    if (!isValidMongoId(tenantId)) {
-      return res.status(400).json({ error: 'Invalid tenantId' });
-    }
-
-    const tenant = await Tenant.findById(tenantId);
-    if (!tenant) {
-      return res.status(404).json({ error: 'Tenant not found' });
-    }
-
-    const tenantObject = tenant.toObject ? tenant.toObject() : tenant;
-    const subscription = normalizeOptionalObject(tenantObject?.subscription);
-    const previousCustomFeatures = extractActiveCustomFeatureOverrides(subscription.customFeatures);
-    const nextCustomFeatures = { ...previousCustomFeatures };
-    WIZKIDS_PLAN_FEATURE_KEYS.forEach((featureKey) => {
-      nextCustomFeatures[featureKey] = true;
-    });
-
-    const now = new Date();
-    // Store an explicit enabled tenant preference too. This repairs a previous
-    // local "off" preference, which otherwise would keep the parent disabled
-    // even after its Super Admin entitlement was granted.
-    await TenantFeatureSetting.bulkWrite(
-      WIZKIDS_CAPABILITY_KEYS.map((featureKey) => ({
-        updateOne: {
-          filter: { tenantId: tenant._id, featureKey },
-          update: {
-            $set: {
-              requestedEnabled: true,
-              superAdminEnforced: false,
-              enforcedEnabled: true,
-              effectiveEnabled: true,
-              planEntitled: true,
-              disabledReason: '',
-              configuredBy: req.user._id,
-              configuredAt: now,
-            },
-            $inc: { version: 1 },
-            $setOnInsert: { tenantId: tenant._id, featureKey },
-          },
-          upsert: true,
-        },
-      }))
-    );
-
-    tenant.subscription = tenant.subscription || {};
-    tenant.subscription.customFeatures = nextCustomFeatures;
-    tenant.subscription.updatedAt = now;
-    await tenant.save();
-
-    await logAuditEvent(AUDIT_ACTIONS.TENANT_UPDATED, {
-      ...buildActorAuditDetails(req),
-      tenantId: tenant._id,
-      tenantName: tenant.name,
-      resourceType: 'Tenant',
-      resourceId: tenant._id,
-      details: {
-        type: 'WIZKIDS_PACKAGE_ENABLED',
-        enabledCapabilities: WIZKIDS_CAPABILITY_KEYS,
-        enabledPlanFeatures: WIZKIDS_PLAN_FEATURE_KEYS,
-        previousCustomFeatures,
-        nextCustomFeatures,
-      },
-    });
-
-    const tenantFeatures = await buildTenantFeaturePayload(tenant);
-    return res.json({
-      tenantFeatures,
-      enabledCapabilities: WIZKIDS_CAPABILITY_KEYS,
-    });
-  } catch (error) {
-    return next(error);
-  }
-});
-
-/**
  * TENANT FEATURE MANAGEMENT UPDATE
  * PUT /api/super-admin/tenants/:tenantId/features
  */
@@ -5422,6 +5376,13 @@ router.post(
       .matches(/^[A-Z0-9_-]+$/)
       .withMessage('Code must contain only uppercase letters, numbers, hyphens, and underscores'),
     body('type').isIn(['SCHOOL', 'COLLEGE', 'COMPANY', 'INSTITUTE', 'GOVERNMENT', 'OTHER']).withMessage('Valid tenant type is required'),
+    // Separate from `type` above (that drives billing/plan-restriction
+    // logic and is unchanged). This is the root of the academic
+    // organization hierarchy (models/academic/OrganizationUnit.js) that
+    // this tenant's admin will build under — see the ownership model in
+    // docs/XAMIGO_TENANT_ADMIN_IA_UI_CORRECTION.md.
+    body('organizationType').isIn(['SCHOOL_GROUP', 'SCHOOL', 'UNIVERSITY', 'COLLEGE', 'INSTITUTE', 'TRAINING_ORGANIZATION', 'OTHER']).withMessage('Valid organization type is required'),
+    body('organizationName').optional().trim().isLength({ max: 160 }).withMessage('organizationName must be 160 characters or fewer'),
     body('contactEmail').isEmail().normalizeEmail().withMessage('Valid email is required'),
     body('planType').optional().isString().withMessage('planType must be a string'),
     body('startedAt')
@@ -5499,10 +5460,17 @@ router.post(
         }
         return true;
       }),
+    // `status` here is the tenant's own enable/disable state (Tenant.status:
+    // ACTIVE/INACTIVE/SUSPENDED) — matches the PUT /tenants/:tenantId update
+    // route's semantics for the same field name. Billing/plan state is the
+    // separate `subscriptionStatus` field below; the two must not be
+    // conflated (they previously were, which made "Inactive" in the Create
+    // Tenant form fail validation and made "Suspended" silently set the
+    // wrong field).
     body('status')
       .optional()
-      .isIn(SUBSCRIPTION_STATUS_VALUES)
-      .withMessage('status must be one of ACTIVE, EXPIRED, SUSPENDED, or CANCELLED'),
+      .isIn(['ACTIVE', 'INACTIVE', 'SUSPENDED'])
+      .withMessage('status must be one of ACTIVE, INACTIVE, or SUSPENDED'),
     body('subscriptionStatus')
       .optional()
       .isIn(SUBSCRIPTION_STATUS_VALUES)
@@ -5519,6 +5487,8 @@ router.post(
         name,
         code,
         type,
+        organizationType,
+        organizationName,
         contactEmail,
         contactPhone,
         address,
@@ -5536,6 +5506,7 @@ router.post(
         status,
         subscriptionStatus,
       } = req.body;
+      const tenantStatus = ['ACTIVE', 'INACTIVE', 'SUSPENDED'].includes(status) ? status : 'ACTIVE';
 
       // Check if code already exists
       const existing = await Tenant.findOne({ code: code.toUpperCase() });
@@ -5579,7 +5550,7 @@ router.post(
       }
 
       const requestedStatus =
-        normalizeSubscriptionStatusInput(subscriptionStatus ?? status) ||
+        normalizeSubscriptionStatusInput(subscriptionStatus) ||
         SUBSCRIPTION_STATUSES.ACTIVE;
       if (requestedStatus === SUBSCRIPTION_STATUSES.EXPIRED && !parsedExpiresAt) {
         parsedExpiresAt = new Date();
@@ -5625,6 +5596,7 @@ router.post(
         contactEmail,
         contactPhone,
         address,
+        status: tenantStatus,
         examLimit: parseOptionalLimitValue(resolvedCustomLimits.maxExamsPerMonth ?? legacyExamLimit),
         attemptLimit: parseOptionalLimitValue(
           resolvedCustomLimits.maxAttemptsPerMonth ?? legacyAttemptLimit
@@ -5637,6 +5609,20 @@ router.post(
         createdBy: req.user._id,
       });
 
+      await tenant.save();
+
+      // Platform provisioning creates the root of the organization
+      // hierarchy in the same request — a Tenant Admin can add children
+      // under it but never create another root (see the guard in
+      // routes/academicV2.js's POST /organization-units).
+      const rootOrganizationUnit = await OrganizationUnit.create({
+        tenantId: tenant._id,
+        name: (organizationName || name).trim(),
+        type: organizationType,
+        parentOrganizationUnitId: null,
+        createdBy: req.user._id,
+      });
+      tenant.rootOrganizationUnitId = rootOrganizationUnit._id;
       await tenant.save();
       await tenant.populate('createdBy', 'name email');
 
@@ -5653,6 +5639,8 @@ router.post(
           tenantStatus: tenant.status,
           planType: subscriptionPayload.planType,
           subscriptionStatus: subscriptionPayload.status,
+          rootOrganizationUnitId: rootOrganizationUnit._id,
+          organizationType: rootOrganizationUnit.type,
         },
       });
 
@@ -5675,7 +5663,7 @@ router.post(
         console.error('[NOTIFICATIONS] Failed to log tenant creation:', notifyError?.message || notifyError);
       }
 
-      res.status(201).json({ tenant });
+      res.status(201).json({ tenant, rootOrganizationUnit });
     } catch (error) {
       if (error.code === 11000) {
         return res.status(409).json({ error: 'Tenant code already exists' });

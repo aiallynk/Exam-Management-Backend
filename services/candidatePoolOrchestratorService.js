@@ -64,7 +64,6 @@ export const generateWithNoveltyAndGrounding = async ({
   targetCount,
   examTitle,
   examDescription,
-  juniorContext,
   blueprintTopic,
   generatorFn = generateGroundedCandidates,
   groundingFn = isQuestionGrounded,
@@ -131,7 +130,6 @@ export const generateWithNoveltyAndGrounding = async ({
       count: requestCount,
       examTitle,
       examDescription,
-      juniorContext,
       excludeQuestionTexts: accepted.map((question) => question.questionText),
       broadenFocus,
     });

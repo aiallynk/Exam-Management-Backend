@@ -23,10 +23,10 @@ export class UserRoleError extends Error {
 
 export { ALL_ROLES, normalizeRoles, hasRole, hasAnyRole, hasAllRoles };
 
-// Evaluator access is an additional capability for the people who create
-// exams.  It is intentionally not a conversion of candidates or tenant
-// administrators into evaluators: their primary workspace and permissions
-// remain untouched, while an Exam Creator gains EVALUATOR in roles[].
+// The evaluator-management convenience action remains limited to active
+// Exam Creators. Tenant Admin's canonical multi-role editor can explicitly
+// create other valid combinations (for example Teacher + Creator + Evaluator)
+// without changing the person's primary role.
 export const isExamCreatorEligibleForEvaluator = (user) =>
   user?.status === 'ACTIVE' && hasRole(user, 'EXAM_CREATOR');
 
@@ -54,6 +54,7 @@ export async function createTenantUser({
   email,
   password,
   role,
+  roles,
   tenantId,
   mobile,
   subTenantId,
@@ -61,6 +62,7 @@ export async function createTenantUser({
   actorId,
   evaluatorAccess,
   academicProfile,
+  academicAdminScope,
 }) {
   if (!ALL_ROLES.includes(role)) {
     throw new UserRoleError(422, `Unsupported role: ${role}`);
@@ -69,12 +71,30 @@ export async function createTenantUser({
     throw new UserRoleError(422, 'SUPER_ADMIN accounts cannot be created through tenant user management.');
   }
 
+  const requestedRoles = Array.from(new Set(
+    (Array.isArray(roles) && roles.length ? roles : [role]).map((value) => String(value || '').trim().toUpperCase())
+  ));
+  if (!requestedRoles.includes(role)) {
+    throw new UserRoleError(422, 'The primary role must also be included in roles.');
+  }
+  if (requestedRoles.some((requestedRole) => !ALL_ROLES.includes(requestedRole) || requestedRole === 'SUPER_ADMIN')) {
+    throw new UserRoleError(422, 'One or more requested tenant roles are unsupported.');
+  }
+  if (requestedRoles.includes('ACADEMIC_ADMIN')) {
+    const wholeTenant = academicAdminScope?.wholeTenant === true;
+    const unitIds = Array.isArray(academicAdminScope?.organizationUnitIds) ? academicAdminScope.organizationUnitIds.filter(Boolean) : [];
+    const programIds = Array.isArray(academicAdminScope?.programIds) ? academicAdminScope.programIds.filter(Boolean) : [];
+    if (!wholeTenant && !unitIds.length && !programIds.length) {
+      throw new UserRoleError(422, 'Academic Admin requires tenant-wide scope or at least one organization unit/program scope.');
+    }
+  }
+
   const existing = await User.findOne({ email: String(email || '').toLowerCase().trim() });
   if (existing) {
     throw new UserRoleError(409, 'Email is already registered.');
   }
 
-  if (role === 'EVALUATOR') {
+  if (requestedRoles.includes('EVALUATOR')) {
     await assertEvaluatorRoleAllowed(tenantId);
   }
 
@@ -83,15 +103,22 @@ export async function createTenantUser({
     email,
     password: password || generateSecurePassword(),
     role,
-    roles: [role],
+    roles: requestedRoles,
     tenantId,
     mobile,
     subTenantId: subTenantId || null,
     status: status || 'ACTIVE',
-    ...(role === 'CANDIDATE' && academicProfile ? { academicProfile } : {}),
+    ...(requestedRoles.includes('CANDIDATE') && academicProfile ? { academicProfile } : {}),
+    ...(requestedRoles.includes('ACADEMIC_ADMIN') ? {
+      academicAdminScope: {
+        wholeTenant: academicAdminScope?.wholeTenant === true,
+        organizationUnitIds: academicAdminScope?.organizationUnitIds || [],
+        programIds: academicAdminScope?.programIds || [],
+      },
+    } : {}),
   });
 
-  if (role === 'EVALUATOR') {
+  if (requestedRoles.includes('EVALUATOR')) {
     user.evaluatorAccess = {
       enabled: true,
       accessExpiresAt: evaluatorAccess?.accessExpiresAt || null,

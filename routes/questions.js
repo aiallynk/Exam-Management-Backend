@@ -3,7 +3,6 @@ import Question from '../models/Question.js';
 import QuestionPaper from '../models/QuestionPaper.js';
 import Section from '../models/Section.js';
 import Exam from '../models/Exam.js';
-import WizKidsExamConfig from '../models/WizKidsExamConfig.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole, requireOwnershipOrAdmin } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
@@ -26,6 +25,7 @@ import {
   normalizeQuestionTypeForStorage,
 } from '../utils/questionTypes.js';
 import { trackAIUsageEvent } from '../services/aiTokenUsageService.js';
+import { BLOOM_LEVELS, COGNITIVE_DEMAND_LEVELS } from '../utils/cognitiveDemand.js';
 import {
   extractCodingFields,
   hasCodingConfiguration,
@@ -33,46 +33,103 @@ import {
 import { queueExamPackageRegeneration } from '../services/examPackageRegenerationService.js';
 import { canCandidateAccessExam } from '../middleware/examPermissions.js';
 import { hasRole } from '../utils/userRoles.js';
-import { findUnsupportedJuniorQuestionType } from '../utils/juniorQuestionPolicy.js';
-import {
-  assertImageGenerationAllowed,
-  resolveTenantFeature,
-} from '../services/tenantFeatureService.js';
+import { assertImageGenerationAllowed } from '../services/tenantFeatureService.js';
+import QuestionUsage from '../models/QuestionUsage.js';
+import { recordQuestionEmbedding, findSemanticQuestionMatches } from '../services/questionEmbeddingService.js';
+import { logAuditEvent, AUDIT_ACTIONS } from '../utils/auditLogger.js';
 
 const router = express.Router();
 
-const validateJuniorQuestionPayloads = async ({ exam, payloads = [] }) => {
-  if (exam?.productModule !== 'WIZKIDS') return null;
+const canonicalQuestionText = (value) => String(value || '')
+  .toLowerCase()
+  .normalize('NFKD')
+  .replace(/[\u0300-\u036f]/g, '')
+  .replace(/[^a-z0-9\s]/g, ' ')
+  .replace(/\s+/g, ' ')
+  .trim();
 
-  const juniorConfig = await WizKidsExamConfig.findOne({
-    tenantId: exam.tenantId,
-    examId: exam._id,
-  }).select('interactionMode').lean();
-  if (juniorConfig?.interactionMode === 'FLASH_MATHS') {
-    return 'Flash Maths rounds must be created through the dedicated deterministic Flash Maths generator.';
-  }
-
-  const normalizedPayloads = Array.isArray(payloads) ? payloads : [];
-  const unsupportedType = findUnsupportedJuniorQuestionType(
-    normalizedPayloads.map((payload) => normalizeQuestionTypeAlias(payload?.questionType || payload?.type))
-  );
-  if (unsupportedType) {
-    return `Question type ${unsupportedType} is not supported for Junior Exam authoring.`;
-  }
-
-  const includesVisualQuestion = normalizedPayloads.some((payload) => {
-    const format = normalizeQuestionFormatAlias(payload?.questionFormat || payload?.question_type || payload?.type);
-    return ['IMAGE', 'IMAGE_BASED'].includes(format);
-  });
-  if (includesVisualQuestion) {
-    const visualCapability = await resolveTenantFeature(exam.tenantId, 'WIZKIDS_VISUAL_QUESTIONS');
-    if (!visualCapability?.effectiveEnabled) {
-      return 'Visual Junior questions are not enabled for this tenant.';
-    }
-  }
-
-  return null;
+const tokenJaccardSimilarity = (left, right) => {
+  const leftTokens = new Set(canonicalQuestionText(left).split(' ').filter(Boolean));
+  const rightTokens = new Set(canonicalQuestionText(right).split(' ').filter(Boolean));
+  if (!leftTokens.size || !rightTokens.size) return 0;
+  const intersection = [...leftTokens].filter((token) => rightTokens.has(token)).length;
+  return intersection / new Set([...leftTokens, ...rightTokens]).size;
 };
+
+// Tenant-scoped, actual persisted-question inventory for the V2 Content &
+// Question Bank page. Questions remain owned by their existing papers/exams;
+// this is a read model, not a duplicate question collection.
+router.get('/bank', requireAuth, requireTenant, enforceTenantBoundaries, requireRole('TENANT_ADMIN', 'EXAM_CREATOR'), async (req, res, next) => {
+  try {
+    const limit = Math.min(200, Math.max(1, Number.parseInt(req.query.limit, 10) || 100));
+    const search = String(req.query.search || '').trim().toLowerCase();
+    const exams = await Exam.find({
+      tenantId: req.user.tenantId,
+      ...(hasRole(req.user, 'EXAM_CREATOR') && !hasRole(req.user, 'TENANT_ADMIN') ? { createdBy: req.user._id } : {}),
+    }).select('_id title assessmentPurpose assessmentType academicContext frameworkVersionId').lean();
+    const examById = new Map(exams.map((exam) => [String(exam._id), exam]));
+    const papers = await QuestionPaper.find({ examId: { $in: exams.map((exam) => exam._id) } }).select('_id examId setName').lean();
+    const paperById = new Map(papers.map((paper) => [String(paper._id), paper]));
+    const filter = { questionPaperId: { $in: papers.map((paper) => paper._id) } };
+    if (search) filter.questionText = { $regex: search.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), $options: 'i' };
+    const questions = await Question.find(filter).sort({ updatedAt: -1 }).limit(limit).lean();
+    const questionIds = questions.map((question) => question._id);
+    const usageRows = questionIds.length ? await QuestionUsage.aggregate([
+      { $match: { tenantId: req.user.tenantId, questionId: { $in: questionIds } } },
+      { $group: { _id: '$questionId', uses: { $sum: 1 }, lastUsedAt: { $max: '$occurredAt' }, events: { $addToSet: '$event' } } },
+    ]) : [];
+    const usageByQuestionId = new Map(usageRows.map((row) => [String(row._id), row]));
+    return res.json({
+      items: questions.map((question) => {
+        const paper = paperById.get(String(question.questionPaperId));
+        const exam = paper ? examById.get(String(paper.examId)) : null;
+        const usage = usageByQuestionId.get(String(question._id));
+        return { ...question, exam: exam ? { _id: exam._id, title: exam.title, assessmentPurpose: exam.assessmentPurpose, assessmentType: exam.assessmentType } : null, setName: paper?.setName || '', usage: usage ? { count: usage.uses, lastUsedAt: usage.lastUsedAt, events: usage.events } : { count: 0, lastUsedAt: null, events: [] } };
+      }),
+    });
+  } catch (error) { return next(error); }
+});
+
+// Exact/near-text lexical check plus, when an embedding provider is
+// configured, tenant-scoped semantic similarity (services/questionEmbeddingService.js).
+// Tenant scoping happens inside the query in both paths — see that module's
+// comments — never as a post-hoc filter over pooled results.
+router.post('/memory/check', requireAuth, requireTenant, enforceTenantBoundaries, requireRole('TENANT_ADMIN', 'EXAM_CREATOR'), async (req, res, next) => {
+  try {
+    const questionText = String(req.body?.questionText || '').trim();
+    if (!questionText) return res.status(400).json({ error: 'questionText is required.' });
+    const exams = await Exam.find({
+      tenantId: req.user.tenantId,
+      ...(hasRole(req.user, 'EXAM_CREATOR') && !hasRole(req.user, 'TENANT_ADMIN') ? { createdBy: req.user._id } : {}),
+    }).select('_id').lean();
+    const papers = await QuestionPaper.find({ examId: { $in: exams.map((exam) => exam._id) } }).select('_id examId').lean();
+    const candidates = await Question.find({ questionPaperId: { $in: papers.map((paper) => paper._id) } }).select('questionText questionType questionPaperId').limit(1000).lean();
+    const canonical = canonicalQuestionText(questionText);
+    const exactMatches = candidates.filter((item) => canonicalQuestionText(item.questionText) === canonical).slice(0, 10);
+    const nearMatches = candidates
+      .map((item) => ({ questionId: item._id, questionText: item.questionText, questionType: item.questionType, score: Number(tokenJaccardSimilarity(questionText, item.questionText).toFixed(3)) }))
+      .filter((item) => item.score >= 0.55 && item.score < 1)
+      .sort((left, right) => right.score - left.score)
+      .slice(0, 10);
+
+    const questionById = new Map(candidates.map((item) => [String(item._id), item]));
+    const semantic = await findSemanticQuestionMatches({ tenantId: req.user.tenantId, queryText: questionText, limit: 10, userId: req.user._id });
+    const semanticMatches = semantic.matches
+      .map((match) => ({ ...match, questionText: questionById.get(String(match.questionId))?.questionText || null }))
+      .filter((match) => match.questionText);
+
+    await logAuditEvent(AUDIT_ACTIONS.QUESTION_MEMORY_CHECKED, {
+      userId: req.user._id, userEmail: req.user.email, userName: req.user.name, userRole: req.user.role,
+      tenantId: req.user.tenantId, resourceType: 'QuestionMemoryCheck', method: req.method, path: req.path,
+      exactMatchCount: exactMatches.length, nearMatchCount: nearMatches.length, semanticMatchCount: semanticMatches.length, semanticMethod: semantic.method,
+    });
+
+    return res.json({
+      exactMatches, nearMatches, similarityMethod: 'LEXICAL_TOKEN_JACCARD_FALLBACK', scope: 'TENANT',
+      semanticMatches, semanticAvailable: semantic.available, semanticMethod: semantic.method, semanticEmbeddingModel: semantic.embeddingModel,
+    });
+  } catch (error) { return next(error); }
+});
 
 const queueExamPackageRegenerationForContentChange = async ({
   examId,
@@ -637,6 +694,47 @@ const resolveQuestionTypeTokenForExamResponse = (question = {}) => {
   return 'short_answer';
 };
 
+const sanitizeCandidateCodingFields = (codingFields) => {
+  if (!codingFields || typeof codingFields !== 'object') return codingFields;
+  return {
+    ...codingFields,
+    // Hidden cases and their expected outputs are part of the answer key.
+    // Candidates only need the public/sample cases needed to use the editor.
+    testCases: Array.isArray(codingFields.testCases)
+      ? codingFields.testCases.filter((testCase) => testCase?.isSample && !testCase?.hidden)
+      : [],
+  };
+};
+
+const serializeCandidateQuestion = (questionDoc) => {
+  const serialized = typeof questionDoc?.toObject === 'function'
+    ? questionDoc.toObject()
+    : { ...(questionDoc || {}) };
+  const sourcePairs = Array.isArray(serialized.matchingPairs) ? serialized.matchingPairs : [];
+  const leftPairs = sourcePairs.map((pair) => ({ left: pair?.left || pair?.term || pair?.prompt || '' }));
+  const matchingChoices = sourcePairs
+    .map((pair) => pair?.right || pair?.match || pair?.answer || '')
+    .filter(Boolean);
+
+  // Question.toObject() emits compatibility aliases, so remove both the
+  // canonical and legacy names. A projection of only `-correctAnswer` is not
+  // sufficient for release-critical candidate delivery.
+  delete serialized.correctAnswer;
+  delete serialized.correct_answer;
+  delete serialized.evaluationConfig;
+  delete serialized.provenance;
+  serialized.codingFields = sanitizeCandidateCodingFields(serialized.codingFields);
+  if ('testCases' in serialized) serialized.testCases = sanitizeCandidateCodingFields({ testCases: serialized.testCases }).testCases;
+
+  return {
+    ...serialized,
+    options: serialized.questionType === 'MATCHING' ? matchingChoices : serialized.options,
+    matchingPairs: serialized.questionType === 'MATCHING' ? leftPairs : serialized.matchingPairs,
+    question_type: resolveQuestionTypeTokenForExamResponse(serialized),
+    ...(questionDoc?.evaluationConfig?.flashMaths ? { interactionType: 'FLASH_MATHS' } : {}),
+  };
+};
+
 const validateCodingQuestionPayload = (payload = {}) => {
   const explicitType = normalizeQuestionTypeAlias(payload.questionType || payload.type);
   const explicitFormat = normalizeQuestionFormatAlias(
@@ -721,6 +819,9 @@ const isValidObjectIdString = (value) => /^[a-fA-F0-9]{24}$/.test(String(value |
 const sanitizeQuestionProvenance = (provenance) => {
   if (!provenance || typeof provenance !== 'object' || Array.isArray(provenance)) return undefined;
   const generationRunId = isValidObjectIdString(provenance.generationRunId) ? provenance.generationRunId : undefined;
+  const reusedFromQuestionId = isValidObjectIdString(provenance.reusedFromQuestionId) ? provenance.reusedFromQuestionId : undefined;
+  const questionBankItemId = isValidObjectIdString(provenance.questionBankItemId) ? provenance.questionBankItemId : undefined;
+  const questionVersionId = isValidObjectIdString(provenance.questionVersionId) ? provenance.questionVersionId : undefined;
   const sourceIds = Array.isArray(provenance.sourceIds)
     ? provenance.sourceIds.filter(isValidObjectIdString).slice(0, 20)
     : undefined;
@@ -737,10 +838,10 @@ const sanitizeQuestionProvenance = (provenance) => {
           blueprint: typeof provenance.noveltySignatures.blueprint === 'string' ? provenance.noveltySignatures.blueprint.slice(0, 128) : undefined,
         }
       : undefined;
-  if (!generationRunId && !sourceIds?.length && !chunkIds?.length && !evidenceSnippet && !noveltySignatures) {
+  if (!generationRunId && !reusedFromQuestionId && !questionBankItemId && !questionVersionId && !sourceIds?.length && !chunkIds?.length && !evidenceSnippet && !noveltySignatures) {
     return undefined;
   }
-  return { generationRunId, sourceIds, chunkIds, evidenceSnippet, noveltySignatures };
+  return { generationRunId, reusedFromQuestionId, questionBankItemId, questionVersionId, sourceIds, chunkIds, evidenceSnippet, noveltySignatures };
 };
 
 // Single source of truth for "does this question belong to a section, and
@@ -773,6 +874,7 @@ const resolveQuestionAssignment = async ({ questionPaperId, sectionId, requested
 };
 
 const createQuestionWithManagedImage = async ({
+  tenantId,
   examId,
   questionPaperId,
   questionText,
@@ -781,6 +883,8 @@ const createQuestionWithManagedImage = async ({
   description,
   instructions,
   difficulty,
+  bloomLevel,
+  cognitiveDemand,
   category,
   questionType,
   type,
@@ -874,6 +978,8 @@ const createQuestionWithManagedImage = async ({
   const normalizedTitle = normalizeString(title || normalizedQuestionText);
   const normalizedDescription = normalizeString(description || normalizedQuestionText);
   const normalizedDifficulty = normalizeString(difficulty);
+  const normalizedBloomLevel = BLOOM_LEVELS.includes(String(bloomLevel || '').toUpperCase()) ? String(bloomLevel).toUpperCase() : undefined;
+  const normalizedCognitiveDemand = COGNITIVE_DEMAND_LEVELS.includes(String(cognitiveDemand || '').toUpperCase()) ? String(cognitiveDemand).toUpperCase() : undefined;
   const normalizedCategory = normalizeString(category);
   const normalizedCodingFields = extractCodingFields({
     difficulty,
@@ -894,6 +1000,26 @@ const createQuestionWithManagedImage = async ({
     sectionId,
     requestedPoints: points ?? max_marks,
   });
+  const normalizedEvaluationConfig =
+    evaluationConfig && typeof evaluationConfig === 'object' && !Array.isArray(evaluationConfig)
+      ? evaluationConfig
+      : {};
+  const rubric = Array.isArray(normalizedEvaluationConfig.rubric)
+    ? normalizedEvaluationConfig.rubric
+    : [];
+  if (rubric.length) {
+    const rubricIsValid = rubric.every((criterion) =>
+      String(criterion?.key || criterion?.label || '').trim() &&
+      Number.isFinite(Number(criterion?.maxMarks)) &&
+      Number(criterion.maxMarks) >= 0
+    );
+    const rubricTotal = rubric.reduce((sum, criterion) => sum + Number(criterion.maxMarks), 0);
+    if (!rubricIsValid || Math.abs(rubricTotal - assignment.points) > 0.001) {
+      const error = new Error('Rubric criteria must be valid and their maximum marks must equal the question marks.');
+      error.statusCode = 400;
+      throw error;
+    }
+  }
 
   const question = new Question({
     questionPaperId,
@@ -902,15 +1028,14 @@ const createQuestionWithManagedImage = async ({
     description: normalizedDescription || undefined,
     instructions: typeof instructions === 'string' ? instructions.trim() : undefined,
     difficulty: normalizedDifficulty || undefined,
+    bloomLevel: normalizedBloomLevel,
+    cognitiveDemand: normalizedCognitiveDemand,
     category: normalizedCategory || undefined,
     questionType: normalizedStorageQuestionType,
     questionFormat: normalizedQuestionFormat,
     options,
     matchingPairs: Array.isArray(matchingPairs) ? matchingPairs : [],
-    evaluationConfig:
-      evaluationConfig && typeof evaluationConfig === 'object' && !Array.isArray(evaluationConfig)
-        ? evaluationConfig
-        : {},
+    evaluationConfig: normalizedEvaluationConfig,
     correctAnswer: normalizeCorrectAnswerForStorage(
       normalizedStorageQuestionType,
       correctAnswer,
@@ -943,8 +1068,28 @@ const createQuestionWithManagedImage = async ({
   });
 
   await question.save();
+  const usageEvents = [
+    { tenantId, questionId: question._id, examId, event: 'APPROVED' },
+    ...(question.provenance?.generationRunId ? [{ tenantId, questionId: question._id, examId, event: 'GENERATED', metadata: { generationRunId: question.provenance.generationRunId } }] : []),
+    ...(question.isIncludedInExam ? [{ tenantId, questionId: question._id, examId, event: 'USED_IN_ASSESSMENT' }] : []),
+    // Question Bank reuse: the copy above is its own APPROVED question, and
+    // the SOURCE gets a SELECTED event so its usage history reflects being
+    // picked for reuse. Legacy exam-to-exam copy targets Question; the
+    // canonical bank materialization path targets the QuestionVersion.
+    ...(question.provenance?.reusedFromQuestionId ? [{ tenantId, questionId: question.provenance.reusedFromQuestionId, examId, event: 'SELECTED', metadata: { copiedToQuestionId: question._id } }] : []),
+    ...(question.provenance?.questionVersionId ? [{ tenantId, questionVersionId: question.provenance.questionVersionId, examId, event: 'SELECTED', metadata: { copiedToQuestionId: question._id, questionBankItemId: question.provenance.questionBankItemId || null } }] : []),
+  ];
+  await QuestionUsage.insertMany(usageEvents);
+  if (question.provenance?.reusedFromQuestionId || question.provenance?.questionVersionId) {
+    await logAuditEvent(AUDIT_ACTIONS.QUESTION_BANK_REUSED, { tenantId, resourceType: 'Question', resourceId: question._id, sourceQuestionId: question.provenance.reusedFromQuestionId || null, questionBankItemId: question.provenance.questionBankItemId || null, questionVersionId: question.provenance.questionVersionId || null, examId });
+  }
+  // Fire-and-forget: recordQuestionEmbedding never throws (see
+  // services/questionEmbeddingService.js), and question creation must not
+  // wait on embedding-provider latency.
+  void recordQuestionEmbedding({ tenantId, questionId: question._id, questionText: question.questionText, questionType: question.questionType, difficulty: question.difficulty });
   await ensureQuestionImageAvailability({
     question,
+    tenantId,
     examId,
     persist: true,
   });
@@ -955,9 +1100,17 @@ const createQuestionWithManagedImage = async ({
 // Get all questions for an exam (via question papers)
 router.get('/:examId/questions', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
-    const exam = await Exam.findById(req.params.examId);
+    const exam = await Exam.findOne({
+      _id: req.params.examId,
+      ...(req.user.role === 'SUPER_ADMIN' ? {} : { tenantId: req.user.tenantId }),
+    });
     if (!exam) {
       return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    const isCandidate = hasRole(req.user, 'CANDIDATE');
+    if (isCandidate && !(await canCandidateAccessExam(req.user._id, exam._id))) {
+      return res.status(403).json({ error: 'You do not have access to this exam.' });
     }
 
     const questionPapers = await QuestionPaper.find({ examId: req.params.examId });
@@ -972,6 +1125,7 @@ router.get('/:examId/questions', requireAuth, requireTenant, enforceTenantBounda
     try {
       await ensureQuestionsImageAvailability({
         questions,
+        tenantId: req.user?.tenantId,
         examId: req.params.examId,
         persist: true,
       });
@@ -982,7 +1136,7 @@ router.get('/:examId/questions', requireAuth, requireTenant, enforceTenantBounda
       );
     }
 
-    res.json({ questions });
+    res.json({ questions: isCandidate ? questions.map(serializeCandidateQuestion) : questions });
   } catch (error) {
     next(error);
   }
@@ -1034,6 +1188,7 @@ router.get('/:examId/question-papers/:paperId/questions', requireAuth, requireTe
     try {
       await ensureQuestionsImageAvailability({
         questions,
+        tenantId: req.user?.tenantId,
         examId,
         persist: true,
       });
@@ -1044,39 +1199,12 @@ router.get('/:examId/question-papers/:paperId/questions', requireAuth, requireTe
       );
     }
 
-    const examResponseQuestions = questions.map((questionDoc) => {
-      const serializedQuestion =
-        typeof questionDoc?.toObject === 'function' ? questionDoc.toObject() : questionDoc;
-
-      if (isCandidate) {
-        // Candidate delivery must never disclose objective answers or WizKids
-        // instant-feedback metadata before a permitted Practice check. For
-        // MATCHING, expose prompts plus a shared set of choices, not the
-        // persisted left/right mapping that is itself the answer key.
-        const { correctAnswer, evaluationConfig, matchingPairs, options, ...candidateQuestion } = serializedQuestion;
-        const sourcePairs = Array.isArray(matchingPairs) ? matchingPairs : [];
-        const leftPairs = sourcePairs.map((pair) => ({ left: pair?.left || pair?.term || pair?.prompt || '' }));
-        const matchingChoices = sourcePairs
-          .map((pair) => pair?.right || pair?.match || pair?.answer || '')
-          .filter(Boolean);
-        return {
-          ...candidateQuestion,
-          options: serializedQuestion.questionType === 'MATCHING' ? matchingChoices : options,
-          matchingPairs: serializedQuestion.questionType === 'MATCHING' ? leftPairs : matchingPairs,
-          question_type: resolveQuestionTypeTokenForExamResponse(serializedQuestion),
-          // Safe to disclose: only the interaction/presentation mode, never the
-          // stripped evaluationConfig/correctAnswer it was derived from. This is
-          // how the candidate renderer knows to play the Flash Maths sequence
-          // instead of showing a plain number input.
-          ...(evaluationConfig?.flashMaths ? { interactionType: 'FLASH_MATHS' } : {}),
-        };
-      }
-
-      return {
-        ...serializedQuestion,
-        question_type: resolveQuestionTypeTokenForExamResponse(serializedQuestion),
-      };
-    });
+    const examResponseQuestions = questions.map((questionDoc) => isCandidate
+      ? serializeCandidateQuestion(questionDoc)
+      : {
+        ...(typeof questionDoc?.toObject === 'function' ? questionDoc.toObject() : questionDoc),
+        question_type: resolveQuestionTypeTokenForExamResponse(questionDoc),
+      });
 
     res.json({ questions: examResponseQuestions });
   } catch (error) {
@@ -1090,7 +1218,7 @@ router.post(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can create questions
+  requireRole('EXAM_CREATOR'),
   requireOwnershipOrAdmin,
   prepareCreateQuestionCount,
   checkQuestionLimit,
@@ -1183,6 +1311,8 @@ router.post(
     body('description').optional({ nullable: true }).isString().withMessage('Description must be a string'),
     body('instructions').optional({ nullable: true }).isString().withMessage('Instructions must be a string'),
     body('difficulty').optional({ nullable: true }).isString().withMessage('Difficulty must be a string'),
+    body('bloomLevel').optional({ nullable: true }).isString().withMessage('bloomLevel must be a string'),
+    body('cognitiveDemand').optional({ nullable: true }).isString().withMessage('cognitiveDemand must be a string'),
     body('category').optional({ nullable: true }).isString().withMessage('Category must be a string'),
     body('languages').optional({ nullable: true }).isArray().withMessage('Languages must be an array'),
     body('language').optional({ nullable: true }).isString().withMessage('language must be a string'),
@@ -1208,6 +1338,8 @@ router.post(
         description,
         instructions,
         difficulty,
+        bloomLevel,
+        cognitiveDemand,
         category,
         questionType,
         type,
@@ -1326,14 +1458,6 @@ router.post(
         }
       }
 
-      const juniorPolicyError = await validateJuniorQuestionPayloads({
-        exam,
-        payloads: normalizedCreatePayloads,
-      });
-      if (juniorPolicyError) {
-        return res.status(400).json({ error: juniorPolicyError });
-      }
-
       const planContext = await resolveExamPlanContext(exam._id);
       if (planContext?.planType && isFreePlan(planContext.planType)) {
         for (const payloadRecord of normalizedCreatePayloads) {
@@ -1377,6 +1501,7 @@ router.post(
         }
 
         const createdQuestion = await createQuestionWithManagedImage({
+          tenantId: req.user?.tenantId,
           examId: req.params.examId,
           questionPaperId,
           questionText: recordQuestionText,
@@ -1385,6 +1510,8 @@ router.post(
           description: payloadRecord.description ?? description,
           instructions: payloadRecord.instructions ?? instructions,
           difficulty: payloadRecord.difficulty ?? difficulty,
+          bloomLevel: payloadRecord.bloomLevel ?? bloomLevel,
+          cognitiveDemand: payloadRecord.cognitiveDemand ?? cognitiveDemand,
           category: payloadRecord.category ?? category,
           questionType: payloadRecord.questionType ?? normalizedQuestionType,
           type: payloadRecord.type ?? type,
@@ -1416,6 +1543,7 @@ router.post(
           memoryLimit: payloadRecord.memoryLimit ?? memoryLimit,
           codingFields: payloadRecord.codingFields ?? codingFields,
           matchingPairs: payloadRecord.matchingPairs ?? matchingPairs,
+          evaluationConfig: payloadRecord.evaluationConfig ?? evaluationConfig,
           provenance: payloadRecord.provenance,
         });
         createdQuestions.push(createdQuestion);
@@ -1455,6 +1583,16 @@ router.post(
 // Get single question
 router.get('/:examId/questions/:questionId', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
+    const exam = await Exam.findOne({
+      _id: req.params.examId,
+      ...(req.user.role === 'SUPER_ADMIN' ? {} : { tenantId: req.user.tenantId }),
+    }).select('_id');
+    if (!exam) return res.status(404).json({ error: 'Exam not found' });
+    const isCandidate = hasRole(req.user, 'CANDIDATE');
+    if (isCandidate && !(await canCandidateAccessExam(req.user._id, exam._id))) {
+      return res.status(403).json({ error: 'You do not have access to this exam.' });
+    }
+
     const question = await Question.findById(req.params.questionId).populate(
       'questionPaperId',
       'setName examId'
@@ -1472,11 +1610,12 @@ router.get('/:examId/questions/:questionId', requireAuth, requireTenant, enforce
 
     await ensureQuestionImageAvailability({
       question,
+      tenantId: req.user?.tenantId,
       examId: req.params.examId,
       persist: true,
     });
 
-    res.json({ question });
+    res.json({ question: isCandidate ? serializeCandidateQuestion(question) : question });
   } catch (error) {
     next(error);
   }
@@ -1568,6 +1707,8 @@ router.put(
     body('description').optional({ nullable: true }).isString().withMessage('Description must be a string'),
     body('instructions').optional({ nullable: true }).isString().withMessage('Instructions must be a string'),
     body('difficulty').optional({ nullable: true }).isString().withMessage('Difficulty must be a string'),
+    body('bloomLevel').optional({ nullable: true }).isString().withMessage('bloomLevel must be a string'),
+    body('cognitiveDemand').optional({ nullable: true }).isString().withMessage('cognitiveDemand must be a string'),
     body('category').optional({ nullable: true }).isString().withMessage('Category must be a string'),
     body('languages').optional({ nullable: true }).isArray().withMessage('Languages must be an array'),
     body('language').optional({ nullable: true }).isString().withMessage('language must be a string'),
@@ -1597,7 +1738,7 @@ router.put(
         return res.status(404).json({ error: 'Question not found for this exam' });
       }
 
-      const exam = await Exam.findById(questionPaper.examId).select('_id createdBy tenantId productModule');
+      const exam = await Exam.findById(questionPaper.examId).select('_id createdBy tenantId');
       if (exam) {
         const planContext = await resolveExamPlanContext(exam._id);
         if (planContext?.planType && isFreePlan(planContext.planType)) {
@@ -1659,6 +1800,8 @@ router.put(
         description,
         instructions,
         difficulty,
+        bloomLevel,
+        cognitiveDemand,
         category,
         languages,
         language,
@@ -1701,11 +1844,6 @@ router.put(
           : {}),
       };
 
-      const juniorPolicyError = await validateJuniorQuestionPayloads({ exam, payloads: [normalizedPayload] });
-      if (juniorPolicyError) {
-        return res.status(400).json({ error: juniorPolicyError });
-      }
-
       const codingPayloadError = validateCodingQuestionPayload(normalizedPayload);
       if (codingPayloadError) {
         return res.status(400).json({ error: codingPayloadError });
@@ -1716,6 +1854,8 @@ router.put(
       if (description !== undefined) question.description = description;
       if (instructions !== undefined) question.instructions = instructions;
       if (difficulty !== undefined) question.difficulty = difficulty;
+      if (bloomLevel !== undefined) question.bloomLevel = BLOOM_LEVELS.includes(String(bloomLevel || '').toUpperCase()) ? String(bloomLevel).toUpperCase() : null;
+      if (cognitiveDemand !== undefined) question.cognitiveDemand = COGNITIVE_DEMAND_LEVELS.includes(String(cognitiveDemand || '').toUpperCase()) ? String(cognitiveDemand).toUpperCase() : null;
       if (category !== undefined) question.category = category;
       if (hasQuestionTypeUpdate || hasQuestionFormatUpdate) {
         question.questionType = normalizeQuestionTypeForStorage({
@@ -1919,6 +2059,7 @@ router.put(
       await syncExamQuestionCount(req.params.examId);
       await ensureQuestionImageAvailability({
         question,
+        tenantId: req.user?.tenantId,
         examId: req.params.examId,
         persist: true,
       });
@@ -2017,6 +2158,7 @@ router.post(
 
       const result = await ensureQuestionImageAvailability({
         question,
+        tenantId: req.user?.tenantId,
         examId: req.params.examId,
         persist: true,
         forceGenerate,
@@ -2046,7 +2188,7 @@ router.post(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Keep import permissions aligned with manual question creation
+  requireRole('EXAM_CREATOR'),
   requireOwnershipOrAdmin,
   prepareImportedQuestionCount,
   checkQuestionLimit,
@@ -2117,7 +2259,7 @@ router.post(
         return res.status(404).json({ error: 'Question paper not found' });
       }
 
-      const exam = await Exam.findById(req.params.examId).select('_id createdBy tenantId productModule');
+      const exam = await Exam.findById(req.params.examId).select('_id createdBy tenantId');
       let freePlanRestriction = null;
       if (exam) {
         const planContext = await resolveExamPlanContext(exam._id);
@@ -2148,14 +2290,6 @@ router.post(
       const preparedImportRecords = importRecords.map((record, index) =>
         prepareImportedQuestionRecordForInsert(record || {}, index)
       );
-      const juniorPolicyError = await validateJuniorQuestionPayloads({
-        exam,
-        payloads: preparedImportRecords,
-      });
-      if (juniorPolicyError) {
-        return res.status(400).json({ error: juniorPolicyError });
-      }
-
       for (let index = 0; index < importRecords.length; index += 1) {
         const record = importRecords[index] || {};
         const preparedRecord = preparedImportRecords[index];
@@ -2187,6 +2321,7 @@ router.post(
 
         try {
           const createdQuestion = await createQuestionWithManagedImage({
+            tenantId: req.user?.tenantId,
             examId: req.params.examId,
             questionPaperId: effectiveQuestionPaperId,
             questionText: preparedRecord.questionText || preparedRecord.question || preparedRecord.title,
@@ -2195,6 +2330,8 @@ router.post(
             description: preparedRecord.description,
             instructions: preparedRecord.instructions,
             difficulty: preparedRecord.difficulty,
+            bloomLevel: preparedRecord.bloomLevel,
+            cognitiveDemand: preparedRecord.cognitiveDemand,
             category: preparedRecord.category,
             questionType: preparedRecord.questionType,
             type: preparedRecord.type,
@@ -2225,6 +2362,7 @@ router.post(
             timeLimit: preparedRecord.timeLimit,
             memoryLimit: preparedRecord.memoryLimit,
             codingFields: preparedRecord.codingFields,
+            evaluationConfig: preparedRecord.evaluationConfig,
           });
           createdQuestions.push(createdQuestion);
         } catch (rowError) {

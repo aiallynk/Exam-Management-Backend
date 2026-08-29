@@ -10,6 +10,7 @@ import util from 'util';
 import { fileURLToPath } from 'url';
 import config from '../config/env.js';
 import { FREE_PLAN_MESSAGES, isPlanFeatureEnabled } from '../config/planLimits.js';
+import { putImage, getImageBuffer, imageExists } from '../services/storage/imageStorage.js';
 
 const execFileAsync = util.promisify(execFile);
 
@@ -914,7 +915,6 @@ const callOmrService = async ({ file, exam, evaluationConfig, manualReviewThresh
   }
 };
 
-const mapPreviewUrl = (storedFilename) => `/uploads/omr/${storedFilename}`;
 
 const resolveUploadedFiles = (req) => {
   const files = [];
@@ -2112,6 +2112,26 @@ router.post(
           continue;
         }
 
+        // The Python detector needs a real local file (file.path); once it's
+        // done with it, persist the same bytes to S3 and drop the scratch
+        // copy — the S3 URL is what gets stored on the OMRResult, not the
+        // local path.
+        let scannedImageUrl = '';
+        try {
+          const fileBuffer = await fs.readFile(file.path);
+          const stored = await putImage({
+            tenantId: req.user.tenantId,
+            examId: exam._id,
+            category: 'omr',
+            fileStem: path.parse(file.originalname || 'sheet').name,
+            extension: ext,
+            buffer: fileBuffer,
+          });
+          scannedImageUrl = stored?.url || '';
+        } finally {
+          await fs.unlink(file.path).catch(() => {});
+        }
+
         for (let sheetIndex = 0; sheetIndex < sheets.length; sheetIndex += 1) {
           const sheet = sheets[sheetIndex] || {};
           const qrPayload = parseQrPayload(sheet.qr_data);
@@ -2198,7 +2218,7 @@ router.post(
           const totalQuestions = evaluationConfig.markingRules?.totalQuestions || 0;
           const omrSheetId = String(qrSheetId || createOmrSheetId()).trim();
           const examCodeValue = String(exam.uniqueId || exam._id || '').trim();
-          const scannedImagePath = String(file.path || '').trim();
+          const scannedImagePath = scannedImageUrl;
 
           const documentPayload = {
             exam_id: exam._id,
@@ -2242,7 +2262,7 @@ router.post(
             scanned_image_path: scannedImagePath,
             preview_url:
               sheet.preview_url ||
-              (SUPPORTED_IMAGE_EXTENSIONS.has(ext) ? mapPreviewUrl(file.filename) : ''),
+              (SUPPORTED_IMAGE_EXTENSIONS.has(ext) ? scannedImageUrl : ''),
             sheet_index: sheetIndex,
             error_message: errorMessage,
             created_by: req.user._id,
@@ -2689,19 +2709,22 @@ router.post(
         return res.status(400).json({ error: 'No source file available for reprocessing.' });
       }
 
-      let fileStats;
-      try {
-        fileStats = await fs.stat(result.source_file);
-      } catch {
-        return res.status(400).json({ error: 'Source file was not found on server.' });
-      }
-      if (!fileStats?.size) {
-        return res.status(400).json({ error: 'Source file is empty or invalid.' });
+      if (!(await imageExists({ url: result.source_file }))) {
+        return res.status(400).json({ error: 'Source file was not found in storage.' });
       }
 
       const sourceExt = path.extname(result.source_file || '').toLowerCase();
+      // The Python detector needs a real local file — materialize a fresh
+      // scratch copy from S3, use it for this reprocess, then discard it.
+      const tempPath = path.join(os.tmpdir(), `omr-reprocess-${Date.now()}-${Math.round(Math.random() * 1e9)}${sourceExt || '.jpg'}`);
+      const sourceBuffer = await getImageBuffer({ url: result.source_file });
+      if (!sourceBuffer?.length) {
+        return res.status(400).json({ error: 'Source file is empty or invalid.' });
+      }
+      await fs.writeFile(tempPath, sourceBuffer);
+
       const pseudoFile = {
-        path: result.source_file,
+        path: tempPath,
         originalname: path.basename(result.source_file),
         mimetype:
           sourceExt === '.png'
@@ -2712,12 +2735,17 @@ router.post(
       };
 
       const manualReviewThreshold = resolveManualReviewThreshold(req.body?.confidenceThreshold);
-      const payload = await callOmrService({
-        file: pseudoFile,
-        exam,
-        evaluationConfig,
-        manualReviewThreshold,
-      });
+      let payload;
+      try {
+        payload = await callOmrService({
+          file: pseudoFile,
+          exam,
+          evaluationConfig,
+          manualReviewThreshold,
+        });
+      } finally {
+        await fs.unlink(tempPath).catch(() => {});
+      }
       const sheets = resolveSheetsFromServiceResponse(payload);
       const currentSheet = sheets[0];
 

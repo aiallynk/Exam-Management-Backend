@@ -84,7 +84,6 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       maxExamCreators: null,
       maxCandidates: null,
       maxQuestionsPerExam: null,
-      maxWizKidsBatches: 1,
       // Source-Grounded AI Question Generation — count of context sources
       // (files/URLs) a tenant may ingest per month, distinct from
       // maxImportFiles (question-import files, a different feature).
@@ -124,21 +123,6 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       temporaryExaminerAssignment: false,
       mandatoryVerification: false,
       moderatorWorkflow: false,
-      // WizKids product module — default OFF for every plan and every tenant.
-      // Entitlement is granted per-tenant only via a Super-Admin-set
-      // subscription.customFeatures override (see routes/superAdmin.js
-      // PUT /tenants/:tenantId/features, custom_features payload), never by
-      // plan tier alone. See services/tenantFeatureService.js TENANT_CAPABILITIES.
-      wizKids: false,
-      wizKidsMentalMaths: false,
-      wizKidsVedicMaths: false,
-      wizKidsSuperMaths: false,
-      wizKidsLogic: false,
-      wizKidsOlympiad: false,
-      wizKidsPractice: false,
-      wizKidsSpeedMode: false,
-      wizKidsGeneratedQuestions: false,
-      wizKidsVisualQuestions: false,
     },
   },
   [SUBSCRIPTION_PLAN_TYPES.PRO]: {
@@ -155,7 +139,6 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       maxExamCreators: 10,
       maxCandidates: 150,
       maxQuestionsPerExam: 100,
-      maxWizKidsBatches: 10,
       maxContextSourcesPerMonth: 15,
     },
     features: {
@@ -202,21 +185,6 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       temporaryExaminerAssignment: true,
       mandatoryVerification: false,
       moderatorWorkflow: false,
-      // WizKids product module — default OFF for every plan and every tenant.
-      // Entitlement is granted per-tenant only via a Super-Admin-set
-      // subscription.customFeatures override (see routes/superAdmin.js
-      // PUT /tenants/:tenantId/features, custom_features payload), never by
-      // plan tier alone. See services/tenantFeatureService.js TENANT_CAPABILITIES.
-      wizKids: false,
-      wizKidsMentalMaths: false,
-      wizKidsVedicMaths: false,
-      wizKidsSuperMaths: false,
-      wizKidsLogic: false,
-      wizKidsOlympiad: false,
-      wizKidsPractice: false,
-      wizKidsSpeedMode: false,
-      wizKidsGeneratedQuestions: false,
-      wizKidsVisualQuestions: false,
     },
   },
   [SUBSCRIPTION_PLAN_TYPES.ULTIMATE]: {
@@ -233,7 +201,6 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       maxExamCreators: null,
       maxCandidates: null,
       maxQuestionsPerExam: null,
-      maxWizKidsBatches: 50,
       maxContextSourcesPerMonth: 40,
     },
     features: {
@@ -282,20 +249,6 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       temporaryExaminerAssignment: true,
       mandatoryVerification: true,
       moderatorWorkflow: true,
-      // WizKids product module — default OFF even on paid/enterprise plans.
-      // Entitlement is granted per-tenant only via a Super-Admin-set
-      // subscription.customFeatures override, never by plan tier alone.
-      // See services/tenantFeatureService.js TENANT_CAPABILITIES.
-      wizKids: false,
-      wizKidsMentalMaths: false,
-      wizKidsVedicMaths: false,
-      wizKidsSuperMaths: false,
-      wizKidsLogic: false,
-      wizKidsOlympiad: false,
-      wizKidsPractice: false,
-      wizKidsSpeedMode: false,
-      wizKidsGeneratedQuestions: false,
-      wizKidsVisualQuestions: false,
     },
   },
   [SUBSCRIPTION_PLAN_TYPES.LEGEND]: {
@@ -312,7 +265,6 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       maxExamCreators: null,
       maxCandidates: null,
       maxQuestionsPerExam: null,
-      maxWizKidsBatches: null,
       maxContextSourcesPerMonth: null,
     },
     features: {
@@ -366,20 +318,6 @@ export const SUBSCRIPTION_PLANS = Object.freeze({
       temporaryExaminerAssignment: true,
       mandatoryVerification: true,
       moderatorWorkflow: true,
-      // WizKids product module — default OFF even on paid/enterprise plans.
-      // Entitlement is granted per-tenant only via a Super-Admin-set
-      // subscription.customFeatures override, never by plan tier alone.
-      // See services/tenantFeatureService.js TENANT_CAPABILITIES.
-      wizKids: false,
-      wizKidsMentalMaths: false,
-      wizKidsVedicMaths: false,
-      wizKidsSuperMaths: false,
-      wizKidsLogic: false,
-      wizKidsOlympiad: false,
-      wizKidsPractice: false,
-      wizKidsSpeedMode: false,
-      wizKidsGeneratedQuestions: false,
-      wizKidsVisualQuestions: false,
     },
   },
 });

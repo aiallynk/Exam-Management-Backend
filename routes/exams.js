@@ -37,12 +37,13 @@ import { normalizeQuestionType } from '../utils/questionTypeRegistry.js';
 import { sanitizeExamAccessControlPayload } from '../utils/examSecurity.js';
 import { queueExamPackageRegeneration } from '../services/examPackageRegenerationService.js';
 import { resolveAttemptExhaustedExamIds } from '../utils/attemptAvailability.js';
-import WizKidsExamConfig from '../models/WizKidsExamConfig.js';
-import {
-  createWizKidsExamArtifacts,
-  prepareWizKidsExamInput,
-  WizKidsExamError,
-} from '../services/wizKidsExamService.js';
+import { resolveAssessmentSpecification } from '../services/assessmentSpecificationResolver.js';
+import RubricTemplate from '../models/RubricTemplate.js';
+import QuestionPaper from '../models/QuestionPaper.js';
+import Question from '../models/Question.js';
+import QuestionUsage from '../models/QuestionUsage.js';
+import { hasRole } from '../utils/userRoles.js';
+import { resolveAcademicVisibility, canOperateExam, canAuthorInCourseOffering } from '../services/academicAccessService.js';
 
 const router = express.Router();
 const SECTION_BASED_EXAM_TYPE = 'SECTION_BASED';
@@ -934,7 +935,7 @@ const runContextAutoAssign = (questions, sections, options = {}) => {
 // Universal: Shows exams based on exam context roles, not user system role
 router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, sanitizePagination, async (req, res, next) => {
   try {
-    const { page, limit, isActive, filterBy, examType, productModule } = req.query;
+    const { page, limit, isActive, filterBy, examType, workspace } = req.query;
     const skip = (page - 1) * limit;
 
     let filter = { ...req.tenantFilter };
@@ -945,16 +946,23 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, sanitizePag
     ) {
       filter.examType = normalizedExamType;
     }
-    const normalizedProductModule = String(productModule || '').trim().toUpperCase();
-    if (['STANDARD', 'WIZKIDS'].includes(normalizedProductModule)) {
-      filter.productModule = normalizedProductModule;
-    }
 
-    // SUPER_ADMIN, TENANT_ADMIN, and EXAM_CREATOR see all exams in their scope
-    if (req.user.role === 'SUPER_ADMIN' || req.user.role === 'TENANT_ADMIN' || req.user.role === 'EXAM_CREATOR') {
+    // Tenant Admin is an organization-wide monitor. Operational personas are
+    // intentionally narrowed to owned or academically assigned assessments.
+    if (hasRole(req.user, 'SUPER_ADMIN') || hasRole(req.user, 'TENANT_ADMIN')) {
       if (isActive !== undefined) {
         filter.isActive = isActive === 'true';
       }
+    } else if (hasRole(req.user, 'EXAM_CREATOR') && workspace !== 'teacher') {
+      const creatorParticipants = await ExamParticipant.find({ userId: req.user._id, examRole: 'CREATOR' }).distinct('examId');
+      filter.$or = [{ createdBy: req.user._id }, { _id: { $in: creatorParticipants } }];
+      if (isActive !== undefined) filter.isActive = isActive === 'true';
+    } else if (hasRole(req.user, 'TEACHER') || hasRole(req.user, 'ACADEMIC_ADMIN')) {
+      const visibility = await resolveAcademicVisibility(req.user);
+      if (!visibility.all) {
+        filter['academicContext.courseOfferingId'] = { $in: visibility.ids['course-offerings'] || [] };
+      }
+      if (isActive !== undefined) filter.isActive = isActive === 'true';
     } else {
       // Candidate-facing exam lists should include public exams and private exams
       // only when the signed-in candidate is explicitly assigned.
@@ -1003,25 +1011,8 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, sanitizePag
       .limit(limit);
 
     const total = await Exam.countDocuments(filter);
-    const juniorExamIds = exams
-      .filter((exam) => exam.productModule === 'WIZKIDS')
-      .map((exam) => exam._id);
-    const juniorConfigs = juniorExamIds.length
-      ? await WizKidsExamConfig.find({ tenantId: req.user.tenantId, examId: { $in: juniorExamIds } })
-        .select('examId mode gradeLevel domains interactionMode')
-        .lean()
-      : [];
-    const juniorConfigByExamId = new Map(
-      juniorConfigs.map((config) => [String(config.examId), config])
-    );
-
     res.json({
-      exams: exams.map((exam) => ({
-        ...withExamCode(exam),
-        ...(exam.productModule === 'WIZKIDS'
-          ? { juniorConfig: juniorConfigByExamId.get(String(exam._id)) || null }
-          : {}),
-      })),
+      exams: exams.map((exam) => withExamCode(exam)),
       pagination: {
         page,
         limit,
@@ -1065,13 +1056,7 @@ router.post(
       }
 
       const requestedUserId = req.body?.userId || req.user._id;
-      const canSubmitForOtherCandidate =
-        ['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR'].includes(req.user.role);
-
-      if (
-        String(requestedUserId) !== String(req.user._id) &&
-        !canSubmitForOtherCandidate
-      ) {
+      if (String(requestedUserId) !== String(req.user._id)) {
         return res.status(403).json({
           error: 'Forbidden - You can only submit exams for your own account',
         });
@@ -1136,13 +1121,13 @@ router.post(
 // Preview exam paper (questions without answers) - for admin preview
 router.get('/:examId/preview', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
-    const exam = await Exam.findById(req.params.examId);
+    const exam = await Exam.findOne({ _id: req.params.examId, ...(req.tenantFilter || {}) });
     if (!exam) {
       return res.status(404).json({ error: 'Exam not found' });
     }
 
-    // Check permissions - only admins can preview
-    if (req.user.role !== 'SUPER_ADMIN' && req.user.role !== 'TENANT_ADMIN' && req.user.role !== 'EXAM_CREATOR') {
+    const mayPreview = hasRole(req.user, 'TENANT_ADMIN') || await canOperateExam(req.user, exam);
+    if (!mayPreview) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -1182,6 +1167,7 @@ router.get('/:examId/preview', requireAuth, requireTenant, enforceTenantBoundari
 
       await ensureQuestionsImageAvailability({
         questions,
+        tenantId: req.user?.tenantId,
         examId: req.params.examId,
         persist: true,
       });
@@ -1267,13 +1253,13 @@ router.get('/:examId/preview', requireAuth, requireTenant, enforceTenantBoundari
 // Audit exam structure - check for inconsistencies
 router.get('/:examId/audit', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
   try {
-    const exam = await Exam.findById(req.params.examId);
+    const exam = await Exam.findOne({ _id: req.params.examId, ...(req.tenantFilter || {}) });
     if (!exam) {
       return res.status(404).json({ error: 'Exam not found' });
     }
 
-    // Check permissions - only admins can audit
-    if (req.user.role !== 'SUPER_ADMIN' && req.user.role !== 'TENANT_ADMIN' && req.user.role !== 'EXAM_CREATOR') {
+    const mayAudit = hasRole(req.user, 'TENANT_ADMIN') || await canOperateExam(req.user, exam);
+    if (!mayAudit) {
       return res.status(403).json({ error: 'Access denied' });
     }
 
@@ -1402,18 +1388,21 @@ router.get('/:examId', requireAuth, requireTenant, enforceTenantBoundaries, asyn
       return res.status(404).json({ error: 'Exam not found' });
     }
 
-    // SUPER_ADMIN, TENANT_ADMIN, and EXAM_CREATOR can access all exams in their scope
-    if (req.user.role === 'SUPER_ADMIN') {
+    if (hasRole(req.user, 'SUPER_ADMIN')) {
       return res.json({ exam: withExamCode(exam) });
     }
 
-    if (req.user.role === 'TENANT_ADMIN' || req.user.role === 'EXAM_CREATOR') {
+    if (hasRole(req.user, 'TENANT_ADMIN')) {
       const userTenantId = req.user.tenantId;
       const examTenantId = exam.tenantId;
 
       if (userTenantId && examTenantId && userTenantId.toString() === examTenantId.toString()) {
         return res.json({ exam: withExamCode(exam) });
       }
+    }
+
+    if (await canOperateExam(req.user, exam)) {
+      return res.json({ exam: withExamCode(exam) });
     }
 
     // Candidate users can only see public exams or the exams they were assigned to.
@@ -1446,7 +1435,7 @@ router.post(
   '/',
   requireAuth,
   requireTenant, // Ensure user belongs to a tenant (except SUPER_ADMIN)
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can create exams
+  requireRole('EXAM_CREATOR'),
   checkExamCreationLimit,
   auditLog(AUDIT_ACTIONS.EXAM_CREATED, (req, res) => ({
     resourceType: 'Exam',
@@ -1461,6 +1450,9 @@ router.post(
     body('maxAttempts').optional().isInt({ min: 1 }),
     body('showResultsImmediately').optional().isBoolean(),
     body('examType').optional().isString(),
+    // Master Phase 4 — independent of examType (ONLINE/OMR). See
+    // docs/XAMIGO_V2_OFFLINE_EVALUATION_INSPECTION.md Part 13.
+    body('deliveryMode').optional().isIn(['ONLINE', 'OFFLINE', 'HYBRID']),
     body('sections').optional().isArray(),
     body('timingMode').optional().isIn(['overall', 'section_based']),
     body('evaluationMode').optional().isIn(['AUTOMATIC', 'AI_OPTIONAL_REVIEW', 'AI_MANDATORY_REVIEW', 'MANUAL', 'HYBRID']),
@@ -1481,8 +1473,10 @@ router.post(
       .optional()
       .isIn(['replace'])
       .withMessage('candidateAssignmentMode must be replace when provided during creation'),
-    body('productModule').optional().isIn(['STANDARD', 'WIZKIDS']),
-    body('juniorConfig').optional().isObject().withMessage('juniorConfig must be an object'),
+    body('creationMode').optional({ nullable: true }).isIn(['QUICK', 'ACADEMIC']),
+    body('assessmentPurpose').optional().isIn(['OF', 'FOR', 'AS']),
+    body('academicContext').optional().isObject(),
+    body('creatorOverrides').optional().isObject(),
   ],
   async (req, res, next) => {
     try {
@@ -1517,6 +1511,7 @@ router.post(
         passingPercentage,
         certificateTemplate,
         examType,
+        deliveryMode,
         sections,
         timingMode,
         allowDurationOverride,
@@ -1527,37 +1522,16 @@ router.post(
         totalMarks,
         subTenantId,
         accessControl,
-        productModule,
-        juniorConfig,
+        creationMode = null,
+        assessmentPurpose = 'OF',
+        assessmentType = 'EXAM',
+        academicContext = {},
+        frameworkId = null,
+        frameworkVersionId = null,
+        rubricTemplateId = null,
+        creatorOverrides = {},
       } =
         req.body;
-
-      const normalizedProductModule = String(productModule || 'STANDARD').trim().toUpperCase();
-      if (normalizedProductModule === 'WIZKIDS' && normalizeExamType(examType) === OMR_EXAM_TYPE) {
-        return res.status(400).json({ error: 'Junior Exam is available only for online exams.' });
-      }
-      let preparedJuniorInput = null;
-      if (normalizedProductModule === 'WIZKIDS') {
-        try {
-          preparedJuniorInput = await prepareWizKidsExamInput({
-            tenantId: resolvedTenantId,
-            mode: juniorConfig?.mode || 'TEST',
-            gradeLevel: juniorConfig?.gradeLevel,
-            domains: juniorConfig?.domains,
-            batchIds: juniorConfig?.batchIds,
-            autoAdvance: juniorConfig?.autoAdvance,
-            allowBackNavigation: juniorConfig?.allowBackNavigation,
-            questionTimerSeconds: juniorConfig?.questionTimerSeconds,
-            interactionMode: juniorConfig?.interactionMode,
-            flashMaths: juniorConfig?.flashMaths,
-          });
-        } catch (juniorError) {
-          if (juniorError instanceof WizKidsExamError) {
-            return res.status(juniorError.status).json({ error: juniorError.message });
-          }
-          throw juniorError;
-        }
-      }
 
       const duplicateExam = await findDuplicateExamByTitle({
         title,
@@ -1721,6 +1695,45 @@ router.post(
         }
       }
 
+      let resolvedSpecification;
+      try {
+        resolvedSpecification = await resolveAssessmentSpecification({
+          tenantId: resolvedTenantId, purpose: assessmentPurpose, academicContext,
+          assessmentType, frameworkId, frameworkVersionId, creatorOverrides,
+        });
+      } catch (error) {
+        return res.status(error.statusCode || error.status || 400).json({ error: error.message });
+      }
+
+      if (resolvedSpecification.academicContext?.courseOfferingId) {
+        const canAuthorContext = await canAuthorInCourseOffering(req.user, resolvedSpecification.academicContext.courseOfferingId);
+        if (!canAuthorContext) {
+          return res.status(403).json({
+            error: 'You are not assigned to create assessments for the selected course offering. Contact Academic Admin.',
+            code: 'ACADEMIC_AUTHORING_SCOPE_REQUIRED',
+          });
+        }
+      }
+
+      let rubricSnapshot = null;
+      if (rubricTemplateId) {
+        const publishedRubric = await RubricTemplate.findOne({
+          _id: rubricTemplateId,
+          tenantId: resolvedTenantId,
+          status: 'PUBLISHED',
+        }).lean();
+        if (!publishedRubric) {
+          return res.status(400).json({ error: 'The selected rubric must be a published template in this tenant.' });
+        }
+        rubricSnapshot = {
+          templateId: String(publishedRubric._id),
+          name: publishedRubric.name,
+          version: publishedRubric.version,
+          criteria: publishedRubric.criteria,
+          capturedAt: new Date().toISOString(),
+        };
+      }
+
       // Resolve and persist tenant scope for exam creation.
       const examData = {
         title,
@@ -1737,13 +1750,23 @@ router.post(
           : 60,
         certificateTemplate: allowCertification ? (certificateTemplate || null) : null,
         examType: isOmrRequest ? OMR_EXAM_TYPE : ONLINE_EXAM_TYPE,
+        deliveryMode: ['ONLINE', 'OFFLINE', 'HYBRID'].includes(deliveryMode) ? deliveryMode : 'ONLINE',
         timingMode: sectionBasedRequest ? 'section_based' : 'overall',
         allowDurationOverride: sectionBasedRequest ? Boolean(allowDurationOverride) : false,
         evaluationMode: requestedEvaluationMode,
         totalMarks: Number.isFinite(Number(totalMarks)) ? Math.max(0, Number(totalMarks)) : 0,
         createdBy: req.user._id,
         tenantId: resolvedTenantId,
-        productModule: normalizedProductModule,
+        creationMode: ['QUICK', 'ACADEMIC'].includes(creationMode) ? creationMode : null,
+        assessmentPurpose: resolvedSpecification.purpose,
+        assessmentType: resolvedSpecification.assessmentType,
+        academicContext: resolvedSpecification.academicContext,
+        frameworkId: frameworkId || null,
+        frameworkVersionId: resolvedSpecification.frameworkVersion?.id || null,
+        rubricTemplateId: rubricTemplateId || null,
+        rubricSnapshot,
+        resolvedSpecificationSnapshot: resolvedSpecification,
+        resolvedSpecificationAt: new Date(),
       };
 
       if (resolvedSubTenantId) {
@@ -1797,15 +1820,6 @@ router.post(
         req.user._id
       );
 
-      let juniorArtifacts = null;
-      if (preparedJuniorInput) {
-        juniorArtifacts = await createWizKidsExamArtifacts({
-          exam,
-          tenantId: resolvedTenantId,
-          createdBy: req.user._id,
-          preparedInput: preparedJuniorInput,
-        });
-      }
 
       // Keep denormalized creator counters in sync for plan enforcement.
       await syncUserExamCount(req.user._id);
@@ -1851,12 +1865,7 @@ router.post(
         });
       }
 
-      res.status(201).json({
-        exam: withExamCode(exam),
-        ...(juniorArtifacts
-          ? { questionPaper: juniorArtifacts.questionPaper, juniorConfig: juniorArtifacts.config }
-          : {}),
-      });
+      res.status(201).json({ exam: withExamCode(exam) });
     } catch (error) {
       next(error);
     }
@@ -1878,6 +1887,9 @@ router.put(
     body('maxAttempts').optional().isInt({ min: 1 }),
     body('showResultsImmediately').optional().isBoolean(),
     body('examType').optional().isString(),
+    // Master Phase 4 — independent of examType (ONLINE/OMR). See
+    // docs/XAMIGO_V2_OFFLINE_EVALUATION_INSPECTION.md Part 13.
+    body('deliveryMode').optional().isIn(['ONLINE', 'OFFLINE', 'HYBRID']),
     body('sections').optional().isArray(),
     body('timingMode').optional().isIn(['overall', 'section_based']),
     body('evaluationMode').optional().isIn(['AUTOMATIC', 'AI_OPTIONAL_REVIEW', 'AI_MANDATORY_REVIEW', 'MANUAL', 'HYBRID']),
@@ -1982,6 +1994,7 @@ router.put(
         showResultsImmediately,
         resultsReleasedAt,
         examType,
+        deliveryMode,
         sections,
         timingMode,
         allowDurationOverride,
@@ -2172,6 +2185,9 @@ router.put(
       if (isActive !== undefined) exam.isActive = isActive;
       if ([ONLINE_EXAM_TYPE, OMR_EXAM_TYPE].includes(requestedExamType)) {
         exam.examType = requestedExamType;
+      }
+      if (['ONLINE', 'OFFLINE', 'HYBRID'].includes(deliveryMode)) {
+        exam.deliveryMode = deliveryMode;
       }
       if (resolvedExamType === OMR_EXAM_TYPE) {
         exam.answerKey = safeOmrPayload.answerKey;
@@ -2441,6 +2457,18 @@ router.post(
 
       exam.resultsReleasedAt = new Date();
       await exam.save();
+      const releasedPapers = await QuestionPaper.find({ examId: exam._id }).select('_id').lean();
+      const releasedQuestionIds = await Question.find({ questionPaperId: { $in: releasedPapers.map((paper) => paper._id) }, isIncludedInExam: { $ne: false } }).distinct('_id');
+      if (releasedQuestionIds.length) {
+        await QuestionUsage.insertMany(releasedQuestionIds.map((questionId) => ({
+          tenantId: exam.tenantId,
+          questionId,
+          examId: exam._id,
+          courseOfferingId: exam.academicContext?.courseOfferingId || null,
+          frameworkVersionId: exam.frameworkVersionId || null,
+          event: 'PUBLISHED',
+        })));
+      }
       await exam.populate('createdBy', 'name email');
 
       res.locals.examId = exam._id.toString();
@@ -2595,7 +2623,7 @@ router.post(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
+  requireRole('EXAM_CREATOR'),
   async (req, res, next) => {
     try {
       const {

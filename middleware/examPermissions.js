@@ -165,21 +165,6 @@ export const requireExamRole = (examRole) => {
         return next();
       }
 
-      // EXAM_CREATOR can access all exams in their tenant
-      if (req.user.role === 'EXAM_CREATOR') {
-        const exam = await Exam.findById(examId).select('tenantId');
-        if (!exam) {
-          return res.status(404).json({ error: 'Exam not found' });
-        }
-
-        const userTenantId = req.user.tenantId;
-        const examTenantId = exam.tenantId;
-
-        if (userTenantId && examTenantId && userTenantId.toString() === examTenantId.toString()) {
-          return next();
-        }
-      }
-
       // Check ExamParticipant for this user and exam
       const participant = await ExamParticipant.findOne({
         examId,
@@ -262,19 +247,6 @@ export const hasExamPermission = async (userId, examId, permission) => {
     const user = await User.findById(userId).select('role tenantId');
     if (user && user.role === 'SUPER_ADMIN') {
       return true;
-    }
-
-    // EXAM_CREATOR has all permissions for exams in their tenant
-    if (user && user.role === 'EXAM_CREATOR') {
-      const exam = await Exam.findById(examId).select('tenantId');
-      if (!exam) return false;
-
-      const userTenantId = user.tenantId;
-      const examTenantId = exam.tenantId;
-
-      if (userTenantId && examTenantId && userTenantId.toString() === examTenantId.toString()) {
-        return true;
-      }
     }
 
     const permissionKey = String(permission || '').toUpperCase();
@@ -517,8 +489,9 @@ export const requireEvaluatorAccess = () => {
  * scope implied by the request (examId + optional sectionId/questionId/
  * attemptId in params/body/query). Attaches the matching assignment to
  * `req.examinerAssignment` for handlers to read capability flags from.
- * SUPER_ADMIN/TENANT_ADMIN/EXAM_CREATOR (within their tenant) always pass,
- * matching the existing exam-permission bypass convention.
+ * There is deliberately no tenant, creator, or platform-role bypass: users
+ * enter this operational surface only through an active EVALUATOR role and
+ * an assignment covering the requested response.
  */
 export const requireExaminerAssignment = () => {
   return async (req, res, next) => {
@@ -532,15 +505,8 @@ export const requireExaminerAssignment = () => {
         return res.status(400).json({ error: 'Exam ID is required' });
       }
 
-      if (req.user.role === 'SUPER_ADMIN') {
-        return next();
-      }
-
-      if (req.user.role === 'EXAM_CREATOR' || req.user.role === 'TENANT_ADMIN') {
-        const exam = await Exam.findById(examId).select('tenantId');
-        if (exam && req.user.tenantId && exam.tenantId && String(req.user.tenantId) === String(exam.tenantId)) {
-          return next();
-        }
+      if (!hasRole(req.user, 'EVALUATOR')) {
+        return res.status(403).json({ error: 'Evaluator role required for assigned-response review.' });
       }
 
       const scope = {

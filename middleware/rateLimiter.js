@@ -7,6 +7,9 @@ import rateLimit from 'express-rate-limit';
 import config from '../config/env.js';
 
 const isDevelopmentMode = () => config.nodeEnv === 'development';
+const isDisposableE2E = () =>
+  config.nodeEnv === 'test' && process.env.XAMIGO_E2E_DISPOSABLE === 'true';
+const skipLocalAutomation = () => isDevelopmentMode() || isDisposableE2E();
 
 /**
  * Rate limiter for authentication endpoints
@@ -35,7 +38,7 @@ export const authRateLimiter = rateLimit({
     return req.ip || req.connection?.remoteAddress || 'unknown';
   },
   // Skip rate limiting in development mode
-  skip: () => isDevelopmentMode(),
+  skip: skipLocalAutomation,
 });
 
 /**
@@ -56,7 +59,7 @@ export const apiRateLimiter = rateLimit({
   },
   // Skip rate limiting for exams routes and related exam management routes
   skip: (req) => {
-    if (isDevelopmentMode()) {
+    if (skipLocalAutomation()) {
       return true;
     }
 
@@ -90,7 +93,7 @@ export const aiRateLimiter = rateLimit({
     return req.ip || req.connection?.remoteAddress || 'unknown';
   },
   // Skip AI throttling during local development so exam creation work is not blocked.
-  skip: () => isDevelopmentMode(),
+  skip: skipLocalAutomation,
 });
 
 /**
@@ -108,6 +111,7 @@ export const uploadRateLimiter = rateLimit({
   keyGenerator: (req) => {
     return req.ip || req.connection?.remoteAddress || 'unknown';
   },
+  skip: skipLocalAutomation,
 });
 
 /**

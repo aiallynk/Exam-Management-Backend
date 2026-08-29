@@ -1,6 +1,7 @@
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
+import { assertDisposableTestDatabase } from '../utils/testDatabaseSafety.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -10,8 +11,9 @@ dotenv.config({ path: path.resolve(__dirname, '../.env') });
 /**
  * Required environment variables - app will fail to start if these are missing
  */
+const IS_TEST_ENVIRONMENT = process.env.NODE_ENV === 'test';
 const REQUIRED_ENV_VARS = [
-  'MONGODB_URI',
+  IS_TEST_ENVIRONMENT ? 'TEST_MONGODB_URI' : 'MONGODB_URI',
   'JWT_SECRET',
   'JWT_REFRESH_SECRET',
 ];
@@ -55,8 +57,12 @@ See server/env.example for reference.
     console.warn('⚠️  WARNING: NOVELTY_SIGNATURE_SECRET appears to be using a default/weak value. Please change it before enabling Source-Grounded generation in production!');
   }
 
+  if (IS_TEST_ENVIRONMENT) {
+    assertDisposableTestDatabase({ nodeEnv: process.env.NODE_ENV, uri: process.env.TEST_MONGODB_URI });
+  }
+
   // Validate MongoDB URI format (basic check)
-  if (process.env.MONGODB_URI && !process.env.MONGODB_URI.startsWith('mongodb://') && !process.env.MONGODB_URI.startsWith('mongodb+srv://')) {
+  if (!IS_TEST_ENVIRONMENT && process.env.MONGODB_URI && !process.env.MONGODB_URI.startsWith('mongodb://') && !process.env.MONGODB_URI.startsWith('mongodb+srv://')) {
     console.warn('⚠️  WARNING: MONGODB_URI format may be incorrect. Expected mongodb:// or mongodb+srv://');
   }
 }
@@ -73,7 +79,10 @@ const resolveOpenAiModel = () => {
 const config = {
   port: process.env.PORT || 4000,
   host: process.env.HOST || '0.0.0.0',
-  mongodbUri: process.env.MONGODB_URI,
+  mongodbUri: IS_TEST_ENVIRONMENT ? process.env.TEST_MONGODB_URI : process.env.MONGODB_URI,
+  mongodbDbName: IS_TEST_ENVIRONMENT
+    ? assertDisposableTestDatabase({ nodeEnv: process.env.NODE_ENV, uri: process.env.TEST_MONGODB_URI }).databaseName
+    : (process.env.MONGODB_DB_NAME || 'exam_system'),
   jwtSecret: process.env.JWT_SECRET,
   jwtRefreshSecret: process.env.JWT_REFRESH_SECRET,
   tokenTtlMinutes: parseInt(process.env.TOKEN_TTL_MINUTES || '15', 10),
@@ -81,6 +90,11 @@ const config = {
   openaiApiKey: process.env.OPENAI_API_KEY,
   openaiModel: resolveOpenAiModel(),
   openaiEmbeddingModel: process.env.OPENAI_EMBEDDING_MODEL || 'text-embedding-3-small',
+  // Optional. Name of an Atlas Vector Search index over
+  // QuestionEmbedding.embedding. When unset (default), tenant-scoped
+  // question semantic similarity falls back to an in-application cosine
+  // comparison — see services/questionEmbeddingService.js.
+  questionVectorSearchIndex: process.env.QUESTION_VECTOR_SEARCH_INDEX || '',
   // Source-Grounded AI Question Generation novelty ledger HMAC key. Not in
   // REQUIRED_ENV_VARS — see the boot-time warning above for why.
   noveltySignatureSecret: process.env.NOVELTY_SIGNATURE_SECRET || '',
@@ -92,6 +106,18 @@ const config = {
   // still readable without it.
   googleDriveApiKey: process.env.GOOGLE_DRIVE_API_KEY || '',
   uploadDir: process.env.UPLOAD_DIR || './uploads',
+  // S3-backed image storage (uploads + AI-generated question diagrams), keyed
+  // per tenant/exam — see services/storage/imageStorage.js. Not required at
+  // boot; image endpoints hard-fail with a clear error until these are set.
+  // Separate from the DB-configured backup-storage feature (routes/systemBackup.js).
+  s3Bucket: process.env.S3_BUCKET || '',
+  s3Region: process.env.S3_REGION || '',
+  s3AccessKeyId: process.env.S3_ACCESS_KEY_ID || '',
+  s3SecretAccessKey: process.env.S3_SECRET_ACCESS_KEY || '',
+  // Optional — only needed for non-AWS S3-compatible providers (MinIO, R2, etc).
+  s3Endpoint: process.env.S3_ENDPOINT || '',
+  s3ForcePathStyle: String(process.env.S3_FORCE_PATH_STYLE || 'false').toLowerCase() === 'true',
+  s3ImageRootPrefix: process.env.S3_IMAGE_ROOT_PREFIX || 'xamigo',
   corsOrigin:
     process.env.CORS_ORIGIN || 'https://exam-management-frontend-psi.vercel.app',
   appBaseUrl:
@@ -109,7 +135,53 @@ const config = {
   judge0EnableNetwork: String(process.env.JUDGE0_ENABLE_NETWORK || 'false').toLowerCase() === 'true',
   judge0PollingIntervalMs: Number(process.env.JUDGE0_POLLING_INTERVAL_MS || 1000),
   judge0MaxPolls: Number(process.env.JUDGE0_MAX_POLLS || 20),
+
+  // ==========================================================
+  // AI PROVIDER CREDENTIALS (backend-only secrets — never VITE_*)
+  // ==========================================================
+  geminiApiKey: process.env.GEMINI_API_KEY || '',
+
+  // ==========================================================
+  // AI CONFIGURATION
+  // ==========================================================
+  // `database` = operation routing loaded from SystemConfig; env defaults
+  // below are bootstrap fallback only when no DB record exists.
+  // `env` = derive routing directly from env defaults (tests/local).
+  aiConfigSource: String(process.env.AI_CONFIG_SOURCE || 'database').trim().toLowerCase(),
+  aiDefaultQuestionProvider: process.env.AI_DEFAULT_QUESTION_PROVIDER
+    || process.env.AI_QUESTION_PROVIDER
+    || 'openai',
+  aiDefaultEvaluationProvider: process.env.AI_DEFAULT_EVALUATION_PROVIDER
+    || process.env.AI_EVALUATION_PROVIDER
+    || 'gemini',
+
+  // Runtime safety
+  aiRequestTimeoutMs: Number(process.env.AI_REQUEST_TIMEOUT_MS || 60000),
+  aiMaxRetries: Number(process.env.AI_MAX_RETRIES || 2),
+  aiStrictProviderRouting: String(process.env.AI_STRICT_PROVIDER_ROUTING || 'true').toLowerCase() !== 'false',
+  aiEnableProviderFallback: String(process.env.AI_ENABLE_PROVIDER_FALLBACK || 'false').toLowerCase() === 'true',
+  aiUseMockProviders: String(process.env.AI_USE_MOCK_PROVIDERS || 'false').toLowerCase() === 'true',
+
+  // Legacy per-domain provider aliases — deprecated; prefer AI_DEFAULT_* +
+  // database routing. Kept for backward compatibility during migration.
+  aiQuestionProvider: process.env.AI_DEFAULT_QUESTION_PROVIDER || process.env.AI_QUESTION_PROVIDER || 'openai',
+  aiEmbeddingProvider: process.env.AI_EMBEDDING_PROVIDER || process.env.AI_DEFAULT_QUESTION_PROVIDER || process.env.AI_QUESTION_PROVIDER || 'openai',
+  aiEvaluationProvider: process.env.AI_DEFAULT_EVALUATION_PROVIDER || process.env.AI_EVALUATION_PROVIDER || 'gemini',
+  aiVisionProvider: process.env.AI_VISION_PROVIDER || process.env.AI_DEFAULT_EVALUATION_PROVIDER || process.env.AI_EVALUATION_PROVIDER || 'gemini',
+  aiHandwritingProvider: process.env.AI_HANDWRITING_PROVIDER || process.env.AI_DEFAULT_EVALUATION_PROVIDER || process.env.AI_EVALUATION_PROVIDER || 'gemini',
+  aiFormativeFeedbackProvider: process.env.AI_FORMATIVE_FEEDBACK_PROVIDER || process.env.AI_DEFAULT_EVALUATION_PROVIDER || process.env.AI_EVALUATION_PROVIDER || 'gemini',
+  aiQuestionImageProvider: process.env.AI_QUESTION_IMAGE_PROVIDER || process.env.AI_DEFAULT_QUESTION_PROVIDER || process.env.AI_QUESTION_PROVIDER || 'openai',
+
+  // OpenAI models (OPENAI_MODEL remains the legacy fallback)
+  openaiQuestionModel: process.env.OPENAI_QUESTION_MODEL || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
+  openaiClassificationModel: process.env.OPENAI_CLASSIFICATION_MODEL || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
+  openaiImageModel: process.env.OPENAI_IMAGE_MODEL || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
+
+  // Gemini models
+  geminiEvaluationModel: process.env.GEMINI_EVALUATION_MODEL || 'gemini-2.0-flash',
+  geminiVisionModel: process.env.GEMINI_VISION_MODEL || process.env.GEMINI_EVALUATION_MODEL || 'gemini-2.0-flash',
+  geminiHandwritingModel: process.env.GEMINI_HANDWRITING_MODEL || process.env.GEMINI_VISION_MODEL || process.env.GEMINI_EVALUATION_MODEL || 'gemini-2.0-flash',
+  geminiFeedbackModel: process.env.GEMINI_FEEDBACK_MODEL || process.env.GEMINI_EVALUATION_MODEL || 'gemini-2.0-flash',
 };
 
 export default config;
-

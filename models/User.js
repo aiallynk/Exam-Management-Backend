@@ -8,6 +8,8 @@ import { generateUniqueIdWithCheck, ID_PREFIXES } from '../utils/idGenerator.js'
  * ROLES:
  * - SUPER_ADMIN: Full system access, can create tenants
  * - TENANT_ADMIN: Manages all data within their tenant (users, exams, sessions, etc.)
+ * - ACADEMIC_ADMIN: Manages delegated academic structure and governance
+ * - TEACHER: Operates only on assigned CourseOfferings/classes
  * - EXAM_CREATOR: Can create exams and sessions within their tenant
  * - CANDIDATE: Can attempt exams within their tenant
  * - EVALUATOR: Can review/score exam responses they are explicitly assigned to
@@ -26,7 +28,7 @@ import { generateUniqueIdWithCheck, ID_PREFIXES } from '../utils/idGenerator.js'
  * - Tenant represents exam hosting entity (School, College, Company, etc.)
  * - Users are assigned to tenants by SUPER_ADMIN
  */
-const ROLE_VALUES = ['SUPER_ADMIN', 'TENANT_ADMIN', 'EXAM_CREATOR', 'CANDIDATE', 'EVALUATOR'];
+const ROLE_VALUES = ['SUPER_ADMIN', 'TENANT_ADMIN', 'ACADEMIC_ADMIN', 'TEACHER', 'EXAM_CREATOR', 'CANDIDATE', 'EVALUATOR'];
 const UserSchema = new mongoose.Schema(
   {
     uniqueId: {
@@ -83,11 +85,17 @@ const UserSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
-    academicProfile: {
-      gradeLevel: { type: Number, min: 1, max: 7, default: null },
-      className: { type: String, trim: true, maxlength: 80, default: '' },
-      division: { type: String, trim: true, maxlength: 40, default: '' },
-      rollNumber: { type: String, trim: true, maxlength: 80, default: '' },
+    // Legacy profile data is retained for existing tenants. New academic
+    // placement is authoritative through tenant-scoped Enrollment records.
+    academicProfile: { type: mongoose.Schema.Types.Mixed, default: {} },
+    // Bounded delegation for ACADEMIC_ADMIN. `wholeTenant` is never inferred
+    // from the role: Tenant Admin must explicitly choose tenant-wide scope or
+    // at least one unit/program. Department scope is represented by an
+    // OrganizationUnit whose type is DEPARTMENT.
+    academicAdminScope: {
+      wholeTenant: { type: Boolean, default: false },
+      organizationUnitIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'OrganizationUnit' }],
+      programIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Program' }],
     },
     // Status management
     status: {
@@ -139,6 +147,8 @@ UserSchema.index({ tenantId: 1, subTenantId: 1, role: 1 });
 UserSchema.index({ status: 1 });
 UserSchema.index({ planType: 1 });
 UserSchema.index({ tenantId: 1, roles: 1 });
+UserSchema.index({ tenantId: 1, 'academicAdminScope.organizationUnitIds': 1 });
+UserSchema.index({ tenantId: 1, 'academicAdminScope.programIds': 1 });
 UserSchema.index({ tenantId: 1, role: 1, 'academicProfile.gradeLevel': 1 });
 
 // Keep `roles` populated and guaranteed to contain the primary `role`.

@@ -19,20 +19,29 @@ import {
 
 const router = express.Router();
 
-// Get all candidates (filtered by tenant for EXAM_CREATOR and TENANT_ADMIN)
-router.get('/candidates', requireAuth, requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), async (req, res, next) => {
+// Get all candidates (tenant-scoped). ACADEMIC_ADMIN added so persona
+// features like enrollment candidate search never need to depend on the
+// Tenant-Admin-only /tenant-admin/users endpoint (Blueprint section 15 /
+// Part Q correction) — this route was already correctly tenant-scoped and
+// role-appropriate for candidate lookup, so it is reused rather than
+// duplicated or /tenant-admin/users weakened.
+router.get('/candidates', requireAuth, requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'ACADEMIC_ADMIN'), async (req, res, next) => {
   try {
-    const { page = 1, limit = 20, search } = req.query;
+    const { page = 1, limit = 20, search, status } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
     // Filter by CANDIDATE role
-    const filter = { 
+    const filter = {
       role: 'CANDIDATE'
     };
-    
-    // Filter by tenant for EXAM_CREATOR and TENANT_ADMIN
-    if ((req.user.role === 'EXAM_CREATOR' || req.user.role === 'TENANT_ADMIN') && req.user.tenantId) {
+
+    // Filter by tenant for EXAM_CREATOR, TENANT_ADMIN, and ACADEMIC_ADMIN
+    if ((req.user.role === 'EXAM_CREATOR' || req.user.role === 'TENANT_ADMIN' || req.user.role === 'ACADEMIC_ADMIN') && req.user.tenantId) {
       filter.tenantId = req.user.tenantId;
+    }
+
+    if (status) {
+      filter.status = status;
     }
 
     if (search) {

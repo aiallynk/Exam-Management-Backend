@@ -2,7 +2,7 @@ import express from 'express';
 import { body, validationResult } from 'express-validator';
 import ExaminerAssignment from '../models/ExaminerAssignment.js';
 import { requireAuth } from '../middleware/auth.js';
-import { requireRole } from '../middleware/roles.js';
+import { requireOwnershipOrAdmin, requireRole } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { validateObjectId } from '../middleware/validation.js';
 import { AUDIT_ACTIONS } from '../middleware/audit.js';
@@ -19,6 +19,7 @@ import {
   getScopedQuestionIds,
   deriveReviewStatus,
 } from '../services/evaluatorAssignmentService.js';
+import { canOperateExam } from '../services/academicAccessService.js';
 
 const router = express.Router();
 
@@ -27,13 +28,30 @@ const isAssignmentCurrentlyActive = (assignment, now = new Date()) =>
   new Date(assignment.accessStartsAt) <= now &&
   (!assignment.accessExpiresAt || new Date(assignment.accessExpiresAt) >= now);
 
+const requireAssignmentOwner = async (req, res, next) => {
+  try {
+    const assignment = await ExaminerAssignment.findOne({
+      _id: req.params.assignmentId,
+      ...(req.tenantFilter || {}),
+    }).lean();
+    if (!assignment) return res.status(404).json({ error: 'Examiner assignment not found' });
+    if (!(await canOperateExam(req.user, assignment.examId))) {
+      return res.status(403).json({ error: 'Only the responsible Exam Creator can change this evaluator assignment.' });
+    }
+    return next();
+  } catch (error) {
+    return next(error);
+  }
+};
+
 // Create a scoped, time-bound examiner assignment.
 router.post(
   '/',
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  requireRole('EXAM_CREATOR'),
+  requireOwnershipOrAdmin,
   requireTenantFeature('EVALUATOR_REVIEW'),
   [
     body('examId').notEmpty().withMessage('examId is required').isMongoId(),
@@ -106,8 +124,9 @@ router.patch(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  requireRole('EXAM_CREATOR'),
   validateObjectId('assignmentId'),
+  requireAssignmentOwner,
   async (req, res, next) => {
     try {
       const assignment = await ExaminerAssignment.findOne({
@@ -153,8 +172,9 @@ router.post(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  requireRole('EXAM_CREATOR'),
   validateObjectId('assignmentId'),
+  requireAssignmentOwner,
   async (req, res, next) => {
     try {
       const assignment = await ExaminerAssignment.findOne({
@@ -192,11 +212,19 @@ router.get(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
   async (req, res, next) => {
     try {
       const filter = { ...req.tenantFilter };
-      if (req.query.examId) filter.examId = req.query.examId;
+      const isTenantMonitor = req.user.role === 'TENANT_ADMIN' || (req.user.roles || []).includes('TENANT_ADMIN');
+      if (!isTenantMonitor) {
+        const Exam = (await import('../models/Exam.js')).default;
+        const ownedExamIds = await Exam.find({ ...req.tenantFilter, createdBy: req.user._id }).distinct('_id');
+        filter.examId = req.query.examId
+          ? { $in: ownedExamIds.filter((examId) => String(examId) === String(req.query.examId)) }
+          : { $in: ownedExamIds };
+      }
+      if (req.query.examId && isTenantMonitor) filter.examId = req.query.examId;
       if (req.query.examinerId) filter.examinerId = req.query.examinerId;
       if (req.query.status) filter.status = req.query.status;
 

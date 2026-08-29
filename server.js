@@ -13,6 +13,8 @@ import { authRateLimiter, apiRateLimiter, aiRateLimiter, uploadRateLimiter } fro
 import { csrfProtection } from './middleware/csrf.js';
 import { requestTimeout } from './middleware/timeout.js';
 import { requestContextMiddleware } from './middleware/requestContext.js';
+import { getImageStream, urlToKey } from './services/storage/imageStorage.js';
+import { bootstrapAiConfig } from './services/aiEngine/aiConfigService.js';
 
 // Import routes
 import authRoutes from './routes/auth.js';
@@ -47,18 +49,13 @@ import compilerRoutes from './routes/compiler.js';
 import notificationRoutes from './routes/notifications.js';
 import systemAlertRoutes from './routes/systemAlerts.js';
 import publicRoutes from './routes/public.js';
-import wizKidsRoutes from './routes/wizKids.js';
-import wizKidsBatchesRoutes from './routes/wizKidsBatches.js';
-import wizKidsExamsRoutes from './routes/wizKidsExams.js';
-import wizKidsQuestionBankRoutes from './routes/wizKidsQuestionBank.js';
-import wizKidsPracticeRoutes from './routes/wizKidsPractice.js';
-import wizKidsSpeedRoutes from './routes/wizKidsSpeed.js';
-import wizKidsGeneratorRoutes from './routes/wizKidsGenerator.js';
-import wizKidsAnalyticsRoutes from './routes/wizKidsAnalytics.js';
-import wizKidsGamificationRoutes from './routes/wizKidsGamification.js';
-import wizKidsCandidateRoutes from './routes/wizKidsCandidate.js';
-import wizKidsTestCompletionRoutes from './routes/wizKidsTestCompletion.js';
-import wizKidsFlashMathsRoutes from './routes/wizKidsFlashMaths.js';
+import academicV2Routes from './routes/academicV2.js';
+import questionBankRoutes from './routes/questionBank.js';
+import answerScriptsRoutes from './routes/answerScripts.js';
+import assessmentGovernanceRoutes from './routes/assessmentGovernance.js';
+import contentLibraryRoutes from './routes/contentLibrary.js';
+import libraryResourcesRoutes from './routes/libraryResources.js';
+import formativeRoutes from './routes/formative.js';
 import { startSubscriptionExpiryScheduler } from './services/subscriptionLifecycleService.js';
 import { startAutoTenantBackupScheduler } from './services/autoBackupSchedulerService.js';
 import { startIncrementalBackupScheduler } from './services/incrementalBackupSchedulerService.js';
@@ -229,7 +226,29 @@ API_BASE_PATHS.forEach((basePath) => {
 const uploadsPath = path.isAbsolute(config.uploadDir)
   ? config.uploadDir
   : path.join(__dirname, config.uploadDir);
-app.use('/uploads', express.static(uploadsPath));
+app.use('/uploads', express.static(uploadsPath)); // serves pre-S3-migration local files
+
+// Reached only when express.static didn't find the file locally (its default
+// fallthrough behavior) — i.e. any image written to S3 after the migration.
+// A missing/unconfigured S3 here degrades to a normal 404, not a 503: reads
+// are best-effort (the image may simply not exist), unlike writes, which
+// hard-fail loudly at the upload/generation endpoints themselves.
+app.use('/uploads', async (req, res, next) => {
+  const key = urlToKey(`/uploads${req.path}`);
+  if (!key) return next();
+  try {
+    const s3Response = await getImageStream({ key });
+    if (!s3Response) return next();
+    res.set('Content-Type', s3Response.ContentType || 'application/octet-stream');
+    if (s3Response.ContentLength) res.set('Content-Length', String(s3Response.ContentLength));
+    s3Response.Body.pipe(res);
+  } catch (error) {
+    if (error?.code === 'S3_NOT_CONFIGURED' || error?.$metadata?.httpStatusCode === 404) {
+      return next();
+    }
+    next(error);
+  }
+});
 
 // Health check with database connectivity verification
 app.get('/health', async (req, res) => {
@@ -308,6 +327,18 @@ const registerApiRoutes = (basePath) => {
   app.use(`${basePath}/tenant-admin`, tenantAdminRoutes);
   app.use(`${basePath}/tenant/features`, tenantFeatureRoutes);
   app.use(`${basePath}/tenant/evaluators`, tenantEvaluatorRoutes);
+  // routes/academic.js (generic AcademicEntity CRUD) was retired here: a
+  // read-only dry-run of scripts/migrateAcademicEntityToExplicitModels.js
+  // confirmed zero AcademicEntity records existed in this database, so
+  // there was no historical data requiring a compatibility window. See
+  // docs/XAMIGO_V2_ARCHITECTURE_CONVERGENCE_MAP.md.
+  app.use(`${basePath}/academic-v2`, academicV2Routes);
+  app.use(`${basePath}/question-bank`, questionBankRoutes);
+  app.use(`${basePath}/answer-scripts`, answerScriptsRoutes);
+  app.use(`${basePath}/assessment-governance`, assessmentGovernanceRoutes);
+  app.use(`${basePath}/content-library`, contentLibraryRoutes);
+  app.use(`${basePath}/library-resources`, libraryResourcesRoutes);
+  app.use(`${basePath}/formative`, formativeRoutes);
   app.use(`${basePath}/languages`, languageRoutes);
   app.use(`${basePath}/sections`, sectionRoutes);
   app.use(`${basePath}/normalization`, normalizationRoutes);
@@ -321,18 +352,6 @@ const registerApiRoutes = (basePath) => {
   app.use(`${basePath}/compiler`, compilerRoutes);
   app.use(`${basePath}/code`, compilerRoutes);
   app.use(`${basePath}/notifications`, notificationRoutes);
-  app.use(`${basePath}/wizkids`, wizKidsRoutes);
-  app.use(`${basePath}/wizkids/batches`, wizKidsBatchesRoutes);
-  app.use(`${basePath}/wizkids/exams`, wizKidsExamsRoutes);
-  app.use(`${basePath}/wizkids/question-bank`, wizKidsQuestionBankRoutes);
-  app.use(`${basePath}/wizkids/attempts`, wizKidsPracticeRoutes);
-  app.use(`${basePath}/wizkids/attempts`, wizKidsSpeedRoutes);
-  app.use(`${basePath}/wizkids/attempts`, wizKidsTestCompletionRoutes);
-  app.use(`${basePath}/wizkids/generator`, wizKidsGeneratorRoutes);
-  app.use(`${basePath}/wizkids/analytics`, wizKidsAnalyticsRoutes);
-  app.use(`${basePath}/wizkids/gamification`, wizKidsGamificationRoutes);
-  app.use(`${basePath}/wizkids/candidate`, wizKidsCandidateRoutes);
-  app.use(`${basePath}/wizkids/flash-maths`, wizKidsFlashMathsRoutes);
 
   // New backup/restore APIs are intentionally canonical and v1-only. Legacy local-file
   // endpoints remain mounted above only as a temporary migration compatibility path.
@@ -388,6 +407,7 @@ const startHttpServer = () =>
 const startServer = async () => {
   try {
     await connect();
+    await bootstrapAiConfig();
     await refreshBackupConfiguration();
     await startHttpServer();
     queueExistingExamPackageBackfillOnStartup();

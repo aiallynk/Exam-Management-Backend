@@ -9,9 +9,8 @@ import {
   validateGeneratedQuestionShape,
 } from '../utils/questionTypeRegistry.js';
 
-// Source-Grounded AI Question Generation — the generationMode:
-// 'SOURCE_GROUNDED' entry point, shared by productModule STANDARD and
-// WIZKIDS alike (both call this exact function — see routes/ai.js). The
+// Source-Grounded AI Question Generation — the generationMode
+// 'SOURCE_GROUNDED' entry point. The
 // hard contract this file exists to enforce: every accepted question must
 // be answerable purely from retrieved source chunks, and the model must
 // NEVER be allowed to silently fall back to general knowledge the way
@@ -19,12 +18,7 @@ import {
 // (generateFallbackQuestions) — that fallback path is simply never
 // reachable from here.
 
-// Pure branch-selector — deliberately keyed ONLY on generationMode, never
-// on productModule. This is what makes STANDARD and WIZKIDS share the
-// exact same Source-Grounded pipeline (master prompt §32-34) rather than
-// WizKids forking off a parallel implementation: whatever productModule
-// value routes/ai.js passes through has no bearing on which generation
-// strategy runs.
+// Pure branch-selector deliberately keyed only on generationMode.
 export const resolveGenerationStrategy = ({ generationMode }) =>
   String(generationMode || 'STANDARD').toUpperCase() === 'SOURCE_GROUNDED' ? 'SOURCE_GROUNDED' : 'STANDARD';
 
@@ -51,12 +45,11 @@ const BROAD_COVERAGE_QUERY_TEXT =
 // retrieval query so the embedding search isn't anchored to a possibly
 // too-narrow/generic phrase and instead surfaces the source's best
 // general-coverage material.
-export const buildQueryText = ({ topic, instructions, questionTypes, juniorContext, broadenFocus = false }) => {
+export const buildQueryText = ({ topic, instructions, questionTypes, broadenFocus = false }) => {
   const text = [
     broadenFocus ? '' : topic,
     instructions,
     Array.isArray(questionTypes) ? questionTypes.join(' ') : '',
-    juniorContext?.gradeLevel ? `grade ${juniorContext.gradeLevel}` : '',
   ]
     .filter(Boolean)
     .join('. ');
@@ -70,7 +63,7 @@ const DIFFICULTY_GUIDANCE = {
   ultra_hard: 'requires precise, nuanced understanding of the source text',
 };
 
-const buildSystemPrompt = ({ retrievedChunks, difficulty, juniorContext }) => {
+const buildSystemPrompt = ({ retrievedChunks, difficulty }) => {
   const sourceBlock = retrievedChunks
     .map((chunk, index) => `[chunk ${index + 1}]\n${chunk.text}`)
     .join('\n\n');
@@ -98,9 +91,6 @@ const buildSystemPrompt = ({ retrievedChunks, difficulty, juniorContext }) => {
     '   inventing unsupported content or repeating the same fact reworded.',
     '3. Do not invent facts, names, numbers, or details that are not in the source material.',
     `4. Target difficulty: ${DIFFICULTY_GUIDANCE[difficulty] || DIFFICULTY_GUIDANCE.medium}.`,
-    juniorContext?.gradeLevel
-      ? `5. Audience is grade ${juniorContext.gradeLevel} students — use age-appropriate language while staying strictly within rule 1.`
-      : '',
     '',
     'TOPIC MATCHING: treat "Topic/focus" below as a loose steering hint, not an exact keyword or',
     'phrase that must literally appear in the source. If the provided source material is from the',
@@ -184,7 +174,6 @@ export const generateGroundedCandidates = async ({
   count,
   examTitle,
   examDescription,
-  juniorContext = null,
   excludeQuestionTexts = [],
   broadenFocus = false,
 }) => {
@@ -193,7 +182,7 @@ export const generateGroundedCandidates = async ({
     throw new InsufficientSourceMaterialError('AI generation is not configured on this deployment.');
   }
 
-  const queryText = buildQueryText({ topic, instructions, questionTypes, juniorContext, broadenFocus });
+  const queryText = buildQueryText({ topic, instructions, questionTypes, broadenFocus });
   const queryEmbedding = await embedSingleText(queryText, { tenantId, userId });
   const retrievedChunks = await retrieveGroundingChunks({
     tenantId,
@@ -221,7 +210,7 @@ export const generateGroundedCandidates = async ({
       model: config.openaiModel,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: buildSystemPrompt({ retrievedChunks, difficulty, juniorContext }) },
+        { role: 'system', content: buildSystemPrompt({ retrievedChunks, difficulty }) },
         {
           role: 'user',
           content: buildUserPrompt({

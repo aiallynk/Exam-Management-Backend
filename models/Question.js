@@ -90,6 +90,25 @@ const QuestionSchema = new mongoose.Schema(
       trim: true,
       default: '',
     },
+    // Cognitive demand (Blueprint section 4B) — independent of difficulty
+    // above and bloomLevel below; never a synonym for either. Additive,
+    // nullable: every pre-existing question has cognitiveDemand: null and
+    // stays that way unless explicitly classified. Always resolved by the
+    // application (utils/cognitiveDemand.js) from bloomLevel + the
+    // applicable framework mapping — never trusted verbatim from an
+    // AI-provided label — except when a human explicitly sets/overrides it
+    // (manual authoring, import review, or a creator override the
+    // framework permits).
+    cognitiveDemand: {
+      type: String,
+      enum: ['LOT', 'MOT', 'HOT', null],
+      default: null,
+    },
+    bloomLevel: {
+      type: String,
+      enum: ['REMEMBER', 'UNDERSTAND', 'APPLY', 'ANALYZE', 'EVALUATE', 'CREATE', null],
+      default: null,
+    },
     category: {
       type: String,
       trim: true,
@@ -238,6 +257,30 @@ const QuestionSchema = new mongoose.Schema(
           generationRunId: {
             type: mongoose.Schema.Types.ObjectId,
             ref: 'AIGenerationRun',
+            default: undefined,
+          },
+          // Set when this question was created via the Question Bank reuse
+          // flow (Content & Question Bank -> "Add to this exam"). Always a
+          // copy, never a shared/live reference — see docs on question-bank
+          // reuse ownership decision.
+          reusedFromQuestionId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'Question',
+            default: undefined,
+          },
+          // Canonical Question Bank materialization (Part 5 convergence) —
+          // set when this question was copied from an APPROVED
+          // QuestionVersion rather than from another exam's delivered
+          // Question. reusedFromQuestionId above remains valid compatibility
+          // metadata for the legacy exam-to-exam copy path.
+          questionBankItemId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'QuestionBankItem',
+            default: undefined,
+          },
+          questionVersionId: {
+            type: mongoose.Schema.Types.ObjectId,
+            ref: 'QuestionVersion',
             default: undefined,
           },
           sourceIds: {

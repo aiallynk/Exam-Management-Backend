@@ -6,6 +6,8 @@ import { requireRole, requireOwnershipOrAdmin } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { body, validationResult } from 'express-validator';
 import { queueExamPackageRegeneration } from '../services/examPackageRegenerationService.js';
+import { canOperateExam } from '../services/academicAccessService.js';
+import { hasRole } from '../utils/userRoles.js';
 
 const router = express.Router();
 
@@ -15,6 +17,9 @@ router.get('/:examId/question-papers', requireAuth, requireTenant, enforceTenant
     const exam = await Exam.findById(req.params.examId);
     if (!exam) {
       return res.status(404).json({ error: 'Exam not found' });
+    }
+    if (!hasRole(req.user, 'TENANT_ADMIN') && !await canOperateExam(req.user, exam)) {
+      return res.status(403).json({ error: 'This assessment is outside your assigned or owned scope.' });
     }
 
     const questionPapers = await QuestionPaper.find({
@@ -35,7 +40,7 @@ router.post(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'), // Only EXAM_CREATOR and TENANT_ADMIN can create question papers
+  requireRole('EXAM_CREATOR'),
   requireOwnershipOrAdmin,
   [
     body('setName').trim().notEmpty().withMessage('Set name is required'),
@@ -95,4 +100,3 @@ router.post(
 );
 
 export default router;
-

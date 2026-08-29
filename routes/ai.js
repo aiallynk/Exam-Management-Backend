@@ -21,7 +21,10 @@ import {
 } from '../services/contextIngestionService.js';
 import { generateWithNoveltyAndGrounding } from '../services/candidatePoolOrchestratorService.js';
 import { buildTenantOwnedSourceFilter } from '../services/contextRetrievalService.js';
+import { assertContentSourcesSelectable, ContentLibraryError } from '../services/contentLibraryService.js';
+import { resolveLibraryResourcesToContextSourceIds } from '../services/libraryResourceService.js';
 import { resolveGenerationStrategy } from '../services/groundedGenerationService.js';
+import { qualityGateQuestionsAgainstSpecification, resolveAssessmentSpecification } from '../services/assessmentSpecificationResolver.js';
 import ContextSet from '../models/ContextSet.js';
 import ContextSource from '../models/ContextSource.js';
 import ContextChunk from '../models/ContextChunk.js';
@@ -46,6 +49,12 @@ import {
   normalizeQuestionType,
 } from '../utils/questionTypeRegistry.js';
 import {
+  resolveCognitiveDemandMapping,
+  deriveCognitiveDemandFromBloom,
+  validateCognitiveDemandDistribution,
+  computeCognitiveDemandDiagnostics,
+} from '../utils/cognitiveDemand.js';
+import {
   createTrackedChatCompletion,
   getAIQuestionCountForTenantByWindow,
   getAIUsageCountForTenantByWindow,
@@ -66,9 +75,6 @@ import {
   resolveUserEffectivePlanType,
   sendPlanRestriction,
 } from '../middleware/planRestrictions.js';
-import { prepareWizKidsExamInput, WizKidsExamError } from '../services/wizKidsExamService.js';
-import { findUnsupportedJuniorQuestionType } from '../utils/juniorQuestionPolicy.js';
-import { generateJuniorDeterministicNumberQuestions } from '../services/juniorAiQuestionService.js';
 import {
   CREDIT_REQUEST_TYPES,
   normalizeTenantExtraCredits,
@@ -650,7 +656,7 @@ router.post(
         }
       }
 
-      const importData = await parseQuestionImportFile(req.file);
+      const importData = await parseQuestionImportFile(req.file, { tenantId: req.user?.tenantId || null });
       const isCsvImport =
         String(importData?.extension || '').trim().toLowerCase() === '.csv';
       let { text, structuredRows } = importData;
@@ -762,6 +768,7 @@ router.post(
         rowEmbeddedArtifacts: importData.rowEmbeddedArtifacts,
         extractionErrors: importData.extractionErrors,
         importSessionId: importData.importSessionId,
+        tenantId: req.user?.tenantId || null,
         // Question import must only ever use images that genuinely exist
         // in the uploaded file (mapped/extracted artifacts, handled
         // above this flag inside attachImagesToImportedQuestions) — never
@@ -1205,12 +1212,13 @@ router.post(
     body('scenarioQuestionTypes').optional().isArray().withMessage('scenarioQuestionTypes must be an array'),
     body('imageQuestionMode').optional().isIn(['percentage', 'per_count']).withMessage('Invalid imageQuestionMode'),
     body('imageQuestionTypes').optional().isArray().withMessage('imageQuestionTypes must be an array'),
-    body('productModule').optional().isIn(['STANDARD', 'WIZKIDS']),
-    body('juniorContext').optional().isObject().withMessage('juniorContext must be an object'),
     body('generationMode').optional().isIn(['STANDARD', 'SOURCE_GROUNDED']).withMessage('Invalid generationMode'),
+    body('cognitiveDemandDistribution').optional().isObject().withMessage('cognitiveDemandDistribution must be an object'),
     body('contextSetId').optional().isMongoId().withMessage('Invalid contextSetId'),
     body('contextSourceIds').optional().isArray({ max: 10 }).withMessage('contextSourceIds must be an array of at most 10 items'),
     body('contextSourceIds.*').optional().isMongoId().withMessage('Invalid contextSourceIds entry'),
+    body('libraryResourceIds').optional().isArray({ max: 10 }).withMessage('libraryResourceIds must be an array of at most 10 items'),
+    body('libraryResourceIds.*').optional().isMongoId().withMessage('Invalid libraryResourceIds entry'),
   ],
   async (req, res, next) => {
     try {
@@ -1242,50 +1250,60 @@ router.post(
         scenarioQuestionTypes,
         imageQuestionMode,
         imageQuestionTypes,
-        productModule,
-        juniorContext,
         generationMode,
         contextSetId,
         contextSourceIds,
+        libraryResourceIds,
+        cognitiveDemandDistribution: requestedCognitiveDemandDistribution,
       } = req.body;
-      // Deliberately keyed only on generationMode, not productModule — see
-      // resolveGenerationStrategy's doc comment. This is what makes
-      // STANDARD and WIZKIDS share one Source-Grounded pipeline.
-      const isSourceGrounded = resolveGenerationStrategy({ generationMode }) === 'SOURCE_GROUNDED';
-      const effectivePlanType = await resolveUserEffectivePlanType(req.user);
-      const isJuniorGeneration = String(productModule || 'STANDARD').toUpperCase() === 'WIZKIDS';
-      let preparedJuniorContext = null;
-      if (isJuniorGeneration) {
-        try {
-          preparedJuniorContext = await prepareWizKidsExamInput({
-            tenantId: req.user.tenantId,
-            mode: juniorContext?.mode || 'TEST',
-            gradeLevel: juniorContext?.gradeLevel,
-            domains: juniorContext?.domains,
-            interactionMode: juniorContext?.interactionMode || 'STANDARD',
-            flashMaths: juniorContext?.flashMaths,
-          });
-        } catch (juniorError) {
-          if (juniorError instanceof WizKidsExamError) {
-            return res.status(juniorError.status).json({ error: juniorError.message });
+      const suppliedSpecification = req.body?.resolvedSpecification || null;
+      let governedSpecification = null;
+      if (suppliedSpecification || req.body?.assessmentPurpose || req.body?.frameworkId || req.body?.frameworkVersionId) {
+        const specificationContext = suppliedSpecification?.academicContext || req.body?.academicContext || {};
+        governedSpecification = await resolveAssessmentSpecification({
+          tenantId: req.user.tenantId,
+          purpose: req.body?.assessmentPurpose || suppliedSpecification?.purpose || 'OF',
+          assessmentType: req.body?.assessmentType || suppliedSpecification?.assessmentType || 'QUIZ',
+          academicContext: specificationContext,
+          frameworkId: req.body?.frameworkId || suppliedSpecification?.framework?.id || null,
+          frameworkVersionId: req.body?.frameworkVersionId || suppliedSpecification?.frameworkVersion?.id || null,
+          creatorOverrides: req.body?.creatorOverrides || {},
+        });
+        const allowedTypes = governedSpecification.specification?.questionGeneration?.questionTypes;
+        if (Array.isArray(allowedTypes) && allowedTypes.length) {
+          const invalidRequestedTypes = (questionTypes || []).filter((type) => !allowedTypes.includes(type));
+          if (invalidRequestedTypes.length) {
+            return res.status(400).json({ error: `Resolved assessment policy does not allow: ${invalidRequestedTypes.join(', ')}.` });
           }
-          throw juniorError;
-        }
-        const normalizedJuniorTypes = Array.isArray(questionTypes)
-          ? questionTypes.map(normalizeAiQuestionType).filter(Boolean)
-          : [];
-        const unsupportedType = findUnsupportedJuniorQuestionType(normalizedJuniorTypes);
-        if (unsupportedType) {
-          return res.status(400).json({ error: `Question type ${unsupportedType} is not supported for Junior AI authoring.` });
         }
       }
 
+      // Cognitive demand (Blueprint section 4B): Academic Assessment uses
+      // whatever the resolver already merged into the specification (a
+      // framework-locked value, or a creator override if and only if the
+      // framework's own allowCreatorOverrides permitted it — the existing
+      // resolver mechanism enforces that, no special-casing needed here).
+      // Quick Assessment has no framework, so an optional creator-supplied
+      // value is used as-is; omitted means "Automatic" (no target at all).
+      const effectiveCognitiveDemandDistribution = governedSpecification
+        ? (governedSpecification.specification?.cognitiveDemandDistribution || null)
+        : (requestedCognitiveDemandDistribution || null);
+      const effectiveCognitiveDemandMapping = resolveCognitiveDemandMapping({
+        cognitiveDemandMapping: governedSpecification?.specification?.cognitiveDemandMapping,
+      });
+      if (effectiveCognitiveDemandDistribution) {
+        const distributionCheck = validateCognitiveDemandDistribution(effectiveCognitiveDemandDistribution);
+        if (!distributionCheck.valid) {
+          return res.status(400).json({ error: `Invalid cognitive demand distribution: ${distributionCheck.error}` });
+        }
+      }
+
+      const isSourceGrounded = resolveGenerationStrategy({ generationMode }) === 'SOURCE_GROUNDED';
+      const effectivePlanType = await resolveUserEffectivePlanType(req.user);
+
       // Source-Grounded AI Question Generation — feature-flag + tenant-
-      // ownership validation. This check is inline (not static route
-      // middleware) because it depends on request-body content
-      // (generationMode), matching the same productModule branching
-      // pattern used for isJuniorGeneration above. Shared by STANDARD and
-      // WIZKIDS productModule alike (master prompt §32-34).
+      // ownership validation. This check is inline because it depends on
+      // request-body generationMode.
       let verifiedContextSourceIds = [];
       if (isSourceGrounded) {
         const capability = await resolveTenantFeature(req.user.tenantId, 'SOURCE_GROUNDED_GENERATION');
@@ -1293,26 +1311,54 @@ router.post(
           return res.status(403).json({ error: 'Source-Grounded AI generation is not enabled for this tenant.' });
         }
         const requestedSourceIds = Array.isArray(contextSourceIds) ? contextSourceIds : [];
-        if (requestedSourceIds.length === 0) {
-          return res.status(400).json({ error: 'At least one context source must be selected for Source-Grounded generation.' });
+        const requestedLibraryResourceIds = Array.isArray(libraryResourceIds) ? libraryResourceIds : [];
+        if (requestedSourceIds.length === 0 && requestedLibraryResourceIds.length === 0) {
+          return res.status(400).json({ error: 'At least one content library resource or source must be selected for Source-Grounded generation.' });
+        }
+        let resolvedFromLibrary = [];
+        if (requestedLibraryResourceIds.length) {
+          try {
+            resolvedFromLibrary = await resolveLibraryResourcesToContextSourceIds(req.user, requestedLibraryResourceIds);
+          } catch (resolveError) {
+            if (resolveError instanceof ContentLibraryError) {
+              return res.status(resolveError.status).json({ error: resolveError.message, code: resolveError.code });
+            }
+            throw resolveError;
+          }
+        }
+        const mergedSourceIds = [...new Set([...requestedSourceIds.map(String), ...resolvedFromLibrary.map(String)])];
+        if (mergedSourceIds.length > 10) {
+          return res.status(400).json({ error: 'At most 10 context sources may be selected for Source-Grounded generation.' });
         }
         // The exact tenant-isolation / IDOR guard: every requested source
         // ID must belong to THIS tenant and be READY. A cross-tenant or
         // unknown ID silently fails this count-equality check rather than
         // ever being fetched/compared after the fact.
-        const readyOwnedCount = await ContextSource.countDocuments(
+        const readyOwnedSources = await ContextSource.find(
           buildTenantOwnedSourceFilter({
             tenantId: req.user.tenantId,
-            sourceIds: requestedSourceIds,
+            sourceIds: mergedSourceIds,
             status: 'READY',
           })
-        );
-        if (readyOwnedCount !== requestedSourceIds.length) {
+        ).select('createdBy isLibraryItem visibility academicScope').lean();
+        if (readyOwnedSources.length !== mergedSourceIds.length) {
           return res.status(403).json({
             error: 'One or more selected sources are unavailable, still processing, or do not belong to this tenant.',
           });
         }
-        verifiedContextSourceIds = requestedSourceIds;
+        // Content Library authorization (Part S): a source another user
+        // uploaded must fall within this requester's own academic
+        // visibility (or be a SHARED, unscoped library item) — never
+        // trusted just because it passed the tenant/READY check above.
+        try {
+          await assertContentSourcesSelectable(req.user, readyOwnedSources);
+        } catch (scopeError) {
+          if (scopeError instanceof ContentLibraryError) {
+            return res.status(scopeError.status).json({ error: scopeError.message });
+          }
+          throw scopeError;
+        }
+        verifiedContextSourceIds = mergedSourceIds;
       }
 
       const normalizedDistribution = Array.isArray(questionTypeDistribution)
@@ -1356,23 +1402,7 @@ router.post(
           });
         }
       }
-      if (isJuniorGeneration && preparedJuniorContext?.interactionMode === 'FLASH_MATHS') {
-        const requestedFlashTypes = new Set([
-          ...normalizedRequestedTypes,
-          ...normalizedDistribution.map((item) => item.type),
-        ]);
-        if ([...requestedFlashTypes].some((type) => type !== 'NUMBER')) {
-          return res.status(400).json({ error: 'Flash Maths generation supports deterministic NUMBER rounds only.' });
-        }
-      }
-      if (isJuniorGeneration && normalizedRequestedTypes.includes('NUMBER') && normalizedRequestedTypes.length > 1 && normalizedDistribution.length === 0) {
-        return res.status(400).json({ error: 'A questionTypeDistribution is required when NUMBER is mixed with other Junior AI question types.' });
-      }
-      const deterministicNumberCount = isJuniorGeneration
-        ? (normalizedDistribution.find((item) => item.type === 'NUMBER')?.count ||
-          (normalizedRequestedTypes.length === 1 && normalizedRequestedTypes[0] === 'NUMBER' ? toNonNegativeInt(count, 0) : 0))
-        : 0;
-      const providerQuestionCount = Math.max(0, toNonNegativeInt(count, 0) - deterministicNumberCount);
+      const providerQuestionCount = toNonNegativeInt(count, 0);
 
       // AI-generated image questions — platform-wide kill switch (master
       // prompt §36-37, Rule 10). Checked for EVERY plan, not only free:
@@ -1487,23 +1517,8 @@ router.post(
         generatedAt: new Date(),
       };
 
-      const deterministicQuestions = deterministicNumberCount > 0
-        ? generateJuniorDeterministicNumberQuestions({
-          count: deterministicNumberCount,
-          difficulty,
-          juniorContext: preparedJuniorContext,
-          topic,
-          seedBase: `${tenantId}:${req.user?._id}:${Date.now()}`,
-        })
-        : [];
-      const providerTypes = normalizedRequestedTypes.filter((type) => type !== 'NUMBER');
-      const providerDistribution = normalizedDistribution.filter((item) => item.type !== 'NUMBER');
-
-      // Source-Grounded AI Question Generation — shared entry point for
-      // BOTH productModule STANDARD and WIZKIDS (master prompt §32-34: one
-      // pipeline, not a parallel WizKids-only implementation). Never falls
-      // through to generateQuestions()'s unconstrained/general-knowledge
-      // path below.
+      // Source-grounded generation never falls through to the unconstrained
+      // general-knowledge path below.
       let providerQuestions = [];
       let sourceGroundedRun = null;
       let sourceGroundedDiagnostics = null;
@@ -1512,7 +1527,6 @@ router.post(
           tenantId,
           userId: req.user._id,
           generationMode: 'SOURCE_GROUNDED',
-          productModule: isJuniorGeneration ? 'WIZKIDS' : 'STANDARD',
           contextSetId: contextSetId || null,
           requestedSourceIds: verifiedContextSourceIds,
           requestedCount: providerQuestionCount,
@@ -1533,14 +1547,11 @@ router.post(
             // field.
             instructions: instructions || examDescription || '',
             difficulty,
-            questionTypes: isJuniorGeneration ? providerTypes : normalizedRequestedTypes,
-            questionTypeDistribution: isJuniorGeneration
-              ? providerDistribution
-              : normalizedDistribution,
+            questionTypes: normalizedRequestedTypes,
+            questionTypeDistribution: normalizedDistribution,
             targetCount: providerQuestionCount,
             examTitle,
             examDescription,
-            juniorContext: preparedJuniorContext,
           });
 
           providerQuestions = result.questions;
@@ -1602,10 +1613,8 @@ router.post(
           topic,
           count: providerQuestionCount,
           difficulty,
-          questionTypes: isJuniorGeneration ? providerTypes : normalizedRequestedTypes,
-          questionTypeDistribution: isJuniorGeneration
-            ? providerDistribution
-            : (normalizedDistribution.length ? normalizedDistribution : undefined),
+          questionTypes: normalizedRequestedTypes,
+          questionTypeDistribution: normalizedDistribution.length ? normalizedDistribution : undefined,
           questionSorting,
           questionSortPattern: Array.isArray(questionSortPattern) ? questionSortPattern : undefined,
           duration,
@@ -1622,15 +1631,31 @@ router.post(
           scenarioQuestionTypes: Array.isArray(scenarioQuestionTypes) ? scenarioQuestionTypes : undefined,
           imageQuestionMode,
           imageQuestionTypes: Array.isArray(imageQuestionTypes) ? imageQuestionTypes : [],
+          cognitiveDemandDistribution: effectiveCognitiveDemandDistribution,
+          cognitiveDemandMapping: effectiveCognitiveDemandMapping,
           tenantId,
           userId: req.user?._id || null,
           metadata: aiMetadata,
-          juniorContext: preparedJuniorContext,
           requireProviderExactDistribution: true,
         });
       }
-      const questions = [...deterministicQuestions, ...providerQuestions]
-        .map((question, index) => ({ ...question, order: index + 1 }));
+      // The application re-resolves policy server-side. AI receives/requested
+      // constraints, but never chooses governance rules itself.
+      const qualityGate = qualityGateQuestionsAgainstSpecification(
+        providerQuestions,
+        governedSpecification?.specification || null
+      );
+      // cognitiveDemand is always application-derived from bloomLevel + the
+      // resolved mapping here — never trusted from any AI-provided label
+      // (none of the prompts above even ask the model for cognitiveDemand
+      // directly, only bloomLevel). A question with no bloomLevel keeps
+      // cognitiveDemand: null rather than a guessed value.
+      const questions = qualityGate.accepted
+        .map((question, index) => ({
+          ...question,
+          order: index + 1,
+          cognitiveDemand: deriveCognitiveDemandFromBloom(question.bloomLevel, effectiveCognitiveDemandMapping),
+        }));
 
       // Requested-vs-generated distribution diagnostics: compares the exact
       // per-type counts the caller asked for against what actually came
@@ -1640,6 +1665,14 @@ router.post(
         normalizedDistribution.length ? normalizedDistribution : questionTypeDistribution,
         questions
       );
+      // Same idea for cognitive demand — never trust the aggregate count
+      // blindly; report target vs actual so the creator/UI can see it
+      // (Post-generation validation: "Do not trust the AI's label blindly").
+      const cognitiveDemandDiagnostics = computeCognitiveDemandDiagnostics({
+        targetDistribution: effectiveCognitiveDemandDistribution,
+        questions,
+        mapping: effectiveCognitiveDemandMapping,
+      });
 
       res.json({
         questions,
@@ -1648,6 +1681,9 @@ router.post(
         generatedDistribution: distributionDiagnostics.generated,
         totalQuestions: Array.isArray(questions) ? questions.length : 0,
         validationStatus: distributionDiagnostics.validationStatus,
+        cognitiveDemandDiagnostics,
+        qualityGate: { acceptedCount: questions.length, rejected: qualityGate.rejected },
+        ...(governedSpecification ? { resolvedSpecification: governedSpecification } : {}),
         ...(sourceGroundedDiagnostics ? { sourceGrounded: sourceGroundedDiagnostics } : {}),
       });
     } catch (error) {

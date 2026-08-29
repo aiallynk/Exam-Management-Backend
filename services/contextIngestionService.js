@@ -68,7 +68,7 @@ const getClientOrThrow = () => {
 // tracked in the shared AITokenUsage accounting collection (via
 // createTrackedEmbedding) so this feature never opens a separate/parallel
 // usage-accounting path.
-const embedTexts = async (texts, { tenantId, userId }) => {
+export const embedTexts = async (texts, { tenantId, userId }) => {
   const client = getClientOrThrow();
   const results = new Array(texts.length);
   let cursor = 0;
@@ -103,7 +103,7 @@ export const embedSingleText = async (text, { tenantId, userId }) => {
   return embedding;
 };
 
-const persistChunks = async ({ tenantId, contextSetId, sourceId, texts, embeddings }) => {
+export const persistChunks = async ({ tenantId, contextSetId, sourceId, texts, embeddings }) => {
   const docs = texts.map((text, index) => ({
     tenantId,
     contextSetId,
@@ -118,7 +118,7 @@ const persistChunks = async ({ tenantId, contextSetId, sourceId, texts, embeddin
   return docs.length;
 };
 
-const finalizeSourceSuccess = async (source, { extractedCharCount, chunkCount }) => {
+export const finalizeSourceSuccess = async (source, { extractedCharCount, chunkCount }) => {
   source.status = 'READY';
   source.extractedCharCount = extractedCharCount;
   source.chunkCount = chunkCount;
@@ -129,7 +129,7 @@ const finalizeSourceSuccess = async (source, { extractedCharCount, chunkCount })
   return source;
 };
 
-const finalizeSourceFailure = async (source, failureReason, errorCode = '') => {
+export const finalizeSourceFailure = async (source, failureReason, errorCode = '') => {
   source.status = 'FAILED';
   source.failureReason = String(failureReason || 'Processing failed.').slice(0, 500);
   source.errorCode = errorCode || '';
@@ -137,7 +137,12 @@ const finalizeSourceFailure = async (source, failureReason, errorCode = '') => {
   return source;
 };
 
+// A Content Library upload (contextSetId null — see ContextSource.js) is
+// not part of any one generation session, so the per-session 10-source cap
+// does not apply to it; it is still bounded by the existing tenant-wide
+// monthly enforceContextSourceLimit middleware, same as every other ingest.
 const ensureUnderSourceCap = async ({ tenantId, contextSetId }) => {
+  if (!contextSetId) return;
   const existingCount = await ContextSource.countDocuments({ tenantId, contextSetId });
   if (existingCount >= sourceGroundedConfig.MAX_CONTEXT_SOURCES_PER_SET) {
     throw new ContextIngestionError(
@@ -147,12 +152,25 @@ const ensureUnderSourceCap = async ({ tenantId, contextSetId }) => {
   }
 };
 
+// Content Library uploads (Part E) accept a broader file allowlist than the
+// existing per-generation upload — an unsupported-for-extraction type is
+// still stored (see finalizeSourceUnsupported below), never rejected.
+const UNSUPPORTED_FILE_TYPE_MESSAGE_PREFIX = 'Unsupported file type.';
+
+export const finalizeSourceUnsupported = async (source, message, errorCode = 'UNSUPPORTED_FOR_AI') => {
+  source.status = 'UNSUPPORTED_FOR_AI';
+  source.failureReason = String(message || 'AI indexing is not available for this file type.').slice(0, 500);
+  source.errorCode = errorCode;
+  await source.save();
+  return source;
+};
+
 /**
  * Ingests one uploaded file: parse -> chunk -> embed -> persist. Runs
  * fully synchronously; the caller's HTTP response IS the completion
  * signal (no polling endpoint in v1).
  */
-export const ingestFileSource = async ({ tenantId, userId, contextSetId, file }) => {
+export const ingestFileSource = async ({ tenantId, userId, contextSetId = null, file, libraryFields = null, skipEmbedding = false }) => {
   await ensureUnderSourceCap({ tenantId, contextSetId });
 
   const source = await ContextSource.create({
@@ -164,10 +182,11 @@ export const ingestFileSource = async ({ tenantId, userId, contextSetId, file })
     fileExtension: (file.originalname.match(/\.[^.]+$/)?.[0] || '').toLowerCase(),
     fileSizeBytes: file.size || file.buffer?.length || 0,
     status: 'PROCESSING',
+    ...(libraryFields || {}),
   });
 
   try {
-    const parsed = await parseQuestionImportFile(file);
+    const parsed = await parseQuestionImportFile(file, { tenantId });
     const text = String(parsed?.text || '').trim();
     if (!text) {
       await finalizeSourceFailure(source, 'No extractable text was found in this file.', 'SOURCE_EMPTY');
@@ -180,11 +199,29 @@ export const ingestFileSource = async ({ tenantId, userId, contextSetId, file })
       return source;
     }
 
+    // Content Library storage is decoupled from AI generation (Part P): a
+    // tenant without SOURCE_GROUNDED_GENERATION can still store/organize
+    // this file — the original is already safely in S3 by this point
+    // (see contentLibraryService.js#uploadContentLibraryFile) — it is just
+    // never embedded/indexed for AI retrieval.
+    if (skipEmbedding) {
+      source.extractionMethod = parsed?.extractionMethod || 'text';
+      source.extractedCharCount = text.length;
+      return finalizeSourceUnsupported(
+        source,
+        'AI indexing is not enabled for this tenant. This file is stored for reference only.',
+        'AI_GENERATION_NOT_ENABLED'
+      );
+    }
+
     const embeddings = await embedTexts(chunks, { tenantId, userId });
     await persistChunks({ tenantId, contextSetId, sourceId: source._id, texts: chunks, embeddings });
     source.extractionMethod = parsed?.extractionMethod || 'text';
     return finalizeSourceSuccess(source, { extractedCharCount: text.length, chunkCount: chunks.length });
   } catch (error) {
+    if (libraryFields && String(error?.message || '').startsWith(UNSUPPORTED_FILE_TYPE_MESSAGE_PREFIX)) {
+      return finalizeSourceUnsupported(source, error.message);
+    }
     await finalizeSourceFailure(source, error?.message || 'Failed to process this file.', 'SOURCE_EXTRACTION_FAILED');
     return source;
   }
@@ -195,7 +232,7 @@ export const ingestFileSource = async ({ tenantId, userId, contextSetId, file })
  * persist. The returned text IS the immutable snapshot generation will
  * ever read from (master prompt §9 — generation never re-fetches live).
  */
-export const ingestUrlSource = async ({ tenantId, userId, contextSetId, url }) => {
+export const ingestUrlSource = async ({ tenantId, userId, contextSetId = null, url, libraryFields = null, skipEmbedding = false }) => {
   await ensureUnderSourceCap({ tenantId, contextSetId });
 
   const source = await ContextSource.create({
@@ -205,6 +242,7 @@ export const ingestUrlSource = async ({ tenantId, userId, contextSetId, url }) =
     sourceType: 'URL',
     sourceUrl: url,
     status: 'PROCESSING',
+    ...(libraryFields || {}),
   });
 
   let extractionAttempted = false;
@@ -214,7 +252,7 @@ export const ingestUrlSource = async ({ tenantId, userId, contextSetId, url }) =
     source.resolvedIp = fetched.resolvedIp;
     source.fetchedAt = new Date();
     source.httpStatus = fetched.httpStatus;
-    source.contentType = fetched.contentType;
+    source.httpContentType = fetched.contentType;
     source.sourceProvider = fetched.sourceProvider || 'WEB';
 
     let text;
@@ -228,11 +266,14 @@ export const ingestUrlSource = async ({ tenantId, userId, contextSetId, url }) =
       source.originalFilename = fetched.filename;
       source.extractionMethod = 'file-pipeline';
       extractionAttempted = true;
-      const parsed = await parseQuestionImportFile({
-        originalname: fetched.filename,
-        buffer: fetched.buffer,
-        size: fetched.buffer.length,
-      });
+      const parsed = await parseQuestionImportFile(
+        {
+          originalname: fetched.filename,
+          buffer: fetched.buffer,
+          size: fetched.buffer.length,
+        },
+        { tenantId }
+      );
       text = String(parsed?.text || '').trim();
     } else {
       source.snapshotHash = fetched.snapshotHash;
@@ -251,10 +292,22 @@ export const ingestUrlSource = async ({ tenantId, userId, contextSetId, url }) =
       return source;
     }
 
+    if (skipEmbedding) {
+      source.extractedCharCount = text.length;
+      return finalizeSourceUnsupported(
+        source,
+        'AI indexing is not enabled for this tenant. This link is stored for reference only.',
+        'AI_GENERATION_NOT_ENABLED'
+      );
+    }
+
     const embeddings = await embedTexts(chunks, { tenantId, userId });
     await persistChunks({ tenantId, contextSetId, sourceId: source._id, texts: chunks, embeddings });
     return finalizeSourceSuccess(source, { extractedCharCount: text.length, chunkCount: chunks.length });
   } catch (error) {
+    if (libraryFields && !(error instanceof SecureUrlFetchError) && String(error?.message || '').startsWith(UNSUPPORTED_FILE_TYPE_MESSAGE_PREFIX)) {
+      return finalizeSourceUnsupported(source, error.message);
+    }
     const message =
       error instanceof SecureUrlFetchError
         ? error.message

@@ -104,7 +104,7 @@ describe('buildUserPrompt — topic is optional', () => {
 });
 
 describe('resolveGenerationStrategy', () => {
-  test('is keyed only on generationMode, sharing one pipeline for STANDARD and WIZKIDS productModule', () => {
+  test('is keyed only on generationMode', () => {
     assert.equal(resolveGenerationStrategy({ generationMode: 'SOURCE_GROUNDED' }), 'SOURCE_GROUNDED');
     assert.equal(resolveGenerationStrategy({ generationMode: 'source_grounded' }), 'SOURCE_GROUNDED');
     assert.equal(resolveGenerationStrategy({ generationMode: 'STANDARD' }), 'STANDARD');
