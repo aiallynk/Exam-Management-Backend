@@ -14,6 +14,7 @@
     "backfill:exam-packages": "node scripts/backfillExamPackages.js",
     "backfill:question-paper-questions": "node scripts/backfillQuestionPaperQuestions.js",
     "backup:worker": "node workers/backupWorker.js",
+    "knowledge:worker": "node workers/knowledgeWorker.js",
     "backup:migrate-legacy": "node scripts/migrateLegacyBackupsToS3.js",
     "migrate:source-grounded-indexes": "node scripts/migrateSourceGroundedIndexes.js",
     "backfill:historical-question-signatures": "node scripts/backfillHistoricalQuestionSignatures.js"

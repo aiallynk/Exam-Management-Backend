@@ -33,6 +33,7 @@ const reserveAlways = async ({ question }) => ({
   nearSignature: `near-${question.questionText}`,
   blueprintSignature: `blueprint-${question.questionText}`,
 });
+const alwaysAllowMemory = async () => ({ decision: 'ALLOW', outcomes: [], fingerprint: {}, novelty: { likelyDuplicate: false } });
 const distinctBatchTracker = () => ({
   isDuplicate: () => false,
   record: () => {},
@@ -82,6 +83,7 @@ describe('Source-Grounded exact question-type distribution', () => {
       groundingFn: alwaysGrounded,
       noveltyProbeFn: alwaysNovel,
       noveltyReserveFn: reserveAlways,
+      memoryPolicyFn: alwaysAllowMemory,
       batchTrackerFactory: distinctBatchTracker,
     });
 
@@ -120,6 +122,7 @@ describe('Source-Grounded exact question-type distribution', () => {
       groundingFn: alwaysGrounded,
       noveltyProbeFn: alwaysNovel,
       noveltyReserveFn: reserveAlways,
+      memoryPolicyFn: alwaysAllowMemory,
       batchTrackerFactory: distinctBatchTracker,
     });
 

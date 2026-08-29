@@ -20,6 +20,7 @@ import {
   getOrCreateContextSet,
 } from '../services/contextIngestionService.js';
 import { generateWithNoveltyAndGrounding } from '../services/candidatePoolOrchestratorService.js';
+import { mapFrameworkMemoryPolicy } from '../services/questionMemoryService.js';
 import { buildTenantOwnedSourceFilter } from '../services/contextRetrievalService.js';
 import { assertContentSourcesSelectable, ContentLibraryError } from '../services/contentLibraryService.js';
 import { resolveLibraryResourcesToContextSourceIds } from '../services/libraryResourceService.js';
@@ -1570,17 +1571,16 @@ router.post(
         });
 
         try {
+          const memoryPolicy = governedSpecification?.specification?.rules?.memory
+            ? mapFrameworkMemoryPolicy(governedSpecification.specification.rules.memory)
+            : null;
+
           const result = await generateWithNoveltyAndGrounding({
             tenantId,
             userId: req.user._id,
             generationRunId: sourceGroundedRun._id,
             sourceIds: verifiedContextSourceIds,
             topic,
-            // Prefer the dedicated "Instructions for AI" field (distinct
-            // from Topic — master prompt §16/§63: Topic is WHAT to focus
-            // on, Instructions is HOW to construct the questions); fall
-            // back to examDescription for older callers that predate this
-            // field.
             instructions: instructions || examDescription || '',
             difficulty,
             questionTypes: normalizedRequestedTypes,
@@ -1588,6 +1588,7 @@ router.post(
             targetCount: providerQuestionCount,
             examTitle,
             examDescription,
+            memoryPolicy,
           });
 
           providerQuestions = result.questions;

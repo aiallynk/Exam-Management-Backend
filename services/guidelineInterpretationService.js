@@ -6,7 +6,7 @@ import { AI_OPERATIONS } from './aiEngine/aiOperations.js';
 import { resolveTenantFeature } from './tenantFeatureService.js';
 import { dispatchJob, JOB_TYPES } from './jobs/jobDispatcherService.js';
 import { parseQuestionImportFile } from './questionImportImageService.js';
-import { putPrivateObject, isS3Configured } from './storage/imageStorage.js';
+import { putPrivateObject, isS3Configured, getPrivateObjectBuffer } from './storage/imageStorage.js';
 import { logError } from '../utils/logger.js';
 
 export class GuidelineError extends Error {
@@ -66,6 +66,81 @@ const validateProposal = (proposal) => {
   return rules;
 };
 
+const runInterpretation = async ({ doc, tenantId, userId, text, onProgress = async () => {} }) => {
+  await onProgress(40, 'Identifying assessment rules');
+  const completion = await runEngineChatCompletion({
+    operation: AI_OPERATIONS.GUIDELINE_INTERPRETATION,
+    tenantId,
+    userId,
+    feature: 'guideline_interpretation',
+    request: {
+      temperature: 0.1,
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: GUIDELINE_SYSTEM_PROMPT },
+        { role: 'user', content: text },
+      ],
+    },
+  });
+  await onProgress(75, 'Building blueprint');
+  const proposal = parseProposal(completion?.choices?.[0]?.message?.content);
+  const rules = validateProposal(proposal);
+  doc.extractedText = text;
+  doc.proposal = { ...proposal, rules };
+  doc.proposalConfidence = proposal.evidence || {};
+  doc.sourceEvidence = Array.isArray(proposal.evidence) ? proposal.evidence : [];
+  doc.aiOperationMetadata = {
+    operation: AI_OPERATIONS.GUIDELINE_INTERPRETATION,
+    model: completion?.model || null,
+    usage: completion?.usage || null,
+  };
+  doc.status = 'READY_FOR_REVIEW';
+  await doc.save();
+  await onProgress(100, 'Ready for review');
+  return { guidelineDocumentId: doc._id, status: doc.status };
+};
+
+export const interpretGuidelineDocument = async ({ tenantId, userId, guidelineDocumentId, onProgress = async () => {} }) => {
+  const doc = await GuidelineDocument.findOne({ _id: guidelineDocumentId, tenantId });
+  if (!doc) throw new GuidelineError(404, 'Guideline document not found.', 'NOT_FOUND');
+
+  let text = String(doc.extractedText || doc.rawText || '').trim();
+  if (!text && doc.originalObject?.key) {
+    await onProgress(15, 'Reading document');
+    doc.status = 'EXTRACTING';
+    await doc.save();
+    const buffer = await getPrivateObjectBuffer({ key: doc.originalObject.key });
+    const file = {
+      originalname: doc.title || 'guideline.pdf',
+      buffer,
+      size: buffer.length,
+      mimetype: doc.originalObject.mimeType || 'application/pdf',
+    };
+    const parsed = await parseQuestionImportFile(file, { tenantId });
+    text = String(parsed?.text || '').trim();
+    if (!text) {
+      doc.status = 'FAILED';
+      doc.failureReason = 'No extractable text found in guideline document.';
+      await doc.save();
+      return { guidelineDocumentId: doc._id, status: doc.status };
+    }
+    doc.extractedText = text;
+    doc.status = 'INTERPRETING';
+    await doc.save();
+  }
+
+  if (!text) {
+    doc.status = 'FAILED';
+    doc.failureReason = 'No guideline text available for interpretation.';
+    await doc.save();
+    return { guidelineDocumentId: doc._id, status: doc.status };
+  }
+
+  doc.status = 'INTERPRETING';
+  await doc.save();
+  return runInterpretation({ doc, tenantId, userId, text, onProgress });
+};
+
 export const interpretGuidelineText = async ({ tenantId, userId, text, title = '' }) => {
   await assertGuidelineAiEnabled(tenantId);
   const doc = await GuidelineDocument.create({
@@ -74,46 +149,15 @@ export const interpretGuidelineText = async ({ tenantId, userId, text, title = '
     inputType: text.length > 500 ? 'PASTE' : 'DESCRIPTION',
     title: title || 'Guideline',
     rawText: text,
+    extractedText: text,
     status: 'INTERPRETING',
   });
-
-  const handler = async () => {
-    const completion = await runEngineChatCompletion({
-      operation: AI_OPERATIONS.GUIDELINE_INTERPRETATION,
-      tenantId,
-      userId,
-      feature: 'guideline_interpretation',
-      request: {
-        temperature: 0.1,
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: GUIDELINE_SYSTEM_PROMPT },
-          { role: 'user', content: text },
-        ],
-      },
-    });
-    const proposal = parseProposal(completion?.choices?.[0]?.message?.content);
-    const rules = validateProposal(proposal);
-    doc.extractedText = text;
-    doc.proposal = { ...proposal, rules };
-    doc.proposalConfidence = proposal.evidence || {};
-    doc.sourceEvidence = Array.isArray(proposal.evidence) ? proposal.evidence : [];
-    doc.aiOperationMetadata = {
-      operation: AI_OPERATIONS.GUIDELINE_INTERPRETATION,
-      model: completion?.model || null,
-      usage: completion?.usage || null,
-    };
-    doc.status = 'READY_FOR_REVIEW';
-    await doc.save();
-    return { guidelineDocumentId: doc._id, status: doc.status };
-  };
 
   const job = await dispatchJob({
     jobType: JOB_TYPES.GUIDELINE_INTERPRETATION,
     tenantId,
     correlationId: String(doc._id),
-    payload: { guidelineDocumentId: doc._id },
-    handler,
+    payload: { tenantId, userId, guidelineDocumentId: doc._id },
   });
   doc.jobId = job.jobId;
   await doc.save();
@@ -147,56 +191,11 @@ export const interpretGuidelineFile = async ({ tenantId, userId, file, title = '
     await doc.save();
   }
 
-  const handler = async () => {
-    doc.status = 'EXTRACTING';
-    await doc.save();
-    const parsed = await parseQuestionImportFile(file, { tenantId });
-    const text = String(parsed?.text || '').trim();
-    if (!text) {
-      doc.status = 'FAILED';
-      doc.failureReason = 'No extractable text found in guideline document.';
-      await doc.save();
-      return { guidelineDocumentId: doc._id, status: doc.status };
-    }
-    doc.extractedText = text;
-    doc.status = 'INTERPRETING';
-    await doc.save();
-
-    const completion = await runEngineChatCompletion({
-      operation: AI_OPERATIONS.GUIDELINE_INTERPRETATION,
-      tenantId,
-      userId,
-      feature: 'guideline_interpretation',
-      request: {
-        temperature: 0.1,
-        response_format: { type: 'json_object' },
-        messages: [
-          { role: 'system', content: GUIDELINE_SYSTEM_PROMPT },
-          { role: 'user', content: text },
-        ],
-      },
-    });
-    const proposal = parseProposal(completion?.choices?.[0]?.message?.content);
-    const rules = validateProposal(proposal);
-    doc.proposal = { ...proposal, rules };
-    doc.proposalConfidence = proposal.evidence || {};
-    doc.sourceEvidence = Array.isArray(proposal.evidence) ? proposal.evidence : [];
-    doc.aiOperationMetadata = {
-      operation: AI_OPERATIONS.GUIDELINE_INTERPRETATION,
-      model: completion?.model || null,
-      usage: completion?.usage || null,
-    };
-    doc.status = 'READY_FOR_REVIEW';
-    await doc.save();
-    return { guidelineDocumentId: doc._id, status: doc.status };
-  };
-
   const job = await dispatchJob({
     jobType: JOB_TYPES.GUIDELINE_INGESTION,
     tenantId,
     correlationId: String(doc._id),
-    payload: { guidelineDocumentId: doc._id },
-    handler,
+    payload: { tenantId, userId, guidelineDocumentId: doc._id },
   });
   doc.jobId = job.jobId;
   await doc.save();

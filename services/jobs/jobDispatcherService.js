@@ -1,6 +1,8 @@
 import IORedis from 'ioredis';
 import { Queue } from 'bullmq';
 import { logError } from '../../utils/logger.js';
+import { executeKnowledgeJob } from './knowledgeJobHandlers.js';
+import { saveJobStatus, getJobStatusRecord } from './jobStatusService.js';
 
 export const JOB_TYPES = Object.freeze({
   CONTENT_INGESTION: 'CONTENT_INGESTION',
@@ -23,8 +25,8 @@ export const QUEUE_MODE = Object.freeze({
   UNAVAILABLE: 'UNAVAILABLE',
 });
 
-const QUEUE_NAME = 'xamigo-knowledge-jobs';
-const inProcessJobs = new Map();
+export const QUEUE_NAME = 'xamigo-knowledge-jobs';
+
 let connection = null;
 let queue = null;
 
@@ -34,6 +36,20 @@ export const getQueueMode = () => {
   if (getRedisUrl()) return QUEUE_MODE.DURABLE_QUEUE;
   if (process.env.NODE_ENV === 'production') return QUEUE_MODE.UNAVAILABLE;
   return QUEUE_MODE.IN_PROCESS_FALLBACK;
+};
+
+export const getQueueHealth = async () => {
+  const mode = getQueueMode();
+  if (mode === QUEUE_MODE.UNAVAILABLE) return { status: 'UNAVAILABLE', mode, reason: 'Redis not configured in production' };
+  if (mode === QUEUE_MODE.IN_PROCESS_FALLBACK) return { status: 'DEGRADED', mode, reason: 'In-process fallback (development only)' };
+  try {
+    const q = getQueue();
+    if (!q) return { status: 'UNAVAILABLE', mode, reason: 'Queue not initialized' };
+    const counts = await q.getJobCounts('waiting', 'active', 'failed', 'completed');
+    return { status: 'HEALTHY', mode, counts };
+  } catch (error) {
+    return { status: 'DEGRADED', mode, reason: error.message };
+  }
 };
 
 const getConnection = () => {
@@ -63,19 +79,7 @@ const getQueue = () => {
   return queue;
 };
 
-const buildJobRecord = ({ jobId, jobType, tenantId, correlationId, status, progress = 0, result = null, error = null }) => ({
-  jobId,
-  jobType,
-  tenantId: tenantId ? String(tenantId) : null,
-  correlationId: correlationId || jobId,
-  status,
-  progress,
-  result,
-  error,
-  updatedAt: new Date().toISOString(),
-});
-
-export const dispatchJob = async ({ jobType, tenantId, correlationId, payload = {}, handler }) => {
+export const dispatchJob = async ({ jobType, tenantId, correlationId, payload = {} }) => {
   const mode = getQueueMode();
   const jobId = `${jobType}:${correlationId || Date.now()}`;
 
@@ -83,7 +87,7 @@ export const dispatchJob = async ({ jobType, tenantId, correlationId, payload = 
     const q = getQueue();
     if (!q) throw new Error('Durable job queue is not available.');
     await q.add(jobType, { tenantId, correlationId, payload }, { jobId });
-    inProcessJobs.set(jobId, buildJobRecord({ jobId, jobType, tenantId, correlationId, status: 'QUEUED' }));
+    await saveJobStatus(jobId, { jobType, tenantId, correlationId, status: 'QUEUED', progress: 0 });
     return { jobId, mode, status: 'QUEUED' };
   }
 
@@ -91,20 +95,20 @@ export const dispatchJob = async ({ jobType, tenantId, correlationId, payload = 
     throw new Error('Durable job processing is required in production but Redis is not configured.');
   }
 
-  inProcessJobs.set(jobId, buildJobRecord({ jobId, jobType, tenantId, correlationId, status: 'PROCESSING', progress: 0 }));
+  await saveJobStatus(jobId, { jobType, tenantId, correlationId, status: 'PROCESSING', progress: 0 });
   setImmediate(async () => {
     try {
-      const result = await handler(payload);
-      inProcessJobs.set(jobId, buildJobRecord({ jobId, jobType, tenantId, correlationId, status: 'COMPLETED', progress: 100, result }));
+      const result = await executeKnowledgeJob(jobType, { tenantId, correlationId, payload, job: { id: jobId } });
+      await saveJobStatus(jobId, { jobType, tenantId, correlationId, status: 'COMPLETED', progress: 100, result });
     } catch (error) {
       logError(error, { context: 'jobDispatcherService.inProcess', jobType, jobId, tenantId });
-      inProcessJobs.set(jobId, buildJobRecord({ jobId, jobType, tenantId, correlationId, status: 'FAILED', error: error.message }));
+      await saveJobStatus(jobId, { jobType, tenantId, correlationId, status: 'FAILED', error: error.message, code: error.code || null });
     }
   });
   return { jobId, mode, status: 'PROCESSING' };
 };
 
-export const getJobStatus = (jobId) => inProcessJobs.get(jobId) || null;
+export const getJobStatus = async (jobId) => getJobStatusRecord(jobId);
 
 export const closeJobDispatcher = async () => {
   if (queue) await queue.close();

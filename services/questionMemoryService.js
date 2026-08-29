@@ -71,10 +71,11 @@ export const evaluateQuestionRepeatPolicy = async ({
   tenantId,
   question,
   blueprint = null,
+  userId = null,
   policy = { exact: REPEAT_POLICIES.BLOCK, semantic: REPEAT_POLICIES.WARN, recentUsage: REPEAT_POLICIES.WARN },
 }) => {
   const novelty = await probeNovelty({ tenantId, question, blueprint });
-  const fingerprint = await buildQuestionFingerprint({ tenantId, question });
+  const fingerprint = await buildQuestionFingerprint({ tenantId, question, userId });
 
   const outcomes = [];
   if (novelty.collision?.layer === 'EXACT') outcomes.push({ layer: 'EXACT', policy: policy.exact, detail: novelty.collision });
@@ -111,3 +112,19 @@ export const onQuestionPublished = async ({ tenantId, questionId, questionVersio
 };
 
 export { SIGNAL_TYPES };
+
+export const indexQuestionMemory = async ({ tenantId, userId, questionId, questionVersionId, questionText, questionType, difficulty }) => {
+  const { recordQuestionEmbedding, recordQuestionVersionEmbedding } = await import('./questionEmbeddingService.js');
+  if (questionVersionId) {
+    await recordQuestionVersionEmbedding({ tenantId, questionVersionId, questionText, questionType, difficulty, userId });
+  } else if (questionId) {
+    await recordQuestionEmbedding({ tenantId, questionId, questionText, questionType, difficulty, userId });
+  }
+  return { indexed: true, questionId, questionVersionId };
+};
+
+export const mapFrameworkMemoryPolicy = (memoryRules = {}) => {
+  const action = String(memoryRules.action || 'WARN').toUpperCase();
+  const mapped = action === 'BLOCK' ? REPEAT_POLICIES.BLOCK : action === 'REGENERATE' ? REPEAT_POLICIES.REGENERATE : action === 'ALLOW' ? REPEAT_POLICIES.ALLOW : REPEAT_POLICIES.WARN;
+  return { exact: mapped, semantic: mapped, recentUsage: mapped };
+};

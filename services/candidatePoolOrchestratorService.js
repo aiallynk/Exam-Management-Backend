@@ -2,6 +2,7 @@ import sourceGroundedConfig from '../config/sourceGroundedConfig.js';
 import { generateGroundedCandidates } from './groundedGenerationService.js';
 import { isQuestionGrounded } from './groundingValidatorService.js';
 import { createBatchNoveltyTracker, probeNovelty, reserveNovelty } from './noveltyService.js';
+import { evaluateQuestionRepeatPolicy, REPEAT_POLICIES, recordQuestionIntelligenceSignal, SIGNAL_TYPES } from './questionMemoryService.js';
 import { normalizeQuestionType } from '../utils/questionTypeRegistry.js';
 
 // Source-Grounded AI Question Generation — the candidate-pool pipeline
@@ -16,6 +17,8 @@ const REJECTION_REASONS = Object.freeze({
   NOT_GROUNDED: 'NOT_GROUNDED',
   DUPLICATE_BATCH: 'DUPLICATE_BATCH',
   DUPLICATE_NOVELTY: 'DUPLICATE_NOVELTY',
+  MEMORY_BLOCKED: 'MEMORY_BLOCKED',
+  MEMORY_REGENERATE: 'MEMORY_REGENERATE',
 });
 
 const bumpReason = (reasons, key) => {
@@ -69,7 +72,10 @@ export const generateWithNoveltyAndGrounding = async ({
   groundingFn = isQuestionGrounded,
   noveltyProbeFn = probeNovelty,
   noveltyReserveFn = reserveNovelty,
+  memoryPolicyFn = evaluateQuestionRepeatPolicy,
   batchTrackerFactory = createBatchNoveltyTracker,
+  memoryPolicy = null,
+  maxMemoryRegenerations = 2,
 }) => {
   const accepted = [];
   const acceptedByType = {};
@@ -93,6 +99,13 @@ export const generateWithNoveltyAndGrounding = async ({
   // broadly, instead of repeating the exact same request and getting the
   // same refusal again.
   let broadenFocus = false;
+  let memoryRegenerationBudget = maxMemoryRegenerations;
+
+  const resolvedMemoryPolicy = memoryPolicy || {
+    exact: REPEAT_POLICIES.BLOCK,
+    semantic: REPEAT_POLICIES.WARN,
+    recentUsage: REPEAT_POLICIES.REGENERATE,
+  };
 
   while (
     accepted.length < effectiveTargetCount &&
@@ -197,6 +210,38 @@ export const generateWithNoveltyAndGrounding = async ({
         difficulty,
       };
 
+      const memoryCheck = await memoryPolicyFn({
+        tenantId,
+        question: candidate,
+        blueprint,
+        policy: resolvedMemoryPolicy,
+        userId,
+      });
+
+      if (memoryCheck.decision === REPEAT_POLICIES.BLOCK) {
+        bumpReason(rejectionReasons, REJECTION_REASONS.MEMORY_BLOCKED);
+        await recordQuestionIntelligenceSignal({
+          tenantId,
+          signalType: SIGNAL_TYPES.QUESTION_REJECTED,
+          metadata: { reason: 'MEMORY_BLOCK', outcomes: memoryCheck.outcomes },
+        });
+        continue;
+      }
+
+      if (memoryCheck.decision === REPEAT_POLICIES.REGENERATE) {
+        bumpReason(rejectionReasons, REJECTION_REASONS.MEMORY_REGENERATE);
+        memoryRegenerationBudget -= 1;
+        await recordQuestionIntelligenceSignal({
+          tenantId,
+          signalType: SIGNAL_TYPES.QUESTION_REGENERATED,
+          metadata: { reason: 'MEMORY_REGENERATE', outcomes: memoryCheck.outcomes },
+        });
+        if (memoryRegenerationBudget <= 0) {
+          bumpReason(rejectionReasons, REJECTION_REASONS.MEMORY_BLOCKED);
+        }
+        continue;
+      }
+
       const probe = await noveltyProbeFn({ tenantId, question: candidate, blueprint });
       if (probe.likelyDuplicate) {
         bumpReason(rejectionReasons, REJECTION_REASONS.DUPLICATE_NOVELTY);
@@ -217,6 +262,8 @@ export const generateWithNoveltyAndGrounding = async ({
         provenance: {
           ...candidate.provenance,
           generationRunId,
+          memoryDecision: memoryCheck.decision,
+          memoryWarnings: memoryCheck.decision === REPEAT_POLICIES.WARN ? memoryCheck.outcomes : undefined,
           noveltySignatures: {
             exact: reservation.exactSignature,
             near: reservation.nearSignature,

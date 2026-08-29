@@ -2,7 +2,7 @@ import { embedSingleText } from './contextIngestionService.js';
 import { retrieveGroundingChunks } from './contextRetrievalService.js';
 import { vectorSearchContextChunks } from './contextVectorSearchService.js';
 import { resolveLibraryResourcesToContextSourceIds } from './libraryResourceService.js';
-import { listEligibleAutoContextResources } from './knowledgeMemoryService.js';
+import { listEligibleAutoContextResources, previewAutoContextResources } from './knowledgeMemoryService.js';
 import { resolveAcademicVisibility } from './academicAccessService.js';
 import sourceGroundedConfig from '../config/sourceGroundedConfig.js';
 import { buildQueryText } from './groundedGenerationService.js';
@@ -136,7 +136,11 @@ export const buildGenerationContext = async ({
     });
   }
 
-  if (!retrievedChunks.length && (mode === CONTEXT_MODES.STRICT_SOURCE || mode === CONTEXT_MODES.SELECTED_CONTEXT)) {
+  if (!retrievedChunks.length && mode === CONTEXT_MODES.STRICT_SOURCE) {
+    throw new InsufficientContextError('Insufficient relevant institution material for Strict Source Only generation.', 'INSUFFICIENT_SOURCE_CONTEXT');
+  }
+
+  if (!retrievedChunks.length && mode === CONTEXT_MODES.SELECTED_CONTEXT) {
     throw new InsufficientContextError('Insufficient source material was retrieved for generation.', 'INSUFFICIENT_SOURCE_MATERIAL');
   }
 
@@ -150,8 +154,14 @@ export const buildGenerationContext = async ({
       chunkIndex: index + 1,
       sourceId: chunk.sourceId,
       libraryResourceId: chunk.libraryResourceId || null,
-      similarity: chunk.similarity ?? null,
       textPreview: String(chunk.text || '').slice(0, 200),
     })),
+    previewResources: await previewAutoContextResources({
+      tenantId: visibility.tenantId,
+      user: { ...user, visibilityRecord: visibility },
+      academicContext,
+      topic,
+      courseId: academicContext?.courseId,
+    }),
   };
 };
