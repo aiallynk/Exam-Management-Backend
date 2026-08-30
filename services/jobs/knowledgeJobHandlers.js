@@ -30,6 +30,7 @@ export const executeKnowledgeJob = async (jobType, { tenantId, correlationId, pa
         userId: payload.userId,
         sourceId: payload.sourceId,
         resourceId: payload.resourceId || null,
+        jobId,
         onProgress: progress,
       });
       return result;

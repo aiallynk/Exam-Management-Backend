@@ -18,7 +18,7 @@ const ContextChunkSchema = new mongoose.Schema(
     contextSetId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'ContextSet',
-      required: true,
+      default: null,
       index: true,
     },
     sourceId: {
@@ -41,6 +41,14 @@ const ContextChunkSchema = new mongoose.Schema(
       required: true,
       min: 0,
     },
+    contentHash: {
+      type: String,
+      trim: true,
+      default: '',
+      index: true,
+    },
+    sectionTitle: { type: String, trim: true, default: '' },
+    sectionLevel: { type: String, enum: ['RESOURCE', 'SECTION', 'CHUNK'], default: 'CHUNK' },
     // Plain array, not a typed vector — no Atlas Search index depends on
     // this field's shape, so a plain [Number] keeps this portable across
     // any Mongo deployment.
@@ -62,6 +70,6 @@ const ContextChunkSchema = new mongoose.Schema(
 
 // Covers the retrieval query directly: { tenantId, sourceId: { $in: [...] } }.
 ContextChunkSchema.index({ tenantId: 1, sourceId: 1, chunkIndex: 1 }, { unique: true });
-ContextChunkSchema.index({ tenantId: 1, contextSetId: 1 });
+ContextChunkSchema.index({ tenantId: 1, sourceId: 1, contentHash: 1 });
 
 export default mongoose.model('ContextChunk', ContextChunkSchema);

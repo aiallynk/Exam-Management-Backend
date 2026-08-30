@@ -507,14 +507,12 @@ router.get('/:sessionId/candidates', requireAuth, requireTenant, enforceTenantBo
           examAssigned: true,
         }));
       } else {
+        // V2 candidate listing uses exam participants / enrollments, not legacy SubTenant.
         const userQuery = {
           role: 'CANDIDATE',
           tenantId: session.tenantId,
           status: 'ACTIVE',
         };
-        if (session.examId?.subTenantId) {
-          userQuery.subTenantId = session.examId.subTenantId;
-        }
         const users = await User.find(userQuery)
           .select('name email profileImage createdAt')
           .lean();

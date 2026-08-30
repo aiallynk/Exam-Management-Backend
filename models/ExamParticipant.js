@@ -79,6 +79,15 @@ const ExamParticipantSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Tenant',
     },
+    // Frozen at exam-roster assignment for offline script mapping integrity.
+    candidateIdentitySnapshot: {
+      displayName: { type: String, trim: true, default: '' },
+      rollNumber: { type: String, trim: true, default: '' },
+      externalStudentId: { type: String, trim: true, default: '' },
+      enrollmentId: { type: mongoose.Schema.Types.ObjectId, ref: 'Enrollment', default: null },
+      academicSectionId: { type: mongoose.Schema.Types.ObjectId, ref: 'AcademicSection', default: null },
+      capturedAt: { type: Date, default: null },
+    },
   },
   {
     timestamps: true,

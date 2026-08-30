@@ -85,6 +85,9 @@ export const routeAndEvaluate = async ({ question, extractedText, extractionConf
         userId,
         metadata: { source: 'offline_answer_script', examId, answerScriptId },
       });
+      if (aiResult?.provider === 'fallback' && aiResult?.fallbackReason === 'OPENAI_EVALUATION_ERROR') {
+        throw Object.assign(new Error('The configured AI evaluation provider failed temporarily.'), { code: 'AI_PROVIDER_TRANSIENT' });
+      }
       const confidence = composeConfidence(baseConfidence, aiResult.confidence);
       return {
         evaluationMethod: 'AI_SEMANTIC',
@@ -98,7 +101,11 @@ export const routeAndEvaluate = async ({ question, extractedText, extractionConf
         reason: confidence < offlineEvaluationConfig.EVALUATION_MEDIUM_CONFIDENCE ? 'Combined OCR/mapping/AI confidence below the review threshold.' : '',
       };
     } catch (error) {
-      return { evaluationMethod: 'MANUAL_REQUIRED', isCorrect: false, pointsEarned: 0, confidence: 0, needsReview: true, reason: `AI evaluation failed: ${error.message}` };
+      if (error?.code === 'AI_PROVIDER_TRANSIENT') throw error;
+      if (/quota|429|rate-limit|rate limit/i.test(String(error?.message || ''))) {
+        throw Object.assign(new Error('The evaluation provider is temporarily rate-limited.'), { code: 'AI_PROVIDER_TRANSIENT' });
+      }
+      return { evaluationMethod: 'MANUAL_REQUIRED', isCorrect: false, pointsEarned: 0, confidence: 0, needsReview: true, reason: 'Subjective evaluation could not be completed automatically. An evaluator can mark this answer.' };
     }
   }
 

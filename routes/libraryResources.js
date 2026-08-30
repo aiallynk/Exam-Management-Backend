@@ -71,6 +71,7 @@ const createResourceValidators = [
   body('chapter').optional().isString().isLength({ max: 200 }),
   body('unit').optional().isString().isLength({ max: 200 }),
   body('topic').optional().isString().isLength({ max: 200 }),
+  body('tags').optional().custom((value) => Array.isArray(value) || typeof value === 'string'),
   body('metadata').optional().isObject(),
 ];
 
@@ -84,6 +85,7 @@ const updateResourceValidators = [
   body('chapter').optional().isString().isLength({ max: 200 }),
   body('unit').optional().isString().isLength({ max: 200 }),
   body('topic').optional().isString().isLength({ max: 200 }),
+  body('tags').optional().custom((value) => Array.isArray(value) || typeof value === 'string'),
   body('metadata').optional().isObject(),
   body('approvalStatus').optional().isIn(['DRAFT', 'READY', 'APPROVED', 'ARCHIVED']),
 ];
@@ -195,12 +197,23 @@ router.post(
         chapter: req.body.chapter,
         unit: req.body.unit,
         topic: req.body.topic,
+        batchId: req.body.batchId || null,
       });
       await logAuditEvent(AUDIT_ACTIONS.CONTENT_LIBRARY_SOURCE_UPLOADED, {
         userId: req.user._id, userEmail: req.user.email, userName: req.user.name, userRole: req.user.role,
         tenantId: req.user.tenantId, resourceType: 'ContextSource', resourceId: source._id,
         sourceType: 'FILE', contentType: source.contentType, visibility: source.visibility,
       });
+      const accepted = ['PENDING', 'PROCESSING'].includes(String(source.status || '').toUpperCase())
+        || ['QUEUED', 'EXTRACTING', 'CHUNKING', 'EMBEDDING'].includes(String(source.processingStage || '').toUpperCase());
+      if (accepted) {
+        return res.status(202).json({
+          source,
+          processing: true,
+          jobId: source.processingJobId || null,
+          message: 'File stored. Indexing has been queued.',
+        });
+      }
       return res.status(source.status === 'FAILED' ? 200 : 201).json({ source });
     } catch (error) {
       return respondError(res, next, error);

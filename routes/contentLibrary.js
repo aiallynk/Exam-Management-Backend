@@ -1,7 +1,7 @@
 // LEGACY COMPATIBILITY — prefer /api/library-resources for educator-facing
-// Content Library product operations. This router remains for ad hoc
-// ContextSource asset operations and backward-compatible clients until
-// all consumers migrate (see docs/XAMIGO_KNOWLEDGE_INTELLIGENCE_COMPLETION_STATUS.md).
+// Content Library product operations. Write routes (POST/PATCH/DELETE) are frozen;
+// new product edits must use /api/library-resources. Read routes remain for
+// historical ContextSource assets and backward-compatible clients.
 import express from 'express';
 import multer from 'multer';
 import path from 'path';

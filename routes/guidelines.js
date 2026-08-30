@@ -94,6 +94,7 @@ router.post(
   body('frameworkId').optional().isMongoId(),
   body('frameworkName').optional().isString().isLength({ max: 300 }),
   body('reviewedProposal').optional().isObject(),
+  body('scope').optional().isObject(),
   async (req, res, next) => {
     try {
       const errors = validationResult(req);
@@ -105,6 +106,7 @@ router.post(
         frameworkId: req.body.frameworkId,
         frameworkName: req.body.frameworkName,
         reviewedProposal: req.body.reviewedProposal,
+        scope: req.body.scope || {},
       });
       return res.status(201).json(result);
     } catch (error) {

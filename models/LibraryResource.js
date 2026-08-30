@@ -36,6 +36,10 @@ const LibraryResourceSchema = new mongoose.Schema(
     chapter: { type: String, trim: true, default: '' },
     unit: { type: String, trim: true, default: '' },
     topic: { type: String, trim: true, default: '' },
+    // Free-form educator tags remain on the logical resource, never copied
+    // into ContextChunk metadata. They are searchable library metadata, not
+    // retrieval evidence or a security control.
+    tags: { type: [{ type: String, trim: true }], default: [] },
 
     // ACADEMIC_SHARED (not "SHARED") per the master brief's own naming for
     // this model specifically — kept distinct from ContextSource.visibility's
@@ -64,5 +68,6 @@ LibraryResourceSchema.index({ tenantId: 1, visibility: 1 });
 LibraryResourceSchema.index({ tenantId: 1, createdBy: 1 });
 LibraryResourceSchema.index({ tenantId: 1, parentResourceId: 1 });
 LibraryResourceSchema.index({ tenantId: 1, resourceType: 1 });
+LibraryResourceSchema.index({ tenantId: 1, tags: 1 });
 
 export default mongoose.model('LibraryResource', LibraryResourceSchema);

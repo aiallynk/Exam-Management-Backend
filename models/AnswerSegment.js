@@ -9,6 +9,7 @@ import mongoose from 'mongoose';
 const AnswerSegmentSchema = new mongoose.Schema({
   tenantId: { type: mongoose.Schema.Types.ObjectId, ref: 'Tenant', required: true, index: true },
   answerScriptId: { type: mongoose.Schema.Types.ObjectId, ref: 'AnswerScript', required: true, index: true },
+  segmentKey: { type: String, default: null },
   pageIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'AnswerScriptPage' }],
 
   questionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Question', default: null, index: true },
@@ -28,6 +29,21 @@ const AnswerSegmentSchema = new mongoose.Schema({
   mappedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null }, // set only for MANUALLY_MAPPED
 
   boundingRegion: { type: mongoose.Schema.Types.Mixed, default: null }, // only when the OCR/vision pass returns reliable geometry — never fabricated
+  lineBoxes: [{
+    _id: false,
+    id: String,
+    text: String,
+    x: { type: Number, min: 0, max: 1 },
+    y: { type: Number, min: 0, max: 1 },
+    width: { type: Number, min: 0, max: 1 },
+    height: { type: Number, min: 0, max: 1 },
+  }],
+  cropObject: {
+    key: { type: String, default: null },
+    checksum: { type: String, default: null },
+    sizeBytes: { type: Number, default: 0 },
+  },
+  contentHash: { type: String, default: null, index: true },
 
   evaluationStatus: { type: String, enum: ['PENDING', 'EVALUATED', 'SKIPPED'], default: 'PENDING' },
   // Draft result from evaluationRouterService — the OFFICIAL record is the
@@ -35,9 +51,19 @@ const AnswerSegmentSchema = new mongoose.Schema({
   // enough for attemptMaterializationService to write it through.
   evaluationResult: { type: mongoose.Schema.Types.Mixed, default: null },
   materializedAnswerId: { type: mongoose.Schema.Types.ObjectId, ref: 'Answer', default: null },
+  evaluationCheckpoint: {
+    inputHash: { type: String, default: null },
+    completedAt: { type: Date, default: null },
+    attempts: { type: Number, default: 0 },
+    lastError: { type: String, default: '' },
+  },
 }, { timestamps: true, minimize: false });
 
 AnswerSegmentSchema.index({ tenantId: 1, answerScriptId: 1, questionId: 1 });
+AnswerSegmentSchema.index(
+  { tenantId: 1, answerScriptId: 1, segmentKey: 1 },
+  { unique: true, partialFilterExpression: { segmentKey: { $type: 'string' } } },
+);
 AnswerSegmentSchema.index({ tenantId: 1, answerScriptId: 1, mappingStatus: 1 });
 
 export default mongoose.model('AnswerSegment', AnswerSegmentSchema);

@@ -106,6 +106,7 @@ const AnswerSchema = new mongoose.Schema(
     evaluationStatus: {
       type: String,
       enum: [
+        'NOT_ATTEMPTED',
         'NOT_EVALUATED',
         'AUTO_EVALUATED',
         'AI_EVALUATED',

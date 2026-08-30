@@ -27,6 +27,36 @@ export const DEFAULT_COGNITIVE_DEMAND_MAPPING = Object.freeze({
   HOT: ['EVALUATE', 'CREATE'],
 });
 
+// Academic Assessment always receives an application-owned automatic target
+// when its framework does not declare one. A framework's valid explicit
+// target still wins; this default is never sourced from an AI response.
+export const DEFAULT_COGNITIVE_DEMAND_DISTRIBUTION = Object.freeze({
+  LOT: 30,
+  MOT: 40,
+  HOT: 30,
+});
+
+// Keeps legacy callers unchanged: only explicit Academic Assessment receives
+// the automatic paper target. Quick remains optional, while an unlabelled
+// legacy request retains its previous no-target behavior.
+export const resolveEffectiveCognitiveDemandDistribution = ({
+  creationMode,
+  requestedDistribution = null,
+  frameworkDistribution = null,
+} = {}) => {
+  const normalizedCreationMode = String(creationMode || '').trim().toUpperCase();
+  if (normalizedCreationMode === 'QUICK') return requestedDistribution || null;
+  if (normalizedCreationMode === 'ACADEMIC') {
+    // Older framework versions can persist an empty object for an optional
+    // target. That represents "not configured", not a malformed authoring
+    // choice that should block an educator from generating questions.
+    return validateCognitiveDemandDistribution(frameworkDistribution).valid
+      ? frameworkDistribution
+      : DEFAULT_COGNITIVE_DEMAND_DISTRIBUTION;
+  }
+  return frameworkDistribution || requestedDistribution || null;
+};
+
 const isValidMapping = (mapping) => {
   if (!mapping || typeof mapping !== 'object') return false;
   const seen = new Set();

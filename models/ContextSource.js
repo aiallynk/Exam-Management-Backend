@@ -164,10 +164,38 @@ const ContextSourceSchema = new mongoose.Schema(
     // value — pre-existing FAILED behavior there is unchanged.
     status: {
       type: String,
-      enum: ['PENDING', 'PROCESSING', 'READY', 'FAILED', 'UNSUPPORTED_FOR_AI'],
+      enum: ['PENDING', 'PROCESSING', 'READY', 'FAILED', 'UNSUPPORTED_FOR_AI', 'STORED_ONLY', 'STALE'],
       default: 'PENDING',
       index: true,
     },
+    processingStage: {
+      type: String,
+      enum: [
+        'UPLOADED', 'QUEUED', 'EXTRACTING', 'NORMALIZING', 'CHUNKING',
+        'EMBEDDING', 'ENRICHING', 'INDEXING', 'AI_READY',
+        'STORED_ONLY', 'PARTIAL', 'FAILED', 'UNSUPPORTED_FOR_AI', 'STALE',
+      ],
+      default: 'UPLOADED',
+      index: true,
+    },
+    processingJobId: { type: String, trim: true, default: '' },
+    ingestionBatchId: { type: mongoose.Schema.Types.ObjectId, ref: 'KnowledgeIngestionBatch', default: null },
+    fileContentHash: { type: String, trim: true, default: '', index: true },
+    ingestionPriority: { type: String, enum: ['FAST', 'ECONOMY'], default: 'FAST' },
+    stageStartedAt: { type: Date, default: null },
+    lastHeartbeatAt: { type: Date, default: null },
+    processedPages: { type: Number, default: 0, min: 0 },
+    totalPages: { type: Number, default: 0, min: 0 },
+    processedChunks: { type: Number, default: 0, min: 0 },
+    totalChunks: { type: Number, default: 0, min: 0 },
+    retryCount: { type: Number, default: 0, min: 0 },
+    retryable: { type: Boolean, default: true },
+    extractionConfidence: { type: Number, default: null },
+    needsReview: { type: Boolean, default: false },
+    pageClass: { type: String, trim: true, default: '' },
+    ocrPageCount: { type: Number, default: 0, min: 0 },
+    nativePageCount: { type: Number, default: 0, min: 0 },
+    indexVersion: { type: Number, default: 1, min: 1 },
     failureReason: {
       type: String,
       trim: true,
@@ -223,11 +251,16 @@ ContextSourceSchema.index({ tenantId: 1, isLibraryItem: 1, visibility: 1 });
 ContextSourceSchema.index({ tenantId: 1, isLibraryItem: 1, createdBy: 1 });
 // Guards against adding identical content twice within the same set
 // (soft-signal only; empty/missing hashes and different sets are exempt).
+// `snapshotHash` defaults to '' and is only ever set to a real sha256 for
+// URL snapshots, so the partial filter must exclude ''. A partialFilter
+// expression cannot use $ne / $not (MongoDB rejects it — "Expression not
+// supported in partial index: $not"); `{ $gt: '' }` is type-bracketed to
+// non-empty strings and is an allowed partial-filter operator.
 ContextSourceSchema.index(
   { contextSetId: 1, snapshotHash: 1 },
   {
     unique: true,
-    partialFilterExpression: { snapshotHash: { $type: 'string', $ne: '' } },
+    partialFilterExpression: { snapshotHash: { $gt: '' } },
   }
 );
 

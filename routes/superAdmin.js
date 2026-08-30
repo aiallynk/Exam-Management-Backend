@@ -17,6 +17,8 @@ import Exam from '../models/Exam.js';
 import ExamAttempt from '../models/ExamAttempt.js';
 import ExamSession from '../models/ExamSession.js';
 import AITokenUsage from '../models/AITokenUsage.js';
+import AnswerScript from '../models/AnswerScript.js';
+import AnswerScriptBatch from '../models/AnswerScriptBatch.js';
 import CreditRequest from '../models/CreditRequest.js';
 import AuditLog from '../models/AuditLog.js';
 import BackupHistory from '../models/BackupHistory.js';
@@ -80,6 +82,9 @@ import {
   TENANT_CAPABILITIES,
 } from '../services/tenantFeatureService.js';
 import { getAiEngineAdminSnapshot, updateAiEngineAdminConfig } from '../services/aiEngine/aiAdminService.js';
+import { getAnswerScriptQueueHealth } from '../services/offlineEvaluation/answerScriptQueueService.js';
+import { getAnswerScriptWorkerHeartbeat } from '../services/offlineEvaluation/answerScriptWorkerService.js';
+import offlineEvaluationConfig from '../config/offlineEvaluationConfig.js';
 
 const router = express.Router();
 
@@ -1707,6 +1712,87 @@ const buildTenantSubscriptionSummary = async (tenant) => {
 // All Super Admin routes require SUPER_ADMIN role
 router.use(requireAuth);
 router.use(requireRole('SUPER_ADMIN'));
+
+router.get('/answer-scripts/telemetry', async (_req, res, next) => {
+  try {
+    const staleBefore = new Date(Date.now() - offlineEvaluationConfig.STALE_AFTER_MS);
+    const [queue, worker, statusCounts, totals, tenantUsage, oldestWaiting, staleCount, batchCounts] = await Promise.all([
+      getAnswerScriptQueueHealth(),
+      getAnswerScriptWorkerHeartbeat(),
+      AnswerScript.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }, { $sort: { count: -1 } }]),
+      AnswerScript.aggregate([{ $group: {
+        _id: null,
+        originalBytes: { $sum: '$storageMetrics.originalBytes' },
+        normalizedBytes: { $sum: '$storageMetrics.normalizedBytes' },
+        previewBytes: { $sum: '$storageMetrics.previewBytes' },
+        thumbnailBytes: { $sum: '$storageMetrics.thumbnailBytes' },
+        annotatedBytes: { $sum: '$storageMetrics.annotatedBytes' },
+        identityCalls: { $sum: '$aiMetrics.identityCalls' },
+        extractionCalls: { $sum: '$aiMetrics.extractionCalls' },
+        evaluationCalls: { $sum: '$aiMetrics.evaluationCalls' },
+        visualCalls: { $sum: '$aiMetrics.visualCalls' },
+        aiLatencyMs: { $sum: '$aiMetrics.latencyMs' },
+        retries: { $sum: '$aiMetrics.retryCount' },
+        estimatedCost: { $sum: { $ifNull: ['$aiMetrics.estimatedCost', 0] } },
+      } }]),
+      AnswerScript.aggregate([
+        { $group: {
+          _id: '$tenantId', scripts: { $sum: 1 }, originalBytes: { $sum: '$storageMetrics.originalBytes' },
+          normalizedBytes: { $sum: '$storageMetrics.normalizedBytes' }, aiCalls: { $sum: { $add: ['$aiMetrics.identityCalls', '$aiMetrics.extractionCalls', '$aiMetrics.evaluationCalls', '$aiMetrics.visualCalls'] } },
+          failed: { $sum: { $cond: [{ $eq: ['$status', 'FAILED'] }, 1, 0] } },
+        } },
+        { $sort: { originalBytes: -1 } }, { $limit: 100 },
+        { $lookup: { from: 'tenants', localField: '_id', foreignField: '_id', as: 'tenant' } },
+        { $project: { tenantId: '$_id', tenantName: { $arrayElemAt: ['$tenant.name', 0] }, scripts: 1, originalBytes: 1, normalizedBytes: 1, aiCalls: 1, failed: 1 } },
+      ]),
+      AnswerScript.find({ status: { $in: ['QUEUED', 'NORMALIZING', 'IDENTIFYING_CANDIDATE', 'EXTRACTING', 'SEGMENTING', 'EVALUATING', 'FINALIZING'] } })
+        .select('_id tenantId status processingMeta.stage createdAt updatedAt').sort({ createdAt: 1 }).limit(20).lean(),
+      AnswerScript.countDocuments({
+        status: { $in: ['NORMALIZING', 'IDENTIFYING_CANDIDATE', 'EXTRACTING', 'SEGMENTING', 'EVALUATING', 'FINALIZING'] },
+        'processingMeta.heartbeatAt': { $lt: staleBefore },
+      }),
+      AnswerScriptBatch.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
+    ]);
+    const aggregate = totals[0] || {};
+    const aiCalls = Number(aggregate.identityCalls || 0) + Number(aggregate.extractionCalls || 0) + Number(aggregate.evaluationCalls || 0) + Number(aggregate.visualCalls || 0);
+    return res.json({
+      generatedAt: new Date(),
+      queue,
+      worker,
+      state: {
+        scripts: Object.fromEntries(statusCounts.map((item) => [item._id, item.count])),
+        batches: Object.fromEntries(batchCounts.map((item) => [item._id, item.count])),
+        staleCount,
+        oldestWaiting,
+      },
+      storage: {
+        originalBytes: Number(aggregate.originalBytes || 0),
+        normalizedBytes: Number(aggregate.normalizedBytes || 0),
+        previewBytes: Number(aggregate.previewBytes || 0),
+        thumbnailBytes: Number(aggregate.thumbnailBytes || 0),
+        annotatedBytes: Number(aggregate.annotatedBytes || 0),
+        workingToOriginalRatio: aggregate.originalBytes ? Number((aggregate.normalizedBytes / aggregate.originalBytes).toFixed(4)) : null,
+        retentionPolicyKey: offlineEvaluationConfig.RETENTION_POLICY_KEY,
+      },
+      ai: {
+        calls: aiCalls,
+        identityCalls: Number(aggregate.identityCalls || 0), extractionCalls: Number(aggregate.extractionCalls || 0),
+        evaluationCalls: Number(aggregate.evaluationCalls || 0), visualCalls: Number(aggregate.visualCalls || 0),
+        retries: Number(aggregate.retries || 0), averageLatencyMs: aiCalls ? Math.round(Number(aggregate.aiLatencyMs || 0) / aiCalls) : null,
+        estimatedCost: Number(aggregate.estimatedCost || 0),
+      },
+      limits: {
+        documentConcurrency: offlineEvaluationConfig.DOCUMENT_CONCURRENCY,
+        aiConcurrency: offlineEvaluationConfig.AI_CONCURRENCY,
+        renderConcurrency: offlineEvaluationConfig.RENDER_CONCURRENCY,
+        maxActivePerTenant: offlineEvaluationConfig.MAX_ACTIVE_PER_TENANT,
+        maxActivePerUploader: offlineEvaluationConfig.MAX_ACTIVE_PER_UPLOADER,
+        providerRequestsPerMinute: offlineEvaluationConfig.PROVIDER_REQUESTS_PER_MINUTE,
+      },
+      tenants: tenantUsage,
+    });
+  } catch (error) { return next(error); }
+});
 
 // Platform controls use the same capability catalogue that resolves tenant
 // controls.  This prevents the platform overview from drifting into a static

@@ -404,6 +404,14 @@ const startHttpServer = () =>
     const server = app.listen(config.port, listenHost, () => {
       resolve(server);
     });
+    // Outlast the idle timeout of any proxy/tunnel in front of us so reused
+    // upstream connections are never closed mid-request (see config/env.js).
+    // headersTimeout must stay > keepAliveTimeout.
+    server.keepAliveTimeout = config.serverKeepAliveTimeoutMs;
+    server.headersTimeout = Math.max(
+      config.serverHeadersTimeoutMs,
+      config.serverKeepAliveTimeoutMs + 1000,
+    );
     server.once('error', reject);
   });
 

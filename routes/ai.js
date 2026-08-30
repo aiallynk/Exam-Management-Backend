@@ -26,6 +26,7 @@ import { assertContentSourcesSelectable, ContentLibraryError } from '../services
 import { resolveLibraryResourcesToContextSourceIds } from '../services/libraryResourceService.js';
 import { buildGenerationContext, CONTEXT_MODES, InsufficientContextError } from '../services/generationContextOrchestrator.js';
 import { resolveGenerationStrategy } from '../services/groundedGenerationService.js';
+import { computeShortfallDistribution } from '../utils/sourceGroundedFulfilment.js';
 import { qualityGateQuestionsAgainstSpecification, resolveAssessmentSpecification } from '../services/assessmentSpecificationResolver.js';
 import ContextSet from '../models/ContextSet.js';
 import ContextSource from '../models/ContextSource.js';
@@ -52,6 +53,7 @@ import {
   normalizeQuestionType,
 } from '../utils/questionTypeRegistry.js';
 import {
+  resolveEffectiveCognitiveDemandDistribution,
   resolveCognitiveDemandMapping,
   deriveCognitiveDemandFromBloom,
   validateCognitiveDemandDistribution,
@@ -1030,7 +1032,11 @@ router.post(
   enforceContextSourceLimit,
   contextSourceUpload.single('file'),
   handleMulterUploadError,
-  [body('contextSetId').optional().isMongoId().withMessage('Invalid contextSetId')],
+  // nullable/checkFalsy: the client sends contextSetId only in the
+  // uploaded-ContextSet flow; the Content Library flow legitimately has none
+  // and may serialize it as null/''. Plain .optional() only skips
+  // `undefined`, so those tripped isMongoId() with "Invalid contextSetId".
+  [body('contextSetId').optional({ nullable: true, checkFalsy: true }).isMongoId().withMessage('Invalid contextSetId')],
   async (req, res, next) => {
     try {
       const errors = validationResult(req);
@@ -1084,7 +1090,7 @@ router.post(
   enforceContextSourceLimit,
   [
     body('url').isURL({ protocols: ['http', 'https'], require_protocol: true }).withMessage('A valid http(s) URL is required'),
-    body('contextSetId').optional().isMongoId().withMessage('Invalid contextSetId'),
+    body('contextSetId').optional({ nullable: true, checkFalsy: true }).isMongoId().withMessage('Invalid contextSetId'),
   ],
   async (req, res, next) => {
     try {
@@ -1215,8 +1221,15 @@ router.post(
     body('imageQuestionMode').optional().isIn(['percentage', 'per_count']).withMessage('Invalid imageQuestionMode'),
     body('imageQuestionTypes').optional().isArray().withMessage('imageQuestionTypes must be an array'),
     body('generationMode').optional().isIn(['STANDARD', 'SOURCE_GROUNDED']).withMessage('Invalid generationMode'),
-    body('cognitiveDemandDistribution').optional().isObject().withMessage('cognitiveDemandDistribution must be an object'),
-    body('contextSetId').optional().isMongoId().withMessage('Invalid contextSetId'),
+    // `null` is the legacy/current UI representation of Automatic. Treat it
+    // exactly like an omitted field; a real custom target must still be a
+    // plain object and is revalidated below for LOT/MOT/HOT totals.
+    body('cognitiveDemandDistribution').optional({ nullable: true }).isObject({ strict: true }).withMessage('cognitiveDemandDistribution must be an object'),
+    // nullable/checkFalsy: the Content Library flow selects libraryResourceIds
+    // and has no ContextSet, so the client legitimately sends no contextSetId
+    // (or a null/'' from older serialization). Plain .optional() only skips
+    // `undefined`, which is what surfaced as "Invalid contextSetId".
+    body('contextSetId').optional({ nullable: true, checkFalsy: true }).isMongoId().withMessage('Invalid contextSetId'),
     body('contextSourceIds').optional().isArray({ max: 10 }).withMessage('contextSourceIds must be an array of at most 10 items'),
     body('contextSourceIds.*').optional().isMongoId().withMessage('Invalid contextSourceIds entry'),
     body('libraryResourceIds').optional().isArray({ max: 10 }).withMessage('libraryResourceIds must be an array of at most 10 items'),
@@ -1259,9 +1272,14 @@ router.post(
         contextMode,
         cognitiveDemandDistribution: requestedCognitiveDemandDistribution,
       } = req.body;
-      const suppliedSpecification = req.body?.resolvedSpecification || null;
+      // Quick Assessment is intentionally independent of academic framework
+      // policy. Older saved browser drafts can retain a resolved specification
+      // after switching modes, so ignore that stale client state here.
+      const creationMode = String(req.body?.creationMode || '').toUpperCase();
+      const isQuickAssessment = creationMode === 'QUICK';
+      const suppliedSpecification = isQuickAssessment ? null : (req.body?.resolvedSpecification || null);
       let governedSpecification = null;
-      if (suppliedSpecification || req.body?.assessmentPurpose || req.body?.frameworkId || req.body?.frameworkVersionId) {
+      if (!isQuickAssessment && (suppliedSpecification || req.body?.assessmentPurpose || req.body?.frameworkId || req.body?.frameworkVersionId)) {
         const specificationContext = suppliedSpecification?.academicContext || req.body?.academicContext || {};
         governedSpecification = await resolveAssessmentSpecification({
           tenantId: req.user.tenantId,
@@ -1272,27 +1290,26 @@ router.post(
           frameworkVersionId: req.body?.frameworkVersionId || suppliedSpecification?.frameworkVersion?.id || null,
           creatorOverrides: req.body?.creatorOverrides || {},
         });
-        const allowedTypes = governedSpecification.specification?.questionGeneration?.questionTypes;
-        if (Array.isArray(allowedTypes) && allowedTypes.length) {
-          const invalidRequestedTypes = (questionTypes || []).filter((type) => !allowedTypes.includes(type));
-          if (invalidRequestedTypes.length) {
-            return res.status(400).json({ error: `Resolved assessment policy does not allow: ${invalidRequestedTypes.join(', ')}.` });
-          }
-        }
+        // Framework question types guide recommendations; they are not a
+        // hidden allow-list. Canonical registry shape checks and active
+        // feature/capability gates remain authoritative for technical
+        // compatibility.
       }
 
-      // Cognitive demand (Blueprint section 4B): Academic Assessment uses
-      // whatever the resolver already merged into the specification (a
-      // framework-locked value, or a creator override if and only if the
-      // framework's own allowCreatorOverrides permitted it — the existing
-      // resolver mechanism enforces that, no special-casing needed here).
-      // Quick Assessment has no framework, so an optional creator-supplied
-      // value is used as-is; omitted means "Automatic" (no target at all).
-      const effectiveCognitiveDemandDistribution = governedSpecification
-        ? (governedSpecification.specification?.cognitiveDemandDistribution || null)
-        : (requestedCognitiveDemandDistribution || null);
+      // Cognitive demand (Blueprint section 4B): an Academic framework's
+      // approved target remains authoritative. If it does not declare one,
+      // Academic Assessment receives the application-owned automatic
+      // 30/40/30 target. Quick stays optional; unlabeled legacy callers keep
+      // their prior no-target behavior.
+      const effectiveCognitiveDemandDistribution = resolveEffectiveCognitiveDemandDistribution({
+        creationMode,
+        requestedDistribution: requestedCognitiveDemandDistribution,
+        frameworkDistribution: governedSpecification?.specification?.cognitiveDemandDistribution || null,
+      });
       const effectiveCognitiveDemandMapping = resolveCognitiveDemandMapping({
-        cognitiveDemandMapping: governedSpecification?.specification?.cognitiveDemandMapping,
+        cognitiveDemandMapping: isQuickAssessment
+          ? null
+          : governedSpecification?.specification?.cognitiveDemandMapping,
       });
       if (effectiveCognitiveDemandDistribution) {
         const distributionCheck = validateCognitiveDemandDistribution(effectiveCognitiveDemandDistribution);
@@ -1377,7 +1394,7 @@ router.post(
             sourceIds: mergedSourceIds,
             status: 'READY',
           })
-        ).select('createdBy isLibraryItem visibility academicScope').lean();
+        ).select('createdBy isLibraryItem visibility academicScope libraryResourceId').lean();
         if (readyOwnedSources.length !== mergedSourceIds.length) {
           return res.status(403).json({
             error: 'One or more selected sources are unavailable, still processing, or do not belong to this tenant.',
@@ -1570,12 +1587,22 @@ router.post(
           status: 'RUNNING',
         });
 
-        try {
-          const memoryPolicy = governedSpecification?.specification?.rules?.memory
-            ? mapFrameworkMemoryPolicy(governedSpecification.specification.rules.memory)
-            : null;
+        // STRICT_SOURCE keeps the original anti-fallback contract: report the
+        // exact shortfall rather than supplementing with general knowledge.
+        // SELECTED_CONTEXT / AUTO_CONTEXT (the default Source-Grounded path)
+        // always fulfil the request — ground what the sources support, then
+        // top up the remainder on the same topic using the retrieved source
+        // text as reference context (Blueprint §4C).
+        const isStrictSource = normalizedContextMode === CONTEXT_MODES.STRICT_SOURCE;
 
-          const result = await generateWithNoveltyAndGrounding({
+        const memoryPolicy = governedSpecification?.specification?.rules?.memory
+          ? mapFrameworkMemoryPolicy(governedSpecification.specification.rules.memory)
+          : null;
+
+        let groundedResult = null;
+        let groundedQuestions = [];
+        try {
+          groundedResult = await generateWithNoveltyAndGrounding({
             tenantId,
             userId: req.user._id,
             generationRunId: sourceGroundedRun._id,
@@ -1590,60 +1617,151 @@ router.post(
             examDescription,
             memoryPolicy,
           });
+          groundedQuestions = Array.isArray(groundedResult.questions) ? groundedResult.questions : [];
+        } catch (groundedError) {
+          if (isStrictSource) {
+            sourceGroundedRun.status = 'FAILED';
+            sourceGroundedRun.errorMessage = groundedError?.message || 'Source-grounded generation failed.';
+            sourceGroundedRun.completedAt = new Date();
+            await sourceGroundedRun.save();
+            throw groundedError;
+          }
+          // Non-strict: a grounded-pass failure is not fatal — fall through to
+          // the topic top-up below so the request is still fulfilled.
+          console.error('[source-grounded] grounded pass failed; supplementing from topic:', groundedError?.message);
+          groundedResult = null;
+          groundedQuestions = [];
+        }
 
-          providerQuestions = result.questions;
+        if (isStrictSource) {
+          providerQuestions = groundedQuestions;
           sourceGroundedDiagnostics = {
-            insufficientSourceMaterial: result.insufficientSourceMaterial,
-            // Distinguishes WHY generation fell short (master prompt
-            // §29/§30/§44) so the frontend can show a specific message
-            // instead of one generic "insufficient" string regardless of
-            // cause: retrieval found nothing at all, the model itself
-            // judged the material insufficient for the requested count,
-            // or candidates were produced but rejected by grounding/
-            // novelty validation.
-            insufficientReason: result.insufficientReason,
-            dominantRejectionReason: result.dominantRejectionReason,
+            insufficientSourceMaterial: groundedResult.insufficientSourceMaterial,
+            insufficientReason: groundedResult.insufficientReason,
+            dominantRejectionReason: groundedResult.dominantRejectionReason,
             requestedCount: providerQuestionCount,
-            acceptedCount: result.acceptedCount,
-            rejectedCount: result.rejectedCount,
-            rejectionReasons: result.rejectionReasons,
-            attempts: result.attempts,
-            requestedDistribution: result.requestedDistribution,
-            generatedDistribution: result.generatedDistribution,
-            missingDistribution: result.missingDistribution,
+            acceptedCount: groundedResult.acceptedCount,
+            rejectedCount: groundedResult.rejectedCount,
+            rejectionReasons: groundedResult.rejectionReasons,
+            attempts: groundedResult.attempts,
+            requestedDistribution: groundedResult.requestedDistribution,
+            generatedDistribution: groundedResult.generatedDistribution,
+            missingDistribution: groundedResult.missingDistribution,
           };
-
-          sourceGroundedRun.acceptedCount = result.acceptedCount;
-          sourceGroundedRun.rejectedCount = result.rejectedCount;
-          sourceGroundedRun.rejectionReasons = result.rejectionReasons;
-          sourceGroundedRun.insufficientSourceMaterial = result.insufficientSourceMaterial;
+          sourceGroundedRun.acceptedCount = groundedResult.acceptedCount;
+          sourceGroundedRun.rejectedCount = groundedResult.rejectedCount;
+          sourceGroundedRun.rejectionReasons = groundedResult.rejectionReasons;
+          sourceGroundedRun.insufficientSourceMaterial = groundedResult.insufficientSourceMaterial;
           sourceGroundedRun.status =
-            result.acceptedCount >= providerQuestionCount
+            groundedResult.acceptedCount >= providerQuestionCount
               ? 'COMPLETED'
-              : result.acceptedCount > 0
+              : groundedResult.acceptedCount > 0
                 ? 'PARTIAL'
                 : 'FAILED';
           sourceGroundedRun.completedAt = new Date();
           await sourceGroundedRun.save();
 
-          if (result.missingDistribution.length > 0) {
+          if (groundedResult.missingDistribution.length > 0) {
             throw new QuestionDistributionError({
-              requested: result.requestedDistribution,
-              generated: result.generatedDistribution,
-              missing: result.missingDistribution.map((item) => ({
+              requested: groundedResult.requestedDistribution,
+              generated: groundedResult.generatedDistribution,
+              missing: groundedResult.missingDistribution.map((item) => ({
                 type: item.type,
-                expected: result.requestedDistribution[item.type] || 0,
-                actual: result.generatedDistribution[item.type] || 0,
+                expected: groundedResult.requestedDistribution[item.type] || 0,
+                actual: groundedResult.generatedDistribution[item.type] || 0,
                 count: item.count,
               })),
             });
           }
-        } catch (groundedError) {
-          sourceGroundedRun.status = 'FAILED';
-          sourceGroundedRun.errorMessage = groundedError?.message || 'Source-grounded generation failed.';
+        } else {
+          const { shortfallDistribution, shortfallCount } = computeShortfallDistribution({
+            requestedDistribution: normalizedDistribution,
+            requestedCount: providerQuestionCount,
+            generatedByType: groundedResult?.generatedDistribution || {},
+            fallbackTypes: normalizedRequestedTypes,
+          });
+
+          let supplementQuestions = [];
+          if (shortfallCount > 0) {
+            // Reference context so the top-up still "checks the attached
+            // file": the token-budgeted chunks the orchestrator already
+            // retrieved, else a direct sample of this source's chunks.
+            let referenceText = (orchestratedContext?.retrievedChunks || [])
+              .map((chunk) => String(chunk?.text || '').trim())
+              .filter(Boolean)
+              .join('\n\n');
+            if (!referenceText && verifiedContextSourceIds.length) {
+              const sampleChunks = await ContextChunk.find({
+                tenantId,
+                sourceId: { $in: verifiedContextSourceIds },
+              })
+                .select('text')
+                .sort({ sourceId: 1, chunkIndex: 1 })
+                .limit(sourceGroundedConfig.RETRIEVAL_TOP_K || 12)
+                .lean();
+              referenceText = sampleChunks
+                .map((chunk) => String(chunk?.text || '').trim())
+                .filter(Boolean)
+                .join('\n\n');
+            }
+
+            supplementQuestions = await generateQuestions({
+              topic,
+              count: shortfallCount,
+              difficulty,
+              questionTypes: shortfallDistribution.length
+                ? shortfallDistribution.map((item) => item.type)
+                : normalizedRequestedTypes,
+              questionTypeDistribution: shortfallDistribution.length ? shortfallDistribution : undefined,
+              uploadedContent: referenceText || uploadedContent || undefined,
+              examTitle,
+              examDescription,
+              existingQuestions: [
+                ...(Array.isArray(existingQuestions) ? existingQuestions : []),
+                ...groundedQuestions.map((question) => question?.questionText).filter(Boolean),
+              ],
+              cognitiveDemandDistribution: effectiveCognitiveDemandDistribution,
+              cognitiveDemandMapping: effectiveCognitiveDemandMapping,
+              tenantId,
+              userId: req.user?._id || null,
+              metadata: aiMetadata,
+              // Resilient by design: the shortfall distribution still steers
+              // the provider toward the right types/count, but a provider or
+              // distribution failure degrades to the deterministic local
+              // filler rather than throwing — the request must always be
+              // fulfilled for SELECTED_CONTEXT / AUTO_CONTEXT (Blueprint §4C).
+              requireProviderExactDistribution: false,
+            });
+          }
+
+          providerQuestions = [...groundedQuestions, ...(Array.isArray(supplementQuestions) ? supplementQuestions : [])];
+          const deliveredCount = providerQuestions.length;
+          sourceGroundedDiagnostics = {
+            // Never surfaced as a blocking error for SELECTED_CONTEXT /
+            // AUTO_CONTEXT — kept for telemetry / the "View source evidence"
+            // affordance only.
+            fulfilled: deliveredCount >= providerQuestionCount,
+            requestedCount: providerQuestionCount,
+            acceptedCount: deliveredCount,
+            groundedCount: groundedQuestions.length,
+            supplementedCount: Array.isArray(supplementQuestions) ? supplementQuestions.length : 0,
+            attempts: groundedResult?.attempts || 0,
+            requestedDistribution: groundedResult?.requestedDistribution || {},
+            generatedDistribution: groundedResult?.generatedDistribution || {},
+            rejectionReasons: groundedResult?.rejectionReasons || {},
+          };
+          sourceGroundedRun.acceptedCount = groundedQuestions.length;
+          sourceGroundedRun.supplementedCount = Array.isArray(supplementQuestions) ? supplementQuestions.length : 0;
+          sourceGroundedRun.rejectedCount = groundedResult?.rejectedCount || 0;
+          sourceGroundedRun.rejectionReasons = groundedResult?.rejectionReasons || {};
+          sourceGroundedRun.insufficientSourceMaterial = false;
+          sourceGroundedRun.status = deliveredCount >= providerQuestionCount
+            ? 'COMPLETED'
+            : deliveredCount > 0
+              ? 'PARTIAL'
+              : 'FAILED';
           sourceGroundedRun.completedAt = new Date();
           await sourceGroundedRun.save();
-          throw groundedError;
         }
       } else if (providerQuestionCount > 0) {
         providerQuestions = await generateQuestions({

@@ -13,6 +13,9 @@ const EnrollmentSchema = new mongoose.Schema({
   curriculumVersionId: { type: mongoose.Schema.Types.ObjectId, ref: 'CurriculumVersion', default: null },
   cohortId: { type: mongoose.Schema.Types.ObjectId, ref: 'Cohort', default: null },
   academicSectionId: { type: mongoose.Schema.Types.ObjectId, ref: 'AcademicSection', default: null },
+  // Canonical academic roll number for this placement (session/cohort/section scoped).
+  rollNumber: { type: String, trim: true, default: '', index: true },
+  externalStudentId: { type: String, trim: true, default: '' },
   status: { type: String, enum: ['ACTIVE', 'INACTIVE', 'COMPLETED', 'WITHDRAWN'], default: 'ACTIVE' },
   metadata: { type: mongoose.Schema.Types.Mixed, default: {} },
   createdBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
@@ -20,5 +23,16 @@ const EnrollmentSchema = new mongoose.Schema({
 
 EnrollmentSchema.index({ tenantId: 1, userId: 1, academicSessionId: 1 }, { unique: true });
 EnrollmentSchema.index({ tenantId: 1, cohortId: 1 });
+EnrollmentSchema.index(
+  { tenantId: 1, academicSessionId: 1, academicSectionId: 1, rollNumber: 1 },
+  {
+    unique: true,
+    partialFilterExpression: {
+      rollNumber: { $type: 'string', $ne: '' },
+      academicSectionId: { $type: 'objectId' },
+      status: 'ACTIVE',
+    },
+  }
+);
 
 export default mongoose.model('Enrollment', EnrollmentSchema);

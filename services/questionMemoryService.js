@@ -9,6 +9,9 @@ import {
 import { findSemanticQuestionMatches } from './questionEmbeddingService.js';
 import { logError } from '../utils/logger.js';
 
+const RECENT_USAGE_LOOKBACK_DAYS = Number(process.env.QUESTION_RECENT_USAGE_LOOKBACK_DAYS || 90);
+const RECENT_USAGE_MIN_COUNT = Number(process.env.QUESTION_RECENT_USAGE_MIN_COUNT || 1);
+
 export const REPEAT_POLICIES = Object.freeze({
   ALLOW: 'ALLOW',
   WARN: 'WARN',
@@ -67,12 +70,39 @@ export const buildQuestionFingerprint = async ({ tenantId, question, userId = nu
   };
 };
 
+const findRecentUsageMatches = async ({ tenantId, exactSignature, courseOfferingId = null }) => {
+  const since = new Date(Date.now() - RECENT_USAGE_LOOKBACK_DAYS * 24 * 60 * 60 * 1000);
+  const usageFilter = {
+    tenantId,
+    occurredAt: { $gte: since },
+    event: { $in: ['USED_IN_ASSESSMENT', 'PUBLISHED', 'SELECTED'] },
+  };
+  if (courseOfferingId) usageFilter.courseOfferingId = courseOfferingId;
+
+  const recentUsages = await QuestionUsage.find(usageFilter)
+    .sort({ occurredAt: -1 })
+    .limit(200)
+    .select('questionId questionVersionId examId occurredAt')
+    .lean();
+  if (recentUsages.length < RECENT_USAGE_MIN_COUNT) return [];
+
+  return recentUsages.slice(0, 5).map((entry) => ({
+    questionId: entry.questionId,
+    questionVersionId: entry.questionVersionId,
+    examId: entry.examId,
+    occurredAt: entry.occurredAt,
+    layer: 'RECENT_USAGE',
+    signature: exactSignature,
+  }));
+};
+
 export const evaluateQuestionRepeatPolicy = async ({
   tenantId,
   question,
   blueprint = null,
   userId = null,
-  policy = { exact: REPEAT_POLICIES.BLOCK, semantic: REPEAT_POLICIES.WARN, recentUsage: REPEAT_POLICIES.WARN },
+  policy = { exact: REPEAT_POLICIES.BLOCK, semantic: REPEAT_POLICIES.WARN, recentUsage: REPEAT_POLICIES.WARN, conceptPattern: REPEAT_POLICIES.WARN },
+  courseOfferingId = null,
 }) => {
   const novelty = await probeNovelty({ tenantId, question, blueprint });
   const fingerprint = await buildQuestionFingerprint({ tenantId, question, userId });
@@ -80,9 +110,20 @@ export const evaluateQuestionRepeatPolicy = async ({
   const outcomes = [];
   if (novelty.collision?.layer === 'EXACT') outcomes.push({ layer: 'EXACT', policy: policy.exact, detail: novelty.collision });
   if (novelty.collision?.layer === 'NEAR') outcomes.push({ layer: 'SEMANTIC', policy: policy.semantic, detail: novelty.collision });
-  if (novelty.collision?.layer === 'BLUEPRINT') outcomes.push({ layer: 'CONCEPT_PATTERN', policy: policy.recentUsage, detail: novelty.collision });
+  if (novelty.collision?.layer === 'BLUEPRINT') {
+    outcomes.push({ layer: 'CONCEPT_PATTERN', policy: policy.conceptPattern || policy.recentUsage, detail: novelty.collision });
+  }
   if ((fingerprint.semanticMatches || []).length) {
     outcomes.push({ layer: 'SEMANTIC_EMBEDDING', policy: policy.semantic, matches: fingerprint.semanticMatches });
+  }
+
+  const recentMatches = await findRecentUsageMatches({
+    tenantId,
+    exactSignature: fingerprint.exactSignature,
+    courseOfferingId,
+  });
+  if (recentMatches.length >= RECENT_USAGE_MIN_COUNT) {
+    outcomes.push({ layer: 'RECENT_USAGE', policy: policy.recentUsage, matches: recentMatches });
   }
 
   const severityOrder = [REPEAT_POLICIES.BLOCK, REPEAT_POLICIES.REGENERATE, REPEAT_POLICIES.WARN, REPEAT_POLICIES.ALLOW];
@@ -126,5 +167,5 @@ export const indexQuestionMemory = async ({ tenantId, userId, questionId, questi
 export const mapFrameworkMemoryPolicy = (memoryRules = {}) => {
   const action = String(memoryRules.action || 'WARN').toUpperCase();
   const mapped = action === 'BLOCK' ? REPEAT_POLICIES.BLOCK : action === 'REGENERATE' ? REPEAT_POLICIES.REGENERATE : action === 'ALLOW' ? REPEAT_POLICIES.ALLOW : REPEAT_POLICIES.WARN;
-  return { exact: mapped, semantic: mapped, recentUsage: mapped };
+  return { exact: mapped, semantic: mapped, recentUsage: mapped, conceptPattern: mapped };
 };

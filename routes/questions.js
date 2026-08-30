@@ -25,6 +25,7 @@ import {
   normalizeQuestionTypeForStorage,
 } from '../utils/questionTypes.js';
 import { trackAIUsageEvent } from '../services/aiTokenUsageService.js';
+import { resolveAuthorizedQuestionVersionForReuse, QuestionBankProvenanceError } from '../services/questionBankProvenanceService.js';
 import { BLOOM_LEVELS, COGNITIVE_DEMAND_LEVELS } from '../utils/cognitiveDemand.js';
 import {
   extractCodingFields,
@@ -917,7 +918,20 @@ const createQuestionWithManagedImage = async ({
   matchingPairs,
   evaluationConfig,
   provenance,
+  user = null,
 }) => {
+  let resolvedProvenance = sanitizeQuestionProvenance(provenance);
+  let bankContentOverride = null;
+  if (resolvedProvenance?.questionVersionId && user) {
+    const authorized = await resolveAuthorizedQuestionVersionForReuse({
+      user,
+      questionVersionId: resolvedProvenance.questionVersionId,
+      requireApproved: true,
+    });
+    resolvedProvenance = authorized.provenance;
+    bankContentOverride = authorized.content;
+  }
+
   const inlineImage = typeof image === 'string' ? image.trim() : '';
   const normalizedImageUrlCandidate =
     imageUrl ||
@@ -974,7 +988,9 @@ const createQuestionWithManagedImage = async ({
       memoryLimit,
       codingFields,
     }) || undefined;
-  const normalizedQuestionText = normalizeString(questionText || questionPrompt || title);
+  const normalizedQuestionText = normalizeString(
+    bankContentOverride?.questionText || questionText || questionPrompt || title,
+  );
   const normalizedTitle = normalizeString(title || normalizedQuestionText);
   const normalizedDescription = normalizeString(description || normalizedQuestionText);
   const normalizedDifficulty = normalizeString(difficulty);
@@ -1031,15 +1047,17 @@ const createQuestionWithManagedImage = async ({
     bloomLevel: normalizedBloomLevel,
     cognitiveDemand: normalizedCognitiveDemand,
     category: normalizedCategory || undefined,
-    questionType: normalizedStorageQuestionType,
-    questionFormat: normalizedQuestionFormat,
-    options,
-    matchingPairs: Array.isArray(matchingPairs) ? matchingPairs : [],
-    evaluationConfig: normalizedEvaluationConfig,
+    questionType: bankContentOverride?.questionType || normalizedStorageQuestionType,
+    questionFormat: bankContentOverride?.questionFormat || normalizedQuestionFormat,
+    options: bankContentOverride?.options ?? options,
+    matchingPairs: bankContentOverride?.matchingPairs ?? (Array.isArray(matchingPairs) ? matchingPairs : []),
+    evaluationConfig: bankContentOverride?.evaluationConfig && Object.keys(bankContentOverride.evaluationConfig).length
+      ? bankContentOverride.evaluationConfig
+      : normalizedEvaluationConfig,
     correctAnswer: normalizeCorrectAnswerForStorage(
-      normalizedStorageQuestionType,
-      correctAnswer,
-      options
+      bankContentOverride?.questionType || normalizedStorageQuestionType,
+      bankContentOverride?.correctAnswer ?? correctAnswer,
+      bankContentOverride?.options ?? options,
     ),
     imageUrl:
       typeof normalizedImageUrlCandidate === 'string' && String(normalizedImageUrlCandidate).trim().length
@@ -1064,7 +1082,7 @@ const createQuestionWithManagedImage = async ({
     order: Number.isFinite(Number(order)) ? Number(order) : 0,
     sectionId: assignment.sectionId,
     isIncludedInExam: assignment.isIncludedInExam,
-    provenance: sanitizeQuestionProvenance(provenance),
+    provenance: resolvedProvenance,
   });
 
   await question.save();
@@ -1545,6 +1563,7 @@ router.post(
           matchingPairs: payloadRecord.matchingPairs ?? matchingPairs,
           evaluationConfig: payloadRecord.evaluationConfig ?? evaluationConfig,
           provenance: payloadRecord.provenance,
+          user: req.user,
         });
         createdQuestions.push(createdQuestion);
       }
@@ -2363,9 +2382,19 @@ router.post(
             memoryLimit: preparedRecord.memoryLimit,
             codingFields: preparedRecord.codingFields,
             evaluationConfig: preparedRecord.evaluationConfig,
+            provenance: preparedRecord.provenance,
+            user: req.user,
           });
           createdQuestions.push(createdQuestion);
         } catch (rowError) {
+          if (rowError instanceof QuestionBankProvenanceError) {
+            rejectedRows.push({
+              row: rowNumber,
+              reason: rowError.message,
+              questionText: normalizeString(preparedRecord.questionText).slice(0, 140),
+            });
+            continue;
+          }
           const detailedReason =
             rowError?.name === 'ValidationError' && rowError?.errors
               ? Object.values(rowError.errors)

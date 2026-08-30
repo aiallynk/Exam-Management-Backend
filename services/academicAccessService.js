@@ -4,7 +4,10 @@ import {
   OrganizationUnit, AcademicSession, Program, Specialization, CurriculumVersion,
   AcademicPeriod, Course, Cohort, AcademicSection, Enrollment, CourseOffering,
 } from '../models/academic/index.js';
-import { hasRole } from '../utils/userRoles.js';
+import ExamParticipant from '../models/ExamParticipant.js';
+import { hasRole, hasAnyRole } from '../utils/userRoles.js';
+import { isStaffExamOwner, OPERATING_STAFF_ROLES } from '../utils/examOperationAccess.js';
+import { expandOrganizationUnits, narrowAcademicFilterByOrganization } from './organizationContextService.js';
 
 const id = (value) => value == null ? '' : String(value);
 const uniqueIds = (values = []) => [...new Set(values.filter(Boolean).map(id))];
@@ -21,26 +24,11 @@ export class AcademicAccessError extends Error {
 const loadCurrentUser = async (user) => {
   if (!user?._id) throw new AcademicAccessError(401, 'Authentication required.');
   return User.findById(user._id)
-    .select('_id tenantId role roles status academicAdminScope')
+    .select('_id tenantId role roles status academicAdminScope primaryOrganizationUnitId organizationUnitAccess organizationPreferences')
     .lean();
 };
 
-const expandOrganizationUnits = async (tenantId, initialIds) => {
-  const allowed = new Set(uniqueIds(initialIds));
-  if (!allowed.size) return [];
-  const units = await OrganizationUnit.find({ tenantId }).select('_id parentOrganizationUnitId').lean();
-  let changed = true;
-  while (changed) {
-    changed = false;
-    units.forEach((unit) => {
-      if (unit.parentOrganizationUnitId && allowed.has(id(unit.parentOrganizationUnitId)) && !allowed.has(id(unit._id))) {
-        allowed.add(id(unit._id));
-        changed = true;
-      }
-    });
-  }
-  return [...allowed];
-};
+// expandOrganizationUnits lives in organizationContextService.js
 
 /**
  * Resolve the bounded academic records visible to an Academic Admin or
@@ -131,10 +119,12 @@ export async function resolveAcademicVisibility(rawUser) {
   };
 }
 
-export async function buildAcademicListFilter(rawUser, resourcePath) {
+export async function buildAcademicListFilter(rawUser, resourcePath, { organizationUnitId = null } = {}) {
   const visibility = await resolveAcademicVisibility(rawUser);
-  if (visibility.all) return { tenantId: visibility.tenantId };
-  if (resourcePath === 'enrollments') {
+  let filter;
+  if (visibility.all) {
+    filter = { tenantId: visibility.tenantId };
+  } else if (resourcePath === 'enrollments') {
     if (hasRole(visibility.user, 'ACADEMIC_ADMIN')) {
       const programIds = visibility.ids.programs || [];
       return { tenantId: visibility.tenantId, programId: { $in: programIds } };
@@ -149,9 +139,11 @@ export async function buildAcademicListFilter(rawUser, resourcePath) {
       ...(offering.cohortId ? { cohortId: offering.cohortId } : {}),
       ...(offering.academicSectionId ? { academicSectionId: offering.academicSectionId } : {}),
     }));
-    return { tenantId: visibility.tenantId, ...(clauses.length ? { $or: clauses } : { _id: { $in: [] } }) };
+    filter = { tenantId: visibility.tenantId, ...(clauses.length ? { $or: clauses } : { _id: { $in: [] } }) };
+  } else {
+    filter = { tenantId: visibility.tenantId, _id: { $in: visibility.ids[resourcePath] || [] } };
   }
-  return { tenantId: visibility.tenantId, _id: { $in: visibility.ids[resourcePath] || [] } };
+  return narrowAcademicFilterByOrganization(filter, resourcePath, organizationUnitId);
 }
 
 export async function assertAcademicMutationAllowed(rawUser, resourcePath, payload = {}, existingId = null) {
@@ -184,7 +176,16 @@ export async function canOperateExam(rawUser, examOrId) {
     ? examOrId
     : await Exam.findOne({ _id: examOrId, tenantId: user?.tenantId }).lean();
   if (!user || !exam || id(user.tenantId) !== id(exam.tenantId)) return false;
-  if (hasRole(user, 'EXAM_CREATOR') && id(exam.createdBy) === id(user._id)) return true;
+  if (isStaffExamOwner(user, exam)) return true;
+  if (hasAnyRole(user, OPERATING_STAFF_ROLES)) {
+    const creatorParticipant = await ExamParticipant.exists({
+      examId: exam._id,
+      userId: user._id,
+      examRole: 'CREATOR',
+      tenantId: user.tenantId,
+    });
+    if (creatorParticipant) return true;
+  }
   if (hasRole(user, 'TEACHER') && exam.academicContext?.courseOfferingId) {
     return Boolean(await CourseOffering.exists({
       _id: exam.academicContext.courseOfferingId,

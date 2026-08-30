@@ -21,6 +21,22 @@ import { canCandidateViewScore } from '../utils/resultVisibility.js';
 
 const router = express.Router();
 
+router.get('/assessment-history', requireAuth, async (req, res, next) => {
+  try {
+    const { getCandidateAssessmentHistory } = await import('../services/candidateAssessmentHistoryService.js');
+    const history = await getCandidateAssessmentHistory(req.user, req.user._id, {
+      academicSessionId: req.query.academicSessionId,
+      courseId: req.query.courseId,
+      deliveryMode: req.query.deliveryMode,
+      limit: Number(req.query.limit || 100),
+    });
+    return res.json(history);
+  } catch (error) {
+    if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+    return next(error);
+  }
+});
+
 // Get own profile (universal: all authenticated users)
 router.get('/profile', requireAuth, async (req, res, next) => {
   try {
@@ -215,4 +231,3 @@ router.get('/results', requireAuth, async (req, res, next) => {
 });
 
 export default router;
-

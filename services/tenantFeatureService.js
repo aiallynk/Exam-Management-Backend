@@ -86,6 +86,21 @@ export const TENANT_CAPABILITIES = Object.freeze({
   ONLINE_EXAMS: { group: 'Examination Modes', platformAvailable: true, planFeature: null, description: 'Online examinations.', releaseStatus: 'RELEASED' },
   RESULT_APPROVAL_WORKFLOW: { group: 'Reporting & Administration', planFeature: 'mandatoryVerification', dependsOn: ['EVALUATOR_REVIEW'], description: 'Result approval before publication.', releaseStatus: 'RELEASED' },
 
+  // Teacher accounts have no general user-management capability by default
+  // (XAMIGO_HIERARCHY.md — a Teacher must not be able to create Teacher/
+  // Exam Creator/Academic Admin/Evaluator accounts). This narrow, opt-in
+  // toggle grants ONLY the ability to add/enroll Candidates into the
+  // Teacher's own assigned classes — never a general people-management
+  // surface. Off by default so no tenant is silently widened.
+  TEACHER_STUDENT_MANAGEMENT: {
+    group: 'Academic & Users',
+    platformAvailable: true,
+    planFeature: null,
+    defaultEnabled: false,
+    description: 'Allow Teachers to add or enroll Candidates into their own assigned classes.',
+    releaseStatus: 'RELEASED',
+  },
+
 });
 
 export const CONTROL_CATEGORY_DEFINITIONS = Object.freeze([
@@ -170,7 +185,10 @@ export const resolveTenantCapabilities = async (tenantId) => {
       ? setting.enforcedEnabled === true
       : setting
         ? setting.requestedEnabled === true
-        : true;
+        // No explicit tenant setting yet: fall back to the capability's own
+        // default (existing capabilities are unaffected — they have no
+        // `defaultEnabled` field, so this stays `true` exactly as before).
+        : definition.defaultEnabled !== false;
     const dependencyStates = (definition.dependsOn || []).map(resolve).filter(Boolean);
     const dependencyOk = dependencyStates.every((state) => state.effectiveEnabled);
     const effectiveState = resolveCapabilityEffectiveState({
@@ -187,7 +205,7 @@ export const resolveTenantCapabilities = async (tenantId) => {
       description: definition.description,
       platformAvailable,
       planEntitled,
-      requestedEnabled: setting ? setting.requestedEnabled : true,
+      requestedEnabled: setting ? setting.requestedEnabled : definition.defaultEnabled !== false,
       effectiveEnabled: platformAvailable && planEntitled && tenantEnabled && dependencyOk,
       effectiveState,
       disabledReason: effectiveState === 'ENABLED' ? '' : effectiveState,

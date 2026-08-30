@@ -18,7 +18,10 @@ const ExamAttemptSchema = new mongoose.Schema(
     sessionId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'ExamSession',
-      required: true,
+      // Scanned-paper attempts converge directly from AnswerScript and may
+      // not have a timed delivery session. Online attempts remain required.
+      required() { return !this.sourceAnswerScriptId; },
+      default: null,
     },
     questionPaperId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -273,6 +276,19 @@ const ExamAttemptSchema = new mongoose.Schema(
       ref: 'AnswerScript',
       default: null,
     },
+    // OMR bubble-sheet attempts converge here; OMRResult remains a processing artifact.
+    sourceOmrResultId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'OMRResult',
+      default: null,
+    },
+    reviewCompletion: {
+      status: { type: String, enum: ['NOT_STARTED', 'IN_PROGRESS', 'COMPLETED', 'REOPENED'], default: 'NOT_STARTED' },
+      completedAt: { type: Date, default: null },
+      completedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      completionComment: { type: String, trim: true, maxlength: 1000, default: '' },
+      version: { type: Number, default: 0 },
+    },
     // Offline exam attempt fields
     offlineMode: {
       type: Boolean,
@@ -362,6 +378,13 @@ ExamAttemptSchema.index({ examId: 1, isCompleted: 1, isDisqualified: 1 });
 
 // For session queries: { sessionId, isCompleted }
 ExamAttemptSchema.index({ sessionId: 1, isCompleted: 1 });
+ExamAttemptSchema.index(
+  { sourceAnswerScriptId: 1 },
+  { unique: true, partialFilterExpression: { sourceAnswerScriptId: { $type: 'objectId' } } },
+);
+ExamAttemptSchema.index(
+  { sourceOmrResultId: 1 },
+  { unique: true, partialFilterExpression: { sourceOmrResultId: { $type: 'objectId' } } },
+);
 
 export default mongoose.model('ExamAttempt', ExamAttemptSchema);
-

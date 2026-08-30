@@ -66,14 +66,11 @@ export const resolveAssessmentSpecification = async ({ tenantId, purpose = 'OF',
 };
 
 export const qualityGateQuestionsAgainstSpecification = (questions, specification) => {
-  const allowed = specification?.questionGeneration?.questionTypes;
   const accepted = [];
   const rejected = [];
   (questions || []).forEach((question, index) => {
     if (!question?.questionText || !question?.questionType) {
       rejected.push({ index, code: 'INVALID_SHAPE', message: 'Question is missing a stem or type.' });
-    } else if (Array.isArray(allowed) && allowed.length && !allowed.includes(question.questionType)) {
-      rejected.push({ index, code: 'TYPE_NOT_ALLOWED', message: `${question.questionType} is not allowed by the resolved assessment specification.` });
     } else {
       accepted.push(question);
     }

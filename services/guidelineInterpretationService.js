@@ -8,6 +8,10 @@ import { dispatchJob, JOB_TYPES } from './jobs/jobDispatcherService.js';
 import { parseQuestionImportFile } from './questionImportImageService.js';
 import { putPrivateObject, isS3Configured, getPrivateObjectBuffer } from './storage/imageStorage.js';
 import { logError } from '../utils/logger.js';
+import User from '../models/User.js';
+import { resolveAcademicVisibility } from './academicAccessService.js';
+import { hasRole } from '../utils/userRoles.js';
+import { isGlobalGovernanceScope, isGovernanceScopeReadable } from '../utils/governanceScope.js';
 
 export class GuidelineError extends Error {
   constructor(status, message, code) {
@@ -202,11 +206,34 @@ export const interpretGuidelineFile = async ({ tenantId, userId, file, title = '
   return { item: doc, job };
 };
 
-export const saveGuidelineProposalAsFrameworkDraft = async ({ tenantId, userId, guidelineDocumentId, frameworkId = null, frameworkName, reviewedProposal }) => {
+export const saveGuidelineProposalAsFrameworkDraft = async ({
+  tenantId,
+  userId,
+  guidelineDocumentId,
+  frameworkId = null,
+  frameworkName,
+  reviewedProposal,
+  scope = {},
+}) => {
   const doc = await GuidelineDocument.findOne({ _id: guidelineDocumentId, tenantId });
   if (!doc) throw new GuidelineError(404, 'Guideline document not found.', 'NOT_FOUND');
   if (!['READY_FOR_REVIEW', 'DRAFT_SAVED'].includes(doc.status)) {
     throw new GuidelineError(409, 'Guideline proposal is not ready for review.', 'NOT_READY');
+  }
+
+  const actor = await User.findById(userId).select('_id role roles tenantId academicAdminScope primaryOrganizationUnitId organizationUnitAccess').lean();
+  if (!actor) throw new GuidelineError(403, 'User not found.', 'NOT_AUTHORIZED');
+  const visibility = await resolveAcademicVisibility(actor);
+  const resolvedScope = scope && typeof scope === 'object' && !Array.isArray(scope) ? scope : {};
+  if (!visibility.all) {
+    if (isGlobalGovernanceScope(resolvedScope)) {
+      throw new GuidelineError(403, 'A bounded Academic Admin must select an academic scope for framework drafts.', 'SCOPE_REQUIRED');
+    }
+    if (!isGovernanceScopeReadable(visibility, resolvedScope)) {
+      throw new GuidelineError(403, 'The selected governance scope is outside your delegated academic scope.', 'SCOPE_NOT_AUTHORIZED');
+    }
+  } else if (!hasRole(actor, 'TENANT_ADMIN') && isGlobalGovernanceScope(resolvedScope)) {
+    throw new GuidelineError(403, 'Only Tenant Admin may create tenant-wide governance drafts.', 'GLOBAL_SCOPE_NOT_ALLOWED');
   }
 
   let framework = null;
@@ -219,6 +246,7 @@ export const saveGuidelineProposalAsFrameworkDraft = async ({ tenantId, userId, 
       name: frameworkName || doc.proposal?.frameworkNameSuggestion || doc.title || 'Guideline Framework',
       code: `GL-${Date.now()}`,
       description: 'Created from guideline interpretation',
+      scope: resolvedScope,
       createdBy: userId,
     });
   }

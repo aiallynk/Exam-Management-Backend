@@ -50,6 +50,15 @@ const AIGenerationRunSchema = new mongoose.Schema(
       default: 0,
       min: 0,
     },
+    // Non-STRICT source-grounded runs (SELECTED_CONTEXT / AUTO_CONTEXT) top up
+    // any grounded shortfall on the same topic so the request is always
+    // fulfilled (Blueprint §4C). This is how many of the delivered questions
+    // came from that top-up rather than from grounded retrieval.
+    supplementedCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
     rejectedCount: {
       type: Number,
       default: 0,

@@ -42,8 +42,13 @@ import RubricTemplate from '../models/RubricTemplate.js';
 import QuestionPaper from '../models/QuestionPaper.js';
 import Question from '../models/Question.js';
 import QuestionUsage from '../models/QuestionUsage.js';
-import { hasRole } from '../utils/userRoles.js';
+import { hasRole, hasAnyRole } from '../utils/userRoles.js';
 import { resolveAcademicVisibility, canOperateExam, canAuthorInCourseOffering } from '../services/academicAccessService.js';
+import { isGovernanceScopeReadable } from '../utils/governanceScope.js';
+import {
+  canChangeExamDeliveryMode,
+  countAnswerScriptsForExam,
+} from '../services/offlineEvaluation/offlineIntakeEligibilityService.js';
 
 const router = express.Router();
 const SECTION_BASED_EXAM_TYPE = 'SECTION_BASED';
@@ -191,12 +196,19 @@ const applyCandidateAssignments = async ({
   }
 
   for (const candidateId of addedCandidateIds) {
+    const { captureCandidateIdentitySnapshot, applyIdentitySnapshotToParticipant } = await import('../services/offlineEvaluation/examRosterIdentityService.js');
+    const snapshot = await captureCandidateIdentitySnapshot({
+      tenantId: exam.tenantId,
+      userId: candidateId,
+      examAcademicContext: exam.academicContext || {},
+    });
     const participant = new ExamParticipant({
       examId: exam._id,
       userId: candidateId,
       examRole: 'CANDIDATE',
       assignedBy: assignedBy || exam.createdBy,
       tenantId: exam.tenantId || null,
+      ...(snapshot ? { candidateIdentitySnapshot: snapshot } : {}),
     });
     await participant.save();
   }
@@ -1529,6 +1541,7 @@ router.post(
         frameworkId = null,
         frameworkVersionId = null,
         rubricTemplateId = null,
+        rubricTemplateIds = [],
         creatorOverrides = {},
       } =
         req.body;
@@ -1715,24 +1728,45 @@ router.post(
         }
       }
 
-      let rubricSnapshot = null;
-      if (rubricTemplateId) {
-        const publishedRubric = await RubricTemplate.findOne({
-          _id: rubricTemplateId,
+      const selectedRubricIds = [...new Set([
+        ...(Array.isArray(rubricTemplateIds) ? rubricTemplateIds : []),
+        rubricTemplateId,
+      ].filter(Boolean).map(String))];
+      let rubricSnapshots = [];
+      if (selectedRubricIds.length) {
+        const publishedRubrics = await RubricTemplate.find({
+          _id: { $in: selectedRubricIds },
           tenantId: resolvedTenantId,
           status: 'PUBLISHED',
         }).lean();
-        if (!publishedRubric) {
-          return res.status(400).json({ error: 'The selected rubric must be a published template in this tenant.' });
+        if (publishedRubrics.length !== selectedRubricIds.length) {
+          return res.status(400).json({ error: 'Every selected rubric must be a published template in this tenant.' });
         }
-        rubricSnapshot = {
-          templateId: String(publishedRubric._id),
-          name: publishedRubric.name,
-          version: publishedRubric.version,
-          criteria: publishedRubric.criteria,
-          capturedAt: new Date().toISOString(),
-        };
+        // The picker is scoped, but the create route must independently
+        // reject a tampered rubric id from another delegated academic scope.
+        // Tenant membership alone is never sufficient authority to attach a
+        // rubric to an assessment.
+        const rubricVisibility = await resolveAcademicVisibility(req.user);
+        const outOfScopeRubric = publishedRubrics.find(
+          (rubric) => !isGovernanceScopeReadable(rubricVisibility, rubric.applicability || {})
+        );
+        if (outOfScopeRubric) {
+          return res.status(403).json({ error: 'One or more selected rubrics are outside your delegated academic scope.' });
+        }
+        const rubricById = new Map(publishedRubrics.map((rubric) => [String(rubric._id), rubric]));
+        rubricSnapshots = selectedRubricIds.map((templateId) => {
+          const publishedRubric = rubricById.get(templateId);
+          return {
+            templateId: String(publishedRubric._id),
+            name: publishedRubric.name,
+            version: publishedRubric.version,
+            criteria: publishedRubric.criteria,
+            capturedAt: new Date().toISOString(),
+          };
+        });
       }
+      const rubricSnapshot = rubricSnapshots[0] || null;
+      const primaryRubricTemplateId = selectedRubricIds[0] || null;
 
       // Resolve and persist tenant scope for exam creation.
       const examData = {
@@ -1763,8 +1797,10 @@ router.post(
         academicContext: resolvedSpecification.academicContext,
         frameworkId: frameworkId || null,
         frameworkVersionId: resolvedSpecification.frameworkVersion?.id || null,
-        rubricTemplateId: rubricTemplateId || null,
+        rubricTemplateId: primaryRubricTemplateId,
         rubricSnapshot,
+        rubricTemplateIds: selectedRubricIds,
+        rubricSnapshots,
         resolvedSpecificationSnapshot: resolvedSpecification,
         resolvedSpecificationAt: new Date(),
       };
@@ -1868,6 +1904,49 @@ router.post(
       res.status(201).json({ exam: withExamCode(exam) });
     } catch (error) {
       next(error);
+    }
+  }
+);
+
+router.patch(
+  '/:examId/delivery-mode',
+  requireAuth,
+  requireTenant,
+  enforceTenantBoundaries,
+  requireRole('ACADEMIC_ADMIN', 'TEACHER', 'EXAM_CREATOR', 'TENANT_ADMIN'),
+  [body('deliveryMode').isIn(['ONLINE', 'OFFLINE', 'HYBRID'])],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      if (hasRole(req.user, 'TENANT_ADMIN') && !hasAnyRole(req.user, ['ACADEMIC_ADMIN', 'TEACHER', 'EXAM_CREATOR'])) {
+        return res.status(403).json({ error: 'Tenant Admin monitors operations and cannot change assessment delivery mode.' });
+      }
+      const exam = await Exam.findOne({ _id: req.params.examId, tenantId: req.user.tenantId });
+      if (!exam) return res.status(404).json({ error: 'Assessment not found.' });
+      if (!(await canOperateExam(req.user, exam))) {
+        return res.status(403).json({ error: 'You can change delivery mode only for an assigned class or an assessment you own.' });
+      }
+      const requested = String(req.body.deliveryMode).toUpperCase();
+      const scriptCount = await countAnswerScriptsForExam({ tenantId: req.user.tenantId, examId: exam._id });
+      const gate = canChangeExamDeliveryMode({ exam, answerScriptCount: scriptCount });
+      if (!gate.allowed) return res.status(409).json({ error: gate.message, code: gate.code });
+      if (gate.restrictTo && !gate.restrictTo.includes(requested)) {
+        return res.status(409).json({ error: gate.message || 'That delivery mode is not allowed for this assessment.' });
+      }
+      const previous = exam.deliveryMode || 'ONLINE';
+      exam.deliveryMode = requested;
+      await exam.save();
+      await logAuditEvent('EXAM_UPDATED', {
+        userId: req.user._id,
+        tenantId: req.user.tenantId,
+        resourceType: 'Exam',
+        resourceId: exam._id,
+        details: { field: 'deliveryMode', from: previous, to: requested },
+      });
+      return res.json({ exam: { _id: exam._id, deliveryMode: exam.deliveryMode } });
+    } catch (error) {
+      return next(error);
     }
   }
 );
@@ -2187,6 +2266,14 @@ router.put(
         exam.examType = requestedExamType;
       }
       if (['ONLINE', 'OFFLINE', 'HYBRID'].includes(deliveryMode)) {
+        const scriptCount = await countAnswerScriptsForExam({ tenantId: req.user.tenantId, examId: exam._id });
+        const gate = canChangeExamDeliveryMode({ exam, answerScriptCount: scriptCount });
+        if (!gate.allowed) {
+          return res.status(409).json({ error: gate.message, code: gate.code });
+        }
+        if (gate.restrictTo && !gate.restrictTo.includes(deliveryMode)) {
+          return res.status(409).json({ error: gate.message || 'That delivery mode is not allowed for this assessment.' });
+        }
         exam.deliveryMode = deliveryMode;
       }
       if (resolvedExamType === OMR_EXAM_TYPE) {
@@ -2644,6 +2731,9 @@ router.post(
         if (!exam) {
           return res.status(404).json({ error: 'Exam not found' });
         }
+        if (!(await canOperateExam(req.user, exam))) {
+          return res.status(403).json({ error: 'You do not have permission to manage this assessment.' });
+        }
 
         const QuestionPaper = (await import('../models/QuestionPaper.js')).default;
         const Section = (await import('../models/Section.js')).default;
@@ -2708,6 +2798,67 @@ router.post(
       next(error);
     }
   }
+);
+
+router.post(
+  '/:id/assign-enrolled-class',
+  requireAuth,
+  requireTenant,
+  enforceTenantBoundaries,
+  requireRole('EXAM_CREATOR', 'TEACHER', 'ACADEMIC_ADMIN', 'TENANT_ADMIN'),
+  async (req, res, next) => {
+    try {
+      const exam = await Exam.findOne({ _id: req.params.id, tenantId: req.user.tenantId });
+      if (!exam) return res.status(404).json({ error: 'Assessment not found.' });
+      if (!(hasRole(req.user, 'TENANT_ADMIN') || await canOperateExam(req.user, exam))) {
+        return res.status(403).json({ error: 'You do not have permission to manage this assessment roster.' });
+      }
+
+      const courseOfferingId = req.body?.courseOfferingId || exam.academicContext?.courseOfferingId;
+      if (!courseOfferingId) {
+        return res.status(400).json({ error: 'courseOfferingId is required for whole-class assignment.' });
+      }
+      let academicAdminScopeOk = false;
+      if (hasRole(req.user, 'ACADEMIC_ADMIN')) {
+        const visibility = await resolveAcademicVisibility(req.user);
+        academicAdminScopeOk = visibility.all
+          || (visibility.ids['course-offerings'] || []).includes(String(courseOfferingId));
+      }
+      if (!(hasRole(req.user, 'TENANT_ADMIN') || academicAdminScopeOk || await canAuthorInCourseOffering(req.user, courseOfferingId))) {
+        return res.status(403).json({ error: 'You are not authorized to assign candidates from this course offering.' });
+      }
+
+      const { default: CourseOffering } = await import('../models/academic/CourseOffering.js');
+      const { default: Enrollment } = await import('../models/academic/Enrollment.js');
+      const offering = await CourseOffering.findOne({ _id: courseOfferingId, tenantId: req.user.tenantId, status: 'ACTIVE' }).lean();
+      if (!offering) return res.status(404).json({ error: 'Course offering not found.' });
+
+      const enrollments = await Enrollment.find({
+        tenantId: req.user.tenantId,
+        academicSessionId: offering.academicSessionId,
+        programId: offering.programId,
+        status: 'ACTIVE',
+        ...(offering.cohortId ? { cohortId: offering.cohortId } : {}),
+        ...(offering.academicSectionId ? { academicSectionId: offering.academicSectionId } : {}),
+      }).select('userId').lean();
+
+      const candidateIds = enrollments.map((item) => String(item.userId));
+      const assignmentResult = await applyCandidateAssignments({
+        exam,
+        candidateIds,
+        mode: req.body?.mode || 'replace',
+        assignedBy: req.user._id,
+      });
+
+      return res.json({
+        message: 'Enrolled class assigned to assessment roster.',
+        candidateCount: assignmentResult.candidateIds.length,
+        assignment: assignmentResult,
+      });
+    } catch (error) {
+      return next(error);
+    }
+  },
 );
 
 export default router;

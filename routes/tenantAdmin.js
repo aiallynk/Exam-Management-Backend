@@ -16,6 +16,7 @@ import TenantFeatureBilling from '../models/TenantFeatureBilling.js';
 import CreditRequest from '../models/CreditRequest.js';
 import { validatePasswordStrength, generateSecurePassword } from '../utils/passwordValidator.js';
 import { createTenantUser, addRole, removeRole, assertEvaluatorRoleAllowed, UserRoleError } from '../services/userRoleService.js';
+import { resolveTargetLocationForUserCreation, UserProvisioningScopeError } from '../services/userProvisioningScopeService.js';
 import { AUDIT_ACTIONS } from '../middleware/audit.js';
 import { logAuditEvent } from '../utils/auditLogger.js';
 import { checkTenantLimits } from '../middleware/planLimits.js';
@@ -36,6 +37,7 @@ import {
 } from '../middleware/planRestrictions.js';
 import { getTenantAnalyticsDashboard } from '../services/analyticsService.js';
 import { deleteUserAndCleanup } from '../services/userDeletionService.js';
+import { normalizeCandidateAcademicProfile } from '../utils/candidateAcademicProfile.js';
 import {
   getTenantAiGradingUsageSnapshot,
   toAiUsageResponsePayload,
@@ -524,14 +526,12 @@ const normalizeBulkImportRow = (row) => {
   const normalizedRole = requestedRole.replace(/[\s-]+/g, '_');
   const role = normalizedRole || 'CANDIDATE';
 
-  const rawGrade = toTrimmedString(getBulkRowValue(row, 'Grade'));
-  const gradeLevel = rawGrade === '' ? null : Number(rawGrade);
-  const academicProfile = {
-    gradeLevel,
-    className: toTrimmedString(getBulkRowValue(row, 'Class')),
-    division: toTrimmedString(getBulkRowValue(row, 'Division')),
-    rollNumber: toTrimmedString(getBulkRowValue(row, 'Roll Number')),
-  };
+  const academicProfile = normalizeCandidateAcademicProfile({
+    rollNumber: getBulkRowValue(row, 'Roll Number') || getBulkRowValue(row, 'Roll No'),
+    grade: getBulkRowValue(row, 'Grade'),
+    section: getBulkRowValue(row, 'Section') || getBulkRowValue(row, 'Division') || getBulkRowValue(row, 'Class'),
+    externalStudentId: getBulkRowValue(row, 'Student ID') || getBulkRowValue(row, 'External Student ID'),
+  });
 
   return { name, email, password, role, academicProfile };
 };
@@ -1733,8 +1733,8 @@ router.get('/users/bulk-import/template', (req, res) => {
   if (!ensureTenantAdminBulkAccess(req, res)) return;
 
   const templateRows = [
-    'Name,Email,Password,Role,Grade,Class,Division,Roll Number',
-    'Aarav Sharma,aarav.sharma@example.com,Test@12345,CANDIDATE,5,5,A,17',
+    'Name,Email,Password,Role,Roll Number,Grade,Section,Student ID',
+    'Aarav Sharma,aarav.sharma@example.com,Test@12345,CANDIDATE,17,10,A,STU-17',
     'Neha Singh,neha.singh@example.com,Test@12345,EXAM_CREATOR,,,,',
   ];
 
@@ -1885,6 +1885,8 @@ router.post(
     body('accessExpiresAt').optional({ nullable: true }).isISO8601(),
     body('academicProfile').optional().isObject(),
     body('academicAdminScope').optional().isObject(),
+    body('primaryOrganizationUnitId').optional({ nullable: true }).custom((value) => value === null || value === '' || /^[a-fA-F0-9]{24}$/.test(String(value))),
+    body('organizationUnitAccess').optional().isArray(),
   ],
   checkTenantLimits,
   async (req, res, next) => {
@@ -1894,7 +1896,7 @@ router.post(
         return res.status(400).json({ errors: errors.array() });
       }
 
-      const { name, email, password, role, roles, mobile, subTenantId, accessExpiresAt, academicProfile, academicAdminScope } = req.body;
+      const { name, email, password, role, roles, mobile, subTenantId, accessExpiresAt, academicProfile, academicAdminScope, primaryOrganizationUnitId, organizationUnitAccess } = req.body;
 
       let resolvedSubTenantId = null;
       if (subTenantId !== undefined) {
@@ -1927,7 +1929,24 @@ router.post(
       // role='CANDIDATE': createTenantUser never downgrades an unsupported
       // or not-yet-entitled role, it rejects with a typed error instead.
       let user;
+      let resolvedLocationId = null;
+      let scopeResolutionMethod = null;
       try {
+        // Tenant Admin is the only role that reaches this router
+        // (router.use(requireRole('TENANT_ADMIN')) above) and is tenant-wide,
+        // so — unlike Academic Admin/Teacher provisioning below — a
+        // client-selected location IS honored here, but it is now validated
+        // against the canonical resolver (an ACTIVE unit belonging to this
+        // tenant) instead of only regex-shape-checked as before.
+        if (primaryOrganizationUnitId) {
+          const resolved = await resolveTargetLocationForUserCreation({
+            actor: req.user,
+            requestedLocationId: primaryOrganizationUnitId,
+          });
+          resolvedLocationId = resolved.locationId;
+          scopeResolutionMethod = resolved.method;
+        }
+
         user = await createTenantUser({
           name,
           email,
@@ -1941,8 +1960,18 @@ router.post(
           evaluatorAccess: (roles || [role]).includes('EVALUATOR') ? { accessExpiresAt: accessExpiresAt || null } : undefined,
           academicProfile: (roles || [role]).includes('CANDIDATE') ? academicProfile : undefined,
           academicAdminScope,
+          primaryOrganizationUnitId: resolvedLocationId,
+          organizationUnitAccess: Array.isArray(organizationUnitAccess)
+            ? organizationUnitAccess.map((entry) => ({
+              organizationUnitId: entry?.organizationUnitId || entry,
+              grantedBy: req.user._id,
+            })).filter((entry) => entry.organizationUnitId)
+            : undefined,
         });
       } catch (roleError) {
+        if (roleError instanceof UserProvisioningScopeError) {
+          return res.status(roleError.status).json({ error: roleError.message, code: roleError.code });
+        }
         if (roleError instanceof UserRoleError) {
           return res.status(roleError.status).json({ error: roleError.message });
         }
@@ -1962,6 +1991,10 @@ router.post(
           createdUserEmail: user.email,
           createdUserRole: user.role,
           createdUserRoles: user.roles,
+          createdBy: String(req.user._id),
+          createdRole: user.role,
+          resolvedLocationId,
+          scopeResolutionMethod,
         },
       });
 
@@ -1989,7 +2022,8 @@ router.put(
       .withMessage('subTenantId must be a valid id when provided'),
     body('academicProfile').optional().isObject(),
     body('academicAdminScope').optional().isObject(),
-    body('academicProfile.gradeLevel').optional({ nullable: true }).isInt({ min: 1, max: 7 }),
+    body('primaryOrganizationUnitId').optional({ nullable: true }).custom((value) => value === null || value === '' || /^[a-fA-F0-9]{24}$/.test(String(value))),
+    body('organizationUnitAccess').optional().isArray(),
   ],
   checkTenantLimits,
   async (req, res, next) => {
@@ -2024,7 +2058,7 @@ router.put(
         subTenantId: user.subTenantId ? String(user.subTenantId) : null,
       };
 
-      const { name, email, password, role, roles, status, mobile, subTenantId, academicProfile, academicAdminScope } = req.body;
+      const { name, email, password, role, roles, status, mobile, subTenantId, academicProfile, academicAdminScope, primaryOrganizationUnitId, organizationUnitAccess } = req.body;
 
       if (name) user.name = name;
       if (email) {
@@ -2083,15 +2117,22 @@ router.put(
         }
       }
       if (academicAdminScope !== undefined) user.academicAdminScope = academicAdminScope;
+      if (primaryOrganizationUnitId !== undefined) {
+        user.primaryOrganizationUnitId = primaryOrganizationUnitId || null;
+      }
+      if (organizationUnitAccess !== undefined) {
+        user.organizationUnitAccess = Array.isArray(organizationUnitAccess)
+          ? organizationUnitAccess.map((entry) => ({
+            organizationUnitId: entry?.organizationUnitId || entry,
+            grantedAt: entry?.grantedAt || new Date(),
+            grantedBy: entry?.grantedBy || req.user._id,
+          })).filter((entry) => entry.organizationUnitId)
+          : [];
+      }
       if (status) user.status = status;
       if (mobile !== undefined) user.mobile = mobile;
       if (academicProfile !== undefined && nextRoles.includes('CANDIDATE')) {
-        user.academicProfile = {
-          gradeLevel: academicProfile?.gradeLevel || null,
-          className: String(academicProfile?.className || '').trim(),
-          division: String(academicProfile?.division || '').trim(),
-          rollNumber: String(academicProfile?.rollNumber || '').trim(),
-        };
+        user.academicProfile = normalizeCandidateAcademicProfile(academicProfile);
       }
       if (subTenantId !== undefined) {
         const effectivePlanType = await resolveUserEffectivePlanType(req.user);

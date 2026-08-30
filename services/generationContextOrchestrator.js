@@ -5,6 +5,7 @@ import { resolveLibraryResourcesToContextSourceIds } from './libraryResourceServ
 import { listEligibleAutoContextResources, previewAutoContextResources } from './knowledgeMemoryService.js';
 import { resolveAcademicVisibility } from './academicAccessService.js';
 import sourceGroundedConfig from '../config/sourceGroundedConfig.js';
+import ingestionConfig from '../config/ingestionConfig.js';
 import { buildQueryText } from './groundedGenerationService.js';
 
 export const CONTEXT_MODES = Object.freeze({
@@ -52,7 +53,10 @@ const resolveSourceIdsForMode = async ({
       courseId: academicContext?.courseId,
     });
     if (!eligible.length) {
-      throw new InsufficientContextError('No eligible institution knowledge was found for this assessment context.', 'NO_AUTO_CONTEXT');
+      // No eligible institution knowledge is not fatal — the caller falls
+      // back to topic-based generation so the request is still fulfilled
+      // (Blueprint §4C). Only STRICT_SOURCE refuses on missing material.
+      return { mode, sourceIds: [], libraryResourceIds: [] };
     }
     const libraryResourceIds = eligible.slice(0, 10).map((r) => r._id);
     const sourceIds = await resolveLibraryResourcesToContextSourceIds(user, libraryResourceIds);
@@ -112,10 +116,14 @@ export const buildGenerationContext = async ({
   });
 
   if (!sourceIds.length) {
-    if (mode === CONTEXT_MODES.STRICT_SOURCE || mode === CONTEXT_MODES.SELECTED_CONTEXT) {
-      throw new InsufficientContextError('Insufficient source material for the selected context mode.', 'NO_READY_SOURCES');
+    // STRICT_SOURCE still refuses (its UI copy promises "only from selected
+    // material"). SELECTED_CONTEXT / AUTO_CONTEXT no longer hard-fail on a
+    // thin selection: the caller (routes/ai.js) grounds what it can and tops
+    // up the remainder on the same topic — see Blueprint §4C.
+    if (mode === CONTEXT_MODES.STRICT_SOURCE) {
+      throw new InsufficientContextError('Insufficient source material for Strict Source Only generation.', 'NO_READY_SOURCES');
     }
-    return base;
+    return { ...base, selectedLibraryResourceIds: libraryResourceIds || [], contextShortfall: { reason: 'NO_READY_SOURCES' } };
   }
 
   const queryText = buildQueryText({ topic, instructions: creatorInstructions || instructions, questionTypes: questionBlueprint?.questionTypes });
@@ -140,16 +148,39 @@ export const buildGenerationContext = async ({
     throw new InsufficientContextError('Insufficient relevant institution material for Strict Source Only generation.', 'INSUFFICIENT_SOURCE_CONTEXT');
   }
 
-  if (!retrievedChunks.length && mode === CONTEXT_MODES.SELECTED_CONTEXT) {
-    throw new InsufficientContextError('Insufficient source material was retrieved for generation.', 'INSUFFICIENT_SOURCE_MATERIAL');
-  }
+  const trimChunksToTokenBudget = (chunks, maxTokens = ingestionConfig.AUTO_CONTEXT_MAX_TOKENS) => {
+    const selected = [];
+    let usedTokens = 0;
+    for (const chunk of chunks) {
+      const pieceTokens = Math.ceil(String(chunk.text || '').length / ingestionConfig.CHARS_PER_TOKEN_ESTIMATE);
+      if (usedTokens + pieceTokens > maxTokens) break;
+      selected.push(chunk);
+      usedTokens += pieceTokens;
+    }
+    return { selected, usedTokens, candidateCount: chunks.length };
+  };
+
+  const budgeted = trimChunksToTokenBudget(retrievedChunks);
+  retrievedChunks = budgeted.selected;
+
+  // SELECTED_CONTEXT / AUTO_CONTEXT: an empty retrieval is not fatal — return
+  // the resolved sourceIds so routes/ai.js can still ground against the raw
+  // chunks and top up the shortfall (Blueprint §4C). STRICT_SOURCE already
+  // threw above.
+  const contextShortfall = !retrievedChunks.length ? { reason: 'NO_RETRIEVED_CONTEXT' } : null;
 
   return {
     ...base,
     contextMode: mode,
+    ...(contextShortfall ? { contextShortfall } : {}),
     selectedLibraryResourceIds: libraryResourceIds,
     selectedContextSourceIds: sourceIds,
     retrievedChunks,
+    contextDiagnostics: {
+      candidateChunks: budgeted.candidateCount,
+      selectedChunks: retrievedChunks.length,
+      selectedContextTokens: budgeted.usedTokens,
+    },
     sourceProvenance: retrievedChunks.map((chunk, index) => ({
       chunkIndex: index + 1,
       sourceId: chunk.sourceId,

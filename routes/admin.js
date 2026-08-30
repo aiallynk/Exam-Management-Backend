@@ -3,8 +3,10 @@ import User from '../models/User.js';
 import ExamAttempt from '../models/ExamAttempt.js';
 import Answer from '../models/Answer.js';
 import SystemConfig from '../models/SystemConfig.js';
+import Enrollment from '../models/academic/Enrollment.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
+import { buildAcademicListFilter } from '../services/academicAccessService.js';
 import { body, validationResult } from 'express-validator';
 import crypto from 'crypto';
 import { validatePasswordStrength, generateSecurePassword } from '../utils/passwordValidator.js';
@@ -38,6 +40,26 @@ router.get('/candidates', requireAuth, requireRole('EXAM_CREATOR', 'TENANT_ADMIN
     // Filter by tenant for EXAM_CREATOR, TENANT_ADMIN, and ACADEMIC_ADMIN
     if ((req.user.role === 'EXAM_CREATOR' || req.user.role === 'TENANT_ADMIN' || req.user.role === 'ACADEMIC_ADMIN') && req.user.tenantId) {
       filter.tenantId = req.user.tenantId;
+    }
+
+    // EXAM_CREATOR/ACADEMIC_ADMIN are location-bound: this endpoint doubles as
+    // "search for a candidate to enroll", so it must not become a tenant-wide
+    // roster browser for other locations. Scope to candidates already
+    // enrolled within the actor's authorized academic scope, plus candidates
+    // never enrolled anywhere yet (a legitimate "add new candidate" case that
+    // isn't location data belonging to anyone else). TENANT_ADMIN stays
+    // tenant-wide by role, as elsewhere.
+    if (req.user.role === 'EXAM_CREATOR' || req.user.role === 'ACADEMIC_ADMIN') {
+      const enrollmentFilter = await buildAcademicListFilter(req.user, 'enrollments');
+      const scopedCandidateIds = await Enrollment.distinct('userId', { ...enrollmentFilter, status: 'ACTIVE' });
+      const everEnrolledCandidateIds = await Enrollment.distinct('userId', { tenantId: req.user.tenantId });
+      filter.$and = filter.$and || [];
+      filter.$and.push({
+        $or: [
+          { _id: { $in: scopedCandidateIds } },
+          { _id: { $nin: everEnrolledCandidateIds } },
+        ],
+      });
     }
 
     if (status) {
@@ -94,6 +116,26 @@ router.get('/candidates', requireAuth, requireRole('EXAM_CREATOR', 'TENANT_ADMIN
     next(error);
   }
 });
+
+router.get(
+  '/candidates/:candidateId/assessment-history',
+  requireAuth,
+  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'ACADEMIC_ADMIN', 'TEACHER'),
+  async (req, res, next) => {
+    try {
+      const { getCandidateAssessmentHistory } = await import('../services/candidateAssessmentHistoryService.js');
+      const history = await getCandidateAssessmentHistory(req.user, req.params.candidateId, {
+        academicSessionId: req.query.academicSessionId,
+        courseId: req.query.courseId,
+        deliveryMode: req.query.deliveryMode,
+      });
+      return res.json(history);
+    } catch (error) {
+      if (error.statusCode) return res.status(error.statusCode).json({ error: error.message });
+      return next(error);
+    }
+  }
+);
 
 // Block/Unblock candidate
 router.post(
@@ -220,19 +262,15 @@ router.get(
         return res.status(404).json({ error: 'Candidate not found' });
       }
 
-      // Verify tenant access
-      // CANDIDATE users can only see their own results
-      if (req.user.role !== 'SUPER_ADMIN' && req.user.role !== 'EXAM_CREATOR') {
-        if (user._id.toString() !== req.user._id.toString()) {
-          return res.status(403).json({ error: 'You can only view your own results' });
-        }
-      } else {
-        // EXAM_CREATOR: verify tenant access
-        const userTenantId = user.tenantId;
-        const adminTenantId = req.user.tenantId;
-        
-        if (userTenantId && adminTenantId && userTenantId.toString() !== adminTenantId.toString()) {
-          return res.status(403).json({ error: 'Access denied - Candidate does not belong to your tenant' });
+      // CANDIDATE users can only see their own results. Staff (EXAM_CREATOR,
+      // TENANT_ADMIN) must be authorized for this specific candidate via the
+      // same scoped check the assessment-history endpoint uses — a bare
+      // tenant-equality check let any Exam Creator in the tenant pull any
+      // other creator's/location's candidate results by raw candidateId.
+      if (user._id.toString() !== req.user._id.toString()) {
+        const { canReadCandidateHistory } = await import('../services/candidateAssessmentHistoryService.js');
+        if (!(await canReadCandidateHistory(req.user, user._id))) {
+          return res.status(403).json({ error: 'You are not authorized to view this candidate\'s results.' });
         }
       }
 

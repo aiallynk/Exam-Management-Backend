@@ -1,6 +1,8 @@
 import ContextSource from '../models/ContextSource.js';
 import ContextChunk from '../models/ContextChunk.js';
 import LibraryResource from '../models/LibraryResource.js';
+import { resolveAcademicVisibility } from './academicAccessService.js';
+import { isContentScopeReadable } from '../utils/contentScope.js';
 import { resolveTenantFeature } from './tenantFeatureService.js';
 import { reprocessContentLibrarySource } from './contentLibraryService.js';
 import { dispatchJob, JOB_TYPES } from './jobs/jobDispatcherService.js';
@@ -12,22 +14,18 @@ export const isAiIndexingEnabled = async (tenantId) => {
   return feature?.effectiveEnabled === true;
 };
 
-export const runSourceIndexingPipeline = async ({ tenantId, userId, sourceId, resourceId = null, onProgress = async () => {} }) => {
+export const runSourceIndexingPipeline = async ({ tenantId, userId, sourceId, resourceId = null, jobId = null, onProgress = async () => {} }) => {
   const source = await ContextSource.findOne({ _id: sourceId, tenantId });
   if (!source) return { status: 'NOT_FOUND', sourceId };
   if (!(await isAiIndexingEnabled(tenantId))) {
     return { status: 'STORED_ONLY', reason: 'AI_CONTENT_INDEXING is not enabled for this tenant.' };
   }
 
-  await onProgress(15, 'Extracting content');
-  await ContextChunk.deleteMany({ tenantId, sourceId });
-  await ContextSource.updateOne({ _id: sourceId, tenantId }, { $set: { status: 'PROCESSING', chunkCount: 0, processedAt: null } });
-
   const user = { _id: userId, tenantId };
-  const refreshed = await reprocessContentLibrarySource(user, sourceId);
+  const refreshed = await reprocessContentLibrarySource(user, sourceId, { onProgress, jobId });
 
   if (refreshed?.status === 'READY') {
-    await onProgress(70, 'Enriching metadata');
+    await onProgress(85, 'Enriching metadata');
     try {
       await enrichContentMetadata({ tenantId, userId, sourceId, resourceId: resourceId || source.libraryResourceId });
     } catch (error) {
@@ -38,6 +36,7 @@ export const runSourceIndexingPipeline = async ({ tenantId, userId, sourceId, re
   await onProgress(100, 'Indexing complete');
   return {
     status: refreshed?.status || 'UNKNOWN',
+    processingStage: refreshed?.processingStage || null,
     sourceId,
     chunkCount: refreshed?.chunkCount || 0,
     resourceId: resourceId || source.libraryResourceId || null,
@@ -61,8 +60,17 @@ export const ingestLibraryResource = async ({ tenantId, userId, resourceId, sour
   return { resourceId, jobs };
 };
 
-export const refreshLibraryResource = async ({ tenantId, userId, resourceId }) =>
-  ingestLibraryResource({ tenantId, userId, resourceId });
+export const refreshLibraryResource = async ({ tenantId, userId, resourceId, sourceId }) => {
+  if (sourceId) {
+    return dispatchJob({
+      jobType: JOB_TYPES.CONTENT_INDEXING,
+      tenantId,
+      correlationId: String(sourceId),
+      payload: { tenantId, userId, sourceId, resourceId },
+    });
+  }
+  return ingestLibraryResource({ tenantId, userId, resourceId });
+};
 
 export const removeLibraryResourceFromIndex = async ({ tenantId, resourceId, archiveOnly = false }) => {
   const sources = await ContextSource.find({ tenantId, libraryResourceId: resourceId }).select('_id').lean();
@@ -121,22 +129,50 @@ export const computeSourceAuthorityRank = (resource = {}) => {
 };
 
 export const listEligibleAutoContextResources = async ({ tenantId, user, academicScope = {}, topic = '', courseId = null, subject = '' }) => {
-  const visibility = user?.visibilityRecord;
+  const visibility = user?.visibilityRecord || (await resolveAcademicVisibility(user));
   const filter = {
     tenantId,
     approvalStatus: { $in: ['READY', 'APPROVED'] },
   };
+
   if (courseId) filter['academicScope.courseId'] = String(courseId);
+
+  // Scope-aware DB filter before in-memory eligibility — never tenant-wide fetch + hope.
+  if (!visibility.all) {
+    const scopeClauses = [];
+    if (visibility.user?._id) {
+      scopeClauses.push({ createdBy: visibility.user._id });
+    }
+    const orgIds = visibility.ids?.['organization-units'] || [];
+    const courseIds = visibility.ids?.courses || [];
+    if (orgIds.length) {
+      scopeClauses.push({ 'academicScope.organizationUnitId': { $in: orgIds } });
+    }
+    if (courseIds.length) {
+      scopeClauses.push({ 'academicScope.courseId': { $in: courseIds } });
+    }
+    scopeClauses.push({ visibility: 'ACADEMIC_SHARED' });
+    if (scopeClauses.length) filter.$or = scopeClauses;
+    else return [];
+  }
+
   const resources = await LibraryResource.find(filter)
     .select('title resourceType academicScope topic chapter unit visibility createdBy approvalStatus')
     .lean();
 
   const topicNeedle = String(topic || subject || '').trim().toLowerCase();
+
   const scored = resources
     .filter((resource) => {
       if (resource.approvalStatus === 'ARCHIVED') return false;
       if (String(resource.createdBy) === String(user?._id)) return true;
       if (resource.visibility === 'PRIVATE') return false;
+      if (resource.visibility === 'COURSE') {
+        return isContentScopeReadable(visibility, resource.academicScope || {});
+      }
+      if (resource.visibility === 'ACADEMIC_SHARED') {
+        if (!visibility.all && !isContentScopeReadable(visibility, resource.academicScope || {})) return false;
+      }
       if (topicNeedle) {
         const haystack = [resource.title, resource.topic, resource.chapter, resource.unit].join(' ').toLowerCase();
         if (!haystack.includes(topicNeedle)) return false;

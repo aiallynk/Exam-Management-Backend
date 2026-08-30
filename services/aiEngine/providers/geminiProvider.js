@@ -1,9 +1,11 @@
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import config from '../../../config/env.js';
 import { AI_OPERATIONS } from '../aiOperations.js';
+import { getModelForOperation } from '../aiConfigService.js';
 
 const SUPPORTED = new Set([
   AI_OPERATIONS.HANDWRITING_EXTRACTION,
+  AI_OPERATIONS.ANSWER_SCRIPT_IDENTITY_EXTRACTION,
   AI_OPERATIONS.ANSWER_SCRIPT_VISION,
   AI_OPERATIONS.ANSWER_TEXT_EVALUATION,
   AI_OPERATIONS.ANSWER_RUBRIC_EVALUATION,
@@ -16,6 +18,7 @@ const SUPPORTED = new Set([
 ]);
 
 let geminiClient = null;
+let geminiHealthCache = { status: 'UNAVAILABLE', checkedAt: 0 };
 
 const getGeminiClient = () => {
   if (!config.geminiApiKey) return null;
@@ -23,10 +26,36 @@ const getGeminiClient = () => {
   return geminiClient;
 };
 
+const probeGeminiHealth = () => {
+  const configured = Boolean(config.geminiApiKey);
+  if (!configured) {
+    geminiHealthCache = { status: 'UNAVAILABLE', checkedAt: Date.now(), configured: false };
+    return geminiHealthCache;
+  }
+  try {
+    getGeminiClient();
+    geminiHealthCache = {
+      status: 'CONFIGURED',
+      checkedAt: Date.now(),
+      configured: true,
+      models: {
+        evaluation: config.geminiEvaluationModel,
+        vision: config.geminiVisionModel,
+        handwriting: config.geminiHandwritingModel,
+        feedback: config.geminiFeedbackModel,
+      },
+    };
+  } catch {
+    geminiHealthCache = { status: 'DEGRADED', checkedAt: Date.now(), configured: true };
+  }
+  return geminiHealthCache;
+};
+
 const resolveModelName = (operation) => {
   switch (operation) {
     case AI_OPERATIONS.HANDWRITING_EXTRACTION:
       return config.geminiHandwritingModel || config.geminiVisionModel || config.geminiEvaluationModel;
+    case AI_OPERATIONS.ANSWER_SCRIPT_IDENTITY_EXTRACTION:
     case AI_OPERATIONS.ANSWER_SCRIPT_VISION:
     case AI_OPERATIONS.ANSWER_IMAGE_EVALUATION:
     case AI_OPERATIONS.DIAGRAM_RESPONSE_EVALUATION:
@@ -37,6 +66,26 @@ const resolveModelName = (operation) => {
     default:
       return config.geminiEvaluationModel;
   }
+};
+
+const isMissingModelError = (error) => {
+  const message = String(error?.message || '');
+  return error?.status === 404 || /is no longer available|is not found for API version|not supported for generateContent/i.test(message);
+};
+
+const isQuotaError = (error) => {
+  const message = String(error?.message || '');
+  return error?.status === 429 || /exceeded your current quota|rate-limit|quota exceeded/i.test(message);
+};
+
+const geminiModelCandidates = (requested) => {
+  const names = [
+    requested,
+    process.env.GEMINI_FALLBACK_MODEL,
+    'gemini-3.6-flash',
+    'gemini-2.5-flash',
+  ].map((value) => String(value || '').replace(/^models\//, '').trim()).filter(Boolean);
+  return [...new Set(names)];
 };
 
 const parseJsonContent = (text) => {
@@ -57,30 +106,26 @@ export const createGeminiProvider = () => ({
     return SUPPORTED.has(operation);
   },
   getHealth() {
-    const configured = Boolean(config.geminiApiKey);
+    const cacheAgeMs = Date.now() - (geminiHealthCache.checkedAt || 0);
+    if (cacheAgeMs > 5 * 60 * 1000) probeGeminiHealth();
+    const health = geminiHealthCache.checkedAt ? geminiHealthCache : probeGeminiHealth();
     return {
-      configured,
-      status: configured ? 'CONFIGURED' : 'UNAVAILABLE',
-      models: {
+      configured: Boolean(health.configured),
+      status: health.status || (health.configured ? 'CONFIGURED' : 'UNAVAILABLE'),
+      models: health.models || {
         evaluation: config.geminiEvaluationModel,
         vision: config.geminiVisionModel,
         handwriting: config.geminiHandwritingModel,
         feedback: config.geminiFeedbackModel,
       },
+      checkedAt: health.checkedAt || null,
     };
   },
   async generateStructured({ operation, request, context = {} }) {
     const client = getGeminiClient();
     if (!client) throw new Error('Gemini is not configured.');
-    const modelName = context.model || resolveModelName(operation);
-    if (!modelName) throw new Error('Gemini model is not configured for this operation.');
-    const model = client.getGenerativeModel({
-      model: modelName,
-      generationConfig: {
-        temperature: request?.temperature ?? 0.1,
-        responseMimeType: request?.response_format?.type === 'json_object' ? 'application/json' : undefined,
-      },
-    });
+    const requestedModel = context.model || getModelForOperation(operation) || resolveModelName(operation);
+    if (!requestedModel) throw new Error('Gemini model is not configured for this operation.');
     const parts = [];
     if (request?.system) parts.push({ text: String(request.system) });
     if (request?.user) parts.push({ text: String(request.user) });
@@ -90,7 +135,27 @@ export const createGeminiProvider = () => ({
         else if (image?.url) parts.push({ text: `[image:${image.url}]` });
       });
     }
-    const result = await model.generateContent({ contents: [{ role: 'user', parts }] });
+    const generationConfig = {
+      temperature: request?.temperature ?? 0.1,
+      responseMimeType: request?.response_format?.type === 'json_object' ? 'application/json' : undefined,
+    };
+    const candidates = geminiModelCandidates(requestedModel);
+    let result;
+    let modelName = candidates[0];
+    let lastError;
+    for (const candidate of candidates) {
+      try {
+        const model = client.getGenerativeModel({ model: candidate, generationConfig });
+        result = await model.generateContent({ contents: [{ role: 'user', parts }] });
+        modelName = candidate;
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (!isMissingModelError(error) && !isQuotaError(error)) throw error;
+      }
+    }
+    if (!result) throw lastError || new Error('Gemini model is not configured for this operation.');
     const content = result?.response?.text?.() || '';
     return {
       provider: 'gemini',
@@ -100,8 +165,12 @@ export const createGeminiProvider = () => ({
       content,
       parsed: parseJsonContent(content),
       usage: {
-        inputTokens: result?.response?.usageMetadata?.promptTokenCount,
-        outputTokens: result?.response?.usageMetadata?.candidatesTokenCount,
+        inputTokens: result?.response?.usageMetadata?.promptTokenCount ?? null,
+        outputTokens: result?.response?.usageMetadata?.candidatesTokenCount ?? null,
+        totalTokens: result?.response?.usageMetadata?.totalTokenCount ?? null,
+        prompt_tokens: result?.response?.usageMetadata?.promptTokenCount ?? null,
+        completion_tokens: result?.response?.usageMetadata?.candidatesTokenCount ?? null,
+        total_tokens: result?.response?.usageMetadata?.totalTokenCount ?? null,
       },
     };
   },

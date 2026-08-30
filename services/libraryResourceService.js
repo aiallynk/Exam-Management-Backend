@@ -1,6 +1,7 @@
 import LibraryResource from '../models/LibraryResource.js';
 import ContextSource from '../models/ContextSource.js';
 import { resolveAcademicVisibility } from './academicAccessService.js';
+import { resolveContentLibraryVisibility } from './contentLibraryAccessService.js';
 import { hasRole } from '../utils/userRoles.js';
 import { CONTENT_SCOPE_FIELDS, isContentScopeReadable, isGlobalContentScope } from '../utils/contentScope.js';
 import { uploadContentLibraryFile, uploadContentLibraryUrl, ContentLibraryError } from './contentLibraryService.js';
@@ -41,7 +42,12 @@ const assertResourceWriteAllowed = (user) => {
   }
 };
 
-const resolveResourceFields = async (user, { title, description, resourceType, parentResourceId, academicScope, chapter, unit, topic, visibility, metadata } = {}) => {
+const normalizeTags = (raw = []) => {
+  const values = Array.isArray(raw) ? raw : String(raw || '').split(',');
+  return [...new Set(values.map((value) => String(value || '').trim()).filter(Boolean))].slice(0, 30).map((value) => value.slice(0, 80));
+};
+
+const resolveResourceFields = async (user, { title, description, resourceType, parentResourceId, academicScope, chapter, unit, topic, tags, visibility, metadata } = {}) => {
   assertResourceWriteAllowed(user);
   const normalizedTitle = String(title || '').trim().slice(0, 300);
   if (!normalizedTitle) throw new ContentLibraryError(400, 'A title is required.', 'TITLE_REQUIRED');
@@ -73,6 +79,7 @@ const resolveResourceFields = async (user, { title, description, resourceType, p
     chapter: String(chapter || '').trim().slice(0, 200),
     unit: String(unit || '').trim().slice(0, 200),
     topic: String(topic || '').trim().slice(0, 200),
+    tags: normalizeTags(tags),
     visibility: normalizedVisibility,
     metadata: {
       publisher: String(metadata?.publisher || '').trim().slice(0, 200),
@@ -90,7 +97,7 @@ export const createLibraryResource = async (user, fields) => {
 };
 
 const getLibraryResourceForRead = async (user, resourceId) => {
-  const visibility = await resolveAcademicVisibility(user);
+  const visibility = await resolveContentLibraryVisibility(user);
   const doc = await LibraryResource.findOne({ _id: resourceId, tenantId: visibility.tenantId }).populate('createdBy', 'name email').lean();
   if (!doc) throw new ContentLibraryError(404, 'Resource not found.', 'NOT_FOUND');
   const isOwner = String(doc.createdBy?._id || doc.createdBy) === String(user._id);
@@ -117,7 +124,7 @@ const getLibraryResourceForWrite = async (user, resourceId) => {
 };
 
 export const listLibraryResources = async (user, { search, resourceType, visibility: visibilityFilter, approvalStatus, parentResourceId, scope } = {}) => {
-  const visibility = await resolveAcademicVisibility(user);
+  const visibility = await resolveContentLibraryVisibility(user);
   const filter = { tenantId: visibility.tenantId };
   if (resourceType) filter.resourceType = resourceType;
   if (approvalStatus) filter.approvalStatus = approvalStatus;
@@ -127,7 +134,10 @@ export const listLibraryResources = async (user, { search, resourceType, visibil
   if (visibilityFilter) filter.visibility = visibilityFilter;
   if (search) {
     const re = new RegExp(escapeRegExp(search), 'i');
-    filter.$or = [{ title: re }, { topic: re }, { chapter: re }, { unit: re }, { 'metadata.author': re }];
+    filter.$or = [
+      { title: re }, { description: re }, { topic: re }, { chapter: re },
+      { unit: re }, { tags: re }, { 'metadata.author': re },
+    ];
   }
   if (scope === 'mine') {
     filter.createdBy = user._id;
@@ -187,6 +197,7 @@ export const updateLibraryResource = async (user, resourceId, updates = {}) => {
     chapter: updates.chapter ?? doc.chapter,
     unit: updates.unit ?? doc.unit,
     topic: updates.topic ?? doc.topic,
+    tags: updates.tags ?? doc.tags,
     visibility: updates.visibility ?? doc.visibility,
     metadata: updates.metadata ?? doc.metadata,
   });
@@ -240,15 +251,17 @@ export const addFileToLibraryResource = async (user, resourceId, uploadFields) =
   const { doc } = await getLibraryResourceForWrite(user, resourceId);
   const source = await uploadContentLibraryFile(user, {
     ...uploadFields,
-    visibility: uploadFields.visibility ?? doc.visibility,
+    // ContextSource predates LibraryResource and uses SHARED for the same
+    // logical visibility named ACADEMIC_SHARED above. Keep the legacy enum
+    // at the technical asset layer while the parent resource remains the
+    // authorization source of truth.
+    visibility: uploadFields.visibility ?? (doc.visibility === 'ACADEMIC_SHARED' ? 'SHARED' : doc.visibility),
     academicScope: uploadFields.academicScope ?? doc.academicScope,
     chapter: uploadFields.chapter ?? doc.chapter,
     unit: uploadFields.unit ?? doc.unit,
     topic: uploadFields.topic ?? doc.topic,
     libraryResourceId: doc._id,
   });
-  const { onLibraryAssetUploaded } = await import('./knowledgeMemoryService.js');
-  void onLibraryAssetUploaded({ tenantId: doc.tenantId, userId: user._id, resourceId: doc._id, sourceId: source._id });
   return source;
 };
 
@@ -256,15 +269,13 @@ export const addUrlToLibraryResource = async (user, resourceId, uploadFields) =>
   const { doc } = await getLibraryResourceForWrite(user, resourceId);
   const source = await uploadContentLibraryUrl(user, {
     ...uploadFields,
-    visibility: uploadFields.visibility ?? doc.visibility,
+    visibility: uploadFields.visibility ?? (doc.visibility === 'ACADEMIC_SHARED' ? 'SHARED' : doc.visibility),
     academicScope: uploadFields.academicScope ?? doc.academicScope,
     chapter: uploadFields.chapter ?? doc.chapter,
     unit: uploadFields.unit ?? doc.unit,
     topic: uploadFields.topic ?? doc.topic,
     libraryResourceId: doc._id,
   });
-  const { onLibraryAssetUploaded } = await import('./knowledgeMemoryService.js');
-  void onLibraryAssetUploaded({ tenantId: doc.tenantId, userId: user._id, resourceId: doc._id, sourceId: source._id });
   return source;
 };
 
@@ -273,7 +284,10 @@ export const addUrlToLibraryResource = async (user, resourceId, uploadFields) =>
 export const computeResourceAiReadiness = (sources = []) => {
   if (!sources.length) return 'STORED_ONLY';
   const statuses = sources.map((source) => String(source.status || '').toUpperCase());
-  if (statuses.some((status) => status === 'PROCESSING' || status === 'PENDING')) return 'PROCESSING';
+  const stages = sources.map((source) => String(source.processingStage || '').toUpperCase());
+  if (statuses.some((status) => status === 'STALE') || stages.some((stage) => stage === 'STALE')) return 'STALE';
+  if (stages.some((stage) => stage === 'INDEXING')) return 'INDEXING';
+  if (statuses.some((status) => status === 'PROCESSING' || status === 'PENDING') || stages.some((stage) => ['QUEUED', 'EXTRACTING', 'CHUNKING', 'EMBEDDING', 'INDEXING'].includes(stage))) return 'PROCESSING';
   if (statuses.every((status) => status === 'UNSUPPORTED_FOR_AI')) return 'UNSUPPORTED';
   if (statuses.some((status) => status === 'FAILED') && !statuses.some((status) => status === 'READY')) return 'FAILED';
   if (statuses.some((status) => status === 'READY')) return 'READY';
@@ -293,7 +307,7 @@ const enrichResourcesWithCounts = async (resources) => {
       { $group: { _id: '$parentResourceId', count: { $sum: 1 } } },
     ]),
     ContextSource.find({ libraryResourceId: { $in: resourceIds } })
-      .select('libraryResourceId status')
+      .select('libraryResourceId status processingStage failureReason errorCode')
       .lean(),
   ]);
   const countByResource = new Map(counts.map((row) => [String(row._id), row.count]));
@@ -304,12 +318,17 @@ const enrichResourcesWithCounts = async (resources) => {
     if (!sourcesByResource.has(key)) sourcesByResource.set(key, []);
     sourcesByResource.get(key).push(source);
   });
-  return resources.map((doc) => ({
-    ...doc,
-    sourceCount: countByResource.get(String(doc._id)) || 0,
-    childResourceCount: childCountByResource.get(String(doc._id)) || 0,
-    aiReadiness: computeResourceAiReadiness(sourcesByResource.get(String(doc._id)) || []),
-  }));
+  return resources.map((doc) => {
+    const sources = sourcesByResource.get(String(doc._id)) || [];
+    const failedSource = sources.find((source) => String(source.status).toUpperCase() === 'FAILED');
+    return {
+      ...doc,
+      sourceCount: countByResource.get(String(doc._id)) || 0,
+      childResourceCount: childCountByResource.get(String(doc._id)) || 0,
+      aiReadiness: computeResourceAiReadiness(sources),
+      failureReason: failedSource?.failureReason || failedSource?.errorCode || '',
+    };
+  });
 };
 
 // Resolve educator-selected LibraryResource IDs into authorized, READY
@@ -317,7 +336,7 @@ const enrichResourcesWithCounts = async (resources) => {
 export const resolveLibraryResourcesToContextSourceIds = async (user, resourceIds = []) => {
   const normalizedIds = [...new Set((resourceIds || []).map(String).filter(Boolean))];
   if (!normalizedIds.length) return [];
-  const visibility = await resolveAcademicVisibility(user);
+  const visibility = await resolveContentLibraryVisibility(user);
   const resources = await LibraryResource.find({ _id: { $in: normalizedIds }, tenantId: visibility.tenantId }).lean();
   if (resources.length !== normalizedIds.length) {
     throw new ContentLibraryError(403, 'One or more selected library resources are unavailable or do not belong to this tenant.', 'RESOURCE_NOT_FOUND');
@@ -338,8 +357,10 @@ export const resolveLibraryResourcesToContextSourceIds = async (user, resourceId
   if (!sources.length) {
     throw new ContentLibraryError(400, 'Selected library resources have no AI-ready source material yet.', 'NO_READY_SOURCES');
   }
-  const { assertContentSourcesSelectable } = await import('./contentLibraryService.js');
-  await assertContentSourcesSelectable(user, sources);
+  // Parent LibraryResource authorization above is authoritative for these
+  // sources. Do not re-apply ContextSource's legacy visibility field here:
+  // older attached sources may still say PRIVATE even though their logical
+  // resource is institution-shared.
   return sources.map((source) => source._id);
 };
 

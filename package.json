@@ -15,6 +15,9 @@
     "backfill:question-paper-questions": "node scripts/backfillQuestionPaperQuestions.js",
     "backup:worker": "node workers/backupWorker.js",
     "knowledge:worker": "node workers/knowledgeWorker.js",
+    "answer-scripts:worker": "node workers/answerScriptWorker.js",
+    "benchmark:answer-scripts": "node scripts/answerScriptCapacityBenchmark.js",
+    "migrate:answer-script-indexes": "node scripts/migrateAnswerScriptIndexes.js",
     "backup:migrate-legacy": "node scripts/migrateLegacyBackupsToS3.js",
     "migrate:source-grounded-indexes": "node scripts/migrateSourceGroundedIndexes.js",
     "backfill:historical-question-signatures": "node scripts/backfillHistoricalQuestionSignatures.js"

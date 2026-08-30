@@ -79,6 +79,17 @@ const resolveOpenAiModel = () => {
 const config = {
   port: process.env.PORT || 4000,
   host: process.env.HOST || '0.0.0.0',
+  // Node's default http keepAliveTimeout is only 5s. When this server sits
+  // behind a reverse proxy / tunnel that reuses upstream connections for
+  // longer (VS Code dev tunnels, Vercel, an ELB, nginx), that 5s window lets
+  // the proxy send a request down a socket Node has just closed — the proxy
+  // then surfaces an ECONNRESET as a 502/504 with no CORS headers, which the
+  // browser reports as "No 'Access-Control-Allow-Origin' header" plus
+  // net::ERR_FAILED, and in-flight requests hang until the client aborts.
+  // Keep keepAliveTimeout above any proxy idle timeout, and headersTimeout
+  // strictly above keepAliveTimeout so header parsing never wins the race.
+  serverKeepAliveTimeoutMs: Number(process.env.SERVER_KEEPALIVE_TIMEOUT_MS || 65000),
+  serverHeadersTimeoutMs: Number(process.env.SERVER_HEADERS_TIMEOUT_MS || 66000),
   mongodbUri: IS_TEST_ENVIRONMENT ? process.env.TEST_MONGODB_URI : process.env.MONGODB_URI,
   mongodbDbName: IS_TEST_ENVIRONMENT
     ? assertDisposableTestDatabase({ nodeEnv: process.env.NODE_ENV, uri: process.env.TEST_MONGODB_URI }).databaseName
@@ -178,11 +189,12 @@ const config = {
   openaiClassificationModel: process.env.OPENAI_CLASSIFICATION_MODEL || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
   openaiImageModel: process.env.OPENAI_IMAGE_MODEL || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
 
-  // Gemini models
-  geminiEvaluationModel: process.env.GEMINI_EVALUATION_MODEL || 'gemini-2.0-flash',
-  geminiVisionModel: process.env.GEMINI_VISION_MODEL || process.env.GEMINI_EVALUATION_MODEL || 'gemini-2.0-flash',
-  geminiHandwritingModel: process.env.GEMINI_HANDWRITING_MODEL || process.env.GEMINI_VISION_MODEL || process.env.GEMINI_EVALUATION_MODEL || 'gemini-2.0-flash',
-  geminiFeedbackModel: process.env.GEMINI_FEEDBACK_MODEL || process.env.GEMINI_EVALUATION_MODEL || 'gemini-2.0-flash',
+  // Gemini models. GEMINI_MODEL is the shared fallback already used in .env.
+  // Do not default to retired flash IDs — Google returns 404 for gemini-2.0-flash.
+  geminiEvaluationModel: process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.1-flash',
+  geminiVisionModel: process.env.GEMINI_VISION_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.1-flash',
+  geminiHandwritingModel: process.env.GEMINI_HANDWRITING_MODEL || process.env.GEMINI_VISION_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.1-flash',
+  geminiFeedbackModel: process.env.GEMINI_FEEDBACK_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.1-flash',
 };
 
 export default config;

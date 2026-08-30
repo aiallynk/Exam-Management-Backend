@@ -2,6 +2,7 @@ import User from '../models/User.js';
 import { ALL_ROLES, normalizeRoles, hasRole, hasAnyRole, hasAllRoles } from '../utils/userRoles.js';
 import { resolveTenantFeature } from './tenantFeatureService.js';
 import { generateSecurePassword } from '../utils/passwordValidator.js';
+import { normalizeCandidateAcademicProfile } from '../utils/candidateAcademicProfile.js';
 
 /**
  * Single source of truth for creating tenant users and adding/removing
@@ -63,6 +64,8 @@ export async function createTenantUser({
   evaluatorAccess,
   academicProfile,
   academicAdminScope,
+  primaryOrganizationUnitId,
+  organizationUnitAccess,
 }) {
   if (!ALL_ROLES.includes(role)) {
     throw new UserRoleError(422, `Unsupported role: ${role}`);
@@ -108,13 +111,23 @@ export async function createTenantUser({
     mobile,
     subTenantId: subTenantId || null,
     status: status || 'ACTIVE',
-    ...(requestedRoles.includes('CANDIDATE') && academicProfile ? { academicProfile } : {}),
+    ...(requestedRoles.includes('CANDIDATE') && academicProfile
+      ? { academicProfile: normalizeCandidateAcademicProfile(academicProfile) }
+      : {}),
     ...(requestedRoles.includes('ACADEMIC_ADMIN') ? {
       academicAdminScope: {
         wholeTenant: academicAdminScope?.wholeTenant === true,
         organizationUnitIds: academicAdminScope?.organizationUnitIds || [],
         programIds: academicAdminScope?.programIds || [],
       },
+    } : {}),
+    ...(primaryOrganizationUnitId ? { primaryOrganizationUnitId } : {}),
+    ...(Array.isArray(organizationUnitAccess) && organizationUnitAccess.length ? {
+      organizationUnitAccess: organizationUnitAccess.map((entry) => ({
+        organizationUnitId: entry.organizationUnitId,
+        grantedAt: entry.grantedAt || new Date(),
+        grantedBy: entry.grantedBy || actorId || null,
+      })),
     } : {}),
   });
 

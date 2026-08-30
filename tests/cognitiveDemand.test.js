@@ -1,8 +1,10 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  DEFAULT_COGNITIVE_DEMAND_DISTRIBUTION,
   DEFAULT_COGNITIVE_DEMAND_MAPPING,
   resolveCognitiveDemandMapping,
+  resolveEffectiveCognitiveDemandDistribution,
   deriveCognitiveDemandFromBloom,
   validateCognitiveDemandDistribution,
   buildBloomTargetsFromCognitiveDistribution,
@@ -63,6 +65,41 @@ describe('validateCognitiveDemandDistribution', () => {
   test('rejects a negative or non-numeric value', () => {
     assert.equal(validateCognitiveDemandDistribution({ LOT: -10, MOT: 60, HOT: 50 }).valid, false);
     assert.equal(validateCognitiveDemandDistribution({ LOT: 'a lot', MOT: 40, HOT: 30 }).valid, false);
+  });
+});
+
+describe('resolveEffectiveCognitiveDemandDistribution', () => {
+  test('automatically targets Academic Assessment at 30/40/30 when the framework has no target', () => {
+    assert.deepEqual(
+      resolveEffectiveCognitiveDemandDistribution({ creationMode: 'ACADEMIC' }),
+      DEFAULT_COGNITIVE_DEMAND_DISTRIBUTION,
+    );
+  });
+
+  test('keeps an explicit academic framework target authoritative', () => {
+    const frameworkDistribution = { LOT: 20, MOT: 50, HOT: 30 };
+    assert.deepEqual(
+      resolveEffectiveCognitiveDemandDistribution({
+        creationMode: 'ACADEMIC',
+        frameworkDistribution,
+      }),
+      frameworkDistribution,
+    );
+  });
+
+  test('treats an empty persisted academic target as unconfigured', () => {
+    assert.deepEqual(
+      resolveEffectiveCognitiveDemandDistribution({
+        creationMode: 'ACADEMIC',
+        frameworkDistribution: {},
+      }),
+      DEFAULT_COGNITIVE_DEMAND_DISTRIBUTION,
+    );
+  });
+
+  test('preserves Quick optional and legacy no-target behavior', () => {
+    assert.equal(resolveEffectiveCognitiveDemandDistribution({ creationMode: 'QUICK' }), null);
+    assert.equal(resolveEffectiveCognitiveDemandDistribution({}), null);
   });
 });
 

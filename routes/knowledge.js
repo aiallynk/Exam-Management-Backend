@@ -5,7 +5,8 @@ import { requireRole } from '../middleware/roles.js';
 import { requireTenant } from '../middleware/multiTenant.js';
 import { getJobStatus, getQueueHealth } from '../services/jobs/jobDispatcherService.js';
 import { getWorkerHeartbeat } from '../services/jobs/knowledgeWorkerService.js';
-import { previewAutoContextResources } from '../services/knowledgeMemoryService.js';
+import { previewAutoContextResources, refreshLibraryResource } from '../services/knowledgeMemoryService.js';
+import { markStaleSources } from '../services/contentLibraryService.js';
 import { resolveAcademicVisibility } from '../services/academicAccessService.js';
 
 const router = express.Router();
@@ -58,5 +59,28 @@ router.post(
     }
   }
 );
+
+router.post('/sources/:sourceId/retry', ...canRead, async (req, res, next) => {
+  try {
+    const result = await refreshLibraryResource({
+      tenantId: req.user.tenantId,
+      userId: req.user._id,
+      resourceId: null,
+      sourceId: req.params.sourceId,
+    });
+    return res.status(202).json({ retry: true, ...result });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.post('/ops/mark-stale', requireAuth, requireRole('SUPER_ADMIN', 'TENANT_ADMIN'), async (_req, res, next) => {
+  try {
+    const marked = await markStaleSources();
+    return res.json({ marked });
+  } catch (error) {
+    return next(error);
+  }
+});
 
 export default router;

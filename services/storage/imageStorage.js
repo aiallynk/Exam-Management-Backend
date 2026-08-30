@@ -18,6 +18,10 @@ import {
   HeadObjectCommand,
   DeleteObjectCommand,
   CopyObjectCommand,
+  CreateMultipartUploadCommand,
+  UploadPartCommand,
+  CompleteMultipartUploadCommand,
+  AbortMultipartUploadCommand,
 } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
 import config from '../../config/env.js';
@@ -223,6 +227,82 @@ export const getPrivateSignedUrl = async ({ key, expiresInSeconds = 300 }) => {
   if (!key) return null;
   const command = new GetObjectCommand({ Bucket: config.s3Bucket, Key: key });
   return getSignedUrl(getClient(), command, { expiresIn: expiresInSeconds });
+};
+
+// Direct private upload primitives. These deliberately expose only signed
+// operations for a server-generated tenant key; callers never choose an S3
+// key or receive credentials/public URLs.
+export const getPrivateUploadUrl = async ({ key, contentType, expiresInSeconds = 900 }) => {
+  assertS3Configured();
+  if (!key) throw new Error('A private object key is required.');
+  const command = new PutObjectCommand({
+    Bucket: config.s3Bucket,
+    Key: key,
+    ContentType: contentType || 'application/octet-stream',
+  });
+  return getSignedUrl(getClient(), command, { expiresIn: expiresInSeconds });
+};
+
+export const createPrivateMultipartUpload = async ({ key, contentType }) => {
+  assertS3Configured();
+  if (!key) throw new Error('A private object key is required.');
+  const result = await getClient().send(new CreateMultipartUploadCommand({
+    Bucket: config.s3Bucket,
+    Key: key,
+    ContentType: contentType || 'application/octet-stream',
+  }));
+  return { uploadId: result.UploadId };
+};
+
+export const getPrivateMultipartPartUrl = async ({ key, uploadId, partNumber, expiresInSeconds = 900 }) => {
+  assertS3Configured();
+  if (!key || !uploadId || !Number.isInteger(Number(partNumber))) {
+    throw new Error('key, uploadId, and partNumber are required.');
+  }
+  const command = new UploadPartCommand({
+    Bucket: config.s3Bucket,
+    Key: key,
+    UploadId: uploadId,
+    PartNumber: Number(partNumber),
+  });
+  return getSignedUrl(getClient(), command, { expiresIn: expiresInSeconds });
+};
+
+export const completePrivateMultipartUpload = async ({ key, uploadId, parts }) => {
+  assertS3Configured();
+  const normalizedParts = (parts || [])
+    .map((part) => ({ ETag: String(part.etag || part.ETag || '').trim(), PartNumber: Number(part.partNumber || part.PartNumber) }))
+    .filter((part) => part.ETag && Number.isInteger(part.PartNumber) && part.PartNumber > 0)
+    .sort((a, b) => a.PartNumber - b.PartNumber);
+  if (!key || !uploadId || !normalizedParts.length) throw new Error('A completed multipart upload requires its key, upload id, and uploaded parts.');
+  return getClient().send(new CompleteMultipartUploadCommand({
+    Bucket: config.s3Bucket,
+    Key: key,
+    UploadId: uploadId,
+    MultipartUpload: { Parts: normalizedParts },
+  }));
+};
+
+export const abortPrivateMultipartUpload = async ({ key, uploadId }) => {
+  if (!key || !uploadId) return;
+  await getClient().send(new AbortMultipartUploadCommand({
+    Bucket: config.s3Bucket,
+    Key: key,
+    UploadId: uploadId,
+  }));
+};
+
+export const headPrivateObject = async ({ key }) => {
+  assertS3Configured();
+  if (!key) return null;
+  const result = await getClient().send(new HeadObjectCommand({ Bucket: config.s3Bucket, Key: key }));
+  return {
+    sizeBytes: Number(result.ContentLength || 0),
+    contentType: result.ContentType || '',
+    etag: String(result.ETag || '').replace(/^"|"$/g, ''),
+    lastModified: result.LastModified || null,
+    storageClass: result.StorageClass || 'STANDARD',
+  };
 };
 
 // S3 has no atomic rename — copy to the destination key, then delete the source.

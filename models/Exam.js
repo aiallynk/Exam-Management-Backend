@@ -125,10 +125,15 @@ const ExamSchema = new mongoose.Schema(
     frameworkId: { type: mongoose.Schema.Types.ObjectId, ref: 'AssessmentFramework', default: null },
     frameworkVersionId: { type: mongoose.Schema.Types.ObjectId, ref: 'FrameworkVersion', default: null },
     rubricTemplateId: { type: mongoose.Schema.Types.ObjectId, ref: 'RubricTemplate', default: null },
+    // Additive assessment-level rubric pool. rubricTemplateId/rubricSnapshot
+    // remain a legacy-compatible view of the first selected rubric; each
+    // question chooses one applicable member of this immutable pool.
+    rubricTemplateIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'RubricTemplate' }],
     // Immutable copy of the selected published rubric. Questions carry their
     // applicable criteria too, but this records the assessment-level source
     // template/version without relying on a mutable lookup later.
     rubricSnapshot: { type: mongoose.Schema.Types.Mixed, default: null, immutable: true },
+    rubricSnapshots: { type: [mongoose.Schema.Types.Mixed], default: undefined, immutable: true },
     // Governance is resolved by the application and frozen with the assessment.
     resolvedSpecificationSnapshot: { type: mongoose.Schema.Types.Mixed, default: null, immutable: true },
     resolvedSpecificationAt: { type: Date, default: null, immutable: true },

@@ -97,6 +97,22 @@ const UserSchema = new mongoose.Schema(
       organizationUnitIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'OrganizationUnit' }],
       programIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Program' }],
     },
+    // Default working organization after login. Does not grant access by itself.
+    primaryOrganizationUnitId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'OrganizationUnit',
+      default: null,
+      index: true,
+    },
+    // Explicit organization grants for operational personas (Teacher, Creator, etc.).
+    organizationUnitAccess: [{
+      organizationUnitId: { type: mongoose.Schema.Types.ObjectId, ref: 'OrganizationUnit', required: true },
+      grantedAt: { type: Date, default: Date.now },
+      grantedBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+    }],
+    organizationPreferences: {
+      activeOrganizationUnitId: { type: mongoose.Schema.Types.ObjectId, ref: 'OrganizationUnit', default: null },
+    },
     // Status management
     status: {
       type: String,
@@ -148,6 +164,8 @@ UserSchema.index({ status: 1 });
 UserSchema.index({ planType: 1 });
 UserSchema.index({ tenantId: 1, roles: 1 });
 UserSchema.index({ tenantId: 1, 'academicAdminScope.organizationUnitIds': 1 });
+UserSchema.index({ tenantId: 1, primaryOrganizationUnitId: 1 });
+UserSchema.index({ tenantId: 1, 'organizationUnitAccess.organizationUnitId': 1 });
 UserSchema.index({ tenantId: 1, 'academicAdminScope.programIds': 1 });
 UserSchema.index({ tenantId: 1, role: 1, 'academicProfile.gradeLevel': 1 });
 

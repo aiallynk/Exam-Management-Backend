@@ -5,7 +5,7 @@ import Question from '../../models/Question.js';
 import { getPrivateObjectBuffer } from '../storage/imageStorage.js';
 import { splitIntoPages } from './pdfPageSplitter.js';
 import { extractPageContent, extractCandidateIdentifiers } from './documentVisionProvider.js';
-import { autoMapCandidate, suggestCandidates } from './candidateMappingService.js';
+import { autoMapCandidate, suggestCandidates, assertNoDuplicateCandidateScript } from './candidateMappingService.js';
 import { buildExpectedQuestionSequence, mapSegmentToQuestion } from './answerMappingService.js';
 import { routeAndEvaluate } from './evaluationRouterService.js';
 import { materializeFromScript } from './attemptMaterializationService.js';
@@ -65,25 +65,16 @@ export const processAnswerScript = async (answerScriptId, { actorUserId } = {}) 
     script.pageCount = pages.length;
     await setStage(script, 'PAGES_SPLIT', { pagesTotal: pages.length, pagesProcessed: 0 });
 
-    // --- Stage 2: OCR / vision extraction (usable pages only — Part F) ---
-    await setStage(script, 'OCR_EXTRACTION');
+    const firstUsablePage = pages.find((page) => ['GOOD', 'ACCEPTABLE'].includes(page.qualityStatus) && page.image?.key);
     const dataUriByPage = {};
-    const pendingSegments = []; // merged across pages, continuation-aware
-    let firstUsablePage = null;
-    let machineTokenChecked = false;
 
-    for (const page of pages) {
-      const usable = ['GOOD', 'ACCEPTABLE'].includes(page.qualityStatus) && page.image?.key;
-      if (!usable) {
-        script.processingMeta.pagesProcessed += 1;
-        await script.save();
-        continue;
-      }
-      const buffer = await getPrivateObjectBuffer({ key: page.image.key });
-      if (!machineTokenChecked && !script.mappingTokenId) {
-        const decodedToken = await decodeMappingTokenFromImageBuffer(buffer);
+    // --- Stage 2: identity extraction BEFORE answer OCR (hard gate) ---
+    if (!script.candidateId && firstUsablePage) {
+      await setStage(script, 'IDENTITY_EXTRACTION');
+      const firstBuffer = await getPrivateObjectBuffer({ key: firstUsablePage.image.key });
+      if (firstBuffer && !script.mappingTokenId) {
+        const decodedToken = await decodeMappingTokenFromImageBuffer(firstBuffer);
         if (decodedToken) {
-          machineTokenChecked = true;
           const mapping = await resolveAnswerScriptMappingToken({ token: decodedToken, tenantId: script.tenantId });
           const scopeMatches = mapping
             && String(mapping.examId) === String(script.examId)
@@ -109,9 +100,97 @@ export const processAnswerScript = async (answerScriptId, { actorUserId } = {}) 
           await script.save();
         }
       }
+
+      if (!script.candidateId) {
+        const dataUri = toDataUri(firstBuffer, 'image/jpeg');
+        dataUriByPage[firstUsablePage.pageNumber] = dataUri;
+        const identifiers = await extractCandidateIdentifiers({ imageUrl: dataUri, tenantId: script.tenantId, userId: actorUserId });
+        script.detectedRollNumber = identifiers.rollNumber || '';
+        script.detectedCandidateName = identifiers.candidateName || '';
+        script.identityExtract = {
+          candidateName: identifiers.candidateName || '',
+          rollNumber: identifiers.rollNumber || '',
+          externalStudentId: identifiers.externalStudentId || '',
+          confidence: identifiers.confidence ?? null,
+          evidence: identifiers.evidence || '',
+          provider: identifiers.provider || '',
+          model: identifiers.model || '',
+        };
+        const autoMapped = await autoMapCandidate({
+          tenantId: script.tenantId,
+          examId: script.examId,
+          detectedRollNumber: identifiers.rollNumber,
+          detectedCandidateName: identifiers.candidateName,
+          detectedExternalStudentId: identifiers.externalStudentId,
+          originalFileName: script.originalFileName,
+          identityConfidence: identifiers.confidence,
+        });
+        if (autoMapped) {
+          const existingForCandidate = await assertNoDuplicateCandidateScript({
+            tenantId: script.tenantId,
+            examId: script.examId,
+            candidateId: autoMapped.candidateId,
+            excludeScriptId: script._id,
+          });
+          if (existingForCandidate) {
+            script.status = 'NEEDS_MAPPING';
+            script.statusReason = 'This candidate already has an answer script for this exam. Resolve the duplicate before continuing.';
+            script.candidateSuggestions = await suggestCandidates({
+              tenantId: script.tenantId,
+              examId: script.examId,
+              detectedRollNumber: identifiers.rollNumber,
+              detectedCandidateName: identifiers.candidateName,
+              detectedExternalStudentId: identifiers.externalStudentId,
+              originalFileName: script.originalFileName,
+            });
+          } else {
+            script.candidateId = autoMapped.candidateId;
+            script.enrollmentId = autoMapped.enrollmentId || script.enrollmentId;
+            script.mappingMethod = autoMapped.method;
+            script.mappingConfidence = autoMapped.confidence;
+            script.mappedAt = new Date();
+            await logAuditEvent(AUDIT_ACTIONS.OFFLINE_CANDIDATE_AUTO_MAPPED, { userId: actorUserId, tenantId: script.tenantId, resourceType: 'AnswerScript', resourceId: script._id, examId: script.examId, candidateId: autoMapped.candidateId, confidence: autoMapped.confidence });
+          }
+        } else {
+          script.candidateSuggestions = await suggestCandidates({
+            tenantId: script.tenantId,
+            examId: script.examId,
+            detectedRollNumber: identifiers.rollNumber,
+            detectedCandidateName: identifiers.candidateName,
+            detectedExternalStudentId: identifiers.externalStudentId,
+            originalFileName: script.originalFileName,
+          });
+        }
+        await script.save();
+      }
+    }
+
+    if (!script.candidateId) {
+      script.status = 'NEEDS_MAPPING';
+      script.statusReason = 'Candidate identity could not be confirmed automatically. Map this script to a candidate to continue.';
+      script.processingMeta.completedAt = new Date();
+      await script.save();
+      return;
+    }
+
+    // --- Stage 3: OCR / vision extraction (usable pages only — Part F) ---
+    await setStage(script, 'OCR_EXTRACTION');
+    const pendingSegments = [];
+    let machineTokenChecked = Boolean(script.mappingTokenId);
+
+    for (const page of pages) {
+      const usable = ['GOOD', 'ACCEPTABLE'].includes(page.qualityStatus) && page.image?.key;
+      if (!usable) {
+        script.processingMeta.pagesProcessed += 1;
+        await script.save();
+        continue;
+      }
+      const buffer = await getPrivateObjectBuffer({ key: page.image.key });
+      if (!machineTokenChecked && !script.mappingTokenId) {
+        machineTokenChecked = true;
+      }
       const dataUri = toDataUri(buffer, 'image/jpeg');
       dataUriByPage[page.pageNumber] = dataUri;
-      if (!firstUsablePage) firstUsablePage = page;
 
       const extraction = await extractPageContent({ imageUrl: dataUri, tenantId: script.tenantId, userId: actorUserId, examId: script.examId, answerScriptId: script._id, pageNumber: page.pageNumber });
       page.extractionConfidence = extraction.pageConfidence ?? null;
@@ -154,32 +233,6 @@ export const processAnswerScript = async (answerScriptId, { actorUserId } = {}) 
     }
     script.processingMeta.segmentsExtracted = segmentDocs.length;
     await script.save();
-
-    // --- Stage 3: candidate identification (Part E) ---
-    await setStage(script, 'CANDIDATE_MAPPING');
-    if (!script.candidateId && firstUsablePage) {
-      const identifiers = await extractCandidateIdentifiers({ imageUrl: dataUriByPage[firstUsablePage.pageNumber], tenantId: script.tenantId, userId: actorUserId });
-      script.detectedRollNumber = identifiers.rollNumber || '';
-      script.detectedCandidateName = identifiers.candidateName || '';
-      const autoMapped = await autoMapCandidate({ tenantId: script.tenantId, examId: script.examId, detectedRollNumber: identifiers.rollNumber, detectedCandidateName: identifiers.candidateName });
-      if (autoMapped) {
-        script.candidateId = autoMapped.candidateId;
-        script.mappingMethod = autoMapped.method;
-        script.mappingConfidence = autoMapped.confidence;
-        await logAuditEvent(AUDIT_ACTIONS.OFFLINE_CANDIDATE_AUTO_MAPPED, { userId: actorUserId, tenantId: script.tenantId, resourceType: 'AnswerScript', resourceId: script._id, examId: script.examId, candidateId: autoMapped.candidateId, confidence: autoMapped.confidence });
-      } else {
-        script.candidateSuggestions = await suggestCandidates({ tenantId: script.tenantId, examId: script.examId, detectedRollNumber: identifiers.rollNumber, detectedCandidateName: identifiers.candidateName });
-      }
-      await script.save();
-    }
-
-    if (!script.candidateId) {
-      script.status = 'NEEDS_MAPPING';
-      script.statusReason = 'Candidate identity could not be confirmed automatically. Map this script to a candidate to continue.';
-      script.processingMeta.completedAt = new Date();
-      await script.save();
-      return; // question mapping/evaluation resumes once a human confirms the candidate — see routes/answerScripts.js's mapping endpoint
-    }
 
     // --- Stage 4: question mapping (Part H) ---
     await setStage(script, 'QUESTION_MAPPING');

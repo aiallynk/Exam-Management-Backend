@@ -22,6 +22,7 @@ import Tenant from '../models/Tenant.js';
 import ExamParticipant from '../models/ExamParticipant.js';
 import OMRResult from '../models/OMRResult.js';
 import User from '../models/User.js';
+import { materializeFromOmrResult } from '../services/omr/omrAttemptMaterializationService.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import { requireTenant } from '../middleware/multiTenant.js';
@@ -2268,6 +2269,7 @@ router.post(
             created_by: req.user._id,
           };
 
+          let resultDoc;
           // Prevent duplicate roll numbers for same exam_code by updating existing row.
           if (candidateRoll && candidateRoll !== 'UNKNOWN') {
             const existingResult = await OMRResult.findOne({
@@ -2278,12 +2280,21 @@ router.post(
               Object.assign(existingResult, documentPayload);
               existingResult.created_by = existingResult.created_by || req.user._id;
               await existingResult.save();
-              savedResults.push(existingResult);
-              continue;
+              resultDoc = existingResult;
             }
           }
 
-          const resultDoc = await OMRResult.create(documentPayload);
+          if (!resultDoc) {
+            resultDoc = await OMRResult.create(documentPayload);
+          }
+
+          if (matchedCandidate?._id && omrAutoGradingEnabled && status !== 'ERROR') {
+            try {
+              await materializeFromOmrResult({ omrResultId: resultDoc._id, actorUserId: req.user._id });
+            } catch (materializeError) {
+              console.error('[OMR][materialize]', materializeError?.message || materializeError);
+            }
+          }
 
           savedResults.push(resultDoc);
         }

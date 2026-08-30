@@ -72,11 +72,10 @@ export const createOpenAIProvider = () => ({
     const model = getModelForOperation(AI_OPERATIONS.EMBEDDING);
     const embeddings = await createTrackedEmbedding({
       client,
+      request: { model, input: texts },
       feature: context.feature || 'embedding',
       tenantId: context.tenantId,
       userId: context.userId,
-      model,
-      input: texts,
     });
     return {
       provider: 'openai',

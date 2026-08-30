@@ -19,6 +19,7 @@ import SessionAssignment from '../models/SessionAssignment.js';
 import ExaminerAssignment from '../models/ExaminerAssignment.js';
 import User from '../models/User.js';
 import { resolveTenantFeature } from '../services/tenantFeatureService.js';
+import { canOperateExam } from '../services/academicAccessService.js';
 import { hasRole } from '../utils/userRoles.js';
 
 const normalizeId = (value) => String(value || '').trim();
@@ -529,4 +530,37 @@ export const requireExaminerAssignment = () => {
       return res.status(500).json({ error: 'Permission check failed' });
     }
   };
+};
+
+/**
+ * Authorizes evaluator assignment/management for an exam. Tenant Admins may
+ * assign from Controls; Academic Admins, Teachers, and Exam Creators may
+ * assign when canOperateExam() covers the assessment.
+ */
+export const requireExamEvaluatorManager = ({ examIdFrom = 'params' } = {}) => async (req, res, next) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    const examId = examIdFrom === 'body' ? req.body.examId : req.params.examId;
+    if (!examId) {
+      return res.status(400).json({ error: 'Exam ID is required' });
+    }
+
+    const exam = await Exam.findOne({ _id: examId, ...(req.tenantFilter || {}) }).lean();
+    if (!exam) {
+      return res.status(404).json({ error: 'Exam not found' });
+    }
+
+    if (hasRole(req.user, 'TENANT_ADMIN') || await canOperateExam(req.user, exam)) {
+      req.exam = exam;
+      return next();
+    }
+
+    return res.status(403).json({ error: 'You do not have permission to manage evaluators for this exam.' });
+  } catch (error) {
+    console.error('requireExamEvaluatorManager error:', error);
+    return res.status(500).json({ error: 'Permission check failed' });
+  }
 };

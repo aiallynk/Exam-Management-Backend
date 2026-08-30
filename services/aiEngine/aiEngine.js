@@ -2,6 +2,7 @@ import config from '../../config/env.js';
 import { AI_OPERATIONS, AIEngineError, AI_ERROR_CODES } from './aiOperations.js';
 import { getProviderForOperation } from './providerRegistry.js';
 import { getEffectiveRuntimeSettings } from './aiConfigService.js';
+import { trackAITokenUsage } from '../aiTokenUsageService.js';
 
 const normalizeProviderError = (error, { operation, providerId }) => {
   const message = String(error?.message || 'AI provider request failed.');
@@ -27,6 +28,7 @@ const dispatch = async (operation, payload, context, provider) => {
     case AI_OPERATIONS.QUESTION_IMAGE_GENERATION:
       return provider.generateImage({ operation, request: payload.request, context });
     case AI_OPERATIONS.HANDWRITING_EXTRACTION:
+    case AI_OPERATIONS.ANSWER_SCRIPT_IDENTITY_EXTRACTION:
     case AI_OPERATIONS.ANSWER_SCRIPT_VISION:
     case AI_OPERATIONS.ANSWER_IMAGE_EVALUATION:
     case AI_OPERATIONS.DIAGRAM_RESPONSE_EVALUATION:
@@ -55,13 +57,25 @@ export const executeAIOperation = async (operation, payload = {}, context = {}) 
           setTimeout(() => reject(new Error('AI request timed out.')), runtime.requestTimeoutMs || 60000);
         }),
       ]);
-      return {
+      const enriched = {
         ...result,
         operation,
         provider: providerId,
         latencyMs: Date.now() - startedAt,
         retryCount: attempt,
       };
+      void trackAITokenUsage({
+        usage: enriched.usage || enriched.raw?.usage || null,
+        feature: context.feature || operation,
+        featureType: context.feature || operation,
+        tenantId: context.tenantId,
+        userId: context.userId,
+        model: enriched.model || context.model,
+        usageCount: 1,
+        questionCount: context.questionCount || 0,
+        requestStatus: 'SUCCESS',
+      });
+      return enriched;
     } catch (error) {
       lastError = error;
       if (attempt >= maxRetries) break;

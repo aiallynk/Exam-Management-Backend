@@ -12,6 +12,41 @@ const AnswerScriptPageSchema = new mongoose.Schema({
     key: { type: String, default: null },
     url: { type: String, default: null },
   },
+  workingImage: {
+    key: { type: String, default: null },
+    checksum: { type: String, default: null },
+    sizeBytes: { type: Number, default: 0 },
+    widthPx: { type: Number, default: null },
+    heightPx: { type: Number, default: null },
+    dpi: { type: Number, default: null },
+    colorMode: { type: String, enum: ['GRAYSCALE', 'COLOR', null], default: null },
+  },
+  previewImage: {
+    key: { type: String, default: null },
+    checksum: { type: String, default: null },
+    sizeBytes: { type: Number, default: 0 },
+    widthPx: { type: Number, default: null },
+    heightPx: { type: Number, default: null },
+  },
+  thumbnailImage: {
+    key: { type: String, default: null },
+    checksum: { type: String, default: null },
+    sizeBytes: { type: Number, default: 0 },
+    widthPx: { type: Number, default: null },
+    heightPx: { type: Number, default: null },
+  },
+  identityHeaderImage: {
+    key: { type: String, default: null },
+    checksum: { type: String, default: null },
+    sizeBytes: { type: Number, default: 0 },
+  },
+  contentHash: { type: String, default: null, index: true },
+  normalizedCrop: {
+    x: { type: Number, default: 0 },
+    y: { type: Number, default: 0 },
+    width: { type: Number, default: 1 },
+    height: { type: Number, default: 1 },
+  },
 
   status: { type: String, enum: ['PENDING', 'PROCESSED', 'FAILED'], default: 'PENDING' },
   // Part F — never let a POOR/UNREADABLE page silently pass as valid AI
@@ -24,9 +59,18 @@ const AnswerScriptPageSchema = new mongoose.Schema({
     heightPx: { type: Number, default: null },
     estimatedDpi: { type: Number, default: null },
     rotationDetectedDegrees: { type: Number, default: 0 },
+    deskewDegrees: { type: Number, default: 0 },
+    colorRelevant: { type: Boolean, default: false },
   },
 
   ocrText: { type: String, default: '' }, // full-page raw extraction, before segmentation
+  extractionSegments: { type: [mongoose.Schema.Types.Mixed], default: [] },
+  extractionCheckpoint: {
+    inputHash: { type: String, default: null },
+    completedAt: { type: Date, default: null },
+    attempts: { type: Number, default: 0 },
+    lastError: { type: String, default: '' },
+  },
   extractionConfidence: { type: Number, default: null, min: 0, max: 1 },
   visionMeta: {
     provider: { type: String, default: '' },

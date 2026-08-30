@@ -2,7 +2,8 @@ import express from 'express';
 import { body, validationResult } from 'express-validator';
 import ExaminerAssignment from '../models/ExaminerAssignment.js';
 import { requireAuth } from '../middleware/auth.js';
-import { requireOwnershipOrAdmin, requireRole } from '../middleware/roles.js';
+import { requireRole } from '../middleware/roles.js';
+import { requireExamEvaluatorManager } from '../middleware/examPermissions.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { validateObjectId } from '../middleware/validation.js';
 import { AUDIT_ACTIONS } from '../middleware/audit.js';
@@ -20,6 +21,7 @@ import {
   deriveReviewStatus,
 } from '../services/evaluatorAssignmentService.js';
 import { canOperateExam } from '../services/academicAccessService.js';
+import { hasRole } from '../utils/userRoles.js';
 
 const router = express.Router();
 
@@ -35,7 +37,7 @@ const requireAssignmentOwner = async (req, res, next) => {
       ...(req.tenantFilter || {}),
     }).lean();
     if (!assignment) return res.status(404).json({ error: 'Examiner assignment not found' });
-    if (!(await canOperateExam(req.user, assignment.examId))) {
+    if (!(await canOperateExam(req.user, assignment.examId)) && !hasRole(req.user, 'TENANT_ADMIN')) {
       return res.status(403).json({ error: 'Only the responsible Exam Creator can change this evaluator assignment.' });
     }
     return next();
@@ -50,8 +52,8 @@ router.post(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR'),
-  requireOwnershipOrAdmin,
+  requireRole('EXAM_CREATOR', 'ACADEMIC_ADMIN', 'TEACHER', 'TENANT_ADMIN'),
+  requireExamEvaluatorManager({ examIdFrom: 'body' }),
   requireTenantFeature('EVALUATOR_REVIEW'),
   [
     body('examId').notEmpty().withMessage('examId is required').isMongoId(),
@@ -124,7 +126,7 @@ router.patch(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR'),
+  requireRole('EXAM_CREATOR', 'ACADEMIC_ADMIN', 'TEACHER', 'TENANT_ADMIN'),
   validateObjectId('assignmentId'),
   requireAssignmentOwner,
   async (req, res, next) => {
@@ -172,7 +174,7 @@ router.post(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR'),
+  requireRole('EXAM_CREATOR', 'ACADEMIC_ADMIN', 'TEACHER', 'TENANT_ADMIN'),
   validateObjectId('assignmentId'),
   requireAssignmentOwner,
   async (req, res, next) => {
@@ -212,7 +214,7 @@ router.get(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN'),
+  requireRole('EXAM_CREATOR', 'ACADEMIC_ADMIN', 'TEACHER', 'TENANT_ADMIN'),
   async (req, res, next) => {
     try {
       const filter = { ...req.tenantFilter };

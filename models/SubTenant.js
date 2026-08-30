@@ -1,5 +1,8 @@
 import mongoose from 'mongoose';
 
+// LEGACY_COMPATIBILITY — commercial/white-label partition (plan-gated multiTenant).
+// NOT a branch/campus/location boundary; OrganizationUnit owns operational locations.
+// See utils/subTenantLegacy.js for classification and sunset path.
 const SubTenantSchema = new mongoose.Schema(
   {
     tenantId: {

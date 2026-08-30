@@ -80,6 +80,77 @@ const normalizeQuestionTypeToken = (value) => {
   return normalizeQuestionType(value) || '';
 };
 
+// AI providers and model versions do not always use the exact property names
+// in our prompt. Keep the accepted spellings here, at the adapter boundary,
+// rather than weakening the canonical Question schema or distribution gate.
+const QUESTION_TYPE_FIELDS = [
+  'questionType',
+  'question_type',
+  'type',
+  'questionFormat',
+  'question_format',
+  'format',
+  'responseType',
+  'response_type',
+  'answerType',
+  'answer_type',
+];
+
+const QUESTION_TEXT_FIELDS = [
+  'questionText',
+  'question_text',
+  'question',
+  'text',
+  'prompt',
+  'stem',
+  'content',
+  'title',
+];
+
+const QUESTION_OPTION_FIELDS = ['options', 'choices', 'answerOptions', 'answer_options'];
+
+const resolveDeclaredQuestionType = (question) => {
+  if (!question || typeof question !== 'object') return '';
+  for (const field of QUESTION_TYPE_FIELDS) {
+    const normalized = normalizeQuestionTypeToken(question[field]);
+    if (normalized) return normalized;
+  }
+  return '';
+};
+
+const resolveQuestionText = (question) => {
+  if (!question || typeof question !== 'object') return '';
+  for (const field of QUESTION_TEXT_FIELDS) {
+    const text = sanitizeString(question[field]);
+    if (text) return text;
+  }
+  return '';
+};
+
+const resolveQuestionOptions = (question) => {
+  if (!question || typeof question !== 'object') return [];
+  for (const field of QUESTION_OPTION_FIELDS) {
+    if (!Array.isArray(question[field])) continue;
+    return question[field].map((option) => {
+      if (!option || typeof option !== 'object') return option;
+      return option.text || option.label || option.value || option.content || option.option || '';
+    });
+  }
+  return [];
+};
+
+const resolveQuestionCorrectAnswer = (question) =>
+  question?.correctAnswer ??
+  question?.correct_answer ??
+  question?.answer ??
+  question?.correct_option ??
+  question?.correctOptions ??
+  question?.correct_options ??
+  question?.answers ??
+  question?.correctAnswers ??
+  question?.correct_answers ??
+  '';
+
 const resolveTrackingContext = ({ tenantId = null, userId = null, metadata = null } = {}) => {
   const metadataTenantId =
     metadata?.tenantId || metadata?.tenant_id || metadata?.tenant?._id || null;
@@ -150,14 +221,10 @@ export const normalizeQuestionObject = (question, index = 0) => {
     return null;
   }
 
-  const rawType = normalizeQuestionTypeToken(
-    question.questionType || question.type || question.question_type
-  );
+  const rawType = resolveDeclaredQuestionType(question);
   const resolvedType = rawType;
   const questionType = VALID_QUESTION_TYPES.includes(resolvedType) ? resolvedType : 'SHORT_ANSWER';
-  const questionText = sanitizeString(
-    question.questionText || question.title || question.question || question.text
-  );
+  const questionText = resolveQuestionText(question);
   if (!questionText) {
     return null;
   }
@@ -191,9 +258,8 @@ export const normalizeQuestionObject = (question, index = 0) => {
     };
   }
 
-  let options = Array.isArray(question.options)
-    ? sanitizeQuestionOptions(question.options)
-    : undefined;
+  const providerOptions = resolveQuestionOptions(question);
+  let options = providerOptions.length ? sanitizeQuestionOptions(providerOptions) : undefined;
 
   if (['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE'].includes(questionType)) {
     if (!options || options.length === 0) {
@@ -211,13 +277,13 @@ export const normalizeQuestionObject = (question, index = 0) => {
   if (questionType === 'MULTIPLE_OPTIONS') {
     correctAnswer = normalizeQuestionCorrectAnswer({
       questionType,
-      correctAnswer: question.correctAnswer || question.answers || question.correctAnswers,
+      correctAnswer: resolveQuestionCorrectAnswer(question),
       options,
     });
   } else {
     correctAnswer = normalizeQuestionCorrectAnswer({
       questionType,
-      correctAnswer: question.correctAnswer || question.answer || question.correct_option || '',
+      correctAnswer: resolveQuestionCorrectAnswer(question),
       options,
     });
   }
@@ -263,6 +329,69 @@ export const normalizeQuestionObject = (question, index = 0) => {
         ? question._sourceRowIndex
         : undefined,
   };
+};
+
+// Some otherwise usable provider responses omit the redundant `questionType`
+// property. We may recover a type only when the candidate itself makes that
+// type clear (options, matching pairs, a writing instruction, or a passage).
+// This is deliberately not a generic fallback and never converts a candidate
+// that already declares a canonical type.
+const inferQuestionTypeFromShape = ({ question, allowedTypes = [] } = {}) => {
+  if (!question || typeof question !== 'object') return '';
+
+  const allowed = new Set(
+    (Array.isArray(allowedTypes) ? allowedTypes : [])
+      .map(normalizeQuestionType)
+      .filter((type) => VALID_QUESTION_TYPES.includes(type))
+  );
+  const supports = (type) => !allowed.size || allowed.has(type);
+  const questionText = resolveQuestionText(question);
+  const options = sanitizeQuestionOptions(resolveQuestionOptions(question));
+  const answer = resolveQuestionCorrectAnswer(question);
+  const answerValues = parseMultiAnswer(answer);
+  const passage = sanitizeString(
+    question.passage || question.context || question.sourceText || question.reference || question.passageText || question.reading
+  );
+  const matchingPairs = question.matchingPairs || question.matching_pairs;
+
+  if (Array.isArray(matchingPairs) && matchingPairs.length >= 2 && supports('MATCHING')) {
+    return 'MATCHING';
+  }
+
+  if (options.length >= 2) {
+    const isTrueFalse = options.length === 2 && options.every((option) => ['true', 'false'].includes(option.toLowerCase()));
+    if (isTrueFalse && supports('TRUE_FALSE')) return 'TRUE_FALSE';
+    if (answerValues.length >= 2 && supports('MULTIPLE_OPTIONS')) return 'MULTIPLE_OPTIONS';
+    if (supports('MULTIPLE_CHOICE')) return 'MULTIPLE_CHOICE';
+  }
+
+  if (supports('FILL_IN_THE_BLANK') && (/_{2,}/.test(questionText) || /\b(?:fill|complete)\s+(?:in\s+)?the\s+blank\b/i.test(questionText))) {
+    return 'FILL_IN_THE_BLANK';
+  }
+  if (supports('ESSAY_LETTER') && /\b(?:write|draft|compose)\b[\s\S]{0,80}\bletter\b/i.test(questionText)) {
+    return 'ESSAY_LETTER';
+  }
+  if (supports('ESSAY_STORY') && /\b(?:write|create|compose)\b[\s\S]{0,80}\b(?:story|narrative)\b/i.test(questionText)) {
+    return 'ESSAY_STORY';
+  }
+  if (supports('ESSAY') && /\b(?:write|compose|develop)\b[\s\S]{0,80}\bessay\b/i.test(questionText)) {
+    return 'ESSAY';
+  }
+  if (supports('PARAGRAPH') && (Boolean(passage) || /\b(?:write|answer|respond)\b[\s\S]{0,80}\bparagraph\b/i.test(questionText))) {
+    return 'PARAGRAPH';
+  }
+  if (supports('CODING') && (Boolean(question.starterCode || question.starter_code) || /\b(?:write|implement)\b[\s\S]{0,80}\b(?:code|function|program)\b/i.test(questionText))) {
+    return 'CODING';
+  }
+
+  // An untyped open response is safely attributable only when the caller
+  // requested Short Answer alone. Objective and longer writing types still
+  // require their own explicit shape above.
+  if (allowed.size === 1 && allowed.has('SHORT_ANSWER') && questionText && !options.length) {
+    return 'SHORT_ANSWER';
+  }
+
+  return '';
 };
 
 const parseCount = (value, fallback = 0) => {
@@ -1096,11 +1225,16 @@ export const selectQuestionsForExactDistribution = ({ questions, typeDistributio
       question?.questionFormat || question?.question_format
     ).toUpperCase();
     const isParagraphGrouped = rawFormat === 'PARAGRAPH' && Boolean(targetByType.PARAGRAPH);
-    const claimedType = normalizeQuestionType(
-      question?.questionType || question?.type || question?.question_type
-    );
+    const declaredType = resolveDeclaredQuestionType(question);
+    const claimedType = declaredType || inferQuestionTypeFromShape({
+      question,
+      allowedTypes: Object.keys(targetByType),
+    });
     if (!isParagraphGrouped && !claimedType) return;
-    const normalized = normalizeQuestionObject(question, index + 1);
+    const normalized = normalizeQuestionObject(
+      claimedType ? { ...question, questionType: claimedType } : question,
+      index + 1
+    );
     if (!normalized) return;
     const type = isParagraphGrouped
       ? 'PARAGRAPH'
@@ -1815,15 +1949,13 @@ ${bloomTargets.length ? `\nCognitive demand (independent of difficulty — a HOT
           throw new Error('Invalid response format from OpenAI');
         }
 
-        const normalizedQuestions = extractedQuestions
-          .map((q, index) => normalizeQuestionObject(q, index + 1))
-          .filter(Boolean);
-
         // Keep only valid candidates in their own requested type bucket. If
         // the provider missed a type, call the same generation mechanism for
-        // only that deficit; never relabel overflow from another type.
+        // only that deficit; never relabel overflow from another type. Pass
+        // the provider objects through unchanged: selection needs their
+        // original field names to recognize safe alternate response shapes.
         const selection = selectQuestionsForExactDistribution({
-          questions: normalizedQuestions,
+          questions: extractedQuestions,
           typeDistribution,
           count: questionCount,
           topic: sanitizedTopic,

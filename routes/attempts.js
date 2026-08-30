@@ -1,6 +1,10 @@
 import express from 'express';
 import ExamAttempt from '../models/ExamAttempt.js';
 import Answer from '../models/Answer.js';
+import AnswerScript from '../models/AnswerScript.js';
+import AnswerScriptPage from '../models/AnswerScriptPage.js';
+import AnswerSegment from '../models/AnswerSegment.js';
+import AnswerAnnotation from '../models/AnswerAnnotation.js';
 import ExamSession from '../models/ExamSession.js';
 import Exam from '../models/Exam.js';
 import Question from '../models/Question.js';
@@ -53,6 +57,9 @@ import {
 } from '../services/codingSubmissionService.js';
 import { normalizeCodingLanguage } from '../utils/codingQuestions.js';
 import { hasRole } from '../utils/userRoles.js';
+import offlineEvaluationConfig from '../config/offlineEvaluationConfig.js';
+import { ANSWER_SCRIPT_JOB, enqueueAnswerScriptStage } from '../services/offlineEvaluation/answerScriptQueueService.js';
+import { normalizeRegion } from '../services/offlineEvaluation/answerAnnotationService.js';
 import {
   FOCUS_VIOLATION_SUBMISSION_SOURCE,
   TAB_SWITCH_DISQUALIFY_STATUS,
@@ -1043,6 +1050,42 @@ const ensureQuestionPaperImagesReady = async ({ tenantId, questionPaperId, examI
 };
 
 const router = express.Router();
+
+const syncOfflineReviewAnnotations = async ({ answer, action, attempt, userId, maximumMarks }) => {
+  if (!answer.sourceAnswerSegmentId) return;
+  if (action === 'approve') {
+    await AnswerAnnotation.updateMany(
+      { answerId: answer._id, status: 'PROPOSED' },
+      { $set: { status: 'APPROVED', updatedBy: userId } },
+    );
+    return;
+  }
+  if (action !== 'override') return;
+  const proposedScoreAnnotation = await AnswerAnnotation.findOne({ answerId: answer._id, type: 'SCORE', source: 'AI' }).sort({ createdAt: -1 });
+  await AnswerAnnotation.updateMany(
+    { answerId: answer._id, source: 'AI', status: { $in: ['PROPOSED', 'APPROVED'] } },
+    { $set: { status: 'REJECTED', updatedBy: userId } },
+  );
+  const segment = await AnswerSegment.findById(answer.sourceAnswerSegmentId).select('answerScriptId pageIds questionId boundingRegion').lean();
+  if (!segment?.pageIds?.[0]) return;
+  await AnswerAnnotation.create({
+    tenantId: attempt.tenantId,
+    answerScriptId: segment.answerScriptId,
+    pageId: segment.pageIds[0],
+    answerId: answer._id,
+    answerSegmentId: segment._id,
+    questionId: segment.questionId,
+    type: 'SCORE',
+    region: normalizeRegion(proposedScoreAnnotation?.region || segment.boundingRegion) || { x: 0.82, y: 0.08, width: 0.12, height: 0.06 },
+    message: `${answer.pointsEarned} / ${maximumMarks}`,
+    proposedScore: answer.pointsEarned,
+    source: 'EVALUATOR',
+    status: 'APPROVED',
+    createdBy: userId,
+    updatedBy: userId,
+    idempotencyKey: `evaluator-score:${answer._id}:${answer.examinerReviewedAt.getTime()}`,
+  });
+};
 
 // Get all attempts (universal: based on exam permissions)
 router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req, res, next) => {
@@ -3357,6 +3400,50 @@ router.get(
 
       const canViewStudentIdentity = matchingAssignments.every((assignment) => assignment.canViewStudentIdentity);
 
+      let offlineReview = null;
+      if (attempt.sourceAnswerScriptId) {
+        const answerScript = await AnswerScript.findOne({
+          _id: attempt.sourceAnswerScriptId,
+          tenantId: attempt.tenantId,
+          materializedAttemptId: attempt._id,
+        }).select('status pageCount mappingMethod mappingConfidence detectedRollNumber courseOfferingId originalFileName reviewCompletion evaluatedDerivative').lean();
+        if (answerScript) {
+          const answerIds = answers.map((answer) => answer._id);
+          const segments = await AnswerSegment.find({ materializedAnswerId: { $in: answerIds } })
+            .select('_id materializedAnswerId pageIds boundingRegion lineBoxes mappingStatus mappingConfidence extractionConfidence evaluationResult cropObject')
+            .lean();
+          const pageIds = [...new Set(segments.flatMap((segment) => (segment.pageIds || []).map(String)))];
+          const pages = await AnswerScriptPage.find({ _id: { $in: pageIds }, answerScriptId: answerScript._id })
+            .select('_id pageNumber previewImage thumbnailImage workingImage qualityStatus qualityMeta')
+            .sort({ pageNumber: 1 }).lean();
+          const annotations = await AnswerAnnotation.find({
+            answerScriptId: answerScript._id,
+            answerId: { $in: answerIds },
+            status: { $ne: 'REJECTED' },
+          }).select('-idempotencyKey').lean();
+          const fullPageAccess = matchingAssignments.every((assignment) => ['FULL_EXAM', 'ATTEMPTS'].includes(assignment.scopeType));
+          offlineReview = {
+            answerScript: {
+              _id: answerScript._id, status: answerScript.status, pageCount: answerScript.pageCount,
+              mappingMethod: answerScript.mappingMethod, mappingConfidence: answerScript.mappingConfidence,
+              detectedRollNumber: canViewStudentIdentity ? answerScript.detectedRollNumber : '',
+              hasEvaluatedPaper: Boolean(answerScript.evaluatedDerivative?.key),
+            },
+            pageAccessMode: fullPageAccess ? 'FULL_PAGE' : 'SCOPED_CROPS',
+            pages: pages.map((page) => ({
+              _id: page._id, pageNumber: page.pageNumber, qualityStatus: page.qualityStatus,
+              widthPx: page.previewImage?.widthPx || page.workingImage?.widthPx,
+              heightPx: page.previewImage?.heightPx || page.workingImage?.heightPx,
+              thumbnailAvailable: Boolean(page.thumbnailImage?.key),
+              previewAvailable: fullPageAccess && Boolean(page.previewImage?.key || page.workingImage?.key),
+            })),
+            segments,
+            annotations,
+            reviewCompletion: attempt.reviewCompletion,
+          };
+        }
+      }
+
       res.json({
         attempt: {
           _id: attempt._id,
@@ -3364,6 +3451,7 @@ router.get(
           submitTime: attempt.submitTime,
           scoreSummary: attempt.scoreSummary,
           candidate: canViewStudentIdentity ? attempt.userId : null,
+          reviewCompletion: attempt.reviewCompletion,
         },
         answers,
         assignment: examinerAssignment
@@ -3372,8 +3460,10 @@ router.get(
             canOverrideScore: examinerAssignment.canOverrideScore,
             canAddFeedback: examinerAssignment.canAddFeedback,
             requiresOverrideReason: examinerAssignment.requiresOverrideReason,
+            scopeType: examinerAssignment.scopeType,
           }
           : null,
+        offlineReview,
       });
     } catch (error) {
       next(error);
@@ -3474,6 +3564,10 @@ router.put(
       answer.evaluationStatus = 'REVIEWED';
 
       await answer.save();
+
+      await syncOfflineReviewAnnotations({
+        answer, action: 'override', attempt, userId: req.user._id, maximumMarks,
+      });
 
       const updatedAttempt = await ExamAttempt.findById(attempt._id);
       await ensureScoreSummary(updatedAttempt, { includeAnswers: false, force: true });
@@ -3620,6 +3714,9 @@ router.put(
       await answer.save();
 
       let scoreSummary = null;
+      await syncOfflineReviewAnnotations({
+        answer, action, attempt, userId: req.user._id, maximumMarks,
+      });
       if (scoreChanged) {
         const updatedAttempt = await ExamAttempt.findById(attempt._id);
         await ensureScoreSummary(updatedAttempt, { includeAnswers: false, force: true });
@@ -3659,15 +3756,222 @@ router.put(
         }
       }
 
+      const annotations = answer.sourceAnswerSegmentId
+        ? await AnswerAnnotation.find({ answerId: answer._id, status: { $ne: 'REJECTED' } }).select('-idempotencyKey').lean()
+        : [];
+
       res.json({
         answer,
         scoreSummary,
+        annotations,
         message: `Answer ${action === 'approve' ? 'approved' : action === 'override' ? 'overridden' : 'flagged for moderation'}.`,
       });
     } catch (error) {
       next(error);
     }
   }
+);
+
+router.post(
+  '/:attemptId/review/approve-page',
+  requireAuth,
+  requireEvaluatorAccess(),
+  validateObjectId('attemptId'),
+  [body('pageId').isMongoId()],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const attempt = await ExamAttempt.findById(req.params.attemptId).select('tenantId examId sourceAnswerScriptId isCompleted');
+      if (!attempt?.sourceAnswerScriptId) return res.status(404).json({ error: 'Offline answer-sheet review was not found.' });
+      if (!hasRole(req.user, 'EVALUATOR')) return res.status(403).json({ error: 'Evaluator role required.' });
+      const page = await AnswerScriptPage.findOne({
+        _id: req.body.pageId, answerScriptId: attempt.sourceAnswerScriptId, tenantId: attempt.tenantId,
+      }).lean();
+      if (!page) return res.status(404).json({ error: 'Answer-sheet page not found.' });
+      const segments = await AnswerSegment.find({
+        answerScriptId: attempt.sourceAnswerScriptId,
+        pageIds: page._id,
+        materializedAnswerId: { $ne: null },
+      }).lean();
+      const answers = await Answer.find({ _id: { $in: segments.map((segment) => segment.materializedAnswerId) } })
+        .populate('questionId', 'points sectionId');
+      const approved = [];
+      const skipped = [];
+      for (const answer of answers) {
+        const segment = segments.find((item) => String(item.materializedAnswerId) === String(answer._id));
+        const assignment = await hasActiveExaminerAssignment(req.user._id, attempt.examId, {
+          attemptId: attempt._id,
+          questionId: answer.questionId?._id || answer.questionId,
+          sectionId: answer.questionId?.sectionId,
+        });
+        const confidence = Number(segment?.evaluationResult?.confidence ?? answer.aiEvaluation?.confidence);
+        const safe = assignment?.canApproveAiScore
+          && ['AUTO_EVALUATED', 'AI_EVALUATED'].includes(answer.evaluationStatus)
+          && !answer.needsReview
+          && segment?.mappingStatus !== 'NEEDS_REVIEW'
+          && segment?.evaluationResult?.evaluationMethod !== 'MANUAL_REQUIRED'
+          && Number.isFinite(confidence)
+          && confidence >= offlineEvaluationConfig.EVALUATION_MEDIUM_CONFIDENCE;
+        if (!safe) {
+          skipped.push({ answerId: answer._id, reason: assignment ? 'Needs individual review because it is flagged, low-confidence, manually routed, or already resolved.' : 'Outside evaluator assignment.' });
+          continue;
+        }
+        answer.examinerScore = answer.pointsEarned;
+        answer.examinerId = req.user._id;
+        answer.examinerReviewedAt = new Date();
+        answer.finalScoreSource = 'EXAMINER';
+        answer.evaluationStatus = 'REVIEWED';
+        answer.needsReview = false;
+        await answer.save();
+        await AnswerAnnotation.updateMany(
+          { answerId: answer._id, status: 'PROPOSED' },
+          { $set: { status: 'APPROVED', updatedBy: req.user._id } },
+        );
+        approved.push(answer._id);
+        await logAuditEvent(AUDIT_ACTIONS.ANSWER_EXAMINER_REVIEWED, {
+          userId: req.user._id, userRole: req.user.role, tenantId: attempt.tenantId,
+          resourceType: 'Answer', resourceId: answer._id,
+          details: { attemptId: attempt._id, action: 'approve_page', pageId: page._id },
+        });
+      }
+      return res.json({ approvedAnswerIds: approved, skipped, message: `${approved.length} safe answer(s) approved on page ${page.pageNumber}.` });
+    } catch (error) { return next(error); }
+  },
+);
+
+router.patch(
+  '/:attemptId/annotations/:annotationId',
+  requireAuth,
+  requireEvaluatorAccess(),
+  validateObjectId('attemptId'),
+  validateObjectId('annotationId'),
+  async (req, res, next) => {
+    try {
+      const attempt = await ExamAttempt.findById(req.params.attemptId).select('tenantId examId sourceAnswerScriptId');
+      const annotation = await AnswerAnnotation.findOne({
+        _id: req.params.annotationId, tenantId: attempt?.tenantId, answerScriptId: attempt?.sourceAnswerScriptId,
+      });
+      if (!attempt || !annotation) return res.status(404).json({ error: 'Annotation not found for this review.' });
+      const answer = annotation.answerId ? await Answer.findById(annotation.answerId).populate('questionId', 'sectionId') : null;
+      const assignment = await hasActiveExaminerAssignment(req.user._id, attempt.examId, {
+        attemptId: attempt._id,
+        questionId: answer?.questionId?._id || annotation.questionId,
+        sectionId: answer?.questionId?.sectionId,
+      });
+      if (!assignment) return res.status(403).json({ error: 'This annotation is outside your evaluator assignment.' });
+      const requestedStatus = String(req.body?.status || '').toUpperCase();
+      if (requestedStatus && !['APPROVED', 'EDITED', 'REJECTED'].includes(requestedStatus)) {
+        return res.status(400).json({ error: 'status must be APPROVED, EDITED, or REJECTED.' });
+      }
+      const hasEdits = ['region', 'message', 'suggestedCorrection', 'proposedScore'].some((key) => req.body?.[key] !== undefined);
+      let updated = annotation;
+      if (annotation.source === 'AI' && hasEdits) {
+        annotation.status = 'REJECTED';
+        annotation.updatedBy = req.user._id;
+        await annotation.save();
+        const region = req.body.region ? normalizeRegion(req.body.region) : normalizeRegion(annotation.region);
+        if (!region) return res.status(400).json({ error: 'A valid normalized annotation region is required.' });
+        const data = annotation.toObject();
+        delete data._id;
+        delete data.createdAt;
+        delete data.updatedAt;
+        delete data.__v;
+        updated = await AnswerAnnotation.create({
+          ...data,
+          region,
+          message: req.body.message ?? annotation.message,
+          suggestedCorrection: req.body.suggestedCorrection ?? annotation.suggestedCorrection,
+          proposedScore: req.body.proposedScore ?? annotation.proposedScore,
+          source: 'EVALUATOR',
+          status: requestedStatus || 'EDITED',
+          createdBy: req.user._id,
+          updatedBy: req.user._id,
+          idempotencyKey: `evaluator-annotation:${annotation._id}:${Date.now()}`,
+        });
+      } else {
+        if (req.body.region) {
+          const region = normalizeRegion(req.body.region);
+          if (!region) return res.status(400).json({ error: 'A valid normalized annotation region is required.' });
+          annotation.region = region;
+        }
+        if (req.body.message !== undefined) annotation.message = String(req.body.message).slice(0, 1000);
+        if (req.body.suggestedCorrection !== undefined) annotation.suggestedCorrection = String(req.body.suggestedCorrection).slice(0, 500);
+        if (req.body.proposedScore !== undefined) annotation.proposedScore = Number(req.body.proposedScore);
+        if (requestedStatus) annotation.status = requestedStatus;
+        annotation.updatedBy = req.user._id;
+        updated = await annotation.save();
+      }
+      await logAuditEvent('ANSWER_ANNOTATION_REVIEWED', {
+        userId: req.user._id, userRole: req.user.role, tenantId: attempt.tenantId,
+        resourceType: 'AnswerAnnotation', resourceId: updated._id,
+        details: { attemptId: attempt._id, sourceAnnotationId: annotation._id, status: updated.status },
+      });
+      return res.json({ annotation: updated });
+    } catch (error) { return next(error); }
+  },
+);
+
+router.post(
+  '/:attemptId/review/complete',
+  requireAuth,
+  requireEvaluatorAccess(),
+  validateObjectId('attemptId'),
+  [body('comment').optional({ nullable: true }).isString().isLength({ max: 1000 })],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const attempt = await ExamAttempt.findById(req.params.attemptId);
+      if (!attempt?.sourceAnswerScriptId) return res.status(404).json({ error: 'Offline answer-sheet review was not found.' });
+      if (!hasRole(req.user, 'EVALUATOR')) return res.status(403).json({ error: 'Evaluator role required.' });
+      const answers = await Answer.find({ attemptId: attempt._id }).populate('questionId', 'sectionId');
+      const unresolved = [];
+      for (const answer of answers) {
+        const assignment = await hasActiveExaminerAssignment(req.user._id, attempt.examId, {
+          attemptId: attempt._id,
+          questionId: answer.questionId?._id || answer.questionId,
+          sectionId: answer.questionId?.sectionId,
+        });
+        if (!assignment || !['REVIEWED', 'FINALIZED', 'MODERATED'].includes(answer.evaluationStatus)) {
+          unresolved.push({ answerId: answer._id, reason: assignment ? answer.evaluationStatus : 'OUTSIDE_ASSIGNMENT' });
+        }
+      }
+      if (unresolved.length) {
+        return res.status(409).json({ error: 'Every answer in the script must be resolved by an assigned evaluator before review can be completed.', unresolved });
+      }
+      const script = await AnswerScript.findOne({ _id: attempt.sourceAnswerScriptId, tenantId: attempt.tenantId });
+      if (!script) return res.status(404).json({ error: 'Answer script not found.' });
+      attempt.reviewCompletion = {
+        status: 'COMPLETED', completedAt: new Date(), completedBy: req.user._id,
+        completionComment: String(req.body?.comment || '').trim(),
+        version: Number(attempt.reviewCompletion?.version || 0) + 1,
+      };
+      await attempt.save();
+      await Answer.updateMany({ attemptId: attempt._id, evaluationStatus: 'REVIEWED' }, { $set: { evaluationStatus: 'FINALIZED' } });
+      script.status = 'FINALIZING';
+      script.finalizedAt = new Date();
+      script.finalizedBy = req.user._id;
+      await script.save();
+      const queued = await enqueueAnswerScriptStage({
+        stage: ANSWER_SCRIPT_JOB.RENDER,
+        answerScriptId: script._id,
+        tenantId: script.tenantId,
+        uploaderId: script.createdBy || req.user._id,
+        batchId: script.batchId,
+        version: attempt.reviewCompletion.version,
+      });
+      await logAuditEvent(AUDIT_ACTIONS.OFFLINE_SCRIPT_FINALIZED, {
+        userId: req.user._id, userRole: req.user.role, tenantId: attempt.tenantId,
+        resourceType: 'AnswerScript', resourceId: script._id,
+        details: { attemptId: attempt._id, action: 'complete_review', renderJobId: queued.jobId },
+      });
+      return res.status(202).json({ reviewCompletion: attempt.reviewCompletion, queue: queued, message: 'Review completed. Evaluated Paper generation is queued; result release remains unchanged.' });
+    } catch (error) {
+      if (error.statusCode) return res.status(error.statusCode).json({ error: error.message, code: error.code });
+      return next(error);
+    }
+  },
 );
 
 // Recalculate attempt result (admin only, requires confirmation)
