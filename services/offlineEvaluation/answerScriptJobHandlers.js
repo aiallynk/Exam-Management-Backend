@@ -20,7 +20,12 @@ import { refreshAnswerScriptBatchCounters } from './answerScriptBatchService.js'
 import { logAuditEvent, AUDIT_ACTIONS } from '../../utils/auditLogger.js';
 import { applyAnswerScriptFailure } from './answerScriptFailure.js';
 
-const dataUri = (buffer) => `data:image/jpeg;base64,${buffer.toString('base64')}`;
+// The Gemini vision model reads PDFs and images natively; label the payload
+// with the page's real type (single-page PDF in the default Python-free path,
+// JPEG when a rasterizer ran, JPEG for raster crops).
+const dataUri = (buffer, mimeType = 'image/jpeg') => `data:${mimeType || 'image/jpeg'};base64,${buffer.toString('base64')}`;
+const pageInputMimeType = (page) => page?.workingImage?.mimeType || page?.image?.mimeType || 'image/jpeg';
+const identityInputMimeType = (page) => page?.identityHeaderImage?.mimeType || pageInputMimeType(page);
 const hash = (value) => crypto.createHash('sha256').update(JSON.stringify(value)).digest('hex');
 
 const queueContext = (script) => ({
@@ -123,7 +128,7 @@ const handleIdentity = async (job) => {
   if (!script.candidateId && identitySource) {
     const startedAt = Date.now();
     let identifiers = await extractCandidateIdentifiers({
-      imageUrl: dataUri(identitySource),
+      imageUrl: dataUri(identitySource, identityInputMimeType(firstPage)),
       tenantId: script.tenantId,
       userId: script.createdBy,
       examId: script.examId,
@@ -141,7 +146,7 @@ const handleIdentity = async (job) => {
         const nextBuffer = nextKey ? await getPrivateObjectBuffer({ key: nextKey }) : null;
         if (nextBuffer) {
           identifiers = await extractCandidateIdentifiers({
-            imageUrl: dataUri(nextBuffer),
+            imageUrl: dataUri(nextBuffer, identityInputMimeType(nextPage)),
             tenantId: script.tenantId,
             userId: script.createdBy,
             examId: script.examId,
@@ -226,7 +231,7 @@ const handleExtractPage = async (job) => {
     if (!buffer) throw Object.assign(new Error('The normalized page image is unavailable.'), { code: 'EXTRACTION_INPUT_MISSING' });
     const startedAt = Date.now();
     const extraction = await extractPageContent({
-      imageUrl: dataUri(buffer), tenantId: script.tenantId, userId: script.createdBy,
+      imageUrl: dataUri(buffer, pageInputMimeType(page)), tenantId: script.tenantId, userId: script.createdBy,
       examId: script.examId, answerScriptId: script._id, pageNumber: page.pageNumber,
     });
     if (extraction.error) throw Object.assign(new Error(extraction.error), { code: extraction.available ? 'AI_PROVIDER_TRANSIENT' : 'AI_PROVIDER_UNAVAILABLE' });

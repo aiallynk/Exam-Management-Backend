@@ -171,6 +171,8 @@ export const trackAITokenUsage = async ({
   tenantId,
   userId,
   model,
+  provider = '',
+  operation = '',
   usageCount = 1,
   questionCount = 0,
   requestStatus = 'SUCCESS',
@@ -181,6 +183,7 @@ export const trackAITokenUsage = async ({
     const promptTokens = resolvedUsage.prompt_tokens;
     const completionTokens = resolvedUsage.completion_tokens;
     const totalTokens = resolvedUsage.total_tokens;
+    const imageCount = asNonNegativeInteger(usage?.imageCount ?? 0);
 
     const context = getRequestContext();
     const requestUser = context?.req?.user || {};
@@ -199,12 +202,13 @@ export const trackAITokenUsage = async ({
     const resolvedRequestStatus = normalizeRequestStatus(requestStatus);
     const resolvedErrorMessage = normalizeErrorMessage(errorMessage);
     const resolvedCostUsd =
-      promptTokens > 0 || completionTokens > 0 || totalTokens > 0
+      promptTokens > 0 || completionTokens > 0 || totalTokens > 0 || imageCount > 0
         ? estimateCostUsd({
             model: resolvedModel,
             promptTokens,
             completionTokens,
             totalTokens,
+            imageCount,
           })
         : 0;
 
@@ -220,6 +224,8 @@ export const trackAITokenUsage = async ({
       feature_type: resolvedFeature,
       user_id: resolvedUserId,
       model: resolvedModel,
+      provider: String(provider || '').trim().toLowerCase(),
+      operation: String(operation || feature || '').trim(),
       cost_usd: resolvedCostUsd,
       request_status: resolvedRequestStatus,
       error_message: resolvedErrorMessage,
@@ -235,10 +241,13 @@ export const trackAITokenUsage = async ({
     }
 
     if (process.env.NODE_ENV === 'development') {
+      const failureSuffix = resolvedRequestStatus === 'FAILED' && resolvedErrorMessage
+        ? ` error="${resolvedErrorMessage}"`
+        : '';
       console.info(
-        `[ai-token-usage] saved feature="${resolvedFeature}" tenant="${
+        `[ai-token-usage] saved feature="${resolvedFeature}" provider="${provider || 'unknown'}" tenant="${
           resolvedTenantId || 'null'
-        }" total_tokens=${totalTokens} usage_count=${resolvedUsageCount} question_count=${resolvedQuestionCount} status=${resolvedRequestStatus}`
+        }" total_tokens=${totalTokens} images=${imageCount} usage_count=${resolvedUsageCount} question_count=${resolvedQuestionCount} status=${resolvedRequestStatus}${failureSuffix}`
       );
     }
 

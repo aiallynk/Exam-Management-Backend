@@ -21,7 +21,26 @@ export default Object.freeze({
   MULTIPART_PART_SIZE_BYTES: positiveInteger('ANSWER_SCRIPT_MULTIPART_PART_SIZE_BYTES', 8 * 1024 * 1024, { min: 5 * 1024 * 1024 }),
   ALLOWED_ANSWER_SCRIPT_MIME_TYPES: ['application/pdf', 'image/jpeg', 'image/png'],
 
-  // --- Adaptive normalization ---
+  // --- Normalization strategy ---
+  // How the uploaded PDF/image is turned into per-page inputs for the Gemini
+  // vision model that actually READS and EVALUATES the handwriting
+  // (services/offlineEvaluation/documentVisionProvider.js).
+  //   VISION_DIRECT (default) — no local Python at all. The PDF is split into
+  //     single-page PDFs with pdf-lib (pure JS) and handed straight to Gemini,
+  //     which reads PDFs natively. Nothing on the host needs Python / PyMuPDF /
+  //     OpenCV.
+  //   PYTHON — force the legacy PyMuPDF (+ optional OpenCV) rasterizer for
+  //     rasterized JPEG previews, deskew, autocrop and blank detection.
+  //   AUTO — try PYTHON, fall back to VISION_DIRECT if the interpreter or its
+  //     dependencies are missing, so a mis-provisioned box still completes.
+  // The evaluation model is Gemini in every mode; this only changes the
+  // deterministic page-preparation step.
+  NORMALIZE_MODE: (() => {
+    const raw = String(process.env.ANSWER_SCRIPT_NORMALIZE_MODE || '').toUpperCase().trim();
+    return ['VISION_DIRECT', 'PYTHON', 'AUTO'].includes(raw) ? raw : 'VISION_DIRECT';
+  })(),
+
+  // --- Adaptive normalization (PYTHON mode only) ---
   NORMAL_WORKING_DPI: positiveInteger('ANSWER_SCRIPT_WORKING_DPI', 220, { min: 120, max: 300 }),
   HIGH_CONFIDENCE_RETRY_DPI: positiveInteger('ANSWER_SCRIPT_RETRY_DPI', 300, { min: 220, max: 400 }),
   WORKING_LONG_EDGE_PX: positiveInteger('ANSWER_SCRIPT_WORKING_LONG_EDGE_PX', 2600, { min: 1400, max: 5000 }),

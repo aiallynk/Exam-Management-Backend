@@ -9,6 +9,8 @@ import AnswerScriptPage from '../../models/AnswerScriptPage.js';
 import offlineEvaluationConfig from '../../config/offlineEvaluationConfig.js';
 import { getPrivateObjectBuffer, putPrivateObject } from '../storage/imageStorage.js';
 import { parseNormalizerStdout } from './answerScriptNormalizationContract.js';
+import { PYTHON_CANDIDATES, looksLikePythonEnvProblem, PYTHON_ENV_HINT } from './pythonRuntime.js';
+import { buildVisionDirectNormalization } from './visionDirectNormalizationService.js';
 import { logError } from '../../utils/logger.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -74,9 +76,23 @@ const runNormalizer = async ({ sourcePath, outputDir, mimeType }) => {
     '--identity-fraction', String(offlineEvaluationConfig.IDENTITY_HEADER_FRACTION),
     '--max-pages', String(offlineEvaluationConfig.MAX_ANSWER_SCRIPT_PAGES),
   ];
-  const run = await runPythonJsonProcess({ executable: 'python3', args });
+  // Try each candidate interpreter (or just the pinned OFFLINE_EVAL_PYTHON).
+  // A spawn ENOENT (interpreter missing) falls through to the next; anything
+  // that actually produced output stops the loop.
+  let run = null;
+  for (const executable of PYTHON_CANDIDATES) {
+    // eslint-disable-next-line no-await-in-loop
+    run = await runPythonJsonProcess({ executable, args });
+    if (run.error?.code === 'ENOENT' && PYTHON_CANDIDATES.length > 1) continue;
+    break;
+  }
   if (run.stderr?.trim()) {
     logError(new Error(run.stderr.trim().slice(0, 800)), 'answerScriptNormalization.stderr');
+  }
+  // Deployed-box misconfiguration (missing cv2/pymupdf/numpy, missing libGL,
+  // no python3 on PATH) — log an actionable hint instead of a bare failure.
+  if (looksLikePythonEnvProblem(run.stderr) || run.error?.code === 'ENOENT') {
+    logError(new Error(`${PYTHON_ENV_HINT} — stderr: ${String(run.stderr || run.error?.message || '').slice(0, 400)}`), 'answerScriptNormalization.pythonEnv');
   }
   if (run.error && !run.stdout?.trim()) {
     run.error.code ||= 'NORMALIZATION_FAILED';
@@ -86,16 +102,52 @@ const runNormalizer = async ({ sourcePath, outputDir, mimeType }) => {
   return parseNormalizerStdout({ stdout: run.stdout, stderr: run.stderr, exitCode: run.exitCode });
 };
 
-const uploadDerivative = async ({ script, localPath, fileStem, category, extension = 'jpg', contentType = 'image/jpeg' }) => {
+// Page-preparation strategy. The Gemini vision model reads and evaluates the
+// handwriting in every mode; this only decides how the upload is turned into
+// per-page inputs. Default is VISION_DIRECT — no local Python.
+const resolveNormalization = async ({ sourcePath, outputDir, mimeType, sourceBuffer }) => {
+  const mode = offlineEvaluationConfig.NORMALIZE_MODE;
+  const runVisionDirect = () => buildVisionDirectNormalization({
+    sourceBuffer,
+    mimeType,
+    outputDir,
+    maxPages: offlineEvaluationConfig.MAX_ANSWER_SCRIPT_PAGES,
+  });
+
+  if (mode === 'VISION_DIRECT') return runVisionDirect();
+  if (mode === 'PYTHON') return runNormalizer({ sourcePath, outputDir, mimeType });
+
+  // AUTO — prefer the Python rasterizer (nicer previews/deskew) but never let
+  // a missing interpreter or dependency block the Gemini-based evaluation.
+  try {
+    return await runNormalizer({ sourcePath, outputDir, mimeType });
+  } catch (error) {
+    logError(
+      new Error(`Python normalizer unavailable (${error.code || error.message}); using the Python-free vision-direct path so Gemini can still read the pages. ${PYTHON_ENV_HINT}`),
+      'answerScriptNormalization.autoFallback',
+    );
+    return runVisionDirect();
+  }
+};
+
+const MIME_BY_EXT = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.webp': 'image/webp', '.pdf': 'application/pdf' };
+
+// When `extension`/`contentType` aren't forced, derive them from the file the
+// Python normalizer actually wrote — the raw (fitz-only) mode emits PNG when
+// the local PyMuPDF build has no native JPEG encoder, so we must not mislabel
+// those bytes as image/jpeg for the downstream Gemini vision call.
+const uploadDerivative = async ({ script, localPath, fileStem, category, extension, contentType }) => {
   const buffer = await fs.readFile(localPath);
+  const ext = (extension && extension.replace(/^\./, '')) || path.extname(String(localPath)).replace(/^\./, '').toLowerCase() || 'jpg';
+  const mime = contentType || MIME_BY_EXT[`.${ext}`] || 'image/jpeg';
   const stored = await putPrivateObject({
     tenantId: script.tenantId,
     category,
     subpath: [String(script.examId), String(script._id)],
     fileStem,
-    extension,
+    extension: ext,
     buffer,
-    contentType,
+    contentType: mime,
   });
   return { key: stored.key, checksum: sha256(buffer), sizeBytes: buffer.length };
 };
@@ -144,20 +196,28 @@ export const normalizeAnswerScript = async ({ answerScriptId }) => {
   try {
     await fs.writeFile(sourcePath, originalBuffer);
     await fs.mkdir(outputDir, { recursive: true });
-    const result = await runNormalizer({ sourcePath, outputDir, mimeType: script.mimeType });
+    const result = await resolveNormalization({
+      sourcePath,
+      outputDir,
+      mimeType: script.mimeType,
+      sourceBuffer: originalBuffer,
+    });
+    const normalizedMimeType = result.normalizedMimeType || 'application/pdf';
 
     const normalized = await uploadDerivative({
       script,
       localPath: result.normalizedPdf,
       fileStem: 'normalized-working-master',
       category: 'answer-script-normalized',
-      extension: 'pdf',
-      contentType: 'application/pdf',
+      contentType: normalizedMimeType,
     });
     const pages = [];
     let previewBytes = 0;
     let thumbnailBytes = 0;
     for (const item of result.pages) {
+      // VISION_DIRECT emits PDF page files; PYTHON emits JPEGs. Carry the real
+      // type through so the downstream Gemini data: URI is labelled correctly.
+      const pageMimeType = item.mimeType || 'image/jpeg';
       const [workingImage, previewImage, thumbnailImage, identityHeaderImage] = await Promise.all([
         uploadDerivative({ script, localPath: item.working, fileStem: `page-${item.pageNumber}-working`, category: 'answer-script-working' }),
         uploadDerivative({ script, localPath: item.preview, fileStem: `page-${item.pageNumber}-preview`, category: 'answer-script-preview' }),
@@ -170,11 +230,11 @@ export const normalizeAnswerScript = async ({ answerScriptId }) => {
         { tenantId: script.tenantId, answerScriptId: script._id, pageNumber: item.pageNumber },
         {
           $set: {
-            image: { key: workingImage.key, url: null },
-            workingImage: { ...workingImage, widthPx: item.widthPx, heightPx: item.heightPx, dpi: item.workingDpi, colorMode: item.colorMode },
+            image: { key: workingImage.key, url: null, mimeType: pageMimeType },
+            workingImage: { ...workingImage, widthPx: item.widthPx, heightPx: item.heightPx, dpi: item.workingDpi, colorMode: item.colorMode, mimeType: pageMimeType },
             previewImage: { ...previewImage, widthPx: item.widthPx, heightPx: item.heightPx },
             thumbnailImage,
-            identityHeaderImage,
+            identityHeaderImage: { ...identityHeaderImage, mimeType: pageMimeType },
             contentHash: item.contentHash,
             normalizedCrop: item.crop,
             status: 'PROCESSED',
@@ -198,9 +258,11 @@ export const normalizeAnswerScript = async ({ answerScriptId }) => {
     script.sourceFile.sizeBytes = originalBuffer.length;
     script.normalizedObject = {
       ...normalized,
-      mimeType: 'application/pdf',
+      mimeType: normalizedMimeType,
       generatedAt: new Date(),
-      profile: `${offlineEvaluationConfig.NORMAL_WORKING_DPI}dpi/${offlineEvaluationConfig.WORKING_LONG_EDGE_PX}px-adaptive`,
+      profile: result.mode === 'VISION_DIRECT'
+        ? 'vision-direct/pdf-page-split'
+        : `${offlineEvaluationConfig.NORMAL_WORKING_DPI}dpi/${offlineEvaluationConfig.WORKING_LONG_EDGE_PX}px-adaptive`,
     };
     script.pageCount = pages.length;
     script.storageMetrics = {

@@ -4602,7 +4602,7 @@ router.get('/ai-usage', async (req, res, next) => {
     const tenantLookupFilter =
       tenantObjectIdFilter ? { _id: tenantObjectIdFilter } : {};
 
-    const [selectedTotals, todayTotals, monthTotals, lifetimeTotals, trendDailyRaw, featureUsageRaw, modelUsageRaw, tenantUsageRaw, tenants] =
+    const [selectedTotals, todayTotals, monthTotals, lifetimeTotals, trendDailyRaw, featureUsageRaw, modelUsageRaw, providerUsageRaw, tenantUsageRaw, tenants] =
       await Promise.all([
         aggregateTokenTotals(selectedRangeMatch),
         aggregateTokenTotals(buildUsageMatch({ start: startOfToday, end: now })),
@@ -4672,6 +4672,48 @@ router.get('/ai-usage', async (req, res, next) => {
               model: '$_id',
               total_tokens: 1,
               request_count: 1,
+              total_cost_usd: 1,
+            },
+          },
+        ]),
+        AITokenUsage.aggregate([
+          ...(Object.keys(selectedRangeMatch).length ? [{ $match: selectedRangeMatch }] : []),
+          {
+            $group: {
+              _id: {
+                $let: {
+                  vars: {
+                    providerValue: {
+                      $toLower: {
+                        $trim: {
+                          input: { $ifNull: ['$provider', 'unknown'] },
+                        },
+                      },
+                    },
+                  },
+                  in: {
+                    $cond: [{ $eq: ['$$providerValue', ''] }, 'unknown', '$$providerValue'],
+                  },
+                },
+              },
+              total_tokens: { $sum: totalTokensExpression },
+              request_count: { $sum: usageCountExpression },
+              failed_requests: {
+                $sum: {
+                  $cond: [{ $eq: [requestStatusExpression, 'FAILED'] }, usageCountExpression, 0],
+                },
+              },
+              total_cost_usd: { $sum: costExpression },
+            },
+          },
+          { $sort: { request_count: -1, total_tokens: -1, _id: 1 } },
+          {
+            $project: {
+              _id: 0,
+              provider: '$_id',
+              total_tokens: 1,
+              request_count: 1,
+              failed_requests: 1,
               total_cost_usd: 1,
             },
           },
@@ -4884,6 +4926,16 @@ router.get('/ai-usage', async (req, res, next) => {
       })
     );
 
+    const usageByProvider = (Array.isArray(providerUsageRaw) ? providerUsageRaw : []).map((row) =>
+      ensureCurrencyFields({
+        provider: row.provider || 'unknown',
+        total_tokens: Number(row.total_tokens) || 0,
+        request_count: Number(row.request_count) || 0,
+        failed_requests: Number(row.failed_requests) || 0,
+        total_cost_usd: Number(row.total_cost_usd) || 0,
+      })
+    );
+
     const usageByTenantId = new Map(
       (Array.isArray(tenantUsageRaw) ? tenantUsageRaw : []).map((row) => [
         row?._id ? String(row._id) : '',
@@ -5070,6 +5122,7 @@ router.get('/ai-usage', async (req, res, next) => {
       trend_daily: trendDaily,
       usage_by_feature: usageByFeature,
       usage_by_model: usageByModel,
+      usage_by_provider: usageByProvider,
       usageByTenant,
       usage_by_tenant: usageByTenant,
       summary,

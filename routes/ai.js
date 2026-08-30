@@ -42,13 +42,19 @@ import {
   extractTextFromImageArtifacts,
   extractTextFromPdfBufferWithVision,
 } from '../services/questionImportImageService.js';
+import {
+  assertImportCoverageOrThrow,
+  buildDocumentMapFromImportData,
+  buildImportExtractionReport,
+  documentMapQuestionsToImportRows,
+} from '../services/questionImportExtractionService.js';
 import { body, validationResult } from 'express-validator';
 import multer from 'multer';
 import path from 'path';
 import pdfParse from 'pdf-parse';
 import readXlsxFile from 'read-excel-file/node';
 import config from '../config/env.js';
-import { runEngineChatCompletion, isOpenAIEngineConfigured } from '../services/aiEngine/aiEngineClient.js';
+import { runEngineChatCompletion, isOpenAIEngineConfigured, isEngineOperationAvailable } from '../services/aiEngine/aiEngineClient.js';
 import { AI_OPERATIONS } from '../services/aiEngine/aiOperations.js';
 import { normalizeQuestionFormat } from '../utils/questionTypes.js';
 import {
@@ -663,10 +669,36 @@ router.post(
         }
       }
 
-      const importData = await parseQuestionImportFile(req.file, { tenantId: req.user?.tenantId || null });
+      const importData = await parseQuestionImportFile(req.file, {
+        tenantId: req.user?.tenantId || null,
+        userId: req.user?._id || null,
+      });
       const isCsvImport =
         String(importData?.extension || '').trim().toLowerCase() === '.csv';
       let { text, structuredRows } = importData;
+
+      const documentMap = buildDocumentMapFromImportData({
+        text: importData.text,
+        pageTexts: importData.pageTexts,
+        filename: req.file.originalname,
+      });
+      const documentMapRows = documentMapQuestionsToImportRows(documentMap);
+
+      if (process.env.NODE_ENV === 'development') {
+        console.log('[question-import-debug] PIPELINE INPUT:', {
+          filename: req.file.originalname,
+          mimeType: req.file.mimetype,
+          pageCount: importData.pageCount || documentMap?.documentMetadata?.pageCount || 0,
+          extractedTextLength: documentMap?.documentMetadata?.extractedTextLength || 0,
+          pagesSuccessfullyParsed: documentMap?.diagnostics?.pagesSuccessfullyParsed || 0,
+          deterministicCandidateCount: documentMap?.diagnostics?.deterministicCandidateCount || 0,
+          documentMapAcceptedCount: documentMap?.diagnostics?.acceptedCandidateCount || 0,
+          visionCandidateCount: Array.isArray(importData.visionCandidates)
+            ? importData.visionCandidates.length
+            : 0,
+          structuredRowCountBeforeFilter: Array.isArray(structuredRows) ? structuredRows.length : 0,
+        });
+      }
 
       const structuredRowCount = Array.isArray(structuredRows)
         ? structuredRows.length
@@ -684,14 +716,16 @@ router.post(
         });
 
       if (placeholderOnlyStructuredRows || shouldBypassSingleStructuredRow) {
-        console.log(
-          '[question-import-debug] STRUCTURED ROW FILTER:',
-          {
-            structuredRowCount,
-            placeholderOnlyStructuredRows,
-            shouldBypassSingleStructuredRow,
-          }
-        );
+        if (process.env.NODE_ENV === 'development') {
+          console.log(
+            '[question-import-debug] STRUCTURED ROW FILTER:',
+            {
+              structuredRowCount,
+              placeholderOnlyStructuredRows,
+              shouldBypassSingleStructuredRow,
+            }
+          );
+        }
         structuredRows = [];
       }
 
@@ -758,6 +792,9 @@ router.post(
       const questions = await extractQuestionsFromContent({
         content: text,
         structuredRows,
+        documentMapRows,
+        visionRows: importData.visionCandidates || [],
+        pageCount: importData.pageCount || documentMap?.documentMetadata?.pageCount || 0,
         filename: req.file.originalname,
         tenantId: req.user?.tenantId || null,
         userId: req.user?._id || null,
@@ -765,6 +802,37 @@ router.post(
           tenantId: req.user?.tenantId || null,
           userId: req.user?._id || null,
         },
+      });
+
+      assertImportCoverageOrThrow({
+        documentMap,
+        finalQuestions: questions,
+        pageCount: importData.pageCount || documentMap?.documentMetadata?.pageCount || 0,
+        textLength: documentMap?.documentMetadata?.extractedTextLength || 0,
+      });
+
+      const extractionReport = buildImportExtractionReport({
+        filename: req.file.originalname,
+        pageCount: importData.pageCount || documentMap?.documentMetadata?.pageCount || 0,
+        textLength: documentMap?.documentMetadata?.extractedTextLength || 0,
+        documentMap,
+        reconciliation: {
+          questions,
+          primarySource: 'reconciled',
+          sourceCounts: {
+            documentMap: documentMapRows.length,
+            final: questions.length,
+          },
+        },
+        extractionErrors: importData.extractionErrors,
+        processingStages: [
+          'Reading document',
+          `Analyzing ${importData.pageCount || documentMap?.documentMetadata?.pageCount || 1} page(s)`,
+          'Identifying sections',
+          'Detecting questions',
+          'Validating question types',
+          `Preparing ${questions.length} question(s) for review`,
+        ],
       });
 
       const imageAttachmentResult = await attachImagesToImportedQuestions({
@@ -985,18 +1053,23 @@ router.post(
           })
         : [];
 
-      console.log('[question-import-debug] DETECTED TOTAL:', detectedQuestionCount);
-      responseQuestions.forEach((question, index) => {
-        console.log(
-          `[question-import-debug] PREVIEW Q${index + 1}: questionType=${question?.questionType || ''} questionFormat=${question?.questionFormat || ''} hasImage=${Boolean(question?.imageUrl || question?.image_path || question?.generatedImage || question?.generated_image)}`
-        );
-      });
+      if (process.env.NODE_ENV === 'development') {
+        console.log('[question-import-debug] DETECTED TOTAL:', detectedQuestionCount);
+        responseQuestions.forEach((question, index) => {
+          console.log(
+            `[question-import-debug] PREVIEW Q${index + 1}: questionType=${question?.questionType || ''} questionFormat=${question?.questionFormat || ''} hasImage=${Boolean(question?.imageUrl || question?.image_path || question?.generatedImage || question?.generated_image)}`
+          );
+        });
+      }
 
       return res.json(
         buildImportSuccessPayload({
           questions: responseQuestions,
           detectedCount: detectedQuestionCount,
-          importReport: imageAttachmentResult?.report || {},
+          importReport: {
+            ...(imageAttachmentResult?.report || {}),
+            ...extractionReport,
+          },
           importLimitPerMonth,
           updatedImportUsage,
           remainingImports,
@@ -1007,7 +1080,10 @@ router.post(
       );
     } catch (error) {
       if (error?.statusCode) {
-        return res.status(error.statusCode).json(buildImportFailurePayload(error.message));
+        return res.status(error.statusCode).json(buildImportFailurePayload(error.message, {
+          code: error.code || 'IMPORT_FAILED',
+          importReport: error.importReport || {},
+        }));
       }
       console.error('[import-questions] unexpected error:', error);
       return res
@@ -2018,9 +2094,9 @@ router.post(
       } else if (['.jpg', '.jpeg', '.png'].includes(fileExtension)) {
         // For images, we'll use OpenAI Vision API if available
         // Otherwise, return error suggesting to convert to PDF
-        if (!isOpenAIEngineConfigured()) {
+        if (!isEngineOperationAvailable(AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE)) {
           return res.status(400).json({ 
-            error: 'Image OCR requires OpenAI API key. Please convert image to PDF or use Excel format.' 
+            error: 'Image OCR requires Gemini API key. Please convert image to PDF or use Excel format.' 
           });
         }
         
@@ -2035,7 +2111,6 @@ router.post(
             tenantId: req.user?.tenantId,
             userId: req.user?._id,
             request: {
-              model: config.openaiModel,
               messages: [
                 {
                   role: 'user',
@@ -2092,12 +2167,11 @@ Format: { "answers": { "q1": { "questionText": "...", "correctAnswer": "...", "p
 
       try {
         const completion = await runEngineChatCompletion({
-          operation: AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE,
+          operation: AI_OPERATIONS.QUESTION_CLASSIFICATION,
           feature: 'answer_key_generation',
           tenantId: req.user?.tenantId,
           userId: req.user?._id,
           request: {
-            model: config.openaiModel,
             messages: [
               { role: 'system', content: systemPrompt },
               { role: 'user', content: userPrompt },

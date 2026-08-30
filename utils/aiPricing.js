@@ -4,11 +4,22 @@ const MODEL_PRICING_USD_PER_1M = Object.freeze({
   'gpt-4.1': { input: 2, output: 8 },
   'gpt-4.1-mini': { input: 0.4, output: 1.6 },
   'gpt-4.1-nano': { input: 0.1, output: 0.4 },
-  // Embeddings have no output tokens; `input` doubles as the flat per-token
-  // rate (see estimateCostUsd's totalTokens branch, used for embeddings
-  // since they never report completion tokens).
   'text-embedding-3-small': { input: 0.02, output: 0.02 },
   'text-embedding-3-large': { input: 0.13, output: 0.13 },
+  'gemini-3.6-flash': { input: 0.15, output: 0.6 },
+  'gemini-3.5-flash-lite': { input: 0.075, output: 0.3 },
+  'gemini-2.5-flash': { input: 0.15, output: 0.6 },
+  'gemini-2.5-flash-image': { input: 0.15, output: 0.6 },
+  'gemini-2.0-flash': { input: 0.1, output: 0.4 },
+  'gemini-3.1-flash': { input: 0.15, output: 0.6 },
+});
+
+const IMAGE_GENERATION_FLAT_USD = Object.freeze({
+  'gemini-2.5-flash-image': 0.039,
+  'gemini-2.0-flash-preview-image-generation': 0.039,
+  'gemini-3.1-flash-image-preview': 0.039,
+  'gpt-image-1': 0.08,
+  'dall-e-3': 0.04,
 });
 
 const KNOWN_MODEL_PREFIXES = Object.freeze([
@@ -19,6 +30,9 @@ const KNOWN_MODEL_PREFIXES = Object.freeze([
   'gpt-4.1',
   'text-embedding-3-small',
   'text-embedding-3-large',
+  'gemini-3.6-flash',
+  'gemini-3.5-flash-lite',
+  'gemini-2.5-flash-image',
 ]);
 
 const DEFAULT_PRICING_USD_PER_1M = Object.freeze({
@@ -62,7 +76,16 @@ export const estimateCostUsd = ({
   promptTokens = 0,
   completionTokens = 0,
   totalTokens = 0,
+  imageCount = 0,
 }) => {
+  const normalizedModel = normalizeModelName(model);
+  if (imageCount > 0) {
+    const perImage = IMAGE_GENERATION_FLAT_USD[normalizedModel]
+      || Object.entries(IMAGE_GENERATION_FLAT_USD).find(([key]) => normalizedModel.startsWith(key))?.[1]
+      || 0.039;
+    return toNumber(imageCount) * perImage;
+  }
+
   const pricing = getModelPricing(model);
   const safePromptTokens = toNumber(promptTokens);
   const safeCompletionTokens = toNumber(completionTokens);

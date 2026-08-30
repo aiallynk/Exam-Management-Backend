@@ -1,12 +1,12 @@
 import { promises as fs } from 'fs';
 import path from 'path';
-import os from 'os';
 import { fileURLToPath } from 'url';
 import { execFile } from 'child_process';
 import { promisify } from 'util';
 import config from '../../config/env.js';
 import { putPrivateObject } from '../storage/imageStorage.js';
 import { assessPageQuality } from './pageQualityService.js';
+import { PYTHON_CANDIDATES } from './pythonRuntime.js';
 import { logError } from '../../utils/logger.js';
 
 // Multi-page PDF -> per-page images. Reuses the SAME Python rasterizer
@@ -26,9 +26,11 @@ const SCRIPT_PATH = path.join(__dirname, '..', 'import_scanned_pdf.py');
 const getUploadsRoot = () =>
   path.isAbsolute(config.uploadDir) ? config.uploadDir : path.join(process.cwd(), config.uploadDir);
 
-const runtimeCandidates = os.platform() === 'win32'
-  ? [{ executable: 'python', prefixArgs: [] }, { executable: 'py', prefixArgs: ['-3'] }, { executable: 'python3', prefixArgs: [] }]
-  : [{ executable: 'python3', prefixArgs: [] }, { executable: 'python', prefixArgs: [] }];
+// Honors OFFLINE_EVAL_PYTHON / PYTHON_BIN (see ./pythonRuntime.js) so a
+// deployment can pin the venv that has cv2 / pymupdf / numpy installed.
+const runtimeCandidates = PYTHON_CANDIDATES.map((executable) =>
+  executable === 'py' ? { executable, prefixArgs: ['-3'] } : { executable, prefixArgs: [] }
+);
 
 const rasterizePdf = async ({ pdfBuffer, sessionId }) => {
   const workingDir = path.join(getUploadsRoot(), 'answer-scripts', 'tmp', sessionId);

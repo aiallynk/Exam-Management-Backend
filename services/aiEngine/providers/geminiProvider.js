@@ -15,6 +15,8 @@ const SUPPORTED = new Set([
   AI_OPERATIONS.FORMATIVE_ANSWER_FEEDBACK,
   AI_OPERATIONS.MISCONCEPTION_ANALYSIS,
   AI_OPERATIONS.EVALUATION_EXPLANATION,
+  AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE,
+  AI_OPERATIONS.QUESTION_IMAGE_GENERATION,
 ]);
 
 let geminiClient = null;
@@ -60,6 +62,7 @@ const resolveModelName = (operation) => {
     case AI_OPERATIONS.ANSWER_IMAGE_EVALUATION:
     case AI_OPERATIONS.DIAGRAM_RESPONSE_EVALUATION:
     case AI_OPERATIONS.VISUAL_RESPONSE_EVALUATION:
+    case AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE:
       return config.geminiVisionModel || config.geminiEvaluationModel;
     case AI_OPERATIONS.FORMATIVE_ANSWER_FEEDBACK:
       return config.geminiFeedbackModel || config.geminiEvaluationModel;
@@ -78,14 +81,50 @@ const isQuotaError = (error) => {
   return error?.status === 429 || /exceeded your current quota|rate-limit|quota exceeded/i.test(message);
 };
 
+const RETIRED_GEMINI_MODELS = new Map([
+  ['gemini-2.5-flash', 'gemini-3.6-flash'],
+  ['gemini-2.0-flash', 'gemini-3.6-flash'],
+  ['gemini-2.0-flash-lite', 'gemini-3.5-flash-lite'],
+  ['gemini-3.1-flash', 'gemini-3.6-flash'],
+]);
+
+const normalizeGeminiModelName = (model) => {
+  const value = String(model || '').replace(/^models\//, '').trim();
+  return RETIRED_GEMINI_MODELS.get(value) || value;
+};
+
 const geminiModelCandidates = (requested) => {
+  const normalized = normalizeGeminiModelName(requested);
+  const names = [
+    normalized,
+    process.env.GEMINI_FALLBACK_MODEL,
+    config.geminiVisionModel,
+    config.geminiEvaluationModel,
+    'gemini-3.6-flash',
+    'gemini-3.5-flash-lite',
+  ].map((value) => normalizeGeminiModelName(String(value || '').replace(/^models\//, '').trim())).filter(Boolean);
+  return [...new Set(names)];
+};
+
+const geminiImageModelCandidates = (requested) => {
   const names = [
     requested,
+    config.geminiImageModel,
+    'gemini-2.5-flash-image',
+    'gemini-2.0-flash-preview-image-generation',
     process.env.GEMINI_FALLBACK_MODEL,
-    'gemini-3.6-flash',
-    'gemini-2.5-flash',
   ].map((value) => String(value || '').replace(/^models\//, '').trim()).filter(Boolean);
   return [...new Set(names)];
+};
+
+const extractInlineImageParts = (payload) => {
+  const parts = payload?.candidates?.[0]?.content?.parts || [];
+  return parts
+    .filter((part) => part?.inlineData?.data)
+    .map((part) => ({
+      b64_json: part.inlineData.data,
+      mimeType: part.inlineData.mimeType || 'image/png',
+    }));
 };
 
 const parseJsonContent = (text) => {
@@ -98,6 +137,87 @@ const parseJsonContent = (text) => {
     if (!match) return null;
     try { return JSON.parse(match[0]); } catch { return null; }
   }
+};
+
+const dataUriToInlineData = (value) => {
+  const url = String(value || '').trim();
+  const match = url.match(/^data:([^;]+);base64,(.+)$/i);
+  if (!match) return null;
+  return { mimeType: match[1], data: match[2] };
+};
+
+const openAiContentToGeminiParts = (content) => {
+  if (typeof content === 'string') {
+    return content.trim() ? [{ text: content }] : [];
+  }
+  if (!Array.isArray(content)) {
+    return [{ text: String(content ?? '') }];
+  }
+  const parts = [];
+  content.forEach((item) => {
+    if (item?.type === 'text') {
+      const text = String(item.text || '').trim();
+      if (text) parts.push({ text });
+      return;
+    }
+    if (item?.type === 'image_url') {
+      const url = item?.image_url?.url || item?.image_url;
+      const inlineData = dataUriToInlineData(url);
+      if (inlineData) {
+        parts.push({ inlineData });
+      } else if (url) {
+        parts.push({ text: `[image:${url}]` });
+      }
+    }
+  });
+  return parts;
+};
+
+const openAiMessagesToGeminiParts = (messages = []) => {
+  const parts = [];
+  messages.forEach((message) => {
+    const role = String(message?.role || 'user').toLowerCase();
+    const rolePrefix =
+      role === 'system' ? 'System instructions:\n'
+      : role === 'assistant' ? 'Assistant:\n'
+      : '';
+    const messageParts = openAiContentToGeminiParts(message?.content);
+    if (!messageParts.length && rolePrefix) {
+      parts.push({ text: rolePrefix.trim() });
+      return;
+    }
+    messageParts.forEach((part, index) => {
+      if (index === 0 && rolePrefix && part.text) {
+        parts.push({ ...part, text: `${rolePrefix}${part.text}` });
+      } else if (index === 0 && rolePrefix) {
+        parts.push({ text: rolePrefix.trim() });
+        parts.push(part);
+      } else {
+        parts.push(part);
+      }
+    });
+  });
+  return parts.length ? parts : [{ text: '' }];
+};
+
+const buildGeminiRequestParts = (request = {}) => {
+  if (Array.isArray(request.messages) && request.messages.length) {
+    return openAiMessagesToGeminiParts(request.messages);
+  }
+  const parts = [];
+  if (request.system) parts.push({ text: String(request.system) });
+  if (request.user) parts.push({ text: String(request.user) });
+  if (Array.isArray(request.images)) {
+    request.images.forEach((image) => {
+      if (image?.inlineData) parts.push({ inlineData: image.inlineData });
+      else if (image?.url) {
+        const inlineData = dataUriToInlineData(image.url);
+        if (inlineData) parts.push({ inlineData });
+        else parts.push({ text: `[image:${image.url}]` });
+      }
+    });
+  }
+  return parts.length ? parts : [{ text: '' }];
 };
 
 export const createGeminiProvider = () => ({
@@ -117,6 +237,7 @@ export const createGeminiProvider = () => ({
         vision: config.geminiVisionModel,
         handwriting: config.geminiHandwritingModel,
         feedback: config.geminiFeedbackModel,
+        image: config.geminiImageModel,
       },
       checkedAt: health.checkedAt || null,
     };
@@ -124,17 +245,11 @@ export const createGeminiProvider = () => ({
   async generateStructured({ operation, request, context = {} }) {
     const client = getGeminiClient();
     if (!client) throw new Error('Gemini is not configured.');
-    const requestedModel = context.model || getModelForOperation(operation) || resolveModelName(operation);
+    const requestedModel = normalizeGeminiModelName(
+      context.model || request.model || getModelForOperation(operation) || resolveModelName(operation)
+    );
     if (!requestedModel) throw new Error('Gemini model is not configured for this operation.');
-    const parts = [];
-    if (request?.system) parts.push({ text: String(request.system) });
-    if (request?.user) parts.push({ text: String(request.user) });
-    if (Array.isArray(request?.images)) {
-      request.images.forEach((image) => {
-        if (image?.inlineData) parts.push({ inlineData: image.inlineData });
-        else if (image?.url) parts.push({ text: `[image:${image.url}]` });
-      });
-    }
+    const parts = buildGeminiRequestParts(request);
     const generationConfig = {
       temperature: request?.temperature ?? 0.1,
       responseMimeType: request?.response_format?.type === 'json_object' ? 'application/json' : undefined,
@@ -179,5 +294,76 @@ export const createGeminiProvider = () => ({
   },
   async analyzeImages({ operation, request, context = {} }) {
     return this.generateStructured({ operation, request, context });
+  },
+  async generateImage({ operation, request, context = {} }) {
+    if (!config.geminiApiKey) throw new Error('Gemini is not configured.');
+    const requestedModel = context.model || request?.model || getModelForOperation(operation) || config.geminiImageModel;
+    const prompt = String(request?.prompt || request?.contents || '').trim();
+    if (!prompt) throw new Error('Image generation prompt is required.');
+
+    const candidates = geminiImageModelCandidates(requestedModel);
+    let payload = null;
+    let modelName = candidates[0];
+    let lastError = null;
+
+    for (const candidate of candidates) {
+      try {
+        const response = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(candidate)}:generateContent?key=${encodeURIComponent(config.geminiApiKey)}`,
+          {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              contents: [{ role: 'user', parts: [{ text: prompt }] }],
+              generationConfig: {
+                responseModalities: ['TEXT', 'IMAGE'],
+              },
+            }),
+          }
+        );
+        const body = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          const message = body?.error?.message || `Gemini image generation failed (${response.status}).`;
+          const error = new Error(message);
+          error.status = response.status;
+          throw error;
+        }
+        payload = body;
+        modelName = candidate;
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+        if (!isMissingModelError(error) && !isQuotaError(error)) throw error;
+      }
+    }
+    if (!payload) throw lastError || new Error('Gemini image model is not configured.');
+
+    const images = extractInlineImageParts(payload);
+    if (!images.length) {
+      throw new Error('Gemini image generation returned no image payload.');
+    }
+
+    const usageMetadata = payload?.usageMetadata || {};
+    return {
+      provider: 'gemini',
+      model: modelName,
+      operation,
+      raw: {
+        data: images,
+        model: modelName,
+        usageMetadata,
+      },
+      images,
+      usage: {
+        inputTokens: usageMetadata.promptTokenCount ?? null,
+        outputTokens: usageMetadata.candidatesTokenCount ?? null,
+        totalTokens: usageMetadata.totalTokenCount ?? null,
+        prompt_tokens: usageMetadata.promptTokenCount ?? 0,
+        completion_tokens: usageMetadata.candidatesTokenCount ?? 0,
+        total_tokens: usageMetadata.totalTokenCount ?? 0,
+        imageCount: images.length,
+      },
+    };
   },
 });

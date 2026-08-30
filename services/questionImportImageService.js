@@ -7,7 +7,7 @@ import crypto from 'crypto';
 import { execFile } from 'child_process';
 import { fileURLToPath } from 'url';
 import config from '../config/env.js';
-import { runEngineChatCompletion, runEngineImageGeneration, isOpenAIEngineConfigured, isImageGenerationEngineConfigured } from './aiEngine/aiEngineClient.js';
+import { runEngineChatCompletion, runEngineImageGeneration, isEngineOperationAvailable, isImageGenerationEngineConfigured } from './aiEngine/aiEngineClient.js';
 import { AI_OPERATIONS } from './aiEngine/aiOperations.js';
 import { getModelForOperation } from './aiEngine/aiConfigService.js';
 import {
@@ -23,6 +23,19 @@ import {
   keyToUrl as s3KeyToUrl,
   buildImageLocation,
 } from './storage/imageStorage.js';
+import {
+  assessVisionCoverage,
+  countNumberedQuestionMarkers,
+  splitPdfTextIntoPages,
+} from './questionImportExtractionService.js';
+import {
+  applyImportMediaPolicy,
+  classifyImportMediaRequirement,
+  logImportMediaClassification,
+  MEDIA_REQUIREMENTS,
+  shouldAttachSourceMedia,
+  validateImportQuestionMedia,
+} from './questionImportMediaService.js';
 
 const SUPPORTED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.svg']);
 const IMAGE_REFERENCE_KEYS = [
@@ -50,15 +63,25 @@ const GENERATED_IMAGE_UPLOAD_SEGMENT = '/uploads/generated_images/';
 const AI_PLACEHOLDER_MARKER = 'AI Diagram Placeholder';
 const AI_PLACEHOLDER_MARKER_LOWER = AI_PLACEHOLDER_MARKER.toLowerCase();
 
-const isVisionConfigured = () => isOpenAIEngineConfigured();
+const isVisionConfigured = () => isEngineOperationAvailable(AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE);
 const isImageGenConfigured = () => isImageGenerationEngineConfigured();
-const OPENAI_MODEL = config.openaiModel || 'gpt-4o-mini';
+
+// Import vision/OCR calls fan out over pages and blocks; a single stuck call
+// must not inherit the global 2-retry / 60s budget (which compounds to
+// minutes). One retry, 45s ceiling — callers may still override via context.
+const IMPORT_VISION_MAX_RETRIES = 1;
+const IMPORT_VISION_TIMEOUT_MS = 45000;
+let activeImportTrackingContext = { tenantId: null, userId: null };
 
 const engineImportChat = (request, feature = 'question_import_ocr', context = {}) => runEngineChatCompletion({
   operation: AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE,
   feature,
+  tenantId: context.tenantId ?? activeImportTrackingContext.tenantId,
+  userId: context.userId ?? activeImportTrackingContext.userId,
+  maxRetries: IMPORT_VISION_MAX_RETRIES,
+  requestTimeoutMs: IMPORT_VISION_TIMEOUT_MS,
   ...context,
-  request: { model: OPENAI_MODEL, ...request },
+  request,
 });
 
 let artifactSequence = 0;
@@ -103,11 +126,12 @@ const normalizeTextKey = (value) =>
 const questionLikelyReferencesImportedImage = (value) => {
   const normalized = stripInlineImageMarkers(value);
   if (!normalized) return false;
-  return (
-    hasInlineImageMarker(value) ||
-    DIAGRAM_KEYWORD_REGEX.test(normalized) ||
-    IMAGE_CONTEXT_HINT_REGEX.test(normalized)
-  );
+  if (hasInlineImageMarker(value)) return true;
+  if (IMAGE_CONTEXT_HINT_REGEX.test(normalized)) return true;
+  if (/\b(?:study the diagram|observe the (?:diagram|image|figure)|refer to the (?:diagram|figure|image|graph)|in the given image|picture shows|image shows)\b/i.test(normalized)) {
+    return true;
+  }
+  return false;
 };
 
 const artifactFingerprint = (artifact) => {
@@ -1821,6 +1845,11 @@ const extractQuestionsFromScannedBlocks = async ({
 
     const diagramUrl = sanitizeString(block?.diagramImageUrl || '');
     const blockImageUrl = sanitizeString(block?.blockImageUrl || '');
+    const mediaRequirement = classifyImportMediaRequirement({
+      questionText: question?.questionText || '',
+      sourceImageRequired: questionLikelyReferencesImportedImage(question?.questionText || ''),
+    });
+    const allowBlockMedia = shouldAttachSourceMedia(mediaRequirement);
 
     if (!question || !sanitizeString(question.questionText)) {
       // Keep import usable even when OCR/vision cannot parse this block.
@@ -1834,19 +1863,23 @@ const extractQuestionsFromScannedBlocks = async ({
         points: 1,
         order: parsedQuestions.length,
         ocrConfidence: 0,
-        imageUrl: diagramUrl || blockImageUrl || undefined,
-        image_path: diagramUrl || blockImageUrl || undefined,
+        imageUrl: allowBlockMedia ? (diagramUrl || blockImageUrl || undefined) : undefined,
+        image_path: allowBlockMedia ? (diagramUrl || blockImageUrl || undefined) : undefined,
+        mediaRequirement,
         sourceRowIndex: parsedQuestions.length,
       });
       continue;
     }
 
-    if (diagramUrl) {
-      question.imageUrl = diagramUrl;
-    } else if (blockImageUrl) {
-      question.imageUrl = blockImageUrl;
+    if (allowBlockMedia) {
+      if (diagramUrl) {
+        question.imageUrl = diagramUrl;
+      } else if (blockImageUrl) {
+        question.imageUrl = blockImageUrl;
+      }
+      question.image_path = question.imageUrl || '';
     }
-    question.image_path = question.imageUrl || '';
+    question.mediaRequirement = mediaRequirement;
 
     if (!sanitizeString(question.questionText)) {
       extractionErrors.push({
@@ -1992,7 +2025,12 @@ const extractQuestionsFromPdfVisionDirect = async ({
   }
 };
 
-export const parseQuestionImportFile = async (file, { tenantId } = {}) => {
+export const parseQuestionImportFile = async (file, { tenantId, userId } = {}) => {
+  activeImportTrackingContext = {
+    tenantId: tenantId || null,
+    userId: userId || null,
+  };
+  try {
   const extension = path.extname(file?.originalname || '').toLowerCase();
   const extractionErrors = [];
   const importSessionId = makeImportSessionId();
@@ -2000,6 +2038,9 @@ export const parseQuestionImportFile = async (file, { tenantId } = {}) => {
   const rowEmbeddedArtifacts = new Map();
   let text = '';
   let structuredRows = null;
+  let visionCandidates = null;
+  let pageTexts = [];
+  let pageCount = 0;
   const extractedArtifacts = [];
 
   if (extension === '.txt') {
@@ -2039,9 +2080,14 @@ export const parseQuestionImportFile = async (file, { tenantId } = {}) => {
       throw parseError;
     }
   } else if (extension === '.pdf') {
+    pageCount = estimatePdfPageCount(file.buffer);
     try {
       const parsed = await pdfParse(file.buffer);
       text = sanitizeString(parsed?.text);
+      pageTexts = splitPdfTextIntoPages(text, pageCount);
+      if (!pageCount && pageTexts.length) {
+        pageCount = pageTexts.length;
+      }
     } catch (error) {
       extractionErrors.push({
         stage: 'pdf-text',
@@ -2057,31 +2103,71 @@ export const parseQuestionImportFile = async (file, { tenantId } = {}) => {
       });
     }
 
-    // Every PDF import (not only scanned/no-text-layer ones) is routed
-    // through vision-based structured extraction: plain pdf-parse text
-    // strips all visual formatting before it ever reaches the AI, so a
-    // highlighted/bolded/circled "correct answer" is invisible unless the
-    // model actually sees the rendered page. This costs a vision call per
-    // PDF import; it takes priority over the plain-text extraction for
-    // building structuredRows (see extractQuestionsFromContent, which
-    // returns structuredRows as-is, including whatever correctAnswer this
-    // step found, without a second blind text-only re-extraction pass).
-    const directVisionQuestions = await extractQuestionsFromPdfVisionDirect({
-      pdfBuffer: file.buffer,
-      extractionErrors,
-    });
+    const markerCount = countNumberedQuestionMarkers(text);
+    // The full-PDF direct-vision pass is a large multimodal call (the whole
+    // PDF, base64) and it runs on every PDF. When the embedded text layer is
+    // already strong and cleanly numbered, the deterministic structural
+    // parsers produce the questions with no AI at all and this call's result
+    // is discarded during reconciliation — so skip it and save the round
+    // trip. Its unique value (reading a *visually* highlighted answer key)
+    // still applies to weak/short/scanned text, where it still runs.
+    // Set QUESTION_IMPORT_FORCE_PDF_VISION=true to always run it.
+    const pagesForRatio = Math.max(pageCount, pageTexts.length, 1);
+    const trimmedTextLength = sanitizeString(text).length;
+    const textLayerStrong =
+      markerCount >= 3 &&
+      trimmedTextLength >= 1200 &&
+      trimmedTextLength >= 300 * pagesForRatio;
+    const skipDirectVision =
+      textLayerStrong && process.env.QUESTION_IMPORT_FORCE_PDF_VISION !== 'true';
+    if (skipDirectVision) {
+      extractionErrors.push({
+        stage: 'pdf-vision-skipped',
+        message: 'Strong embedded text layer detected — skipped the full-PDF AI vision pass for speed.',
+      });
+    }
+    const directVisionQuestions = skipDirectVision
+      ? []
+      : await extractQuestionsFromPdfVisionDirect({
+          pdfBuffer: file.buffer,
+          extractionErrors,
+        });
     if (directVisionQuestions.length > 0) {
-      structuredRows = directVisionQuestions;
-      if (!text) {
-        text = directVisionQuestions.map((q) => q.questionText).join('\n\n');
+      visionCandidates = directVisionQuestions;
+      const coverage = assessVisionCoverage({
+        visionRowCount: directVisionQuestions.length,
+        pageCount,
+        textLength: sanitizeString(text).length,
+        markerCount,
+        documentMapCount: markerCount,
+      });
+      if (coverage.authoritative) {
+        structuredRows = directVisionQuestions;
+        if (!text) {
+          text = directVisionQuestions.map((q) => q.questionText).join('\n\n');
+        }
+      } else {
+        extractionErrors.push({
+          stage: 'pdf-vision-undercoverage',
+          message:
+            `Direct PDF vision returned ${directVisionQuestions.length} question(s) for a ${pageCount || pageTexts.length || 'multi'}-page document; deferring to structural extraction.`,
+        });
       }
     }
 
     // Scanned PDF fallback: render pages -> detect blocks -> extract question text with vision.
-    // Only reached when there is no text layer AND the lighter whole-PDF
-    // vision pass above didn't produce anything — this heavier
-    // page-rendering/block-detection pipeline is reserved as a last resort.
-    if (!text && (!Array.isArray(structuredRows) || structuredRows.length === 0)) {
+    // Reached when structural extraction is unavailable or direct vision under-covered.
+    const needsScannedFallback =
+      (!Array.isArray(structuredRows) || structuredRows.length === 0) &&
+      (
+        !text ||
+        (
+          (pageCount >= 2 || pageTexts.length >= 2) &&
+          markerCount < 2 &&
+          (!Array.isArray(visionCandidates) || visionCandidates.length <= 1)
+        )
+      );
+    if (needsScannedFallback) {
       let scanned = { blocks: [], pages: [], workingDir: '' };
       try {
         scanned = await runScannedPdfProcessor({
@@ -2324,12 +2410,18 @@ export const parseQuestionImportFile = async (file, { tenantId } = {}) => {
     extension,
     text: sanitizeString(text),
     structuredRows,
+    visionCandidates,
+    pageTexts,
+    pageCount,
     importSessionId,
     extractedArtifacts,
     rowImageReferences,
     rowEmbeddedArtifacts,
     extractionErrors,
   };
+  } finally {
+    activeImportTrackingContext = { tenantId: null, userId: null };
+  }
 };
 
 export const attachImagesToImportedQuestions = async ({
@@ -2381,6 +2473,14 @@ export const attachImagesToImportedQuestions = async ({
   let mappedImageCount = 0;
   let aiGeneratedCount = 0;
   let fallbackGeneratedCount = 0;
+  let sourceMediaExtractedCount = 0;
+  let sourceRegionPreviewCount = 0;
+  let mediaValidationFailures = 0;
+
+  for (let index = 0; index < safeQuestions.length; index += 1) {
+    const question = safeQuestions[index];
+    question.mediaRequirement = classifyImportMediaRequirement(question);
+  }
 
   const persistArtifactSafely = async ({ artifact, questionIndex, fileStem, stage }) => {
     try {
@@ -2462,14 +2562,20 @@ export const attachImagesToImportedQuestions = async ({
 
     const row = rowIndex !== null ? safeRows[rowIndex] : null;
     const rowText = row ? getRawQuestionTextFromRow(row) : '';
-    const expectsImportedImage =
-      questionLikelyReferencesImportedImage(questionText) ||
-      rowHasImageMarker(row) ||
-      questionLikelyReferencesImportedImage(rowText);
+    const mediaRequirement = classifyImportMediaRequirement({
+      ...question,
+      questionText: questionText || rowText,
+    });
+    question.mediaRequirement = mediaRequirement;
+    const expectsImportedImage = shouldAttachSourceMedia(mediaRequirement)
+      || (
+        mediaRequirement === MEDIA_REQUIREMENTS.VISUAL_REQUIREMENT_UNCERTAIN
+        && (questionLikelyReferencesImportedImage(questionText) || questionLikelyReferencesImportedImage(rowText))
+      );
 
     let resolvedImageUrl = '';
 
-    if (existingImageValue) {
+    if (existingImageValue && shouldAttachSourceMedia(mediaRequirement)) {
       if (looksLikeUrl(existingImageValue)) {
         resolvedImageUrl = existingImageValue;
       } else {
@@ -2496,7 +2602,7 @@ export const attachImagesToImportedQuestions = async ({
       }
     }
 
-    if (!resolvedImageUrl && rowIndex !== null) {
+    if (!resolvedImageUrl && shouldAttachSourceMedia(mediaRequirement) && rowIndex !== null) {
       const embedded = consumeRowEmbeddedArtifact(rowIndex);
       if (embedded) {
         resolvedImageUrl = await persistArtifactSafely({
@@ -2508,7 +2614,7 @@ export const attachImagesToImportedQuestions = async ({
       }
     }
 
-    if (!resolvedImageUrl && rowIndex !== null && rowRefMap.has(rowIndex)) {
+    if (!resolvedImageUrl && shouldAttachSourceMedia(mediaRequirement) && rowIndex !== null && rowRefMap.has(rowIndex)) {
       const refs = rowRefMap.get(rowIndex);
       while (refs.length && !resolvedImageUrl) {
         const reference = sanitizeString(refs.shift());
@@ -2556,60 +2662,29 @@ export const attachImagesToImportedQuestions = async ({
       }
     }
 
+    if (resolvedImageUrl && !shouldAttachSourceMedia(mediaRequirement)) {
+      sourceRegionPreviewCount += 1;
+      resolvedImageUrl = '';
+    }
+
     if (resolvedImageUrl) {
       resolvedImageUrl = await verifyUploadImageUrlExists(resolvedImageUrl, 'validate-import-image-path');
       question.imageUrl = resolvedImageUrl;
       if (resolvedImageUrl) {
         mappedImageCount += 1;
+        sourceMediaExtractedCount += 1;
       }
     }
   }
 
-  const unresolvedQuestionIndexes = safeQuestions
-    .map((question, index) => ({
-      index,
-      hasImage: Boolean(sanitizeString(question.imageUrl || question.generatedImage)),
-    }))
-    .filter(({ hasImage }) => !hasImage)
-    .map(({ index }) => index);
-
-  if (
-    unresolvedQuestionIndexes.length > 0 &&
-    safeArtifacts.length > 0 &&
-    (unresolvedQuestionIndexes.length === safeArtifacts.length || unresolvedQuestionIndexes.length === 1)
-  ) {
-    const targetIndexes =
-      unresolvedQuestionIndexes.length === 1
-        ? unresolvedQuestionIndexes.slice(0, 1)
-        : unresolvedQuestionIndexes.slice(0, safeArtifacts.length);
-
-    for (const questionIndex of targetIndexes) {
-      const artifact = consumeLooseArtifact();
-      if (!artifact) break;
-
-      const persistedUrl = await persistArtifactSafely({
-        artifact,
-        questionIndex,
-        fileStem: 'extracted',
-        stage: 'persist-sequential-extracted-image',
-      });
-      if (!persistedUrl) continue;
-
-      const verifiedUrl = await verifyUploadImageUrlExists(
-        persistedUrl,
-        'validate-import-image-path'
-      );
-      if (!verifiedUrl) continue;
-
-      safeQuestions[questionIndex].imageUrl = verifiedUrl;
-      mappedImageCount += 1;
-    }
-  }
+  // Never attach leftover PDF images to arbitrary text-only questions.
+  // Source visuals must be semantically required before persistence.
 
   if (generateMissingDiagrams) {
     for (let index = 0; index < safeQuestions.length; index += 1) {
       const question = safeQuestions[index];
       if (sanitizeString(question.imageUrl)) continue;
+      if (classifyImportMediaRequirement(question) !== MEDIA_REQUIREMENTS.NEW_AI_VISUAL_REQUIRED) continue;
       if (!DIAGRAM_KEYWORD_REGEX.test(sanitizeString(question.questionText))) continue;
 
       const diagramType = detectDiagramType(question.questionText);
@@ -2639,6 +2714,21 @@ export const attachImagesToImportedQuestions = async ({
       }
     }
   }
+
+  safeQuestions.forEach((question, index) => {
+    const policyApplied = applyImportMediaPolicy(question);
+    safeQuestions[index] = policyApplied;
+    const validation = validateImportQuestionMedia(policyApplied);
+    if (!validation.ok && validation.reason !== 'missing-required-source-visual') {
+      mediaValidationFailures += 1;
+      errors.push({
+        stage: 'import-media-validation',
+        message: `Question ${index + 1}: ${validation.reason}`,
+      });
+    }
+  });
+
+  logImportMediaClassification(safeQuestions);
 
   safeQuestions.forEach((question) => {
     const cleanedQuestionText = stripInlineImageMarkers(
@@ -2673,8 +2763,13 @@ export const attachImagesToImportedQuestions = async ({
     report: {
       extractedImageCount: totalExtractedImageCount,
       mappedImageCount,
+      sourceMediaExtractedCount,
+      sourceRegionPreviewCount,
       aiGeneratedCount,
+      aiGeneratedImageCount: aiGeneratedCount,
+      aiImageGenerationAttempts: aiGeneratedCount + fallbackGeneratedCount,
       fallbackGeneratedCount,
+      mediaValidationFailures,
       extractionErrors: errors.slice(0, 100),
     },
   };
@@ -2693,7 +2788,7 @@ export const extractTextFromImageArtifacts = async ({
   if (!isVisionConfigured()) {
     warnings.push({
       stage: 'ocr-images',
-      message: 'OpenAI API key is not configured for OCR fallback.',
+      message: 'Gemini API key is not configured for OCR fallback.',
     });
     return { text: '', warnings };
   }
@@ -2758,7 +2853,7 @@ export const extractTextFromPdfBufferWithVision = async ({
   if (!isVisionConfigured()) {
     warnings.push({
       stage: 'ocr-pdf',
-      message: 'OpenAI API key is not configured for scanned PDF OCR fallback.',
+      message: 'Gemini API key is not configured for scanned PDF OCR fallback.',
     });
     return { text: '', warnings };
   }

@@ -18,6 +18,7 @@ import {
   validateGeneratedQuestionShape,
 } from '../utils/questionTypeRegistry.js';
 import { BLOOM_LEVELS, COGNITIVE_DEMAND_DESCRIPTIONS, buildBloomTargetsFromCognitiveDistribution } from '../utils/cognitiveDemand.js';
+import { reconcileImportQuestionCandidates } from './questionImportExtractionService.js';
 
 // Sanitizes an AI-returned bloomLevel token to one of the six canonical
 // values or undefined — never trusted/stored if unrecognized. cognitiveDemand
@@ -29,14 +30,28 @@ const sanitizeBloomLevel = (value) => {
   return BLOOM_LEVELS.includes(token) ? token : undefined;
 };
 
-const OPENAI_MODEL = config.openaiModel || 'gpt-4o-mini';
+const OPENAI_MODEL = config.openaiQuestionModel || config.openaiModel || 'gpt-4o';
 
 // Re-export for backward compatibility — canonical client lives in aiEngine/openaiClient.js
 export { getOpenAIClient };
 const IMPORT_EXTRACTION_MODEL = 'gpt-4o-mini';
 const MAX_IMPORT_AI_CHUNKS = 120;
 const MAX_IMPORT_CHUNK_PREVIEW_LENGTH = 8000;
-const MAX_PARALLEL_IMPORT_CHUNK_REQUESTS = 4;
+const MAX_PARALLEL_IMPORT_CHUNK_REQUESTS = 6;
+// Import AI calls fan out; a stuck one must fail fast, not inherit the global
+// 2-retry / 60s budget.
+const IMPORT_AI_MAX_RETRIES = 1;
+const IMPORT_AI_TIMEOUT_MS = 45000;
+// Bulk pre-pass: pack many question blocks into one request instead of one
+// call per question. ~12k chars ≈ 15-40 typical questions per call.
+const IMPORT_BULK_WINDOW_CHARS = 12000;
+const MAX_IMPORT_BULK_WINDOWS = 12;
+// Only guard chatty per-block logging; keep error logs unconditional.
+const QUESTION_IMPORT_DEBUG =
+  process.env.QUESTION_IMPORT_DEBUG === 'true' || process.env.NODE_ENV === 'development';
+const qImportDebug = (...args) => {
+  if (QUESTION_IMPORT_DEBUG) console.log(...args);
+};
 const IMPORT_HEADER_LINE_REGEX =
   /^(?:quiz|name|date|section|instructions?)\b(?:\s*[:\-].*|[\s_]*$)/i;
 const IMPORT_HEADER_BLOCK_HINT_REGEX = /\b(?:quiz|name|date|section)\b/i;
@@ -2154,6 +2169,9 @@ export const extractQuestionsFromContent = async (params) => {
   const {
     content,
     structuredRows,
+    documentMapRows = [],
+    visionRows = [],
+    pageCount = 0,
     tenantId = null,
     userId = null,
     metadata = null,
@@ -2162,9 +2180,19 @@ export const extractQuestionsFromContent = async (params) => {
 
   const trimmedContent = sanitizeString(content);
   const normalizedContent = normalizeImportTextForParsing(trimmedContent);
-  console.log('[question-import-debug] CLEAN TEXT:', normalizedContent);
+  qImportDebug('[question-import-debug] CLEAN TEXT:', normalizedContent);
   const normalizedFromRows = Array.isArray(structuredRows)
     ? structuredRows
+      .map((row, idx) => normalizeStructuredRow(row, idx))
+      .filter((question) => isValidParsedImportQuestion(question))
+    : [];
+  const normalizedDocumentMapRows = Array.isArray(documentMapRows)
+    ? documentMapRows
+      .map((row, idx) => normalizeStructuredRow(row, idx))
+      .filter((question) => isValidParsedImportQuestion(question))
+    : [];
+  const normalizedVisionRows = Array.isArray(visionRows)
+    ? visionRows
       .map((row, idx) => normalizeStructuredRow(row, idx))
       .filter((question) => isValidParsedImportQuestion(question))
     : [];
@@ -2173,20 +2201,26 @@ export const extractQuestionsFromContent = async (params) => {
     ? extractQuestionsFromNumberedText(normalizedContent)
     : [];
 
-  if (
-    normalizedFromRows.length &&
-    parsedFromNumbering.length > normalizedFromRows.length &&
-    normalizedFromRows.length <= 1
-  ) {
-    console.log(
-      '[question-import-debug] STRUCTURED ROWS BYPASSED:',
-      `rows=${normalizedFromRows.length} numbered=${parsedFromNumbering.length}`
-    );
-    return parsedFromNumbering;
-  }
+  const reconciliation = reconcileImportQuestionCandidates({
+    documentMapRows: normalizedDocumentMapRows,
+    numberedRows: parsedFromNumbering,
+    structuredRows: normalizedFromRows,
+    visionRows: normalizedVisionRows,
+    pageCount,
+    textLength: normalizedContent.length,
+    markerCount: parsedFromNumbering.length,
+  });
 
-  if (normalizedFromRows.length) {
-    return normalizedFromRows;
+  if (reconciliation.questions.length > 0) {
+    qImportDebug(
+      '[question-import-debug] RECONCILED SOURCE:',
+      reconciliation.primarySource,
+      'count=',
+      reconciliation.questions.length,
+      'sources=',
+      reconciliation.sourceCounts
+    );
+    return reconciliation.questions;
   }
 
   if (!normalizedContent) {
@@ -3098,9 +3132,9 @@ const normalizeSingleChunkQuestion = ({ extracted, chunkText, index }) => {
     options = undefined;
   }
 
-  console.log('[question-import-debug] BLOCK:', normalizedChunkText);
-  console.log('[question-import-debug] OPTIONS:', options);
-  console.log('[question-import-debug] TYPE:', questionType);
+  qImportDebug('[question-import-debug] BLOCK:', normalizedChunkText);
+  qImportDebug('[question-import-debug] OPTIONS:', options);
+  qImportDebug('[question-import-debug] TYPE:', questionType);
 
   const normalizedQuestion = normalizeQuestionObject(
     {
@@ -3152,6 +3186,8 @@ const parseSingleChunkWithAi = async ({
     feature: 'question_import',
     tenantId: trackingContext.tenantId,
     userId: trackingContext.userId,
+    maxRetries: IMPORT_AI_MAX_RETRIES,
+    requestTimeoutMs: IMPORT_AI_TIMEOUT_MS,
     request: {
       model: IMPORT_EXTRACTION_MODEL,
       messages: [
@@ -3194,6 +3230,71 @@ Return format:
   });
 };
 
+// Greedily pack consecutive question blocks into ~IMPORT_BULK_WINDOW_CHARS
+// windows so one AI call covers many questions instead of one call each.
+const packBlocksIntoWindows = (blocks = []) => {
+  const windows = [];
+  let current = '';
+  for (const block of blocks) {
+    const piece = sanitizeString(block);
+    if (!piece) continue;
+    if (current && current.length + piece.length + 2 > IMPORT_BULK_WINDOW_CHARS) {
+      windows.push(current);
+      current = '';
+    }
+    current = current ? `${current}\n\n${piece}` : piece;
+    if (current.length >= IMPORT_BULK_WINDOW_CHARS) {
+      windows.push(current);
+      current = '';
+    }
+  }
+  if (current) windows.push(current);
+  return windows.slice(0, MAX_IMPORT_BULK_WINDOWS);
+};
+
+// One AI call → every question in the window as a JSON array.
+const parseWindowWithAi = async ({ windowText, baseIndex, trackingContext }) => {
+  const safeWindow = sanitizeString(windowText);
+  if (!safeWindow) return [];
+  const completion = await runEngineChatCompletion({
+    operation: AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE,
+    feature: 'question_import',
+    tenantId: trackingContext.tenantId,
+    userId: trackingContext.userId,
+    maxRetries: IMPORT_AI_MAX_RETRIES,
+    requestTimeoutMs: IMPORT_AI_TIMEOUT_MS,
+    request: {
+      model: IMPORT_EXTRACTION_MODEL,
+      messages: [
+        {
+          role: 'system',
+          content: `Extract EVERY distinct question from the supplied exam text into structured JSON. Preserve the original order. Do not merge, split, invent, paraphrase, or skip questions.
+- If options A/B/C/D are present, set "type" to "MCQ" and list the option wording in "options".
+- If it says "True or False", set "type" to "TRUE_FALSE".
+- Otherwise set "type" to "DESCRIPTIVE" and omit "options".
+Return: {"questions":[{"questionText":"","type":"MCQ","options":[]}]}`,
+        },
+        { role: 'user', content: safeWindow },
+      ],
+      temperature: 0,
+      response_format: { type: 'json_object' },
+    },
+  });
+  const parsed = parseJsonObjectContent(completion?.choices?.[0]?.message?.content || '');
+  const items = Array.isArray(parsed?.questions)
+    ? parsed.questions
+    : Array.isArray(parsed)
+      ? parsed
+      : [];
+  return items
+    .map((item, offset) => normalizeSingleChunkQuestion({
+      extracted: item,
+      chunkText: sanitizeString(item?.questionText || item?.question || item?.question_text),
+      index: baseIndex + offset,
+    }))
+    .filter((question) => question?.questionText);
+};
+
 const extractQuestionsFromChunkedAi = async ({
   content,
   trackingContext,
@@ -3205,6 +3306,34 @@ const extractQuestionsFromChunkedAi = async ({
 
   if (!rawChunks.length) {
     return [];
+  }
+
+  // Fast path: a few windowed multi-question calls instead of one per chunk.
+  try {
+    const windows = packBlocksIntoWindows(rawChunks);
+    if (windows.length) {
+      const bulk = [];
+      for (const batch of chunkArray(
+        windows.map((windowText, windowIndex) => ({ windowText, windowIndex })),
+        MAX_PARALLEL_IMPORT_CHUNK_REQUESTS,
+      )) {
+        // eslint-disable-next-line no-await-in-loop
+        const batchResults = await Promise.all(
+          batch.map(({ windowText, windowIndex }) =>
+            parseWindowWithAi({ windowText, baseIndex: windowIndex * 1000, trackingContext }).catch(() => [])),
+        );
+        batchResults.forEach((questions) => bulk.push(...questions));
+      }
+      const deduped = dedupeQuestionsByText(bulk);
+      // Accept the bulk result when it recovered most of the detected blocks;
+      // otherwise fall through to the resilient per-chunk path below.
+      if (deduped.length >= Math.max(1, Math.ceil(rawChunks.length * 0.6))) {
+        qImportDebug('[question-import-debug] BULK EXTRACT:', deduped.length, 'from', rawChunks.length, 'blocks /', windows.length, 'calls');
+        return deduped;
+      }
+    }
+  } catch {
+    // Any bulk failure → per-chunk fallback.
   }
 
   const indexedChunks = rawChunks.map((chunk, index) => ({ chunk, index }));
@@ -3347,9 +3476,9 @@ const normalizeParsedQuestionFromBlock = ({ block, index }) => {
     options = undefined;
   }
 
-  console.log('[question-import-debug] BLOCK:', block);
-  console.log('[question-import-debug] OPTIONS:', options);
-  console.log('[question-import-debug] TYPE:', questionType);
+  qImportDebug('[question-import-debug] BLOCK:', block);
+  qImportDebug('[question-import-debug] OPTIONS:', options);
+  qImportDebug('[question-import-debug] TYPE:', questionType);
 
   const correctAnswer = resolveCorrectAnswerFromRaw({
     rawAnswer,
@@ -3378,11 +3507,11 @@ const normalizeParsedQuestionFromBlock = ({ block, index }) => {
 
 export const extractQuestionsFromNumberedText = (content) => {
   const blocks = splitNumberedQuestionBlocks(content);
-  console.log('[question-import-debug] QUESTION BLOCKS:', blocks.length);
-  console.log('[question-import] Total blocks:', blocks.length);
+  qImportDebug('[question-import-debug] QUESTION BLOCKS:', blocks.length);
+  qImportDebug('[question-import] Total blocks:', blocks.length);
 
   if (!blocks.length) {
-    console.log('[question-import] Parsed questions:', 0);
+    qImportDebug('[question-import] Parsed questions:', 0);
     return [];
   }
 
@@ -3390,15 +3519,17 @@ export const extractQuestionsFromNumberedText = (content) => {
     .map((block, idx) => normalizeParsedQuestionFromBlock({ block, index: idx }))
     .filter(Boolean);
 
-  console.log('[question-import] Parsed questions:', parsed.length);
-  parsed.forEach((question, idx) => {
-    const questionText = sanitizeString(question?.questionText).slice(0, 180);
-    const optionsCount = Array.isArray(question?.options) ? question.options.length : 0;
-    const detectedType = sanitizeString(question?.questionType) || 'UNKNOWN';
-    console.log(
-      `[question-import] Q${idx + 1}: text="${questionText}" options=${optionsCount} type=${detectedType}`
-    );
-  });
+  qImportDebug('[question-import] Parsed questions:', parsed.length);
+  if (QUESTION_IMPORT_DEBUG) {
+    parsed.forEach((question, idx) => {
+      const questionText = sanitizeString(question?.questionText).slice(0, 180);
+      const optionsCount = Array.isArray(question?.options) ? question.options.length : 0;
+      const detectedType = sanitizeString(question?.questionType) || 'UNKNOWN';
+      console.log(
+        `[question-import] Q${idx + 1}: text="${questionText}" options=${optionsCount} type=${detectedType}`
+      );
+    });
+  }
 
   if (parsed.length < 1) {
     return [];

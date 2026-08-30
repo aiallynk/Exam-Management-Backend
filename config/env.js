@@ -71,6 +71,7 @@ See server/env.example for reference.
 validateEnvVars();
 
 const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
+const DEFAULT_OPENAI_QUESTION_MODEL = 'gpt-4o';
 const resolveOpenAiModel = () => {
   const configured = String(process.env.OPENAI_MODEL || '').trim();
   return configured || DEFAULT_OPENAI_MODEL;
@@ -182,19 +183,19 @@ const config = {
   aiVisionProvider: process.env.AI_VISION_PROVIDER || process.env.AI_DEFAULT_EVALUATION_PROVIDER || process.env.AI_EVALUATION_PROVIDER || 'gemini',
   aiHandwritingProvider: process.env.AI_HANDWRITING_PROVIDER || process.env.AI_DEFAULT_EVALUATION_PROVIDER || process.env.AI_EVALUATION_PROVIDER || 'gemini',
   aiFormativeFeedbackProvider: process.env.AI_FORMATIVE_FEEDBACK_PROVIDER || process.env.AI_DEFAULT_EVALUATION_PROVIDER || process.env.AI_EVALUATION_PROVIDER || 'gemini',
-  aiQuestionImageProvider: process.env.AI_QUESTION_IMAGE_PROVIDER || process.env.AI_DEFAULT_QUESTION_PROVIDER || process.env.AI_QUESTION_PROVIDER || 'openai',
+  aiQuestionImageProvider: process.env.AI_QUESTION_IMAGE_PROVIDER || process.env.AI_DEFAULT_EVALUATION_PROVIDER || process.env.AI_EVALUATION_PROVIDER || 'gemini',
 
   // OpenAI models (OPENAI_MODEL remains the legacy fallback)
-  openaiQuestionModel: process.env.OPENAI_QUESTION_MODEL || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
+  openaiQuestionModel: process.env.OPENAI_QUESTION_MODEL || DEFAULT_OPENAI_QUESTION_MODEL,
   openaiClassificationModel: process.env.OPENAI_CLASSIFICATION_MODEL || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
   openaiImageModel: process.env.OPENAI_IMAGE_MODEL || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
 
   // Gemini models. GEMINI_MODEL is the shared fallback already used in .env.
-  // Do not default to retired flash IDs — Google returns 404 for gemini-2.0-flash.
-  geminiEvaluationModel: process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.1-flash',
-  geminiVisionModel: process.env.GEMINI_VISION_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.1-flash',
-  geminiHandwritingModel: process.env.GEMINI_HANDWRITING_MODEL || process.env.GEMINI_VISION_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.1-flash',
-  geminiFeedbackModel: process.env.GEMINI_FEEDBACK_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.1-flash',
+  geminiEvaluationModel: process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.6-flash',
+  geminiVisionModel: process.env.GEMINI_VISION_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.6-flash',
+  geminiHandwritingModel: process.env.GEMINI_HANDWRITING_MODEL || process.env.GEMINI_VISION_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.6-flash',
+  geminiFeedbackModel: process.env.GEMINI_FEEDBACK_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.6-flash',
+  geminiImageModel: process.env.GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image',
 };
 
 export default config;

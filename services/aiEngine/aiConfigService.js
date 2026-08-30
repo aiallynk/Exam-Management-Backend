@@ -25,12 +25,12 @@ export const buildEnvBootstrapOperationRouting = ({
     [AI_OPERATIONS.CONTENT_GROUNDED_QUESTION_GENERATION]: question,
     [AI_OPERATIONS.QUESTION_REGENERATION]: question,
     [AI_OPERATIONS.QUESTION_REPAIR]: question,
-    [AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE]: question,
+    [AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE]: evaluation,
     [AI_OPERATIONS.QUESTION_CLASSIFICATION]: question,
     [AI_OPERATIONS.COGNITIVE_CLASSIFICATION]: question,
     [AI_OPERATIONS.BLOOM_CLASSIFICATION]: question,
     [AI_OPERATIONS.QUESTION_EXPLANATION_GENERATION]: question,
-    [AI_OPERATIONS.QUESTION_IMAGE_GENERATION]: question,
+    [AI_OPERATIONS.QUESTION_IMAGE_GENERATION]: evaluation,
     [AI_OPERATIONS.EMBEDDING]: question,
     [AI_OPERATIONS.HANDWRITING_EXTRACTION]: evaluation,
     [AI_OPERATIONS.ANSWER_SCRIPT_IDENTITY_EXTRACTION]: evaluation,
@@ -65,12 +65,12 @@ const ENV_MODEL_BY_OPERATION = Object.freeze({
   [AI_OPERATIONS.CONTENT_GROUNDED_QUESTION_GENERATION]: () => config.openaiQuestionModel || config.openaiModel,
   [AI_OPERATIONS.QUESTION_REGENERATION]: () => config.openaiQuestionModel || config.openaiModel,
   [AI_OPERATIONS.QUESTION_REPAIR]: () => config.openaiQuestionModel || config.openaiModel,
-  [AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE]: () => config.openaiQuestionModel || config.openaiModel,
+  [AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE]: () => config.geminiVisionModel || config.geminiEvaluationModel,
   [AI_OPERATIONS.QUESTION_CLASSIFICATION]: () => config.openaiClassificationModel || config.openaiModel,
   [AI_OPERATIONS.COGNITIVE_CLASSIFICATION]: () => config.openaiClassificationModel || config.openaiModel,
   [AI_OPERATIONS.BLOOM_CLASSIFICATION]: () => config.openaiClassificationModel || config.openaiModel,
   [AI_OPERATIONS.QUESTION_EXPLANATION_GENERATION]: () => config.openaiQuestionModel || config.openaiModel,
-  [AI_OPERATIONS.QUESTION_IMAGE_GENERATION]: () => config.openaiImageModel || config.openaiModel,
+  [AI_OPERATIONS.QUESTION_IMAGE_GENERATION]: () => config.geminiImageModel,
   [AI_OPERATIONS.EMBEDDING]: () => config.openaiEmbeddingModel,
   [AI_OPERATIONS.HANDWRITING_EXTRACTION]: () => config.geminiHandwritingModel,
   [AI_OPERATIONS.ANSWER_SCRIPT_IDENTITY_EXTRACTION]: () => config.geminiVisionModel,
@@ -174,7 +174,13 @@ export const bootstrapAiConfig = async () => {
     const record = await SystemConfig.findOne({ key: AI_OPERATION_ROUTING_CONFIG_KEY }).lean();
     const dbRouting = parseDbJsonObject(record?.value);
     if (dbRouting && Object.keys(dbRouting).length) {
-      cachedRouting = { ...bootstrap, ...dbRouting };
+      cachedRouting = {
+        ...bootstrap,
+        ...dbRouting,
+        // Product policy: import vision/OCR and image generation stay on Gemini.
+        [AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE]: bootstrap[AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE],
+        [AI_OPERATIONS.QUESTION_IMAGE_GENERATION]: bootstrap[AI_OPERATIONS.QUESTION_IMAGE_GENERATION],
+      };
       cachedSource = 'database';
       return { source: cachedSource, routing: cachedRouting, runtime: cachedRuntime };
     }

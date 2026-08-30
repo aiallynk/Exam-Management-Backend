@@ -552,6 +552,22 @@ const buildRefreshTokenPayload = ({ userId, tenantId, tokenVersion }) => {
   return payload;
 };
 
+const buildClientAuthUser = (user, extras = {}) => {
+  const profilePictureUrl = String(user?.profilePictureUrl || '').trim();
+  return {
+    _id: user._id,
+    name: user.name,
+    email: user.email,
+    role: user.role,
+    roles: user.roles && user.roles.length ? user.roles : [user.role],
+    planType: user.planType,
+    examsCreated: user.examsCreated ?? 0,
+    profilePictureUrl,
+    avatar: profilePictureUrl,
+    ...extras,
+  };
+};
+
 /**
  * Register - Create new user account
  * 
@@ -680,17 +696,10 @@ router.post(
       res.status(201).json({
         accessToken,
         refreshToken,
-        user: {
-          _id: user._id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          roles: user.roles && user.roles.length ? user.roles : [user.role],
-          planType: user.planType,
-          examsCreated: user.examsCreated ?? 0,
+        user: buildClientAuthUser(user, {
           tenantId: tenant?._id || null,
           tenant: tenant || null,
-        },
+        }),
       });
     } catch (error) {
       next(error);
@@ -733,13 +742,13 @@ router.post(
       // Find user
       loginProfiler.mark('user_lookup_start');
       let user = await User.findOne({ email }).select(
-        'name email password role roles tenantId status planType examsCreated'
+        'name email password role roles tenantId status planType examsCreated profilePictureUrl'
       );
       loginProfiler.mark('user_lookup_done', { found: Boolean(user) });
       if (!user && rawEmailInput && rawEmailInput !== email) {
         loginProfiler.mark('user_lookup_raw_fallback_start');
         user = await User.findOne({ email: rawEmailInput.trim() }).select(
-          'name email password role roles tenantId status planType examsCreated'
+          'name email password role roles tenantId status planType examsCreated profilePictureUrl'
         );
         loginProfiler.mark('user_lookup_raw_fallback_done', {
           found: Boolean(user),
@@ -989,19 +998,13 @@ router.post(
         accessToken,
         refreshToken,
         rememberMe,
-        user: {
-          _id: user._id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          roles: user.roles && user.roles.length ? user.roles : [user.role],
+        user: buildClientAuthUser(user, {
           planType: effectivePlanType,
-          examsCreated: user.examsCreated ?? 0,
           tenantId: tenant?._id || null,
           tenant: tenant || null,
           subscriptionStatus,
           subscriptionWarning,
-        },
+        }),
         session: {
           rememberMe,
           refreshTokenExpiresIn,
@@ -1295,19 +1298,13 @@ router.post('/refresh', async (req, res, next) => {
 
       res.json({
         accessToken,
-        user: {
-          _id: user._id,
-          name: user.name,
-          email: user.email,
-          role: user.role,
-          roles: user.roles && user.roles.length ? user.roles : [user.role],
+        user: buildClientAuthUser(user, {
           planType: effectivePlanType,
-          examsCreated: user.examsCreated ?? 0,
           tenantId: tenant?._id || null,
           tenant: tenant || null,
           subscriptionStatus,
           subscriptionWarning,
-        },
+        }),
       });
     } catch (error) {
       return res.status(401).json({ error: 'Invalid refresh token' });
@@ -1371,10 +1368,13 @@ router.get('/me', requireAuth, async (req, res, next) => {
 
     const userPayload = user.toObject();
     const tenant = await resolveTenantSnapshot(user.tenantId, 'name code status uniqueId type');
+    const profilePictureUrl = String(userPayload.profilePictureUrl || '').trim();
 
     res.json({
       user: {
         ...userPayload,
+        profilePictureUrl,
+        avatar: profilePictureUrl,
         tenantId: tenant?._id || null,
         tenant: tenant || null,
         subscriptionStatus: req.user?.subscriptionStatus || SUBSCRIPTION_STATUSES.ACTIVE,

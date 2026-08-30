@@ -46,7 +46,15 @@ export const executeAIOperation = async (operation, payload = {}, context = {}) 
     throw new AIEngineError(AI_ERROR_CODES.AI_OPERATION_UNSUPPORTED, `Provider "${providerId}" does not support ${operation}.`, { operation, provider: providerId });
   }
   const runtime = getEffectiveRuntimeSettings();
-  const maxRetries = Number.isFinite(runtime.maxRetries) ? runtime.maxRetries : 2;
+  // Per-call overrides let latency-sensitive callers (e.g. question import,
+  // which fans out many small calls) fail fast instead of inheriting the
+  // global 2-retry / 60s budget, which can compound to minutes per call.
+  const maxRetries = Number.isFinite(context.maxRetries)
+    ? Math.max(0, context.maxRetries)
+    : Number.isFinite(runtime.maxRetries) ? runtime.maxRetries : 2;
+  const requestTimeoutMs = Number.isFinite(context.requestTimeoutMs) && context.requestTimeoutMs > 0
+    ? context.requestTimeoutMs
+    : (runtime.requestTimeoutMs || 60000);
   let lastError = null;
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     try {
@@ -54,7 +62,7 @@ export const executeAIOperation = async (operation, payload = {}, context = {}) 
       const result = await Promise.race([
         dispatch(operation, payload, context, provider),
         new Promise((_, reject) => {
-          setTimeout(() => reject(new Error('AI request timed out.')), runtime.requestTimeoutMs || 60000);
+          setTimeout(() => reject(new Error('AI request timed out.')), requestTimeoutMs);
         }),
       ]);
       const enriched = {
@@ -64,14 +72,17 @@ export const executeAIOperation = async (operation, payload = {}, context = {}) 
         latencyMs: Date.now() - startedAt,
         retryCount: attempt,
       };
+      const usagePayload = enriched.usage || enriched.raw?.usage || enriched.raw?.usageMetadata || null;
       void trackAITokenUsage({
-        usage: enriched.usage || enriched.raw?.usage || null,
+        usage: usagePayload,
         feature: context.feature || operation,
         featureType: context.feature || operation,
         tenantId: context.tenantId,
         userId: context.userId,
         model: enriched.model || context.model,
-        usageCount: 1,
+        provider: providerId,
+        operation,
+        usageCount: usagePayload?.imageCount || context.usageCount || 1,
         questionCount: context.questionCount || 0,
         requestStatus: 'SUCCESS',
       });
@@ -81,6 +92,20 @@ export const executeAIOperation = async (operation, payload = {}, context = {}) 
       if (attempt >= maxRetries) break;
     }
   }
+  void trackAITokenUsage({
+    usage: null,
+    feature: context.feature || operation,
+    featureType: context.feature || operation,
+    tenantId: context.tenantId,
+    userId: context.userId,
+    model: context.model,
+    provider: providerId,
+    operation,
+    usageCount: context.usageCount || 1,
+    questionCount: context.questionCount || 0,
+    requestStatus: 'FAILED',
+    errorMessage: lastError?.message || 'AI provider request failed.',
+  });
   throw normalizeProviderError(lastError, { operation, providerId });
 };
 

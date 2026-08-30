@@ -1,0 +1,25 @@
+# Python dependencies for the LEGACY answer-sheet rasterizer
+# (services/offlineEvaluation/normalize_answer_script.py).
+#
+# NOT REQUIRED for normal operation. The default page-preparation mode is
+# ANSWER_SCRIPT_NORMALIZE_MODE=VISION_DIRECT, which is pure Node (pdf-lib):
+# the uploaded PDF is split into single-page PDFs and handed straight to the
+# Gemini vision model, which reads and evaluates the handwriting. No Python,
+# PyMuPDF or OpenCV is involved in that path.
+#
+# Install these ONLY if you set ANSWER_SCRIPT_NORMALIZE_MODE=PYTHON (or =AUTO
+# and want the rasterized-preview path to succeed) for the SAME interpreter
+# the Node process spawns — the system `python3` or a venv pointed at by
+# OFFLINE_EVAL_PYTHON / PYTHON_BIN:
+#
+#   python3 -m pip install -r services/offlineEvaluation/requirements.txt
+#
+# Rasterizes the PDF into page images + a normalized PDF. Pure wheel, no
+# system libraries needed.
+pymupdf>=1.23
+
+# OPTIONAL even in PYTHON mode — cosmetic image enhancement only (deskew /
+# autocrop / glare). If these (or their system OpenGL lib) are missing, the
+# normalizer runs a fitz-only "raw" mode and still completes.
+#   opencv-python-headless>=4.8   (also needs: apt-get install -y libgl1 libglib2.0-0)
+#   numpy>=1.24

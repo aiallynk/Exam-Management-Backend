@@ -774,7 +774,10 @@ router.get('/:id/pages/:pageId/image', ...intake, async (req, res, next) => {
       : variant === 'working' ? (page?.workingImage || page?.image) : (page?.previewImage || page?.workingImage || page?.image);
     if (!object?.key) return res.status(404).json({ error: 'Page image not available.' });
     const url = await getPrivateSignedUrl({ key: object.key, expiresInSeconds: offlineEvaluationConfig.PRIVATE_URL_EXPIRY_SECONDS });
-    return res.json({ url, variant, pageNumber: page.pageNumber, widthPx: object.widthPx, heightPx: object.heightPx, expiresInSeconds: offlineEvaluationConfig.PRIVATE_URL_EXPIRY_SECONDS });
+    // 'application/pdf' when the page was prepared Python-free — the client
+    // renders it in a PDF frame instead of an <img>.
+    const mimeType = object.mimeType || page?.workingImage?.mimeType || page?.image?.mimeType || 'image/jpeg';
+    return res.json({ url, variant, pageNumber: page.pageNumber, mimeType, widthPx: object.widthPx, heightPx: object.heightPx, expiresInSeconds: offlineEvaluationConfig.PRIVATE_URL_EXPIRY_SECONDS });
   } catch (err) { return next(err); }
 });
 
@@ -794,13 +797,14 @@ router.get('/review/:attemptId/pages/:pageId/image', requireAuth, requireTenant,
       _id: req.params.pageId,
       answerScriptId: attempt.sourceAnswerScriptId,
       tenantId: req.user.tenantId,
-    }).select('previewImage workingImage thumbnailImage pageNumber').lean();
+    }).select('image previewImage workingImage thumbnailImage pageNumber').lean();
     if (!page) return res.status(404).json({ error: 'Answer-sheet page not found.' });
     const variant = String(req.query.variant || 'preview').toLowerCase();
     const object = variant === 'thumbnail' ? page.thumbnailImage : (page.previewImage?.key ? page.previewImage : page.workingImage);
     if (!object?.key) return res.status(404).json({ error: 'Requested page derivative is unavailable.' });
     const url = await getPrivateSignedUrl({ key: object.key, expiresInSeconds: offlineEvaluationConfig.PRIVATE_URL_EXPIRY_SECONDS });
-    return res.json({ url, pageNumber: page.pageNumber, variant, widthPx: object.widthPx, heightPx: object.heightPx, expiresInSeconds: offlineEvaluationConfig.PRIVATE_URL_EXPIRY_SECONDS });
+    const mimeType = object.mimeType || page.workingImage?.mimeType || page.image?.mimeType || 'image/jpeg';
+    return res.json({ url, pageNumber: page.pageNumber, variant, mimeType, widthPx: object.widthPx, heightPx: object.heightPx, expiresInSeconds: offlineEvaluationConfig.PRIVATE_URL_EXPIRY_SECONDS });
   } catch (error) { return next(error); }
 });
 
@@ -904,12 +908,15 @@ router.get('/segments/:segmentId/image', requireAuth, requireTenant, enforceTena
     });
     if (!hasEvaluatorScope) return res.status(403).json({ error: 'An active evaluator assignment covering this answer is required.' });
     const page = await AnswerScriptPage.findOne({ _id: segment.pageIds[0], tenantId: req.user.tenantId }).select('previewImage workingImage image pageNumber').lean();
-    const key = ['SECTION', 'QUESTIONS'].includes(hasEvaluatorScope.scopeType)
+    const isCrop = ['SECTION', 'QUESTIONS'].includes(hasEvaluatorScope.scopeType);
+    const key = isCrop
       ? segment.cropObject?.key
       : (page?.previewImage?.key || page?.workingImage?.key || page?.image?.key);
     if (!key) return res.status(404).json({ error: 'Scoped answer image not available.' });
     const url = await getPrivateSignedUrl({ key, expiresInSeconds: offlineEvaluationConfig.PRIVATE_URL_EXPIRY_SECONDS });
-    return res.json({ url, pageNumber: page?.pageNumber, accessMode: ['SECTION', 'QUESTIONS'].includes(hasEvaluatorScope.scopeType) ? 'SCOPED_CROP' : 'FULL_PAGE', expiresInSeconds: offlineEvaluationConfig.PRIVATE_URL_EXPIRY_SECONDS });
+    // Raster answer-region crops are always JPEG; a full page follows its own type.
+    const mimeType = isCrop ? 'image/jpeg' : (page?.workingImage?.mimeType || page?.image?.mimeType || 'image/jpeg');
+    return res.json({ url, pageNumber: page?.pageNumber, mimeType, accessMode: isCrop ? 'SCOPED_CROP' : 'FULL_PAGE', expiresInSeconds: offlineEvaluationConfig.PRIVATE_URL_EXPIRY_SECONDS });
   } catch (err) { return next(err); }
 });
 

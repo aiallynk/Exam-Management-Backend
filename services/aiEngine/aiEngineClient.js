@@ -15,6 +15,9 @@ export const runEngineChatCompletion = async ({
   request = {},
   model = null,
   questionCount = null,
+  // Optional per-call overrides of the global AI runtime retry/timeout budget.
+  maxRetries = null,
+  requestTimeoutMs = null,
 }) => {
   const resolvedModel = model || request.model || getModelForOperation(operation);
   const result = await executeAIOperation(
@@ -26,9 +29,20 @@ export const runEngineChatCompletion = async ({
       feature: feature || operation.toLowerCase(),
       model: resolvedModel,
       questionCount,
+      ...(Number.isFinite(maxRetries) ? { maxRetries } : {}),
+      ...(Number.isFinite(requestTimeoutMs) ? { requestTimeoutMs } : {}),
     }
   );
-  return result.raw;
+  if (result?.raw?.choices) {
+    return result.raw;
+  }
+  const content = result?.content || '';
+  return {
+    id: `engine-${operation.toLowerCase()}-${Date.now()}`,
+    model: result?.model || resolvedModel,
+    choices: [{ index: 0, message: { role: 'assistant', content } }],
+    usage: result?.usage || null,
+  };
 };
 
 export const runEngineEmbedding = async ({

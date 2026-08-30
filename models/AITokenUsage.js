@@ -69,6 +69,19 @@ const AITokenUsageSchema = new mongoose.Schema(
       trim: true,
       default: '',
     },
+    provider: {
+      type: String,
+      trim: true,
+      lowercase: true,
+      default: '',
+      index: true,
+    },
+    operation: {
+      type: String,
+      trim: true,
+      default: '',
+      index: true,
+    },
     cost_usd: {
       type: Number,
       required: true,

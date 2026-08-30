@@ -11,6 +11,10 @@ const AnswerScriptPageSchema = new mongoose.Schema({
   image: {
     key: { type: String, default: null },
     url: { type: String, default: null },
+    // 'application/pdf' when the page was prepared Python-free (a single-page
+    // PDF handed straight to the Gemini vision model); an image/* type when a
+    // rasterizer produced a JPEG/PNG. Null on legacy rows (treated as JPEG).
+    mimeType: { type: String, default: null },
   },
   workingImage: {
     key: { type: String, default: null },
@@ -20,6 +24,7 @@ const AnswerScriptPageSchema = new mongoose.Schema({
     heightPx: { type: Number, default: null },
     dpi: { type: Number, default: null },
     colorMode: { type: String, enum: ['GRAYSCALE', 'COLOR', null], default: null },
+    mimeType: { type: String, default: null },
   },
   previewImage: {
     key: { type: String, default: null },
@@ -39,6 +44,7 @@ const AnswerScriptPageSchema = new mongoose.Schema({
     key: { type: String, default: null },
     checksum: { type: String, default: null },
     sizeBytes: { type: Number, default: 0 },
+    mimeType: { type: String, default: null },
   },
   contentHash: { type: String, default: null, index: true },
   normalizedCrop: {

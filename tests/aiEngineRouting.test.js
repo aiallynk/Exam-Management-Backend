@@ -10,6 +10,8 @@ test('AI operation routing defaults', async () => {
   await bootstrapAiConfig();
   assert.equal(resolveOperationProviderId(AI_OPERATIONS.QUESTION_GENERATION), 'openai');
   assert.equal(resolveOperationProviderId(AI_OPERATIONS.EMBEDDING), 'openai');
+  assert.equal(resolveOperationProviderId(AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE), 'gemini');
+  assert.equal(resolveOperationProviderId(AI_OPERATIONS.QUESTION_IMAGE_GENERATION), 'gemini');
   assert.equal(resolveOperationProviderId(AI_OPERATIONS.HANDWRITING_EXTRACTION), 'gemini');
   assert.equal(resolveOperationProviderId(AI_OPERATIONS.ANSWER_RUBRIC_EVALUATION), 'gemini');
   assert.equal(resolveOperationProviderId(AI_OPERATIONS.DIAGRAM_RESPONSE_EVALUATION), 'gemini');
@@ -21,6 +23,8 @@ test('env bootstrap routing maps question vs evaluation domains', () => {
   assert.equal(routing[AI_OPERATIONS.QUESTION_GENERATION], 'openai');
   assert.equal(routing[AI_OPERATIONS.CONTENT_GROUNDED_QUESTION_GENERATION], 'openai');
   assert.equal(routing[AI_OPERATIONS.EMBEDDING], 'openai');
+  assert.equal(routing[AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE], 'gemini');
+  assert.equal(routing[AI_OPERATIONS.QUESTION_IMAGE_GENERATION], 'gemini');
   assert.equal(routing[AI_OPERATIONS.HANDWRITING_EXTRACTION], 'gemini');
   assert.equal(routing[AI_OPERATIONS.ANSWER_RUBRIC_EVALUATION], 'gemini');
 });
