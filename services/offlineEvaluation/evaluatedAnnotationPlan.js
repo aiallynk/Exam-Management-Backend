@@ -1,7 +1,10 @@
 import { normalizeRegion } from './answerAnnotationService.js';
 
-const MARK_SIZE = { width: 0.18, height: 0.052 };
-const MARK_SIZE_WITH_REMARK = { width: 0.2, height: 0.088 };
+// These dimensions intentionally remain normalized. The PDF renderer resolves
+// their typography, padding and strokes against the *current source page*;
+// this plan owns only safe spatial association.
+const MARK_SIZE = { width: 0.2, height: 0.07 };
+const MARK_SIZE_WITH_REMARK = { width: 0.22, height: 0.115 };
 const GENERIC_REMARK = /^(this statement needs correction\.?|ai approved|approved by ai|needs review)$/i;
 const SCORE_ONLY = /^\d+(?:\.\d+)?\s*\/\s*\d+(?:\.\d+)?$/;
 
@@ -70,17 +73,21 @@ export const placeTeacherMark = ({
     width: Number(markSize.width) || MARK_SIZE.width,
     height: Number(markSize.height) || MARK_SIZE.height,
   };
+  // A blank answer can have only a small question-anchor region. It is still
+  // much safer than inventing a bottom-of-page position for "Not attempted".
+  const anchor = normalizeRegion(answerRegion);
   const reliable = hasReliableAnswerRegion(answerRegion);
 
-  if (reliable) {
-    const region = normalizeRegion(answerRegion);
+  if (anchor) {
+    const region = anchor;
+    const leaderTo = { x: region.x + region.width, y: region.y + Math.min(region.height * 0.5, 0.035) };
     const right = {
       x: region.x + region.width + 0.012,
       y: region.y + 0.006,
       ...size,
     };
     if (fitsOnPage(right, occupied)) {
-      return { ...right, confidence: 'HIGH', strategy: 'RIGHT_MARGIN' };
+      return { ...right, confidence: reliable ? 'HIGH' : 'MEDIUM', strategy: 'RIGHT_MARGIN', leaderTo };
     }
 
     const clampedRight = {
@@ -89,7 +96,7 @@ export const placeTeacherMark = ({
       ...size,
     };
     if (clampedRight.x >= region.x + region.width - 0.012 && fitsOnPage(clampedRight, occupied)) {
-      return { ...clampedRight, confidence: 'HIGH', strategy: 'RIGHT_MARGIN' };
+      return { ...clampedRight, confidence: reliable ? 'HIGH' : 'MEDIUM', strategy: 'RIGHT_MARGIN', leaderTo };
     }
 
     const below = {
@@ -98,27 +105,33 @@ export const placeTeacherMark = ({
       ...size,
     };
     if (fitsOnPage(below, occupied)) {
-      return { ...below, confidence: 'HIGH', strategy: 'BELOW_ANSWER' };
+      return { ...below, confidence: reliable ? 'HIGH' : 'MEDIUM', strategy: 'BELOW_ANSWER', leaderTo };
     }
   }
 
   for (let slot = 0; slot < 18; slot += 1) {
     const safe = {
-      x: 0.832,
+      x: 0.988 - size.width,
       y: 0.075 + slot * (size.height + 0.016),
       ...size,
     };
     if (fitsOnPage(safe, occupied)) {
-      return { ...safe, confidence: reliable ? 'MEDIUM' : 'LOW', strategy: 'SAFE_MARGIN' };
+      return {
+        ...safe,
+        confidence: reliable ? 'MEDIUM' : 'LOW',
+        strategy: 'SAFE_MARGIN',
+        leaderTo: anchor ? { x: anchor.x + anchor.width, y: anchor.y + Math.min(anchor.height * 0.5, 0.035) } : null,
+      };
     }
   }
 
   return {
-    x: 0.832,
+    x: 0.988 - size.width,
     y: Math.max(0.02, 0.96 - size.height),
     ...size,
     confidence: 'LOW',
     strategy: 'SAFE_MARGIN',
+    leaderTo: anchor ? { x: anchor.x + anchor.width, y: anchor.y + Math.min(anchor.height * 0.5, 0.035) } : null,
   };
 };
 
@@ -166,16 +179,32 @@ export const selectExportEvidenceAnnotations = (annotations = [], pageNumberById
     .filter((annotation) => {
       if (!isApprovedForExport(annotation)) return false;
       const type = String(annotation.type || '').toUpperCase();
-      if (!['CORRECT', 'INCORRECT', 'PARTIAL', 'MISSING_POINT', 'SPELLING', 'GRAMMAR', 'COMMENT'].includes(type)) return false;
+      // Final correctness belongs to the authoritative score marker. Generic
+      // AI CORRECT/INCORRECT/PARTIAL proposals often cover an entire answer
+      // region and must never become a speculative paragraph highlight.
+      if (!['MISSING_POINT', 'SPELLING', 'GRAMMAR', 'COMMENT', 'RUBRIC_NOTE', 'CHECK', 'CROSS', 'HIGHLIGHT', 'UNDERLINE'].includes(type)) return false;
       const region = normalizeRegion(annotation.region);
       if (!region) return false;
       if (['SPELLING', 'GRAMMAR'].includes(type) && (region.height > 0.08 || region.width > 0.72)) return false;
-      return Boolean(annotation.message || annotation.suggestedCorrection || annotation.evidenceText);
+      const message = String(annotation.message || annotation.suggestedCorrection || annotation.evidenceText || '').trim();
+      if (['COMMENT', 'MISSING_POINT', 'RUBRIC_NOTE'].includes(type)) return isUsefulRemark(message);
+      // A teacher can make a purely visual tick, cross, underline, or
+      // highlight. AI evidence must identify a concrete phrase before it can
+      // render over student handwriting.
+      if (['CHECK', 'CROSS'].includes(type)) return String(annotation.source || '').toUpperCase() === 'EVALUATOR' || Boolean(message);
+      if (['HIGHLIGHT', 'UNDERLINE'].includes(type)) {
+        return String(annotation.source || '').toUpperCase() === 'EVALUATOR'
+          || Boolean(String(annotation.evidenceText || '').trim());
+      }
+      return Boolean(message);
     })
     .map((annotation) => ({
       type: String(annotation.type).toUpperCase(),
       region: normalizeRegion(annotation.region),
       pageNumber: Number(pageNumberById[String(annotation.pageId)] || 0),
+      source: String(annotation.source || '').toUpperCase(),
+      answerId: String(annotation.answerId || ''),
+      questionId: String(annotation.questionId?._id || annotation.questionId || ''),
       message: String(annotation.message || '').slice(0, 120),
       suggestedCorrection: String(annotation.suggestedCorrection || '').slice(0, 80),
       evidenceText: String(annotation.evidenceText || '').slice(0, 120),
@@ -210,6 +239,32 @@ const pageNumbersForSegment = (segment, pageNumberById) => (
     .filter((pageNumber) => pageNumber > 0)
 );
 
+const regionForLines = (lineBoxes = []) => {
+  const regions = lineBoxes.map((line) => normalizeRegion(line)).filter(Boolean);
+  if (!regions.length) return null;
+  const left = Math.min(...regions.map((region) => region.x));
+  const top = Math.min(...regions.map((region) => region.y));
+  const right = Math.max(...regions.map((region) => region.x + region.width));
+  const bottom = Math.max(...regions.map((region) => region.y + region.height));
+  return normalizeRegion({ x: left, y: top, width: right - left, height: bottom - top });
+};
+
+const scoreAnchorForSegment = ({ segment, pageNumber, pageNumberById }) => {
+  if (!segment) return null;
+  const pages = pageNumbersForSegment(segment, pageNumberById);
+  const spansPages = pages.length > 1;
+  if (!spansPages || pages[0] === pageNumber) {
+    return normalizeRegion(segment.boundingRegion) || regionForLines(segment.lineBoxes || []);
+  }
+
+  // New extraction records carry pageId on every line box. This lets a
+  // continuing response attach its one score to the final handwritten line.
+  const finalPageLines = (segment.lineBoxes || []).filter((line) => (
+    Number(pageNumberById[String(line?.pageId)] || 0) === pageNumber
+  ));
+  return regionForLines(finalPageLines);
+};
+
 const occupiedRegionsOnPage = ({ segments, pageNumber, pageNumberById, includeLineBoxes = true }) => {
   const occupied = [];
   for (const segment of segments) {
@@ -234,11 +289,14 @@ export const buildTeacherAnnotationPlan = ({
   segments = [],
   annotations = [],
   pageNumberById = {},
+  questionAnchorsByQuestionNumber = {},
   attemptTotal = null,
 } = {}) => {
   const sorted = [...answers].sort((left, right) => (
     Number(left.questionId?.order ?? 0) - Number(right.questionId?.order ?? 0)
   ));
+  const evidence = selectExportEvidenceAnnotations(annotations, pageNumberById);
+  const corrections = evidence.filter((item) => ['SPELLING', 'GRAMMAR'].includes(item.type));
   const placementsByPage = new Map();
   const marks = sorted.map((answer) => {
     const questionNumber = Number(answer.questionId?.order ?? 0) + 1;
@@ -247,18 +305,28 @@ export const buildTeacherAnnotationPlan = ({
     const segment = resolveSegment(answer, segments);
     const pageNumbers = pageNumbersForSegment(segment, pageNumberById);
     const spansPages = pageNumbers.length > 1;
-    const pageNumber = spansPages ? pageNumbers[pageNumbers.length - 1] : (pageNumbers[0] || 1);
-    const answerRegion = !spansPages && hasReliableAnswerRegion(segment?.boundingRegion)
-      ? normalizeRegion(segment.boundingRegion)
-      : null;
-    const remark = answer?.evaluationStatus === 'NOT_ATTEMPTED'
+    const mappedQuestionAnchor = questionAnchorsByQuestionNumber[questionNumber] || null;
+    const pageNumber = spansPages
+      ? pageNumbers[pageNumbers.length - 1]
+      : (pageNumbers[0] || Number(mappedQuestionAnchor?.pageNumber) || 1);
+    const answerRegion = scoreAnchorForSegment({ segment, pageNumber, pageNumberById })
+      || normalizeRegion(mappedQuestionAnchor?.region);
+    const notAttempted = answer?.evaluationStatus === 'NOT_ATTEMPTED'
+      || answer?.aiEvaluation?.notAttempted === true;
+    const remark = notAttempted
       ? 'Not attempted'
       : shortTeacherRemark(answer, annotations);
     const markSize = remark ? MARK_SIZE_WITH_REMARK : MARK_SIZE;
     const existingPlacements = placementsByPage.get(pageNumber) || [];
+    const annotationOccupancy = evidence
+      .filter((annotation) => annotation.pageNumber === pageNumber)
+      .map((annotation) => annotation.region);
     const placement = placeTeacherMark({
       answerRegion,
-      occupiedRegions: occupiedRegionsOnPage({ segments, pageNumber, pageNumberById }),
+      occupiedRegions: [
+        ...occupiedRegionsOnPage({ segments, pageNumber, pageNumberById }),
+        ...annotationOccupancy,
+      ],
       existingPlacements,
       markSize,
     });
@@ -280,8 +348,8 @@ export const buildTeacherAnnotationPlan = ({
 
   return {
     marks,
-    corrections: selectExportCorrections(annotations, pageNumberById),
-    evidence: selectExportEvidenceAnnotations(annotations, pageNumberById),
+    corrections,
+    evidence,
     displayedTotal: marks.reduce((sum, mark) => sum + Number(mark.marksObtained), 0),
     attemptTotal: attemptTotal == null ? null : Number(attemptTotal),
   };

@@ -154,6 +154,62 @@ export const onQuestionPublished = async ({ tenantId, questionId, questionVersio
 
 export { SIGNAL_TYPES };
 
+// --- History-aware duplicate classification (spec Parts 16, 18) --------------
+// Turns the raw exact/lexical/semantic/blueprint outcomes into ONE
+// educator-meaningful relationship, distinguishing "same concept, different
+// question" (allowed) from a genuine near-duplicate (blocked). Pure — takes
+// an already-computed evaluateQuestionRepeatPolicy result.
+
+const NEAR_DUP_SEMANTIC = 0.86;
+const SAME_CONCEPT_SEMANTIC = 0.72;
+
+const interrogativeOf = (text) => {
+  const m = String(text || '').trim().toLowerCase().match(/^(which|what|why|how|when|where|who|name|state|define|explain|list|describe|is|are|does|do)\b/);
+  return m ? m[1] : '';
+};
+
+const bestSemanticMatch = (outcomes = []) => {
+  const sem = outcomes.find((o) => o.layer === 'SEMANTIC_EMBEDDING');
+  const matches = (sem?.matches || []).slice().sort((a, b) => (b.similarity || b.score || 0) - (a.similarity || a.score || 0));
+  return matches[0] || null;
+};
+
+export const classifyRepeatRelationship = ({ questionText, repeatResult }) => {
+  const outcomes = repeatResult?.outcomes || [];
+  const layers = new Set(outcomes.map((o) => o.layer));
+  const top = bestSemanticMatch(outcomes);
+  const topSim = top ? Number(top.similarity ?? top.score ?? 0) : 0;
+  const matchText = top?.questionText || top?.text || repeatResult?.novelty?.collision?.questionText || null;
+  const usedIn = top?.examTitle || top?.assessmentTitle || top?.usedIn || null;
+
+  let relationship = 'UNIQUE';
+  if (layers.has('EXACT')) relationship = 'EXACT_DUPLICATE';
+  else if (layers.has('SEMANTIC') || topSim >= NEAR_DUP_SEMANTIC) relationship = 'NEAR_DUPLICATE';
+  else if (layers.has('CONCEPT_PATTERN') || topSim >= SAME_CONCEPT_SEMANTIC) {
+    // A moderate semantic overlap with a different question form is the
+    // "same concept, different question" case — NOT a duplicate.
+    const sameForm = matchText && interrogativeOf(questionText) === interrogativeOf(matchText);
+    relationship = sameForm && topSim >= NEAR_DUP_SEMANTIC ? 'NEAR_DUPLICATE' : 'SAME_CONCEPT_DIFFERENT_QUESTION';
+  }
+
+  // Educator-facing: a rounded % band, never a raw cosine (spec Part 18/31).
+  const pct = topSim > 0 ? Math.round(topSim * 100) : (relationship === 'EXACT_DUPLICATE' ? 100 : 0);
+  const category =
+    relationship === 'EXACT_DUPLICATE' ? 'Exact match'
+      : relationship === 'NEAR_DUPLICATE' ? 'Similar question found'
+      : relationship === 'SAME_CONCEPT_DIFFERENT_QUESTION' ? 'Same concept, different question'
+      : 'Unique';
+
+  return {
+    relationship,
+    isBlocking: relationship === 'EXACT_DUPLICATE' || relationship === 'NEAR_DUPLICATE',
+    category,
+    similarityPercent: pct || null,
+    matchText: matchText || null,
+    usedIn: usedIn || null,
+  };
+};
+
 export const indexQuestionMemory = async ({ tenantId, userId, questionId, questionVersionId, questionText, questionType, difficulty }) => {
   const { recordQuestionEmbedding, recordQuestionVersionEmbedding } = await import('./questionEmbeddingService.js');
   if (questionVersionId) {

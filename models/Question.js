@@ -169,6 +169,20 @@ const QuestionSchema = new mongoose.Schema(
       trim: true,
       alias: 'paragraph_group_id',
     },
+    // Choice / alternative semantics (Phase 1C). Additive & optional
+    // (default undefined ⇒ every existing question is byte-for-byte
+    // unaffected). Set only by import or manual authoring to record that a
+    // set of questions are alternatives ("write on ANY ONE of the
+    // following") rather than compulsory. Stage 1 stores this as metadata
+    // only; it is not yet read by delivery or scoring.
+    choiceGroup: {
+      type: {
+        groupId: { type: String, trim: true },
+        kind: { type: String, enum: ['ALTERNATIVES'], default: 'ALTERNATIVES' },
+        selectRequired: { type: Number, default: 1, min: 1 },
+      },
+      default: undefined,
+    },
     codingFields: {
       languages: {
         type: [String],
@@ -309,6 +323,75 @@ const QuestionSchema = new mongoose.Schema(
               },
               { _id: false }
             ),
+            default: undefined,
+          },
+          // --- Source-Verified Question Intelligence (additive) ---------------
+          // Every field default:undefined ⇒ pre-existing questions are
+          // byte-for-byte unaffected; the educator-facing labels below only
+          // appear once these are populated by a new generation.
+          generationMode: {
+            // How this question came to exist. Drives the "Based on ..." label.
+            type: String,
+            enum: ['STANDARD', 'SOURCE_GROUNDED', 'MANUAL', 'QUESTION_BANK_REUSE', 'IMPORTED'],
+            default: undefined,
+          },
+          sourcePolicy: {
+            type: String,
+            enum: ['STRICT_SOURCE', 'SELECTED_CONTEXT', 'AUTO_CONTEXT', 'NONE'],
+            default: undefined,
+          },
+          // The creator's own instruction text at generation time — frozen so
+          // history stays explainable ("Generated from creator instructions").
+          creatorInstructionSnapshot: { type: String, trim: true, default: undefined },
+          // The AI Engine operation id for this generation (audit / observability).
+          generationOperationId: { type: String, trim: true, default: undefined },
+          generatedAt: { type: Date, default: undefined },
+          // CURRENT until a manual edit materially changes the factual basis;
+          // AI Modify re-runs grounding verification and resets this.
+          revalidationState: {
+            type: String,
+            enum: ['CURRENT', 'SOURCE_REFERENCE_NEEDS_REVALIDATION'],
+            default: undefined,
+          },
+          // Overall grounding outcome recorded by the verifier at accept time.
+          groundingVerdict: {
+            type: String,
+            enum: ['SUPPORTED', 'PARTIALLY_SUPPORTED', 'UNSUPPORTED', 'NOT_APPLICABLE'],
+            default: undefined,
+          },
+          // Frozen, educator-facing source references. Xamigo assigns every
+          // value from persisted LibraryResource / ContextSource / ContextChunk
+          // metadata — the AI provider never contributes any of these.
+          sourceReferences: {
+            type: [
+              new mongoose.Schema(
+                {
+                  libraryResourceId: { type: mongoose.Schema.Types.ObjectId, ref: 'LibraryResource', default: undefined },
+                  contextSourceId: { type: mongoose.Schema.Types.ObjectId, ref: 'ContextSource', default: undefined },
+                  resourceTitleSnapshot: { type: String, trim: true, default: undefined },
+                  resourceTypeSnapshot: { type: String, trim: true, default: undefined },
+                  fileTitleSnapshot: { type: String, trim: true, default: undefined },
+                  chapterSnapshot: { type: String, trim: true, default: undefined },
+                  unitSnapshot: { type: String, trim: true, default: undefined },
+                  topicSnapshot: { type: String, trim: true, default: undefined },
+                  sectionTitleSnapshot: { type: String, trim: true, default: undefined },
+                  // null when the parser did not expose page positions — never guessed.
+                  pageStart: { type: Number, default: undefined },
+                  pageEnd: { type: Number, default: undefined },
+                  // Internal only — redacted from every API response by toProvenanceView().
+                  evidenceChunkIdsInternal: { type: [mongoose.Schema.Types.ObjectId], ref: 'ContextChunk', default: undefined },
+                  evidenceHash: { type: String, trim: true, default: undefined },
+                  evidenceTextSnapshot: { type: String, trim: true, default: undefined },
+                  relevanceScoreInternal: { type: Number, default: undefined },
+                  usage: {
+                    type: [String],
+                    enum: ['QUESTION_CONCEPT', 'ANSWER_SUPPORT', 'SCENARIO_CONTEXT', 'IMAGE_CONTEXT'],
+                    default: undefined,
+                  },
+                },
+                { _id: false }
+              ),
+            ],
             default: undefined,
           },
         },

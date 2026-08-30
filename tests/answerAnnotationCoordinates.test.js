@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
-import { buildCanonicalAnnotations, hasReliableRegion, normalizeRegion } from '../services/offlineEvaluation/answerAnnotationService.js';
+import { buildCanonicalAnnotations, hasReliableRegion, normalizeAnnotationType, normalizeRegion } from '../services/offlineEvaluation/answerAnnotationService.js';
 
 describe('annotation coordinate validation', () => {
   test('rejects incomplete or out-of-range regions', () => {
@@ -28,5 +28,25 @@ describe('annotation coordinate validation', () => {
     assert.ok(items.length >= 2);
     assert.ok(items.every((item) => hasReliableRegion(item.region)));
     assert.ok(items.some((item) => item.type === 'SCORE'));
+  });
+
+  test('accepts the teacher pen vocabulary without a parallel annotation type system', () => {
+    assert.equal(normalizeAnnotationType('tick'), 'CHECK');
+    assert.equal(normalizeAnnotationType('check'), 'CHECK');
+    assert.equal(normalizeAnnotationType('cross'), 'CROSS');
+    assert.equal(normalizeAnnotationType('highlight'), 'HIGHLIGHT');
+    assert.equal(normalizeAnnotationType('underline'), 'UNDERLINE');
+    assert.equal(normalizeAnnotationType('photoshop-layer'), null);
+  });
+
+  test('keeps zero as an explicit proposed score rather than treating it as missing', () => {
+    const items = buildCanonicalAnnotations({
+      segment: { boundingRegion: { x: 0.1, y: 0.4, width: 0.7, height: 0.2 }, lineBoxes: [] },
+      result: { pointsEarned: 0, maxScore: 5, isCorrect: false, confidence: 0.9 },
+      pageId: 'page-1',
+    });
+    const score = items.find((item) => item.type === 'SCORE');
+    assert.equal(score.proposedScore, 0);
+    assert.equal(score.message, '0 / 5');
   });
 });

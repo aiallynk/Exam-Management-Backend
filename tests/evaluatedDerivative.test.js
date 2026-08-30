@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { inflateSync } from 'node:zlib';
 import { describe, test } from 'node:test';
 import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
-import { buildEvaluatedDerivativePdf } from '../services/offlineEvaluation/evaluatedDerivativeService.js';
+import { buildEvaluatedDerivativePdf, buildQuestionAnchorsByQuestionNumber, pageRelativeMetrics } from '../services/offlineEvaluation/evaluatedDerivativeService.js';
 import { EvaluatedDerivativeIntegrityError } from '../services/offlineEvaluation/evaluatedAnnotationPlan.js';
 
 const extractPdfText = (buffer) => {
@@ -62,6 +62,17 @@ const buildHandwrittenSource = async ({ pages = 2 } = {}) => {
         '   Light intensity affects the rate.',
       ],
     },
+    {
+      heading: 'Class test — Science (final page)',
+      lines: [
+        'Q6. Give one limitation.',
+        '   The response is incomplete.',
+        'Q7. Explain the final idea.',
+        '   The answer continues from page two.',
+        'Q8. State the final conclusion.',
+        '   No response was written.',
+      ],
+    },
   ].slice(0, pages);
 
   rules.forEach((pageSpec) => {
@@ -105,7 +116,8 @@ const representativeAnswers = () => ([
   {
     _id: 'a4', sourceAnswerSegmentId: 's4',
     questionId: { _id: 'q4', order: 3, points: 5, questionText: 'Write the word equation' },
-    pointsEarned: 0, evaluationStatus: 'FINALIZED', finalScoreSource: 'AI',
+    pointsEarned: 0, evaluationStatus: 'NOT_ATTEMPTED', finalScoreSource: 'AI',
+    aiEvaluation: { notAttempted: true },
   },
   {
     _id: 'a5', sourceAnswerSegmentId: 's5',
@@ -123,6 +135,32 @@ const representativeSegments = () => ([
 ]);
 
 describe('evaluated derivative generation', () => {
+  test('scales visible teacher marks with each source-page dimension', () => {
+    const appendix = pageRelativeMetrics({
+      page: { getWidth: () => 595.28, getHeight: () => 841.89 },
+      frame: { width: 595.28, height: 841.89 },
+    });
+    const highResolutionScan = pageRelativeMetrics({
+      page: { getWidth: () => 1795, getHeight: () => 2436 },
+      frame: { width: 1795, height: 2436 },
+    });
+    assert.ok(appendix.scoreFontSize >= 18);
+    assert.ok(highResolutionScan.scoreFontSize > appendix.scoreFontSize * 2.9);
+    assert.ok(highResolutionScan.symbolSize > appendix.symbolSize * 2.9);
+    assert.ok(highResolutionScan.annotationStroke > appendix.annotationStroke * 2.9);
+  });
+
+  test('reuses page extraction geometry as the local anchor for an unattempted question', () => {
+    const anchors = buildQuestionAnchorsByQuestionNumber([{
+      pageNumber: 2,
+      extractionSegments: [{ detectedQuestionNumber: 'Q4', region: { x: 0.08, y: 0.42, width: 0.16, height: 0.035 } }],
+    }]);
+    assert.deepEqual(anchors[4], {
+      pageNumber: 2,
+      region: { x: 0.08, y: 0.42, width: 0.16, height: 0.035 },
+    });
+  });
+
   test('burns teacher marks onto a working copy and leaves source bytes unused as the original', async () => {
     const source = await PDFDocument.create();
     const page = source.addPage([400, 600]);
@@ -204,8 +242,9 @@ describe('evaluated derivative generation', () => {
     assert.match(parsed, /3 \/ 5/);
     assert.match(parsed, /4 \/ 5/);
     assert.match(parsed, /0 \/ 5/);
+    assert.match(parsed, /Not attempted/);
     assert.match(parsed, /15 \/ 25/);
-    assert.doesNotMatch(parsed, /Edit Score|Approve|Flag|AI Approved|enviroment/);
+    assert.doesNotMatch(parsed, /Edit Score|\bApprove\b|\bFlag\b|enviroment/);
 
     await assert.rejects(
       () => buildEvaluatedDerivativePdf({
@@ -221,5 +260,52 @@ describe('evaluated derivative generation', () => {
       }),
       (error) => error instanceof EvaluatedDerivativeIntegrityError && error.code === 'DERIVATIVE_INTEGRITY',
     );
+  });
+
+  test('three-page paper fixture retains its original pages and overlays final 0 scores plus manual pen marks', async () => {
+    const sourceBuffer = await buildHandwrittenSource({ pages: 3 });
+    const answers = [
+      { _id: 'a1', sourceAnswerSegmentId: 's1', questionId: { order: 0, questionText: 'Q1', points: 5 }, pointsEarned: 5, evaluationStatus: 'FINALIZED' },
+      { _id: 'a2', sourceAnswerSegmentId: 's2', questionId: { order: 1, questionText: 'Q2', points: 5 }, pointsEarned: 3, evaluationStatus: 'FINALIZED' },
+      { _id: 'a3', sourceAnswerSegmentId: 's3', questionId: { order: 2, questionText: 'Q3', points: 5 }, pointsEarned: 3, evaluationStatus: 'FINALIZED' },
+      { _id: 'a4', sourceAnswerSegmentId: 's4', questionId: { order: 3, questionText: 'Q4', points: 5 }, pointsEarned: 0, evaluationStatus: 'FINALIZED' },
+      { _id: 'a5', sourceAnswerSegmentId: 's5', questionId: { order: 4, questionText: 'Q5', points: 5 }, pointsEarned: 4, evaluationStatus: 'FINALIZED' },
+      { _id: 'a6', sourceAnswerSegmentId: 's6', questionId: { order: 5, questionText: 'Q6', points: 5 }, pointsEarned: 2, evaluationStatus: 'FINALIZED' },
+      { _id: 'a7', sourceAnswerSegmentId: 's7', questionId: { order: 6, questionText: 'Q7', points: 5 }, pointsEarned: 4, evaluationStatus: 'FINALIZED' },
+      { _id: 'a8', sourceAnswerSegmentId: 's8', questionId: { order: 7, questionText: 'Q8', points: 5 }, pointsEarned: 0, evaluationStatus: 'FINALIZED' },
+    ];
+    const derivative = await buildEvaluatedDerivativePdf({
+      sourceBuffer,
+      mimeType: 'application/pdf',
+      candidate: { name: 'Asha' },
+      exam: { title: 'Three-page paper review' },
+      script: scriptMeta,
+      answers,
+      segments: [
+        { _id: 's1', pageIds: ['p1'], boundingRegion: { x: 0.08, y: 0.10, width: 0.68, height: 0.11 } },
+        { _id: 's2', pageIds: ['p1'], boundingRegion: { x: 0.08, y: 0.25, width: 0.68, height: 0.11 } },
+        { _id: 's3', pageIds: ['p1'], boundingRegion: { x: 0.08, y: 0.42, width: 0.68, height: 0.11 } },
+        { _id: 's4', pageIds: ['p1'], boundingRegion: { x: 0.08, y: 0.60, width: 0.68, height: 0.11 } },
+        { _id: 's5', pageIds: ['p2'], boundingRegion: { x: 0.08, y: 0.15, width: 0.68, height: 0.11 } },
+        { _id: 's6', pageIds: ['p2'], boundingRegion: { x: 0.08, y: 0.42, width: 0.68, height: 0.11 } },
+        { _id: 's7', pageIds: ['p2', 'p3'], boundingRegion: { x: 0.08, y: 0.46, width: 0.68, height: 0.14 } },
+        { _id: 's8', pageIds: ['p3'], boundingRegion: { x: 0.08, y: 0.66, width: 0.68, height: 0.10 } },
+      ],
+      annotations: [
+        { type: 'HIGHLIGHT', source: 'EVALUATOR', status: 'APPROVED', pageId: 'p1', region: { x: 0.2, y: 0.31, width: 0.2, height: 0.03 }, message: 'Missing one point' },
+        { type: 'CHECK', source: 'EVALUATOR', status: 'APPROVED', pageId: 'p2', region: { x: 0.8, y: 0.17, width: 0.04, height: 0.05 } },
+        { type: 'UNDERLINE', source: 'EVALUATOR', status: 'APPROVED', pageId: 'p2', region: { x: 0.2, y: 0.48, width: 0.22, height: 0.02 } },
+        { type: 'CROSS', source: 'EVALUATOR', status: 'APPROVED', pageId: 'p3', region: { x: 0.8, y: 0.68, width: 0.04, height: 0.05 } },
+      ],
+      pageNumberById: { p1: 1, p2: 2, p3: 3 },
+      attemptTotal: 21,
+    });
+    const loaded = await PDFDocument.load(derivative);
+    const parsed = extractPdfText(derivative);
+    assert.ok(loaded.getPageCount() >= 4, 'three original pages plus secondary appendix');
+    assert.match(parsed, /5 \/ 5/);
+    assert.match(parsed, /3 \/ 5/);
+    assert.match(parsed, /0 \/ 5/);
+    assert.match(parsed, /21 \/ 40/);
   });
 });

@@ -16,7 +16,9 @@ const AnswerAnnotationSchema = new mongoose.Schema({
   questionId: { type: mongoose.Schema.Types.ObjectId, ref: 'Question', default: null, index: true },
   type: {
     type: String,
-    enum: ['CORRECT', 'INCORRECT', 'PARTIAL', 'SPELLING', 'GRAMMAR', 'MISSING_POINT', 'EXTRA_POINT', 'RUBRIC_NOTE', 'COMMENT', 'SCORE'],
+    // CHECK/CROSS/HIGHLIGHT/UNDERLINE are evaluator-facing pen marks.
+    // The existing semantic types remain for AI evidence and compatibility.
+    enum: ['CORRECT', 'INCORRECT', 'PARTIAL', 'SPELLING', 'GRAMMAR', 'MISSING_POINT', 'EXTRA_POINT', 'RUBRIC_NOTE', 'COMMENT', 'SCORE', 'CHECK', 'CROSS', 'HIGHLIGHT', 'UNDERLINE'],
     required: true,
   },
   region: { type: RegionSchema, required: true },

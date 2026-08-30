@@ -71,6 +71,23 @@ const SectionSchema = new mongoose.Schema(
       default: 25,
       min: 0,
     },
+    // Section attempt semantics (Phase 1C). Additive & backward-compatible:
+    // the default { mode: 'ALL' } means every section that predates this field,
+    // and every section created without it, is read and delivered exactly as
+    // before (answer every question). 'ANY_N' + requiredCount records a
+    // "attempt any N questions from this section" rule detected on import or
+    // set manually. Stage 1 persists this as METADATA ONLY — delivery,
+    // packaging (services/examPackageService.js) and scoring still treat every
+    // section as ALL until a separately-signed-off sub-stage enables ANY_N
+    // end-to-end with its own evaluation regression pass.
+    attemptRule: {
+      mode: { type: String, enum: ['ALL', 'ANY_N'], default: 'ALL' },
+      requiredCount: { type: Number, default: null, min: 1 },
+      // 'DETECTED' (from import), 'MANUAL', or 'REVIEW_REQUIRED' when the
+      // source structure could not be represented safely and must not be
+      // silently converted into multiple compulsory questions.
+      source: { type: String, enum: ['MANUAL', 'DETECTED', 'REVIEW_REQUIRED'], default: 'MANUAL' },
+    },
   },
   {
     timestamps: true,

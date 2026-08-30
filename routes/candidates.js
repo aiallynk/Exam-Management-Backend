@@ -9,9 +9,11 @@
  */
 
 import express from 'express';
+import multer from 'multer';
 import User from '../models/User.js';
 import ExamAttempt from '../models/ExamAttempt.js';
 import { requireAuth } from '../middleware/auth.js';
+import { putImage } from '../services/storage/imageStorage.js';
 import { body, validationResult } from 'express-validator';
 import bcrypt from 'bcryptjs';
 import { ensureScoreSummary } from '../utils/attemptScores.js';
@@ -83,10 +85,11 @@ router.put(
         return res.status(404).json({ error: 'User not found' });
       }
 
-      const { name, mobile } = req.body;
+      const { name, mobile, profilePictureUrl } = req.body;
 
       if (name) user.name = name;
       if (mobile !== undefined) user.mobile = mobile;
+      if (profilePictureUrl !== undefined) user.profilePictureUrl = String(profilePictureUrl).trim();
 
       await user.save();
 
@@ -96,6 +99,32 @@ router.put(
     }
   }
 );
+
+// Upload own profile picture (any authenticated user). Also used, for a
+// Tenant Admin, as the last-resort institutional-paper logo source.
+const avatarUpload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 4 * 1024 * 1024 } });
+router.post('/profile/picture', requireAuth, avatarUpload.single('picture'), async (req, res, next) => {
+  try {
+    if (!req.file?.buffer?.length) return res.status(400).json({ error: 'No image uploaded.' });
+    const ext = (req.file.originalname || '').match(/\.[^.]+$/)?.[0]?.toLowerCase() || '.png';
+    if (!['.png', '.jpg', '.jpeg', '.webp'].includes(ext)) {
+      return res.status(400).json({ error: 'Picture must be PNG, JPG or WEBP.' });
+    }
+    const stored = await putImage({
+      tenantId: req.user.tenantId || 'platform',
+      category: 'avatars',
+      subpath: [String(req.user._id)],
+      fileStem: 'avatar',
+      extension: ext.slice(1),
+      buffer: req.file.buffer,
+    });
+    if (!stored?.url) return res.status(503).json({ error: 'Image storage is not configured on this deployment.' });
+    await User.updateOne({ _id: req.user._id }, { $set: { profilePictureUrl: stored.url } });
+    res.status(201).json({ profilePictureUrl: stored.url });
+  } catch (error) {
+    next(error);
+  }
+});
 
 // Change password (universal: all authenticated users)
 router.post(

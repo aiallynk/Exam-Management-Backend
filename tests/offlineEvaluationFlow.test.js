@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import {
   buildRubricEvaluationPayload,
+  formatRubricRowsForAppendix,
   normalizeRubricCriterionScores,
 } from '../services/offlineEvaluation/rubricScoreNormalization.js';
 import {
@@ -34,6 +35,40 @@ describe('rubric score normalization', () => {
     });
     assert.equal(payload.finalMark, 4);
     assert.equal(payload.finalScores[0].marks, 4);
+  });
+
+  test('uses criterion identity rather than a mismatched array position', () => {
+    const normalized = normalizeRubricCriterionScores([
+      { key: 'coverage', score: 2, maxScore: 2 },
+      { key: 'accuracy', score: 3, maxScore: 3 },
+    ], [
+      { key: 'accuracy', criterion: 'Accuracy', maxScore: 3 },
+      { key: 'coverage', criterion: 'Coverage', maxScore: 2 },
+    ]);
+    assert.deepEqual(normalized.entries.map((entry) => [entry.criterion, entry.marks]), [
+      ['Accuracy', 3],
+      ['Coverage', 2],
+    ]);
+  });
+
+  test('reports an unavailable breakdown rather than fake zero criteria after a question-level override', () => {
+    const rubric = [
+      { key: 'process', criterion: 'Process', maxScore: 3 },
+      { key: 'clarity', criterion: 'Clarity', maxScore: 2 },
+    ];
+    const formatted = formatRubricRowsForAppendix({
+      pointsEarned: 5,
+      rubricEvaluation: {
+        aiScores: [{ key: 'process', score: 0, maxScore: 3 }, { key: 'clarity', score: 0, maxScore: 2 }],
+        finalScores: [],
+        finalMark: 5,
+        overriddenBy: 'evaluator-1',
+        overrideReason: 'Checked against the handwritten response.',
+      },
+    }, rubric);
+    assert.equal(formatted.available, false);
+    assert.equal(formatted.reason, 'QUESTION_LEVEL_OVERRIDE');
+    assert.deepEqual(formatted.rows, []);
   });
 });
 
@@ -124,11 +159,11 @@ describe('processing status payload', () => {
 describe('evidence export selection', () => {
   test('exports approved teacher-style evidence annotations', () => {
     const exported = selectExportEvidenceAnnotations([
-      { type: 'INCORRECT', status: 'APPROVED', region: { x: 0.1, y: 0.2, width: 0.4, height: 0.03 }, pageId: 'p1', message: 'Wrong formula' },
+      { type: 'HIGHLIGHT', source: 'EVALUATOR', status: 'APPROVED', region: { x: 0.1, y: 0.2, width: 0.4, height: 0.03 }, pageId: 'p1', message: 'Wrong formula' },
       { type: 'SCORE', status: 'APPROVED', region: { x: 0.8, y: 0.2, width: 0.1, height: 0.04 }, pageId: 'p1' },
     ], { p1: 1 });
     assert.equal(exported.length, 1);
-    assert.equal(exported[0].type, 'INCORRECT');
+    assert.equal(exported[0].type, 'HIGHLIGHT');
   });
 });
 

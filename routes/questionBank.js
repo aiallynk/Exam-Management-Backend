@@ -6,6 +6,7 @@ import { requireRole } from '../middleware/roles.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { logAuditEvent, AUDIT_ACTIONS } from '../utils/auditLogger.js';
 import { recordQuestionVersionEmbedding } from '../services/questionEmbeddingService.js';
+import { recordCreatorDecision } from '../services/questionHistoryService.js';
 import { resolveAcademicVisibility } from '../services/academicAccessService.js';
 import { hasRole } from '../utils/userRoles.js';
 import { BLOOM_LEVELS } from '../utils/cognitiveDemand.js';
@@ -113,6 +114,14 @@ router.post('/items', ...canContribute, async (req, res, next) => {
     item.currentVersionId = version._id;
     await item.save();
     void recordQuestionVersionEmbedding({ tenantId: req.user.tenantId, questionVersionId: version._id, questionText: version.questionText, questionType: version.questionType, difficulty: version.difficulty, userId: req.user._id });
+    // Strong positive quality signal (spec Part 14). Fire-and-forget.
+    void recordCreatorDecision({
+      tenantId: req.user.tenantId,
+      outcome: 'SAVED_TO_BANK',
+      userId: req.user._id,
+      questionVersionId: version._id,
+      question,
+    }).catch(() => {});
     await logAuditEvent(AUDIT_ACTIONS.QUESTION_BANK_ITEM_CREATED, { userId: req.user._id, tenantId: req.user.tenantId, resourceType: 'QuestionBankItem', resourceId: item._id, method: req.method, path: req.path });
     return res.status(201).json({ item, version });
   } catch (error) { return next(error); }

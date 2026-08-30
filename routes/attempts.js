@@ -1,4 +1,5 @@
 import express from 'express';
+import { randomUUID } from 'crypto';
 import ExamAttempt from '../models/ExamAttempt.js';
 import Answer from '../models/Answer.js';
 import AnswerScript from '../models/AnswerScript.js';
@@ -59,7 +60,7 @@ import { normalizeCodingLanguage } from '../utils/codingQuestions.js';
 import { hasRole } from '../utils/userRoles.js';
 import offlineEvaluationConfig from '../config/offlineEvaluationConfig.js';
 import { ANSWER_SCRIPT_JOB, enqueueAnswerScriptStage } from '../services/offlineEvaluation/answerScriptQueueService.js';
-import { normalizeRegion } from '../services/offlineEvaluation/answerAnnotationService.js';
+import { normalizeAnnotationType, normalizeRegion } from '../services/offlineEvaluation/answerAnnotationService.js';
 import {
   FOCUS_VIOLATION_SUBMISSION_SOURCE,
   TAB_SWITCH_DISQUALIFY_STATUS,
@@ -1066,6 +1067,10 @@ const syncOfflineReviewAnnotations = async ({ answer, action, attempt, userId, m
     { answerId: answer._id, source: 'AI', status: { $in: ['PROPOSED', 'APPROVED'] } },
     { $set: { status: 'REJECTED', updatedBy: userId } },
   );
+  await AnswerAnnotation.updateMany(
+    { answerId: answer._id, type: 'SCORE', source: 'EVALUATOR', status: { $in: ['PROPOSED', 'APPROVED', 'EDITED'] } },
+    { $set: { status: 'REJECTED', updatedBy: userId } },
+  );
   const segment = await AnswerSegment.findById(answer.sourceAnswerSegmentId).select('answerScriptId pageIds questionId boundingRegion').lean();
   if (!segment?.pageIds?.[0]) return;
   await AnswerAnnotation.create({
@@ -1085,6 +1090,21 @@ const syncOfflineReviewAnnotations = async ({ answer, action, attempt, userId, m
     updatedBy: userId,
     idempotencyKey: `evaluator-score:${answer._id}:${answer.examinerReviewedAt.getTime()}`,
   });
+};
+
+// An evaluator may either supply a criterion-by-criterion final breakdown or
+// make a documented question-level override. The latter must not leave an old
+// AI breakdown looking authoritative in the evaluated-paper appendix.
+const persistRubricOverride = ({ answer, rubric, rubricScores, userId, overrideReason }) => {
+  if (!Array.isArray(rubric) || !rubric.length) return;
+  answer.rubricEvaluation = {
+    ...(answer.rubricEvaluation?.toObject?.() || answer.rubricEvaluation || {}),
+    finalScores: Array.isArray(rubricScores) ? rubricScores : [],
+    finalMark: Number(answer.pointsEarned),
+    overriddenBy: userId,
+    overrideReason: normalizeString(overrideReason),
+    updatedAt: new Date(),
+  };
 };
 
 // Get all attempts (universal: based on exam permissions)
@@ -3347,7 +3367,7 @@ router.get(
   validateObjectId('attemptId'),
   async (req, res, next) => {
     try {
-      const attempt = await ExamAttempt.findById(req.params.attemptId)
+      const attempt = await ExamAttempt.findOne({ _id: req.params.attemptId, tenantId: req.user.tenantId })
         .populate('examId', 'title duration evaluationMode')
         .populate('userId', 'name email');
       if (!attempt) return res.status(404).json({ error: 'Attempt not found' });
@@ -3490,7 +3510,7 @@ router.put(
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-      const attempt = await ExamAttempt.findById(req.params.attemptId).select('tenantId isCompleted examId');
+      const attempt = await ExamAttempt.findOne({ _id: req.params.attemptId, tenantId: req.user.tenantId }).select('tenantId isCompleted examId');
       if (!attempt) return res.status(404).json({ error: 'Attempt not found' });
       if (!attempt.isCompleted) return res.status(400).json({ error: 'Only completed attempts can be manually graded' });
 
@@ -3554,7 +3574,13 @@ router.put(
           overriddenAt: new Date(),
         },
       };
-      if (rubricScores) answer.rubricEvaluation = { ...(answer.rubricEvaluation?.toObject?.() || answer.rubricEvaluation || {}), finalScores: rubricScores, finalMark: answer.pointsEarned, overriddenBy: req.user._id, overrideReason: normalizeString(req.body.overrideReason), updatedAt: new Date() };
+      persistRubricOverride({
+        answer,
+        rubric,
+        rubricScores,
+        userId: req.user._id,
+        overrideReason: req.body.overrideReason,
+      });
 
       answer.examinerScore = answer.pointsEarned;
       answer.examinerFeedback = normalizeString(req.body.feedback) || answer.examinerFeedback;
@@ -3609,7 +3635,7 @@ router.put(
   validateObjectId('attemptId'),
   validateObjectId('answerId'),
   [
-    body('action').isIn(['approve', 'override', 'flag']).withMessage('action must be approve, override, or flag'),
+    body('action').isIn(['approve', 'override', 'remark', 'flag']).withMessage('action must be approve, override, remark, or flag'),
     body('pointsEarned').optional({ nullable: true }).isFloat({ min: 0 }),
     body('feedback').optional({ nullable: true }).isString().isLength({ max: 4000 }),
     body('overrideReason').optional({ nullable: true }).isString().isLength({ max: 1000 }),
@@ -3620,7 +3646,7 @@ router.put(
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
 
-      const attempt = await ExamAttempt.findById(req.params.attemptId).select('tenantId isCompleted examId');
+      const attempt = await ExamAttempt.findOne({ _id: req.params.attemptId, tenantId: req.user.tenantId }).select('tenantId isCompleted examId');
       if (!attempt) return res.status(404).json({ error: 'Attempt not found' });
       if (!attempt.isCompleted) return res.status(400).json({ error: 'Only completed attempts can be reviewed' });
 
@@ -3699,10 +3725,24 @@ router.put(
         answer.finalScoreSource = 'EXAMINER';
         answer.evaluationStatus = 'REVIEWED';
         answer.needsReview = false;
-        if (rubricScores) answer.rubricEvaluation = { ...(answer.rubricEvaluation?.toObject?.() || answer.rubricEvaluation || {}), finalScores: rubricScores, finalMark: Number(requestedMarks.toFixed(2)), overriddenBy: req.user._id, overrideReason: normalizeString(req.body.overrideReason), updatedAt: new Date() };
+        persistRubricOverride({
+          answer,
+          rubric,
+          rubricScores,
+          userId: req.user._id,
+          overrideReason: req.body.overrideReason,
+        });
         auditAction = AUDIT_ACTIONS.ANSWER_SCORE_OVERRIDDEN;
         scoreChanged = true;
         req.body.__previousMarks = previousMarks;
+      } else if (action === 'remark') {
+        if (!examinerAssignment?.canAddFeedback) {
+          return res.status(403).json({ error: 'This assignment does not permit evaluator remarks.' });
+        }
+        if (!feedback) return res.status(400).json({ error: 'A remark is required.', field: 'feedback', answerId: answer._id });
+        answer.examinerFeedback = feedback;
+        answer.examinerId = req.user._id;
+        answer.examinerReviewedAt = new Date();
       } else if (action === 'flag') {
         answer.examinerFeedback = feedback || answer.examinerFeedback;
         answer.examinerId = req.user._id;
@@ -3764,7 +3804,7 @@ router.put(
         answer,
         scoreSummary,
         annotations,
-        message: `Answer ${action === 'approve' ? 'approved' : action === 'override' ? 'overridden' : 'flagged for moderation'}.`,
+        message: `Answer ${action === 'approve' ? 'approved' : action === 'override' ? 'overridden' : action === 'remark' ? 'remark saved' : 'flagged for moderation'}.`,
       });
     } catch (error) {
       next(error);
@@ -3782,7 +3822,7 @@ router.post(
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-      const attempt = await ExamAttempt.findById(req.params.attemptId).select('tenantId examId sourceAnswerScriptId isCompleted');
+      const attempt = await ExamAttempt.findOne({ _id: req.params.attemptId, tenantId: req.user.tenantId }).select('tenantId examId sourceAnswerScriptId isCompleted');
       if (!attempt?.sourceAnswerScriptId) return res.status(404).json({ error: 'Offline answer-sheet review was not found.' });
       if (!hasRole(req.user, 'EVALUATOR')) return res.status(403).json({ error: 'Evaluator role required.' });
       const page = await AnswerScriptPage.findOne({
@@ -3848,7 +3888,8 @@ router.patch(
   validateObjectId('annotationId'),
   async (req, res, next) => {
     try {
-      const attempt = await ExamAttempt.findById(req.params.attemptId).select('tenantId examId sourceAnswerScriptId');
+      if (!hasRole(req.user, 'EVALUATOR')) return res.status(403).json({ error: 'Evaluator role required.' });
+      const attempt = await ExamAttempt.findOne({ _id: req.params.attemptId, tenantId: req.user.tenantId }).select('tenantId examId sourceAnswerScriptId');
       const annotation = await AnswerAnnotation.findOne({
         _id: req.params.annotationId, tenantId: attempt?.tenantId, answerScriptId: attempt?.sourceAnswerScriptId,
       });
@@ -3865,6 +3906,9 @@ router.patch(
         return res.status(400).json({ error: 'status must be APPROVED, EDITED, or REJECTED.' });
       }
       const hasEdits = ['region', 'message', 'suggestedCorrection', 'proposedScore'].some((key) => req.body?.[key] !== undefined);
+      if (annotation.type === 'SCORE' && hasEdits) {
+        return res.status(400).json({ error: 'Final marks are changed from the question review panel, not by editing a page marker.' });
+      }
       let updated = annotation;
       if (annotation.source === 'AI' && hasEdits) {
         annotation.status = 'REJECTED';
@@ -3907,7 +3951,116 @@ router.patch(
         resourceType: 'AnswerAnnotation', resourceId: updated._id,
         details: { attemptId: attempt._id, sourceAnnotationId: annotation._id, status: updated.status },
       });
-      return res.json({ annotation: updated });
+      return res.json({ annotation: updated, replacedAnnotationId: annotation.source === 'AI' && hasEdits ? annotation._id : null });
+    } catch (error) { return next(error); }
+  },
+);
+
+// Teacher pen marks are always bound to an answer already inside the
+// evaluator's assignment. They use normalized page coordinates and the same
+// AnswerAnnotation collection as AI proposals; the original scan is never
+// altered here.
+router.post(
+  '/:attemptId/annotations',
+  requireAuth,
+  requireEvaluatorAccess(),
+  validateObjectId('attemptId'),
+  [
+    body('answerId').isMongoId(),
+    body('pageId').isMongoId(),
+    body('type').isString().isLength({ min: 1, max: 40 }),
+    body('region').isObject(),
+    body('message').optional({ nullable: true }).isString().isLength({ max: 1000 }),
+    body('suggestedCorrection').optional({ nullable: true }).isString().isLength({ max: 500 }),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      if (!hasRole(req.user, 'EVALUATOR')) return res.status(403).json({ error: 'Evaluator role required.' });
+
+      const attempt = await ExamAttempt.findOne({ _id: req.params.attemptId, tenantId: req.user.tenantId }).select('tenantId examId sourceAnswerScriptId');
+      if (!attempt?.sourceAnswerScriptId) return res.status(404).json({ error: 'Offline answer-sheet review was not found.' });
+      const answer = await Answer.findOne({ _id: req.body.answerId, attemptId: attempt._id }).populate('questionId', 'sectionId');
+      if (!answer) return res.status(404).json({ error: 'Answer not found for this review.' });
+      const assignment = await hasActiveExaminerAssignment(req.user._id, attempt.examId, {
+        attemptId: attempt._id,
+        questionId: answer.questionId?._id || answer.questionId,
+        sectionId: answer.questionId?.sectionId,
+      });
+      if (!assignment) return res.status(403).json({ error: 'This annotation is outside your evaluator assignment.' });
+
+      const page = await AnswerScriptPage.findOne({
+        _id: req.body.pageId, answerScriptId: attempt.sourceAnswerScriptId, tenantId: attempt.tenantId,
+      }).select('_id').lean();
+      if (!page) return res.status(404).json({ error: 'Answer-sheet page not found.' });
+      const region = normalizeRegion(req.body.region);
+      if (!region) return res.status(400).json({ error: 'A valid normalized annotation region is required.' });
+      const type = normalizeAnnotationType(req.body.type);
+      if (!type || type === 'SCORE') return res.status(400).json({ error: 'Use the question review panel to change marks.' });
+
+      const segment = answer.sourceAnswerSegmentId
+        ? await AnswerSegment.findOne({ _id: answer.sourceAnswerSegmentId, answerScriptId: attempt.sourceAnswerScriptId }).select('_id questionId').lean()
+        : null;
+      const annotation = await AnswerAnnotation.create({
+        tenantId: attempt.tenantId,
+        answerScriptId: attempt.sourceAnswerScriptId,
+        pageId: page._id,
+        answerId: answer._id,
+        answerSegmentId: segment?._id || answer.sourceAnswerSegmentId || null,
+        questionId: answer.questionId?._id || segment?.questionId || null,
+        type,
+        region,
+        message: String(req.body.message || '').slice(0, 1000),
+        suggestedCorrection: String(req.body.suggestedCorrection || '').slice(0, 500),
+        source: 'EVALUATOR',
+        status: 'APPROVED',
+        createdBy: req.user._id,
+        updatedBy: req.user._id,
+        idempotencyKey: `evaluator-annotation:${randomUUID()}`,
+      });
+      await logAuditEvent('ANSWER_ANNOTATION_CREATED', {
+        userId: req.user._id, userRole: req.user.role, tenantId: attempt.tenantId,
+        resourceType: 'AnswerAnnotation', resourceId: annotation._id,
+        details: { attemptId: attempt._id, answerId: answer._id, type },
+      });
+      return res.status(201).json({ annotation });
+    } catch (error) { return next(error); }
+  },
+);
+
+// Keep annotation audit history while immediately removing the mark from the
+// paper and from the evaluated derivative that is generated after completion.
+router.delete(
+  '/:attemptId/annotations/:annotationId',
+  requireAuth,
+  requireEvaluatorAccess(),
+  validateObjectId('attemptId'),
+  validateObjectId('annotationId'),
+  async (req, res, next) => {
+    try {
+      if (!hasRole(req.user, 'EVALUATOR')) return res.status(403).json({ error: 'Evaluator role required.' });
+      const attempt = await ExamAttempt.findOne({ _id: req.params.attemptId, tenantId: req.user.tenantId }).select('tenantId examId sourceAnswerScriptId');
+      const annotation = await AnswerAnnotation.findOne({
+        _id: req.params.annotationId, tenantId: attempt?.tenantId, answerScriptId: attempt?.sourceAnswerScriptId,
+      });
+      if (!attempt || !annotation) return res.status(404).json({ error: 'Annotation not found for this review.' });
+      const answer = annotation.answerId ? await Answer.findOne({ _id: annotation.answerId, attemptId: attempt._id }).populate('questionId', 'sectionId') : null;
+      const assignment = await hasActiveExaminerAssignment(req.user._id, attempt.examId, {
+        attemptId: attempt._id,
+        questionId: answer?.questionId?._id || annotation.questionId,
+        sectionId: answer?.questionId?.sectionId,
+      });
+      if (!assignment) return res.status(403).json({ error: 'This annotation is outside your evaluator assignment.' });
+      annotation.status = 'REJECTED';
+      annotation.updatedBy = req.user._id;
+      await annotation.save();
+      await logAuditEvent('ANSWER_ANNOTATION_REMOVED', {
+        userId: req.user._id, userRole: req.user.role, tenantId: attempt.tenantId,
+        resourceType: 'AnswerAnnotation', resourceId: annotation._id,
+        details: { attemptId: attempt._id, answerId: annotation.answerId || null, type: annotation.type },
+      });
+      return res.json({ annotation, deletedAnnotationId: annotation._id });
     } catch (error) { return next(error); }
   },
 );
@@ -3922,7 +4075,7 @@ router.post(
     try {
       const errors = validationResult(req);
       if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-      const attempt = await ExamAttempt.findById(req.params.attemptId);
+      const attempt = await ExamAttempt.findOne({ _id: req.params.attemptId, tenantId: req.user.tenantId });
       if (!attempt?.sourceAnswerScriptId) return res.status(404).json({ error: 'Offline answer-sheet review was not found.' });
       if (!hasRole(req.user, 'EVALUATOR')) return res.status(403).json({ error: 'Evaluator role required.' });
       const answers = await Answer.find({ attemptId: attempt._id }).populate('questionId', 'sectionId');

@@ -15,6 +15,20 @@ export default Object.freeze({
   RETRIEVAL_TOP_K: 24,
   RETRIEVAL_MIN_SIMILARITY: 0.18,
 
+  // --- Source discovery (spec Parts 5, 6, 23) ---
+  // Per-source coverage buckets from (share of a source's chunks scoring
+  // above RETRIEVAL_MIN_SIMILARITY) blended with that source's best score.
+  // A source below LOW is dropped from the evidence set and from provenance
+  // even though the creator selected it in the UI.
+  DISCOVERY_MAX_CHUNKS_SCANNED_PER_SOURCE: 400,
+  DISCOVERY_COVERAGE_HIGH: 0.22,
+  DISCOVERY_COVERAGE_MEDIUM: 0.10,
+  DISCOVERY_COVERAGE_LOW: 0.03,
+  // A source with at least this best-chunk similarity is kept even if its
+  // coverage share is tiny (a short but highly on-topic passage).
+  DISCOVERY_STRONG_SINGLE_HIT_SIMILARITY: 0.42,
+  DISCOVERY_TOP_CHUNKS_PER_SOURCE: 6,
+
   // --- Candidate pool / novelty ---
   CANDIDATE_POOL_OVERSAMPLE_FACTOR: 1.6,
   CANDIDATE_POOL_MAX_ATTEMPTS: 3,

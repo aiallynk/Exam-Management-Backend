@@ -273,18 +273,19 @@ const handleSegment = async (job) => {
   for (const page of pages) {
     for (let index = 0; index < (page.extractionSegments || []).length; index += 1) {
       const proposal = page.extractionSegments[index];
+      const pageLineBoxes = (proposal.lineBoxes || []).map((line) => ({ ...line, pageId: page._id }));
       if (proposal.continuesFromPrevious && !proposal.detectedQuestionNumber && pending.length) {
         const previous = pending[pending.length - 1];
         previous.text += `\n${proposal.text}`;
         previous.pageIds.push(page._id);
         previous.confidence = Math.min(previous.confidence, proposal.confidence);
-        previous.lineBoxes.push(...(proposal.lineBoxes || []));
+        previous.lineBoxes.push(...pageLineBoxes);
       } else if (String(proposal.text || '').trim()) {
         pending.push({
           segmentKey: hash({ page: page.pageNumber, index, question: proposal.detectedQuestionNumber, text: proposal.text }).slice(0, 32),
           detectedQuestionNumber: proposal.detectedQuestionNumber || '', text: proposal.text,
           confidence: proposal.confidence, pageIds: [page._id], boundingRegion: proposal.region || null,
-          lineBoxes: proposal.lineBoxes || [], firstPage: page,
+          lineBoxes: pageLineBoxes, firstPage: page,
         });
       }
     }
@@ -467,4 +468,3 @@ export const markAnswerScriptJobPermanentlyFailed = async (job, error) => {
   await script.save();
   if (script.batchId) await refreshAnswerScriptBatchCounters(script.batchId);
 };
-

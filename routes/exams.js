@@ -38,6 +38,7 @@ import { sanitizeExamAccessControlPayload } from '../utils/examSecurity.js';
 import { queueExamPackageRegeneration } from '../services/examPackageRegenerationService.js';
 import { resolveAttemptExhaustedExamIds } from '../utils/attemptAvailability.js';
 import { resolveAssessmentSpecification } from '../services/assessmentSpecificationResolver.js';
+import { freezePaperTemplateOntoExam, PaperTemplateError } from '../services/paperTemplateService.js';
 import RubricTemplate from '../models/RubricTemplate.js';
 import QuestionPaper from '../models/QuestionPaper.js';
 import Question from '../models/Question.js';
@@ -1820,6 +1821,24 @@ router.post(
       }
 
       const exam = new Exam(examData);
+      // Institutional paper template (Phase 1A) — additive & optional. When the
+      // creator selected an APPROVED template, resolve it (template + branding +
+      // permitted overrides) and deep-freeze it onto the exam now; it is
+      // write-once, so later branding/template edits never alter this paper.
+      // No template selected ⇒ nothing changes.
+      if (req.body.paperTemplateId) {
+        try {
+          await freezePaperTemplateOntoExam(exam, {
+            templateId: req.body.paperTemplateId,
+            overrides: req.body.paperTemplateOverrides,
+          });
+        } catch (error) {
+          if (error instanceof PaperTemplateError) {
+            return res.status(error.status).json({ error: error.message, code: error.code });
+          }
+          throw error;
+        }
+      }
       await exam.save();
       await exam.populate('createdBy', 'name email');
 

@@ -49,6 +49,17 @@ const ContextChunkSchema = new mongoose.Schema(
     },
     sectionTitle: { type: String, trim: true, default: '' },
     sectionLevel: { type: String, enum: ['RESOURCE', 'SECTION', 'CHUNK'], default: 'CHUNK' },
+    // Page positions from the deterministic PDF parser ONLY — never guessed
+    // (spec Part 22). Absent/undefined when the parser did not expose page
+    // geometry; provenance then shows "Referenced pages: unavailable".
+    pageStart: { type: Number, default: undefined },
+    pageEnd: { type: Number, default: undefined },
+    // How the chapter/section metadata for this chunk's resource was obtained.
+    metadataConfidence: {
+      type: String,
+      enum: ['USER_CONFIRMED', 'DETECTED', 'UNKNOWN'],
+      default: 'UNKNOWN',
+    },
     // Plain array, not a typed vector — no Atlas Search index depends on
     // this field's shape, so a plain [Number] keeps this portable across
     // any Mongo deployment.

@@ -24,9 +24,17 @@ const COLORS = {
   score: rgb(0.12, 0.16, 0.24),
   remark: rgb(0.28, 0.22, 0.18),
   underline: rgb(0.72, 0.16, 0.16),
-  highlightIncorrect: rgb(1, 0.86, 0.86),
-  highlightPartial: rgb(1, 0.94, 0.82),
+  leader: rgb(0.38, 0.42, 0.48),
+  highlightIncorrect: rgb(1, 0.66, 0.7),
+  highlightPartial: rgb(1, 0.82, 0.36),
+  highlightCorrect: rgb(0.48, 0.82, 0.58),
+  scoreCorrectFill: rgb(0.9, 0.98, 0.93),
+  scoreIncorrectFill: rgb(1, 0.92, 0.92),
+  scorePartialFill: rgb(1, 0.96, 0.86),
+  commentFill: rgb(1, 0.98, 0.91),
 };
+
+const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, value));
 
 const printable = (value) => String(value ?? '')
   .replace(/[\r\t]+/g, ' ')
@@ -49,9 +57,9 @@ const wrap = (font, text, size, maxWidth) => {
 };
 
 const finalComment = (answer) => {
-  if (answer.moderatorReviewedAt) return answer.moderatorFeedback || '';
-  if (answer.examinerReviewedAt) return answer.examinerFeedback || '';
-  return answer.aiEvaluation?.feedback || '';
+  if (answer.moderatorReviewedAt) return { label: 'Evaluator Remark', text: answer.moderatorFeedback || '' };
+  if (answer.examinerReviewedAt) return { label: 'Evaluator Remark', text: answer.examinerFeedback || '' };
+  return { label: 'AI Feedback', text: answer.aiEvaluation?.feedback || '' };
 };
 
 const formatAppendixTotal = (value) => {
@@ -60,22 +68,69 @@ const formatAppendixTotal = (value) => {
   return Number.isInteger(numeric) ? String(numeric) : String(Math.round(numeric * 100) / 100);
 };
 
+const reviewStatusLabel = (value) => ({
+  NOT_ATTEMPTED: 'Not Attempted',
+  NOT_EVALUATED: 'Pending',
+  AUTO_EVALUATED: 'AI Evaluated',
+  AI_EVALUATED: 'AI Evaluated',
+  PENDING_REVIEW: 'Pending',
+  UNDER_REVIEW: 'Pending',
+  REVIEWED: 'Review Complete',
+  FLAGGED: 'Flagged',
+  MODERATED: 'Review Complete',
+  FINALIZED: 'Finalized',
+  EVALUATION_FAILED: 'Pending',
+}[String(value || '').toUpperCase()] || 'Pending');
+
+const scoreSourceLabel = (answer) => {
+  const source = String(answer?.finalScoreSource || '').toUpperCase();
+  if (source === 'RULE_ENGINE') return 'Final Score set by assessment rules';
+  if (source === 'AI') return answer?.examinerReviewedAt || answer?.moderatorReviewedAt ? 'AI Score Approved' : 'AI Evaluated';
+  if (['EXAMINER', 'MODERATOR', 'ADMIN_OVERRIDE'].includes(source)) return 'Evaluator Modified';
+  return '';
+};
+
 export const buildDerivativeReviewRows = (answers = []) => answers.map((answer) => {
   const rubric = formatRubricRowsForAppendix(answer, answer.questionId?.evaluationConfig?.rubric || []);
+  const comment = finalComment(answer);
   return {
     questionNumber: Number(answer.questionId?.order ?? 0) + 1,
     questionText: answer.questionId?.questionText || '',
     marksObtained: Number(answer.pointsEarned || 0),
     maxMarks: Number(answer.questionId?.points || 0),
-    comment: finalComment(answer),
+    comment: comment.text,
+    commentLabel: comment.label,
     rubricAvailable: rubric.available,
     rubric: rubric.rows,
+    rubricReason: rubric.reason || '',
     hasRubricConfig: Array.isArray(answer.questionId?.evaluationConfig?.rubric) && answer.questionId.evaluationConfig.rubric.length > 0,
-    finalStatus: answer.evaluationStatus || 'NOT_EVALUATED',
-    scoreSource: answer.finalScoreSource || '',
+    finalStatus: reviewStatusLabel(answer.evaluationStatus),
+    scoreSource: scoreSourceLabel(answer),
     examinerOverride: Boolean(answer.examinerReviewedAt || answer.moderatorReviewedAt),
   };
 });
+
+const detectedQuestionNumber = (value) => {
+  const match = String(value || '').match(/(?:question\s*|q\s*)?(\d+)/i);
+  return match ? Number(match[1]) : null;
+};
+
+// Blank responses do not always materialize an AnswerSegment. The page-level
+// extraction record still owns the observed question-label geometry, so reuse
+// it as a question anchor instead of fabricating a bottom-page score location.
+export const buildQuestionAnchorsByQuestionNumber = (pages = []) => {
+  const anchors = {};
+  for (const page of pages) {
+    for (const proposal of page?.extractionSegments || []) {
+      const questionNumber = detectedQuestionNumber(proposal?.detectedQuestionNumber)
+        || detectedQuestionNumber(proposal?.text);
+      const region = proposal?.region || proposal?.boundingRegion;
+      if (!questionNumber || !region || anchors[questionNumber]) continue;
+      anchors[questionNumber] = { pageNumber: Number(page.pageNumber), region };
+    }
+  }
+  return anchors;
+};
 
 const appendOriginal = async ({ pdf, sourceBuffer, mimeType }) => {
   const frames = [];
@@ -121,32 +176,81 @@ const toPdfRect = (frame, region) => ({
   height: Number(region.height) * frame.height,
 });
 
-const drawCheck = (page, x, y, size, color) => {
+const toPdfPoint = (frame, point) => ({
+  x: frame.x + Number(point.x) * frame.width,
+  y: frame.y + (1 - Number(point.y)) * frame.height,
+});
+
+// PDF coordinates may be A4-sized or the full dimensions of a scanned page.
+// Coordinates were normalized already; every visible size must be normalized
+// as well so Fit Page remains readable for either source.
+export const pageRelativeMetrics = ({ page, frame }) => {
+  const width = Math.max(Number(frame?.width) || 0, Number(page?.getWidth?.()) || 0, 1);
+  const height = Math.max(Number(frame?.height) || 0, Number(page?.getHeight?.()) || 0, 1);
+  return {
+    scoreFontSize: clamp(width * 0.032, 18, Math.max(18, width * 0.042)),
+    commentFontSize: clamp(width * 0.017, 9.5, Math.max(11, width * 0.024)),
+    symbolSize: clamp(width * 0.045, 24, Math.max(28, width * 0.064)),
+    scorePaddingX: clamp(width * 0.011, 7, Math.max(10, width * 0.018)),
+    scorePaddingY: clamp(height * 0.009, 6, Math.max(9, height * 0.016)),
+    markerBorder: clamp(width * 0.0028, 1.5, Math.max(2, width * 0.005)),
+    annotationStroke: clamp(width * 0.003, 1.6, Math.max(2.2, width * 0.0055)),
+    underlineOffset: clamp(height * 0.003, 1.5, Math.max(2.5, height * 0.006)),
+    highlightPadX: clamp(width * 0.004, 2, Math.max(3, width * 0.009)),
+    highlightPadY: clamp(height * 0.003, 1.5, Math.max(2.5, height * 0.007)),
+    calloutPadding: clamp(width * 0.009, 5, Math.max(7, width * 0.015)),
+    leaderStroke: clamp(width * 0.0018, 1, Math.max(1.4, width * 0.0035)),
+  };
+};
+
+const clampPdfRectToFrame = (rect, frame) => {
+  const x = clamp(rect.x, frame.x, frame.x + frame.width);
+  const y = clamp(rect.y, frame.y, frame.y + frame.height);
+  const right = clamp(rect.x + rect.width, frame.x, frame.x + frame.width);
+  const top = clamp(rect.y + rect.height, frame.y, frame.y + frame.height);
+  return { x, y, width: Math.max(0, right - x), height: Math.max(0, top - y) };
+};
+
+const expandPdfRect = (rect, frame, horizontal, vertical) => clampPdfRectToFrame({
+  x: rect.x - horizontal,
+  y: rect.y - vertical,
+  width: rect.width + horizontal * 2,
+  height: rect.height + vertical * 2,
+}, frame);
+
+const rectsOverlap = (left, right, gap = 0) => (
+  left.x < right.x + right.width + gap
+  && left.x + left.width + gap > right.x
+  && left.y < right.y + right.height + gap
+  && left.y + left.height + gap > right.y
+);
+
+const drawCheck = (page, x, y, size, color, thickness) => {
   page.drawLine({
     start: { x, y: y + size * 0.42 },
     end: { x: x + size * 0.34, y },
-    thickness: 1.7,
+    thickness,
     color,
   });
   page.drawLine({
     start: { x: x + size * 0.34, y },
     end: { x: x + size, y: y + size * 0.82 },
-    thickness: 1.7,
+    thickness,
     color,
   });
 };
 
-const drawCross = (page, x, y, size, color) => {
+const drawCross = (page, x, y, size, color, thickness) => {
   page.drawLine({
     start: { x, y },
     end: { x: x + size, y: y + size },
-    thickness: 1.6,
+    thickness,
     color,
   });
   page.drawLine({
     start: { x: x + size, y },
     end: { x, y: y + size },
-    thickness: 1.6,
+    thickness,
     color,
   });
 };
@@ -154,76 +258,167 @@ const drawCross = (page, x, y, size, color) => {
 const drawTeacherMark = ({ page, frame, mark, regular, bold }) => {
   const box = toPdfRect(frame, mark.placement);
   if (![box.x, box.y, box.width, box.height].every(Number.isFinite)) return;
-  const symbolSize = 14;
-  const symbolY = box.y + box.height - 18;
+  const metrics = pageRelativeMetrics({ page, frame });
+  const fill = mark.verdict === 'CORRECT'
+    ? COLORS.scoreCorrectFill
+    : mark.verdict === 'INCORRECT' ? COLORS.scoreIncorrectFill : COLORS.scorePartialFill;
+  page.drawRectangle({
+    x: box.x,
+    y: box.y,
+    width: box.width,
+    height: box.height,
+    color: fill,
+    opacity: 0.92,
+    borderColor: mark.verdict === 'INCORRECT' ? COLORS.incorrect : mark.verdict === 'CORRECT' ? COLORS.correct : COLORS.partial,
+    borderWidth: metrics.markerBorder,
+    borderOpacity: 0.85,
+  });
+  const symbolSize = Math.min(metrics.symbolSize, Math.max(metrics.scoreFontSize * 1.18, box.height * 0.58));
+  const labelY = box.y + box.height - metrics.scorePaddingY - metrics.scoreFontSize;
+  const symbolY = labelY + Math.max(0, (metrics.scoreFontSize - symbolSize) * 0.24);
   const verdictColor = mark.verdict === 'INCORRECT' ? COLORS.incorrect : COLORS.correct;
-  if (mark.verdict === 'INCORRECT') drawCross(page, box.x, symbolY, symbolSize, verdictColor);
-  else drawCheck(page, box.x, symbolY, symbolSize, verdictColor);
+  const symbolX = box.x + metrics.scorePaddingX;
+  if (mark.verdict === 'INCORRECT') drawCross(page, symbolX, symbolY, symbolSize, verdictColor, metrics.annotationStroke);
+  else if (mark.verdict === 'CORRECT') drawCheck(page, symbolX, symbolY, symbolSize, verdictColor, metrics.annotationStroke);
 
   const showQuestion = mark.placement.strategy === 'SAFE_MARGIN' || mark.placement.confidence === 'LOW';
   const label = showQuestion ? `Q${mark.questionNumber}  ${mark.scoreLabel}` : mark.scoreLabel;
+  const labelX = box.x + metrics.scorePaddingX + (mark.verdict === 'PARTIAL' ? 0 : symbolSize + metrics.scorePaddingX * 0.75);
   page.drawText(label, {
-    x: box.x + 18,
-    y: symbolY + 1,
-    size: 14,
+    x: labelX,
+    y: labelY,
+    size: metrics.scoreFontSize,
     font: bold,
     color: mark.verdict === 'INCORRECT' ? COLORS.incorrect : COLORS.score,
   });
 
   if (mark.remark) {
-    wrap(regular, mark.remark, 8.5, Math.max(56, box.width - 6)).slice(0, 2).forEach((line, index) => {
+    wrap(regular, mark.remark, metrics.commentFontSize, Math.max(56, box.width - metrics.scorePaddingX * 2)).slice(0, 2).forEach((line, index) => {
       page.drawText(line, {
-        x: box.x + 18,
-        y: symbolY - 13 - (index * 10),
-        size: 8.5,
+        x: box.x + metrics.scorePaddingX,
+        y: labelY - metrics.commentFontSize * 1.15 - (index * metrics.commentFontSize * 1.18),
+        size: metrics.commentFontSize,
         font: regular,
         color: COLORS.remark,
       });
     });
   }
+
+  if (mark.placement.strategy === 'SAFE_MARGIN' && mark.placement.leaderTo) {
+    page.drawLine({
+      start: { x: box.x, y: box.y + box.height * 0.5 },
+      end: toPdfPoint(frame, mark.placement.leaderTo),
+      thickness: metrics.leaderStroke,
+      color: COLORS.leader,
+      opacity: 0.8,
+    });
+  }
 };
 
-const evidenceStyle = (type) => {
+const evidenceStyle = (type, text = '') => {
   const normalized = String(type || '').toUpperCase();
-  if (normalized === 'CORRECT') return { color: COLORS.correct, highlight: null, underline: true };
-  if (normalized === 'PARTIAL') return { color: COLORS.partial, highlight: COLORS.highlightPartial, underline: true };
-  if (normalized === 'MISSING_POINT') return { color: COLORS.remark, highlight: null, underline: false, marginOnly: true };
-  return { color: COLORS.incorrect, highlight: COLORS.highlightIncorrect, underline: true };
+  const semanticText = String(text || '').toLowerCase();
+  const positive = /\b(good|correct|strong|clear|well done)\b/.test(semanticText);
+  const negative = /\b(missing|incorrect|wrong|error|repeat|repeated|similar|confus)/.test(semanticText);
+  if (normalized === 'CHECK') return { color: COLORS.correct, symbol: 'CHECK' };
+  if (normalized === 'CROSS') return { color: COLORS.incorrect, symbol: 'CROSS' };
+  if (normalized === 'HIGHLIGHT') return {
+    color: positive ? COLORS.correct : negative ? COLORS.incorrect : COLORS.partial,
+    highlight: positive ? COLORS.highlightCorrect : negative ? COLORS.highlightIncorrect : COLORS.highlightPartial,
+  };
+  if (normalized === 'UNDERLINE') return { color: positive ? COLORS.correct : negative ? COLORS.underline : COLORS.partial, underline: true };
+  if (['COMMENT', 'MISSING_POINT', 'RUBRIC_NOTE'].includes(normalized)) return { color: COLORS.remark, comment: true };
+  if (normalized === 'SPELLING' || normalized === 'GRAMMAR') return { color: COLORS.underline, underline: true };
+  return null;
 };
 
-const drawEvidenceAnnotation = ({ page, frame, annotation, regular }) => {
+const drawCommentCallout = ({ page, frame, anchor, text, regular, metrics, reservedBoxes = [] }) => {
+  const note = printable(text).slice(0, 110);
+  if (!note) return;
+  const maxWidth = Math.min(frame.width * 0.28, Math.max(frame.width * 0.16, 150));
+  const lines = wrap(regular, note, metrics.commentFontSize, maxWidth - metrics.calloutPadding * 2).slice(0, 2);
+  const width = Math.min(maxWidth, Math.max(
+    frame.width * 0.15,
+    ...lines.map((line) => regular.widthOfTextAtSize(line, metrics.commentFontSize) + metrics.calloutPadding * 2),
+  ));
+  const height = lines.length * metrics.commentFontSize * 1.22 + metrics.calloutPadding * 2;
+  const candidates = [
+    { x: anchor.x + anchor.width + metrics.calloutPadding, y: anchor.y + anchor.height - height },
+    { x: anchor.x + anchor.width - width, y: anchor.y - height - metrics.calloutPadding },
+    { x: anchor.x + anchor.width - width, y: anchor.y + anchor.height + metrics.calloutPadding },
+    { x: anchor.x - width - metrics.calloutPadding, y: anchor.y + anchor.height - height },
+  ].map((candidate) => clampPdfRectToFrame({ ...candidate, width, height }, frame));
+  const callout = candidates.find((candidate) => (
+    candidate.width >= width * 0.9
+    && candidate.height >= height * 0.9
+    && !reservedBoxes.some((reserved) => rectsOverlap(candidate, reserved, metrics.calloutPadding * 0.45))
+  ));
+  if (!callout) return;
+  page.drawLine({
+    start: { x: callout.x, y: callout.y + callout.height * 0.5 },
+    end: { x: anchor.x + anchor.width, y: anchor.y + anchor.height * 0.5 },
+    thickness: metrics.leaderStroke,
+    color: COLORS.leader,
+    opacity: 0.8,
+  });
+  page.drawRectangle({
+    ...callout,
+    color: COLORS.commentFill,
+    opacity: 0.94,
+    borderColor: COLORS.remark,
+    borderWidth: metrics.markerBorder * 0.72,
+    borderOpacity: 0.68,
+  });
+  lines.forEach((line, index) => {
+    page.drawText(line, {
+      x: callout.x + metrics.calloutPadding,
+      y: callout.y + callout.height - metrics.calloutPadding - metrics.commentFontSize - index * metrics.commentFontSize * 1.2,
+      size: metrics.commentFontSize,
+      font: regular,
+      color: COLORS.remark,
+    });
+  });
+};
+
+const drawEvidenceAnnotation = ({ page, frame, annotation, regular, layer = 'stroke', reservedBoxes = [] }) => {
   const box = toPdfRect(frame, annotation.region);
   if (![box.x, box.y, box.width, box.height].every(Number.isFinite)) return;
-  const style = evidenceStyle(annotation.type);
-  if (style.highlight && box.width > 8 && box.height > 4) {
-    page.drawRectangle({
-      x: box.x,
-      y: box.y,
-      width: box.width,
-      height: box.height,
-      color: style.highlight,
-      opacity: 0.35,
-      borderWidth: 0,
-    });
+  const note = annotation.message || annotation.suggestedCorrection || annotation.evidenceText;
+  const style = evidenceStyle(annotation.type, note);
+  if (!style) return;
+  const metrics = pageRelativeMetrics({ page, frame });
+  if (layer === 'comment') {
+    if (style.comment) drawCommentCallout({ page, frame, anchor: box, text: note, regular, metrics, reservedBoxes });
+    return;
+  }
+  if (style.comment) return;
+  const expandedBox = expandPdfRect(box, frame, metrics.highlightPadX, metrics.highlightPadY);
+  if (layer === 'highlight') {
+    if (style.highlight && expandedBox.width > metrics.highlightPadX * 2 && expandedBox.height > metrics.highlightPadY * 2) {
+      page.drawRectangle({ ...expandedBox, color: style.highlight, opacity: 0.32, borderWidth: 0 });
+    }
+    return;
+  }
+  if (style.symbol === 'CHECK') {
+    const x = box.x + Math.min(metrics.highlightPadX, box.width * 0.16);
+    const y = box.y + Math.max(metrics.highlightPadY, box.height * 0.42);
+    const width = Math.max(metrics.symbolSize * 0.72, Math.min(metrics.symbolSize, box.width * 0.88));
+    const height = Math.max(metrics.symbolSize * 0.58, Math.min(metrics.symbolSize * 0.78, box.height * 0.88));
+    page.drawLine({ start: { x, y }, end: { x: x + width * 0.34, y: y - height * 0.42 }, thickness: metrics.annotationStroke, color: style.color });
+    page.drawLine({ start: { x: x + width * 0.34, y: y - height * 0.42 }, end: { x: x + width, y: y + height * 0.44 }, thickness: metrics.annotationStroke, color: style.color });
+  }
+  if (style.symbol === 'CROSS') {
+    const inset = Math.max(metrics.annotationStroke, Math.min(metrics.symbolSize * 0.16, Math.min(box.width, box.height) * 0.16));
+    page.drawLine({ start: { x: box.x + inset, y: box.y + inset }, end: { x: box.x + box.width - inset, y: box.y + box.height - inset }, thickness: metrics.annotationStroke, color: style.color });
+    page.drawLine({ start: { x: box.x + inset, y: box.y + box.height - inset }, end: { x: box.x + box.width - inset, y: box.y + inset }, thickness: metrics.annotationStroke, color: style.color });
   }
   if (style.underline) {
+    const y = Math.max(frame.y, box.y - metrics.underlineOffset);
     page.drawLine({
-      start: { x: box.x, y: box.y - 0.8 },
-      end: { x: box.x + box.width, y: box.y - 0.8 },
-      thickness: style.marginOnly ? 0 : 1.1,
+      start: { x: box.x, y },
+      end: { x: box.x + box.width, y },
+      thickness: metrics.annotationStroke,
       color: style.color,
-    });
-  }
-  const note = annotation.message || annotation.suggestedCorrection || annotation.evidenceText;
-  if (note && (style.marginOnly || box.width < 48)) {
-    wrap(regular, note, 7.5, Math.max(72, box.width + 40)).slice(0, 2).forEach((line, index) => {
-      page.drawText(line, {
-        x: Math.min(frame.x + frame.width - 120, box.x + box.width + 4),
-        y: box.y + box.height - (index * 9),
-        size: 7.5,
-        font: regular,
-        color: style.color,
-      });
     });
   }
 };
@@ -238,6 +433,7 @@ export const buildEvaluatedDerivativePdf = async ({
   annotations = [],
   segments = [],
   pageNumberById = {},
+  questionAnchorsByQuestionNumber = {},
   attemptTotal = null,
 }) => {
   const plan = buildTeacherAnnotationPlan({
@@ -245,6 +441,7 @@ export const buildEvaluatedDerivativePdf = async ({
     segments,
     annotations,
     pageNumberById,
+    questionAnchorsByQuestionNumber,
     attemptTotal,
   });
   assertDerivativeIntegrity(plan, { answers, attemptTotal });
@@ -255,26 +452,47 @@ export const buildEvaluatedDerivativePdf = async ({
   const bold = await pdf.embedFont(StandardFonts.HelveticaBold);
   const sourcePages = pdf.getPages();
 
+  // Z-order: transparent highlighter first, then pen strokes, then the final
+  // score, then compact comments. Original page content remains the base.
+  (plan.evidence || []).forEach((annotation) => {
+    const index = Math.max(0, Number(annotation.pageNumber) - 1);
+    const page = sourcePages[index];
+    const frame = frames[index];
+    if (page && frame) drawEvidenceAnnotation({ page, frame, annotation, regular, layer: 'highlight' });
+  });
+
+  (plan.evidence || []).forEach((annotation) => {
+    const index = Math.max(0, Number(annotation.pageNumber) - 1);
+    const page = sourcePages[index];
+    const frame = frames[index];
+    if (page && frame) drawEvidenceAnnotation({ page, frame, annotation, regular, layer: 'stroke' });
+  });
+
+  const scoreBoxesByPage = new Map();
   plan.marks.forEach((mark) => {
     const index = Math.max(0, Number(mark.pageNumber) - 1);
     const page = sourcePages[index] || sourcePages[sourcePages.length - 1];
     const frame = frames[index] || frames[frames.length - 1];
-    if (page && frame) drawTeacherMark({ page, frame, mark, regular, bold });
-  });
-
-  plan.corrections.forEach((correction) => {
-    const index = Math.max(0, Number(correction.pageNumber) - 1);
-    const page = sourcePages[index];
-    const frame = frames[index];
-    if (page && frame) drawEvidenceAnnotation({ page, frame, annotation: correction, regular });
+    if (page && frame) {
+      drawTeacherMark({ page, frame, mark, regular, bold });
+      const boxes = scoreBoxesByPage.get(index) || [];
+      boxes.push(toPdfRect(frame, mark.placement));
+      scoreBoxesByPage.set(index, boxes);
+    }
   });
 
   (plan.evidence || []).forEach((annotation) => {
-    if (['SPELLING', 'GRAMMAR'].includes(annotation.type)) return;
     const index = Math.max(0, Number(annotation.pageNumber) - 1);
     const page = sourcePages[index];
     const frame = frames[index];
-    if (page && frame) drawEvidenceAnnotation({ page, frame, annotation, regular });
+    if (page && frame) drawEvidenceAnnotation({
+      page,
+      frame,
+      annotation,
+      regular,
+      layer: 'comment',
+      reservedBoxes: scoreBoxesByPage.get(index) || [],
+    });
   });
 
   const rows = buildDerivativeReviewRows(answers);
@@ -324,7 +542,7 @@ export const buildEvaluatedDerivativePdf = async ({
     paragraph(row.questionText, { size: 9 });
     if (row.comment) {
       y -= 3;
-      paragraph(`Evaluator comment: ${row.comment}`, { size: 9 });
+      paragraph(`${row.commentLabel}: ${row.comment}`, { size: 9 });
     }
     if (row.rubricAvailable) {
       row.rubric.forEach((criterion) => paragraph(
@@ -332,9 +550,15 @@ export const buildEvaluatedDerivativePdf = async ({
         { size: 8, indent: 10 },
       ));
     } else if (row.hasRubricConfig) {
-      paragraph('Rubric breakdown unavailable', { size: 8, indent: 10 });
+      paragraph(
+        row.rubricReason === 'QUESTION_LEVEL_OVERRIDE'
+          ? 'Rubric breakdown unavailable — Final Score was set by the evaluator.'
+          : 'Rubric breakdown unavailable',
+        { size: 8, indent: 10 },
+      );
     }
-    paragraph(`Final evaluator status: ${row.finalStatus}${row.scoreSource ? ` (${row.scoreSource})` : ''}`, { size: 8 });
+    paragraph(`Review status: ${row.finalStatus}`, { size: 8 });
+    if (row.scoreSource) paragraph(row.scoreSource, { size: 8 });
     y -= 10;
   });
 
@@ -354,7 +578,7 @@ export const generateEvaluatedDerivative = async ({ answerScriptId, actorUserId,
       .populate('questionId', 'questionText points order evaluationConfig')
       .sort({ createdAt: 1 })
       .lean(),
-    AnswerScriptPage.find({ answerScriptId: script._id }).select('_id pageNumber').lean(),
+    AnswerScriptPage.find({ answerScriptId: script._id }).select('_id pageNumber extractionSegments').lean(),
     AnswerSegment.find({ answerScriptId: script._id })
       .select('_id materializedAnswerId questionId pageIds boundingRegion lineBoxes')
       .lean(),
@@ -376,6 +600,7 @@ export const generateEvaluatedDerivative = async ({ answerScriptId, actorUserId,
       annotations,
       segments,
       pageNumberById: Object.fromEntries(pages.map((page) => [String(page._id), page.pageNumber])),
+      questionAnchorsByQuestionNumber: buildQuestionAnchorsByQuestionNumber(pages),
       attemptTotal,
     });
   } catch (error) {

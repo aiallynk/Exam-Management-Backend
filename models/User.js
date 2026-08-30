@@ -51,6 +51,14 @@ const UserSchema = new mongoose.Schema(
       required: true,
       trim: true,
     },
+    // Optional profile picture (served /uploads/... URL). Additive; empty for
+    // every existing user. Used, among other things, as the last-resort logo
+    // source for institutional paper templates (a Tenant Admin's picture).
+    profilePictureUrl: {
+      type: String,
+      trim: true,
+      default: '',
+    },
     password: {
       type: String,
       required: true,

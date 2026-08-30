@@ -5,6 +5,22 @@ import { mapObservationsToAnnotations } from './evidenceAnnotationService.js';
 
 const clamp = (value, minimum, maximum) => Math.max(minimum, Math.min(maximum, Number(value)));
 
+export const ANSWER_ANNOTATION_TYPES = new Set([
+  'CORRECT', 'INCORRECT', 'PARTIAL', 'SPELLING', 'GRAMMAR', 'MISSING_POINT',
+  'EXTRA_POINT', 'RUBRIC_NOTE', 'COMMENT', 'SCORE', 'CHECK', 'CROSS',
+  'HIGHLIGHT', 'UNDERLINE',
+]);
+
+// Provider terminology and the simple teacher toolbar intentionally meet at
+// one persisted vocabulary. This preserves older CORRECT/INCORRECT records
+// while accepting CHECK/TICK/CROSS proposals without a second overlay model.
+export const normalizeAnnotationType = (value) => {
+  const type = String(value || '').trim().toUpperCase().replace(/[\s-]+/g, '_');
+  if (['CHECK', 'TICK'].includes(type)) return 'CHECK';
+  if (['CROSS', 'X_MARK'].includes(type)) return 'CROSS';
+  return ANSWER_ANNOTATION_TYPES.has(type) ? type : null;
+};
+
 export const normalizeRegion = (region, fallback = null) => {
   const candidate = region && typeof region === 'object' ? region : fallback;
   if (!candidate) return null;
@@ -64,8 +80,8 @@ export const buildCanonicalAnnotations = ({ segment, result, pageId }) => {
       : null;
     const region = normalizeRegion(proposal.region, line || segment.boundingRegion);
     if (!region) continue;
-    const type = String(proposal.type || 'COMMENT').toUpperCase();
-    if (!['CORRECT', 'INCORRECT', 'PARTIAL', 'SPELLING', 'GRAMMAR', 'MISSING_POINT', 'EXTRA_POINT', 'RUBRIC_NOTE', 'COMMENT', 'SCORE'].includes(type)) continue;
+    const type = normalizeAnnotationType(proposal.type || 'COMMENT');
+    if (!type) continue;
     items.push({
       type, region, lineId: String(proposal.lineId || ''),
       evidenceText: String(proposal.evidenceText || line?.text || '').slice(0, 500),
@@ -103,12 +119,6 @@ export const buildCanonicalAnnotations = ({ segment, result, pageId }) => {
   return items.filter((item) => item.region);
 };
 
-const autoApproveEvidence = (proposal) => {
-  const type = String(proposal?.type || '').toUpperCase();
-  if (!['CORRECT', 'INCORRECT', 'PARTIAL', 'MISSING_POINT', 'SPELLING', 'GRAMMAR'].includes(type)) return false;
-  return Number(proposal?.confidence || 0) >= 0.45;
-};
-
 export const persistCanonicalAnnotations = async ({ segmentId }) => {
   const segment = await AnswerSegment.findById(segmentId);
   if (!segment?.evaluationResult || !segment.pageIds?.length) return [];
@@ -135,7 +145,9 @@ export const persistCanonicalAnnotations = async ({ segmentId }) => {
           answerSegmentId: segment._id,
           questionId: segment.questionId || null,
           source: 'AI',
-          status: autoApproveEvidence(proposal) ? 'APPROVED' : 'PROPOSED',
+          // AI marks are suggestions. Only a scoped evaluator can approve
+          // them for the evaluated paper, irrespective of AI confidence.
+          status: 'PROPOSED',
           idempotencyKey,
           ...proposal,
         },
