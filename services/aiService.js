@@ -30,7 +30,7 @@ const sanitizeBloomLevel = (value) => {
   return BLOOM_LEVELS.includes(token) ? token : undefined;
 };
 
-const OPENAI_MODEL = config.openaiQuestionModel || config.openaiModel || 'gpt-4o';
+const OPENAI_MODEL = config.openaiQuestionModel || config.openaiModel || 'gpt-5.6-luna-medium';
 
 // Re-export for backward compatibility — canonical client lives in aiEngine/openaiClient.js
 export { getOpenAIClient };
@@ -2399,6 +2399,8 @@ export const evaluateAnswer = async (params) => {
     tenantId = null,
     userId = null,
     metadata = null,
+    qualityTier = 'STANDARD',
+    model,
   } = params;
   const trackingContext = resolveTrackingContext({ tenantId, userId, metadata });
 
@@ -2413,6 +2415,8 @@ export const evaluateAnswer = async (params) => {
       evaluationConfig,
       tenantId: trackingContext.tenantId,
       userId: trackingContext.userId,
+      qualityTier,
+      model,
     });
   }
 
@@ -2512,7 +2516,7 @@ Rubric (score only these criteria): ${JSON.stringify(effectiveRubric.map(({ crit
       tenantId: trackingContext.tenantId,
       userId: trackingContext.userId,
       request: {
-        model: OPENAI_MODEL,
+        model: model || OPENAI_MODEL,
         messages: [
           { role: 'system', content: systemPrompt },
           { role: 'user', content: userPrompt },
@@ -2529,6 +2533,14 @@ Rubric (score only these criteria): ${JSON.stringify(effectiveRubric.map(({ crit
     }
 
     const receivedRubricScores = Array.isArray(evaluation?.rubricScores) ? evaluation.rubricScores : [];
+    const hasCompleteRubricResponse = effectiveRubric.length > 0
+      && receivedRubricScores.length === effectiveRubric.length
+      && effectiveRubric.every((rubricEntry) => receivedRubricScores.some(
+        (item) => normalizeEvaluationText(item?.criterion) === normalizeEvaluationText(rubricEntry.criterion)
+      ));
+    if (effectiveRubric.length && !hasCompleteRubricResponse) {
+      throw new Error('Rubric evaluation response is incomplete or has mismatched criterion identifiers.');
+    }
     const mappedScores = effectiveRubric.map((rubricEntry) => {
       const candidate = receivedRubricScores.find(
         (item) => normalizeEvaluationText(item?.criterion) === normalizeEvaluationText(rubricEntry.criterion)
@@ -2591,6 +2603,20 @@ Rubric (score only these criteria): ${JSON.stringify(effectiveRubric.map(({ crit
     return result;
   } catch (error) {
     console.error('OpenAI evaluation error:', error);
+    if (Array.isArray(rubric) && rubric.length) {
+      return {
+        score: null,
+        pointsEarned: null,
+        isCorrect: false,
+        confidence: 0,
+        needsReview: true,
+        feedback: 'Rubric evaluation could not be completed.',
+        rubricScores: [],
+        provider: 'fallback',
+        fallbackReason: 'RUBRIC_EVALUATION_ERROR',
+        rubricEvaluationFailed: true,
+      };
+    }
     return {
       ...evaluateFallbackAnswer(params),
       provider: 'fallback',

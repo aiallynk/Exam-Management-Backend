@@ -6,6 +6,7 @@ import {
   buildTeacherAnnotationPlan,
   classifyVerdict,
   formatScoreLabel,
+  formatTeacherMarkLabel,
   isWordLevelRegion,
   placeTeacherMark,
   regionsOverlap,
@@ -39,6 +40,8 @@ describe('teacher annotation plan — verdicts and labels', () => {
     assert.equal(formatScoreLabel(5, 5), '5 / 5');
     assert.equal(formatScoreLabel(3, 5), '3 / 5');
     assert.equal(formatScoreLabel(0, 5), '0 / 5');
+    assert.equal(formatTeacherMarkLabel({ questionNumber: 2, earned: 2, max: 5 }), 'Q2  2/5');
+    assert.equal(formatTeacherMarkLabel({ questionNumber: 4, earned: 0, max: 5, notAttempted: true }), 'Q4  Not attempted 0/5');
   });
 });
 
@@ -200,7 +203,7 @@ describe('teacher annotation plan — required render cases', () => {
     });
     const q4 = plan.marks.find((mark) => mark.questionNumber === 4);
     const q5 = plan.marks.find((mark) => mark.questionNumber === 5);
-    assert.equal(q4.placement.strategy, 'RIGHT_MARGIN');
+    assert.equal(q4.placement.strategy, 'SAFE_MARGIN');
     assert.ok(q4.placement.x >= 0.76, 'Q4 uses the right-side margin rather than Q5 space');
     assert.ok(!regionsOverlap(q4.placement, { x: 0.08, y: 0.36, width: 0.68, height: 0.11 }, 0));
     assert.ok(!regionsOverlap(q4.placement, q5.placement, 0));
@@ -260,6 +263,58 @@ describe('teacher annotation plan — required render cases', () => {
     assert.equal(plan.marks.length, 5);
     assert.equal(new Set(plan.marks.map((mark) => mark.questionNumber)).size, 5);
     assertDerivativeIntegrity(plan, { answers: authoritative, attemptTotal: 15 });
+  });
+
+  test('12. Ravi fixture — Q2 score stays with Q2 and every mark includes question number', () => {
+    const authoritative = answers({ q1: 5, q2: 2, q3: 4, q4: 0, q5: 3 });
+    const plan = buildTeacherAnnotationPlan({
+      answers: authoritative,
+      segments: [
+        { _id: 's1', pageIds: ['p1'], boundingRegion: { x: 0.08, y: 0.08, width: 0.68, height: 0.14 } },
+        { _id: 's2', pageIds: ['p1'], boundingRegion: { x: 0.08, y: 0.26, width: 0.68, height: 0.14 } },
+        {
+          _id: 's3',
+          pageIds: ['p1', 'p2'],
+          boundingRegion: { x: 0.08, y: 0.54, width: 0.68, height: 0.16 },
+          lineBoxes: [
+            { pageId: 'p2', x: 0.08, y: 0.10, width: 0.68, height: 0.05 },
+            { pageId: 'p2', x: 0.08, y: 0.16, width: 0.68, height: 0.05 },
+          ],
+        },
+        { _id: 's5', pageIds: ['p2'], boundingRegion: { x: 0.08, y: 0.40, width: 0.68, height: 0.18 } },
+      ],
+      questionAnchorsByQuestionNumber: {
+        4: { pageNumber: 2, region: { x: 0.08, y: 0.31, width: 0.18, height: 0.035 } },
+      },
+      pageNumberById,
+      attemptTotal: 14,
+    });
+
+    assert.deepEqual(plan.marks.map((mark) => mark.scoreLabel), ['5 / 5', '2 / 5', '4 / 5', '0 / 5', '3 / 5']);
+    assert.equal(plan.displayedTotal, 14);
+
+    const q1 = plan.marks.find((mark) => mark.questionNumber === 1);
+    const q2 = plan.marks.find((mark) => mark.questionNumber === 2);
+    const q3 = plan.marks.find((mark) => mark.questionNumber === 3);
+    const q4 = plan.marks.find((mark) => mark.questionNumber === 4);
+    const q5 = plan.marks.find((mark) => mark.questionNumber === 5);
+
+    plan.marks.forEach((mark) => {
+      assert.match(mark.displayLabel, new RegExp(`^Q${mark.questionNumber}\\s`));
+    });
+
+    assert.equal(q1.pageNumber, 1);
+    assert.equal(q2.pageNumber, 1);
+    assert.equal(q3.pageNumber, 2);
+    assert.equal(q4.pageNumber, 2);
+    assert.equal(q5.pageNumber, 2);
+
+    const q3StartRegion = { x: 0.08, y: 0.54, width: 0.68, height: 0.16 };
+    assert.ok(q2.placement.y < q3StartRegion.y + q3StartRegion.height * 0.5, 'Q2 marker must not sit inside Q3 start region');
+    assert.ok(!regionsOverlap(q2.placement, q3StartRegion, 0.02));
+    assert.ok(q3.placement.y >= 0.08 && q3.placement.y <= 0.28, 'Q3 final score anchors near continuation on page 2');
+
+    assertDerivativeIntegrity(plan, { answers: authoritative, attemptTotal: 14 });
   });
 
   test('11. evaluator check, cross, highlight, and underline stay on original-page coordinates for export', () => {

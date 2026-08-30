@@ -23,8 +23,39 @@ const AnswerSchema = new mongoose.Schema(
     },
     pointsEarned: {
       type: Number,
-      default: 0,
+      // A provisional general-AI recommendation intentionally has no
+      // authoritative mark. Legacy answers retain their historic default 0.
+      default: null,
       min: 0,
+    },
+    // One authoritative score-resolution contract. `pointsEarned` remains
+    // the legacy effective-score field for existing readers, but is written
+    // only when finalScore is resolved for new provisional evaluation flows.
+    scoringMode: {
+      type: String,
+      enum: ['RUBRIC_BASED', 'AI_GENERAL_PROVISIONAL', 'EVALUATION_FAILED', 'MANUAL', 'DETERMINISTIC'],
+      default: undefined,
+    },
+    aiEvaluationStatus: {
+      type: String,
+      enum: ['NOT_RUN', 'SUCCESS', 'FAILED', 'LOW_CONFIDENCE'],
+      default: undefined,
+    },
+    aiProposedScore: { type: Number, min: 0, default: null },
+    aiConfidence: { type: Number, min: 0, max: 1, default: null },
+    evaluatorDecision: {
+      type: String,
+      enum: ['PENDING', 'APPROVE_AI', 'OVERRIDE', 'MANUAL_SCORE'],
+      default: undefined,
+    },
+    evaluatorOverrideScore: { type: Number, min: 0, default: null },
+    finalScore: { type: Number, min: 0, default: null },
+    scoreResolved: { type: Boolean, default: undefined },
+    requiresReview: { type: Boolean, default: undefined },
+    answerStatus: {
+      type: String,
+      enum: ['ATTEMPTED', 'NOT_ATTEMPTED'],
+      default: undefined,
     },
     aiEvaluation: {
       type: mongoose.Schema.Types.Mixed,

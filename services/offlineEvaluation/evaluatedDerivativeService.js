@@ -14,7 +14,9 @@ import {
   assertDerivativeIntegrity,
   buildTeacherAnnotationPlan,
 } from './evaluatedAnnotationPlan.js';
+import { buildQuestionAnswerMap } from './questionAnswerMapService.js';
 import { formatRubricRowsForAppendix } from './rubricScoreNormalization.js';
+import { isUnresolvedScore, resolveAuthoritativeScore } from './scoreResolutionService.js';
 
 const PAGE = { width: 595.28, height: 841.89, margin: 46 };
 const COLORS = {
@@ -68,6 +70,12 @@ const formatAppendixTotal = (value) => {
   return Number.isInteger(numeric) ? String(numeric) : String(Math.round(numeric * 100) / 100);
 };
 
+const formatAppendixReviewStatus = (row) => {
+  if (row.scoreSource) return row.scoreSource;
+  if (row.finalStatus === 'AI Evaluated' && !row.examinerOverride) return 'AI Evaluated — Review Pending';
+  return row.finalStatus;
+};
+
 const reviewStatusLabel = (value) => ({
   NOT_ATTEMPTED: 'Not Attempted',
   NOT_EVALUATED: 'Pending',
@@ -85,7 +93,7 @@ const reviewStatusLabel = (value) => ({
 const scoreSourceLabel = (answer) => {
   const source = String(answer?.finalScoreSource || '').toUpperCase();
   if (source === 'RULE_ENGINE') return 'Final Score set by assessment rules';
-  if (source === 'AI') return answer?.examinerReviewedAt || answer?.moderatorReviewedAt ? 'AI Score Approved' : 'AI Evaluated';
+  if (source === 'AI') return answer?.examinerReviewedAt || answer?.moderatorReviewedAt ? 'AI Score Approved' : 'AI Evaluated — Review Pending';
   if (['EXAMINER', 'MODERATOR', 'ADMIN_OVERRIDE'].includes(source)) return 'Evaluator Modified';
   return '';
 };
@@ -96,7 +104,7 @@ export const buildDerivativeReviewRows = (answers = []) => answers.map((answer) 
   return {
     questionNumber: Number(answer.questionId?.order ?? 0) + 1,
     questionText: answer.questionId?.questionText || '',
-    marksObtained: Number(answer.pointsEarned || 0),
+    marksObtained: resolveAuthoritativeScore(answer),
     maxMarks: Number(answer.questionId?.points || 0),
     comment: comment.text,
     commentLabel: comment.label,
@@ -281,8 +289,7 @@ const drawTeacherMark = ({ page, frame, mark, regular, bold }) => {
   if (mark.verdict === 'INCORRECT') drawCross(page, symbolX, symbolY, symbolSize, verdictColor, metrics.annotationStroke);
   else if (mark.verdict === 'CORRECT') drawCheck(page, symbolX, symbolY, symbolSize, verdictColor, metrics.annotationStroke);
 
-  const showQuestion = mark.placement.strategy === 'SAFE_MARGIN' || mark.placement.confidence === 'LOW';
-  const label = showQuestion ? `Q${mark.questionNumber}  ${mark.scoreLabel}` : mark.scoreLabel;
+  const label = mark.displayLabel || `Q${mark.questionNumber}  ${mark.scoreLabel}`;
   const labelX = box.x + metrics.scorePaddingX + (mark.verdict === 'PARTIAL' ? 0 : symbolSize + metrics.scorePaddingX * 0.75);
   page.drawText(label, {
     x: labelX,
@@ -436,6 +443,12 @@ export const buildEvaluatedDerivativePdf = async ({
   questionAnchorsByQuestionNumber = {},
   attemptTotal = null,
 }) => {
+  const questionAnswerMap = buildQuestionAnswerMap({
+    answers,
+    segments,
+    pageNumberById,
+    questionAnchorsByQuestionNumber,
+  });
   const plan = buildTeacherAnnotationPlan({
     answers,
     segments,
@@ -444,7 +457,7 @@ export const buildEvaluatedDerivativePdf = async ({
     questionAnchorsByQuestionNumber,
     attemptTotal,
   });
-  assertDerivativeIntegrity(plan, { answers, attemptTotal });
+  assertDerivativeIntegrity(plan, { answers, attemptTotal, questionAnswerMap });
 
   const pdf = await PDFDocument.create();
   const frames = await appendOriginal({ pdf, sourceBuffer, mimeType });
@@ -557,8 +570,7 @@ export const buildEvaluatedDerivativePdf = async ({
         { size: 8, indent: 10 },
       );
     }
-    paragraph(`Review status: ${row.finalStatus}`, { size: 8 });
-    if (row.scoreSource) paragraph(row.scoreSource, { size: 8 });
+    paragraph(`Review status: ${formatAppendixReviewStatus(row)}`, { size: 8 });
     y -= 10;
   });
 
@@ -585,6 +597,9 @@ export const generateEvaluatedDerivative = async ({ answerScriptId, actorUserId,
     AnswerAnnotation.find({ answerScriptId: script._id, status: { $in: ['APPROVED', 'EDITED'] } }).lean(),
   ]);
   if (!sourceBuffer) throw new Error('Original answer script is unavailable in private storage.');
+  if (attempt?.scoreSummary?.isFinal === false || answers.some((answer) => isUnresolvedScore(answer) || resolveAuthoritativeScore(answer) === null)) {
+    throw new Error('The evaluated paper cannot be rendered while any answer has only a proposed or failed evaluation score.');
+  }
   const attemptTotal = Number.isFinite(Number(attempt?.scoreSummary?.totalScore))
     ? Number(attempt.scoreSummary.totalScore)
     : answers.reduce((sum, answer) => sum + Number(answer.pointsEarned || 0), 0);

@@ -1,4 +1,5 @@
 import Answer from '../models/Answer.js';
+import { isUnresolvedScore, resolveAuthoritativeScore, resolveProposedScore } from '../services/offlineEvaluation/scoreResolutionService.js';
 
 const isFiniteNumber = (value) => Number.isFinite(Number(value));
 
@@ -60,32 +61,45 @@ export const ensureScoreSummary = async (
   }
 
   let totalScore = 0;
+  let proposedTotal = 0;
   let maxScore = 0;
+  let hasUnresolvedScore = false;
 
   answers.forEach((answer) => {
-    totalScore += Number(answer.pointsEarned) || 0;
+    const authoritativeScore = resolveAuthoritativeScore(answer);
+    const proposedScore = resolveProposedScore(answer);
+    if (isUnresolvedScore(answer) || authoritativeScore === null) {
+      hasUnresolvedScore = true;
+      proposedTotal += proposedScore ?? 0;
+    } else {
+      totalScore += authoritativeScore;
+      proposedTotal += authoritativeScore;
+    }
     const questionPoints = Number(answer.questionId?.points) || 0;
     maxScore += questionPoints;
   });
 
-  const percentage = maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : 0;
+  const percentage = !hasUnresolvedScore && maxScore > 0 ? Math.round((totalScore / maxScore) * 100) : null;
 
   attempt.scoreSummary = {
-    totalScore,
+    totalScore: hasUnresolvedScore ? null : totalScore,
     maxScore,
     percentage,
+    proposedTotal: hasUnresolvedScore ? proposedTotal : null,
+    isFinal: !hasUnresolvedScore,
     computedAt: new Date(),
   };
   await attempt.save();
 
   return {
     summary: {
-      totalScore,
+      totalScore: hasUnresolvedScore ? null : totalScore,
       maxScore,
       percentage,
+      proposedTotal: hasUnresolvedScore ? proposedTotal : null,
+      isFinal: !hasUnresolvedScore,
     },
     answers,
   };
 };
-
 

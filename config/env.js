@@ -71,7 +71,8 @@ See server/env.example for reference.
 validateEnvVars();
 
 const DEFAULT_OPENAI_MODEL = 'gpt-4o-mini';
-const DEFAULT_OPENAI_QUESTION_MODEL = 'gpt-4o';
+const DEFAULT_OPENAI_QUESTION_MODEL = 'gpt-5.6-luna-medium';
+const DEFAULT_GEMINI_MODEL = 'gemini-3.1-flash-lite';
 const resolveOpenAiModel = () => {
   const configured = String(process.env.OPENAI_MODEL || '').trim();
   return configured || DEFAULT_OPENAI_MODEL;
@@ -191,10 +192,14 @@ const config = {
   openaiImageModel: process.env.OPENAI_IMAGE_MODEL || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
 
   // Gemini models. GEMINI_MODEL is the shared fallback already used in .env.
-  geminiEvaluationModel: process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.6-flash',
-  geminiVisionModel: process.env.GEMINI_VISION_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.6-flash',
-  geminiHandwritingModel: process.env.GEMINI_HANDWRITING_MODEL || process.env.GEMINI_VISION_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.6-flash',
-  geminiFeedbackModel: process.env.GEMINI_FEEDBACK_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || 'gemini-3.6-flash',
+  geminiEvaluationModel: process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL,
+  // Optional high-accuracy evaluation tier. It is selected server-side only
+  // for eligible subjective-answer operations; absence keeps the standard
+  // configured evaluation model.
+  geminiHighAccuracyEvaluationModel: process.env.GEMINI_HIGH_ACCURACY_EVALUATION_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL,
+  geminiVisionModel: process.env.GEMINI_VISION_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL,
+  geminiHandwritingModel: process.env.GEMINI_HANDWRITING_MODEL || process.env.GEMINI_VISION_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL,
+  geminiFeedbackModel: process.env.GEMINI_FEEDBACK_MODEL || process.env.GEMINI_EVALUATION_MODEL || process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL,
   geminiImageModel: process.env.GEMINI_IMAGE_MODEL || 'gemini-2.5-flash-image',
 };
 

@@ -60,6 +60,24 @@ let cachedSource = 'env';
 let cachedRuntime = null;
 let cachedModels = null;
 
+const RETIRED_OPENAI_MODELS = new Map([
+  ['gpt-4o', 'gpt-5.6-luna-medium'],
+]);
+
+const RETIRED_GEMINI_MODELS = new Map([
+  ['gemini-2.5-flash', 'gemini-3.1-flash-lite'],
+  ['gemini-2.0-flash', 'gemini-3.1-flash-lite'],
+  ['gemini-3.1-flash', 'gemini-3.1-flash-lite'],
+  ['gemini-3.6-flash', 'gemini-3.1-flash-lite'],
+  ['gemini-3.1-flash-lite-preview', 'gemini-3.1-flash-lite'],
+]);
+
+const normalizeConfiguredModel = (model) => {
+  const value = String(model || '').trim();
+  if (!value) return value;
+  return RETIRED_OPENAI_MODELS.get(value) || RETIRED_GEMINI_MODELS.get(value) || value;
+};
+
 const ENV_MODEL_BY_OPERATION = Object.freeze({
   [AI_OPERATIONS.QUESTION_GENERATION]: () => config.openaiQuestionModel || config.openaiModel,
   [AI_OPERATIONS.CONTENT_GROUNDED_QUESTION_GENERATION]: () => config.openaiQuestionModel || config.openaiModel,
@@ -89,9 +107,9 @@ const ENV_MODEL_BY_OPERATION = Object.freeze({
 
 export const getModelForOperation = (operation) => {
   const fromDb = cachedModels?.[operation];
-  if (fromDb) return fromDb;
+  if (fromDb) return normalizeConfiguredModel(fromDb);
   const resolver = ENV_MODEL_BY_OPERATION[operation];
-  return resolver ? resolver() : config.openaiModel;
+  return normalizeConfiguredModel(resolver ? resolver() : config.openaiModel);
 };
 
 export const getCachedModelConfig = () => cachedModels || {};

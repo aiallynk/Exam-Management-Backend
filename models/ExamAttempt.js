@@ -109,7 +109,7 @@ const ExamAttemptSchema = new mongoose.Schema(
     scoreSummary: {
       totalScore: {
         type: Number,
-        default: 0,
+        default: null,
         min: 0,
       },
       maxScore: {
@@ -119,9 +119,21 @@ const ExamAttemptSchema = new mongoose.Schema(
       },
       percentage: {
         type: Number,
-        default: 0,
+        default: null,
         min: 0,
         max: 100,
+      },
+      // When a handwritten answer has only a provisional AI suggestion, no
+      // official total exists. Keep an explicitly-labelled internal estimate
+      // separate from the published/effective total.
+      proposedTotal: {
+        type: Number,
+        default: null,
+        min: 0,
+      },
+      isFinal: {
+        type: Boolean,
+        default: true,
       },
       computedAt: {
         type: Date,

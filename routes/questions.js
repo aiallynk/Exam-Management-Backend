@@ -1020,8 +1020,11 @@ const createQuestionWithManagedImage = async ({
     evaluationConfig && typeof evaluationConfig === 'object' && !Array.isArray(evaluationConfig)
       ? evaluationConfig
       : {};
-  const rubric = Array.isArray(normalizedEvaluationConfig.rubric)
-    ? normalizedEvaluationConfig.rubric
+  const effectiveEvaluationConfig = bankContentOverride?.evaluationConfig && Object.keys(bankContentOverride.evaluationConfig).length
+    ? bankContentOverride.evaluationConfig
+    : normalizedEvaluationConfig;
+  const rubric = Array.isArray(effectiveEvaluationConfig.rubric)
+    ? effectiveEvaluationConfig.rubric
     : [];
   if (rubric.length) {
     const rubricIsValid = rubric.every((criterion) =>
@@ -1051,9 +1054,8 @@ const createQuestionWithManagedImage = async ({
     questionFormat: bankContentOverride?.questionFormat || normalizedQuestionFormat,
     options: bankContentOverride?.options ?? options,
     matchingPairs: bankContentOverride?.matchingPairs ?? (Array.isArray(matchingPairs) ? matchingPairs : []),
-    evaluationConfig: bankContentOverride?.evaluationConfig && Object.keys(bankContentOverride.evaluationConfig).length
-      ? bankContentOverride.evaluationConfig
-      : normalizedEvaluationConfig,
+    evaluationConfig: effectiveEvaluationConfig,
+    rubricSnapshot: rubric.length ? { criteria: rubric } : null,
     correctAnswer: normalizeCorrectAnswerForStorage(
       bankContentOverride?.questionType || normalizedStorageQuestionType,
       bankContentOverride?.correctAnswer ?? correctAnswer,

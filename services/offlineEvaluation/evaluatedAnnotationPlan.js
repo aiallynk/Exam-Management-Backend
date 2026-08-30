@@ -27,6 +27,18 @@ export const formatMarkNumber = (value) => {
 
 export const formatScoreLabel = (earned, max) => `${formatMarkNumber(earned)} / ${formatMarkNumber(max)}`;
 
+export const formatTeacherMarkLabel = ({
+  questionNumber,
+  earned,
+  max,
+  notAttempted = false,
+} = {}) => {
+  const score = `${formatMarkNumber(earned)}/${formatMarkNumber(max)}`;
+  const prefix = `Q${questionNumber}`;
+  if (notAttempted) return `${prefix}  Not attempted ${score}`;
+  return `${prefix}  ${score}`;
+};
+
 export const classifyVerdict = (earned, max) => {
   const marks = Number(earned) || 0;
   const maximum = Number(max) || 0;
@@ -65,10 +77,15 @@ const fitsOnPage = (rect, occupied, padding = 0.008) => (
 export const placeTeacherMark = ({
   answerRegion = null,
   occupiedRegions = [],
+  forbiddenRegions = [],
   existingPlacements = [],
   markSize = MARK_SIZE,
 } = {}) => {
   const occupied = [...occupiedRegions, ...existingPlacements];
+  const forbidden = [...forbiddenRegions];
+  const collidesForbidden = (rect, padding = 0.012) => (
+    forbidden.some((region) => regionsOverlap(rect, normalizeRegion(region), padding))
+  );
   const size = {
     width: Number(markSize.width) || MARK_SIZE.width,
     height: Number(markSize.height) || MARK_SIZE.height,
@@ -86,7 +103,7 @@ export const placeTeacherMark = ({
       y: region.y + 0.006,
       ...size,
     };
-    if (fitsOnPage(right, occupied)) {
+    if (fitsOnPage(right, occupied) && !collidesForbidden(right)) {
       return { ...right, confidence: reliable ? 'HIGH' : 'MEDIUM', strategy: 'RIGHT_MARGIN', leaderTo };
     }
 
@@ -95,7 +112,7 @@ export const placeTeacherMark = ({
       y: region.y + 0.006,
       ...size,
     };
-    if (clampedRight.x >= region.x + region.width - 0.012 && fitsOnPage(clampedRight, occupied)) {
+    if (clampedRight.x >= region.x + region.width - 0.012 && fitsOnPage(clampedRight, occupied) && !collidesForbidden(clampedRight)) {
       return { ...clampedRight, confidence: reliable ? 'HIGH' : 'MEDIUM', strategy: 'RIGHT_MARGIN', leaderTo };
     }
 
@@ -104,7 +121,7 @@ export const placeTeacherMark = ({
       y: region.y + region.height + 0.01,
       ...size,
     };
-    if (fitsOnPage(below, occupied)) {
+    if (fitsOnPage(below, occupied) && !collidesForbidden(below)) {
       return { ...below, confidence: reliable ? 'HIGH' : 'MEDIUM', strategy: 'BELOW_ANSWER', leaderTo };
     }
   }
@@ -115,7 +132,7 @@ export const placeTeacherMark = ({
       y: 0.075 + slot * (size.height + 0.016),
       ...size,
     };
-    if (fitsOnPage(safe, occupied)) {
+    if (fitsOnPage(safe, occupied) && !collidesForbidden(safe)) {
       return {
         ...safe,
         confidence: reliable ? 'MEDIUM' : 'LOW',
@@ -265,21 +282,50 @@ const scoreAnchorForSegment = ({ segment, pageNumber, pageNumberById }) => {
   return regionForLines(finalPageLines);
 };
 
+const regionsForSegmentOnPage = (segment, pageNumber, pageNumberById) => {
+  if (!segment) return [];
+  const pages = pageNumbersForSegment(segment, pageNumberById);
+  if (!pages.includes(pageNumber)) return [];
+  const regions = [];
+  if (!pages.length || pages[0] === pageNumber) {
+    const region = normalizeRegion(segment.boundingRegion);
+    if (region) regions.push(region);
+  }
+  for (const line of segment.lineBoxes || []) {
+    if (Number(pageNumberById[String(line?.pageId)] || 0) === pageNumber) {
+      const region = normalizeRegion(line);
+      if (region) regions.push(region);
+    }
+  }
+  return regions;
+};
+
+const forbiddenRegionsForQuestion = ({
+  questionNumber,
+  currentSegmentId,
+  segments,
+  pageNumber,
+  pageNumberById,
+  questionAnchorsByQuestionNumber = {},
+}) => {
+  const forbidden = [];
+  for (const segment of segments) {
+    if (String(segment._id) === String(currentSegmentId || '')) continue;
+    forbidden.push(...regionsForSegmentOnPage(segment, pageNumber, pageNumberById));
+  }
+  Object.entries(questionAnchorsByQuestionNumber || {}).forEach(([number, anchor]) => {
+    if (Number(number) === Number(questionNumber)) return;
+    if (Number(anchor?.pageNumber) !== Number(pageNumber)) return;
+    const region = normalizeRegion(anchor?.region);
+    if (region) forbidden.push(region);
+  });
+  return forbidden;
+};
+
 const occupiedRegionsOnPage = ({ segments, pageNumber, pageNumberById, includeLineBoxes = true }) => {
   const occupied = [];
   for (const segment of segments) {
-    const pages = pageNumbersForSegment(segment, pageNumberById);
-    if (!pages.includes(pageNumber)) continue;
-    if (!pages.length || pages[0] === pageNumber) {
-      const region = normalizeRegion(segment.boundingRegion);
-      if (region) occupied.push(region);
-    }
-    if (includeLineBoxes && pages[0] === pageNumber) {
-      for (const line of segment.lineBoxes || []) {
-        const region = normalizeRegion(line);
-        if (region) occupied.push(region);
-      }
-    }
+    occupied.push(...regionsForSegmentOnPage(segment, pageNumber, pageNumberById));
   }
   return occupied;
 };
@@ -327,6 +373,14 @@ export const buildTeacherAnnotationPlan = ({
         ...occupiedRegionsOnPage({ segments, pageNumber, pageNumberById }),
         ...annotationOccupancy,
       ],
+      forbiddenRegions: forbiddenRegionsForQuestion({
+        questionNumber,
+        currentSegmentId: segment?._id,
+        segments,
+        pageNumber,
+        pageNumberById,
+        questionAnchorsByQuestionNumber,
+      }),
       existingPlacements,
       markSize,
     });
@@ -338,6 +392,12 @@ export const buildTeacherAnnotationPlan = ({
       marksObtained,
       maxMarks,
       scoreLabel: formatScoreLabel(marksObtained, maxMarks),
+      displayLabel: formatTeacherMarkLabel({
+        questionNumber,
+        earned: marksObtained,
+        max: maxMarks,
+        notAttempted,
+      }),
       verdict: classifyVerdict(marksObtained, maxMarks),
       remark,
       pageNumber,
@@ -355,7 +415,7 @@ export const buildTeacherAnnotationPlan = ({
   };
 };
 
-export const assertDerivativeIntegrity = (plan, { answers = [], attemptTotal = null } = {}) => {
+export const assertDerivativeIntegrity = (plan, { answers = [], attemptTotal = null, questionAnswerMap = null } = {}) => {
   const expected = [...answers]
     .sort((left, right) => Number(left.questionId?.order ?? 0) - Number(right.questionId?.order ?? 0))
     .map((answer) => ({
@@ -402,6 +462,18 @@ export const assertDerivativeIntegrity = (plan, { answers = [], attemptTotal = n
         },
       );
     }
+    const expectedLabel = formatTeacherMarkLabel({
+      questionNumber: mark.questionNumber,
+      earned: authoritative.marksObtained,
+      max: authoritative.maxMarks,
+      notAttempted: mark.remark === 'Not attempted',
+    });
+    if (mark.displayLabel !== expectedLabel) {
+      throw new EvaluatedDerivativeIntegrityError(
+        `Rendered mark for question ${mark.questionNumber} is missing explicit question ownership.`,
+        { questionNumber: mark.questionNumber, displayLabel: mark.displayLabel, expectedLabel },
+      );
+    }
   }
 
   for (const authoritative of expected) {
@@ -428,6 +500,24 @@ export const assertDerivativeIntegrity = (plan, { answers = [], attemptTotal = n
       'Displayed question marks do not match the final attempt total.',
       { displayedTotal, attemptTotal: finalTotal },
     );
+  }
+
+  if (Array.isArray(questionAnswerMap) && questionAnswerMap.length) {
+    if (questionAnswerMap.length !== plan.marks.length) {
+      throw new EvaluatedDerivativeIntegrityError(
+        'Question-answer map does not align with rendered marks.',
+        { mapped: questionAnswerMap.length, rendered: plan.marks.length },
+      );
+    }
+    for (const mark of plan.marks) {
+      const mapped = questionAnswerMap.find((entry) => entry.questionNumber === mark.questionNumber);
+      if (!mapped || !sameMarks(mapped.finalScore, mark.marksObtained)) {
+        throw new EvaluatedDerivativeIntegrityError(
+          `Question-answer map score for Q${mark.questionNumber} does not match rendered mark.`,
+          { questionNumber: mark.questionNumber },
+        );
+      }
+    }
   }
 
   return true;

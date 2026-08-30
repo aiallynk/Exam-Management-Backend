@@ -1,11 +1,13 @@
 const MODEL_PRICING_USD_PER_1M = Object.freeze({
   'gpt-4o-mini': { input: 0.15, output: 0.6 },
   'gpt-4o': { input: 5, output: 15 },
+  'gpt-5.6-luna-medium': { input: 0.2, output: 0.8 },
   'gpt-4.1': { input: 2, output: 8 },
   'gpt-4.1-mini': { input: 0.4, output: 1.6 },
   'gpt-4.1-nano': { input: 0.1, output: 0.4 },
   'text-embedding-3-small': { input: 0.02, output: 0.02 },
   'text-embedding-3-large': { input: 0.13, output: 0.13 },
+  'gemini-3.1-flash-lite': { input: 0.125, output: 0.75 },
   'gemini-3.6-flash': { input: 0.15, output: 0.6 },
   'gemini-3.5-flash-lite': { input: 0.075, output: 0.3 },
   'gemini-2.5-flash': { input: 0.15, output: 0.6 },
@@ -23,6 +25,7 @@ const IMAGE_GENERATION_FLAT_USD = Object.freeze({
 });
 
 const KNOWN_MODEL_PREFIXES = Object.freeze([
+  'gpt-5.6-luna-medium',
   'gpt-4o-mini',
   'gpt-4o',
   'gpt-4.1-mini',
@@ -30,6 +33,7 @@ const KNOWN_MODEL_PREFIXES = Object.freeze([
   'gpt-4.1',
   'text-embedding-3-small',
   'text-embedding-3-large',
+  'gemini-3.1-flash-lite',
   'gemini-3.6-flash',
   'gemini-3.5-flash-lite',
   'gemini-2.5-flash-image',

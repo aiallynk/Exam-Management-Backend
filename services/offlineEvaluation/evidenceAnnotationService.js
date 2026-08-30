@@ -76,6 +76,7 @@ const marginRegionForSegment = (segment, index = 0) => {
 
 export const buildEvidenceObservations = (result = {}) => {
   const ai = result?.aiEvaluation && typeof result.aiEvaluation === 'object' ? result.aiEvaluation : {};
+  const proposedScore = Number(result?.aiProposedScore ?? ai.proposedScore ?? result?.pointsEarned);
   const observations = [];
   const push = (entry) => {
     if (!entry?.feedback && !entry?.quotedText) return;
@@ -90,7 +91,7 @@ export const buildEvidenceObservations = (result = {}) => {
   (Array.isArray(ai.missingConcepts) ? ai.missingConcepts : []).slice(0, 4).forEach((concept) => {
     push({ type: 'MISSING', quotedText: '', feedback: `Missing: ${String(concept).slice(0, 220)}`, severity: 'major' });
   });
-  if (Number(result?.pointsEarned || 0) > 0 && Number(result?.maxScore || 0) > 0 && Number(result.pointsEarned) < Number(result.maxScore)) {
+  if (Number.isFinite(proposedScore) && proposedScore > 0 && Number(result?.maxScore || 0) > 0 && proposedScore < Number(result.maxScore)) {
     push({
       type: 'PARTIAL',
       quotedText: '',
@@ -110,6 +111,19 @@ export const buildEvidenceObservations = (result = {}) => {
       feedback: item?.feedback || item?.message || '',
       rubricCriterionId: item?.rubricCriterionId || '',
       severity: item?.severity || 'minor',
+    });
+  });
+  // General no-rubric scoring returns structured concept findings. They are
+  // proposed annotations only, and evidence text is matched against OCR line
+  // boxes before any word-level mark is used.
+  (Array.isArray(ai.findings) ? ai.findings : []).slice(0, 8).forEach((finding) => {
+    const type = String(finding?.type || 'UNCLEAR').toUpperCase();
+    if (!['CORRECT', 'INCORRECT', 'PARTIAL', 'MISSING', 'IRRELEVANT', 'UNCLEAR'].includes(type)) return;
+    push({
+      type: type === 'IRRELEVANT' || type === 'UNCLEAR' ? 'PARTIAL' : type,
+      quotedText: finding?.evidenceText || '',
+      feedback: finding?.description || '',
+      severity: type === 'INCORRECT' || type === 'MISSING' ? 'major' : 'minor',
     });
   });
   return observations;

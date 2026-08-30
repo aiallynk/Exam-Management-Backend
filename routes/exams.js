@@ -2529,23 +2529,27 @@ router.post(
         return res.status(404).json({ error: 'Exam not found' });
       }
 
-      // Evaluation-mode gate: exams that require examiner/moderator review
-      // cannot publish while any in-scope answer is still pending review.
-      // Optional review never blocks publication. Existing exams default to
-      // AUTOMATIC, so historic behavior and already-published results remain
-      // untouched.
-      if (['AI_MANDATORY_REVIEW', 'MANUAL', 'HYBRID'].includes(exam.evaluationMode)) {
-        const attemptIds = await ExamAttempt.find({
-          examId: exam._id,
-          isCompleted: true,
-        }).distinct('_id');
-
-        const pendingReviewCount = await Answer.countDocuments({
-          attemptId: { $in: attemptIds },
+      const attemptIds = await ExamAttempt.find({
+        examId: exam._id,
+        isCompleted: true,
+      }).distinct('_id');
+      const mandatoryReviewMode = ['AI_MANDATORY_REVIEW', 'MANUAL', 'HYBRID'].includes(exam.evaluationMode);
+      // A no-rubric general-AI score is always provisional, independently of
+      // the legacy exam evaluation mode. A broken configured rubric likewise
+      // cannot be released as zero or as a generic fallback score.
+      const pendingReviewCount = attemptIds.length ? await Answer.countDocuments({
+        attemptId: { $in: attemptIds },
+        $or: [
+          { scoringMode: 'AI_GENERAL_PROVISIONAL', evaluatorDecision: 'PENDING' },
+          { scoringMode: 'EVALUATION_FAILED' },
+          { scoreResolved: false },
+          ...(mandatoryReviewMode ? [{
           evaluationStatus: { $in: ['PENDING_REVIEW', 'UNDER_REVIEW', 'FLAGGED'] },
-        });
+          }] : []),
+        ],
+      }) : 0;
 
-        if (pendingReviewCount > 0) {
+      if (pendingReviewCount > 0) {
           await logAuditEvent(AUDIT_ACTIONS.RESULT_PUBLICATION_BLOCKED, {
             userId: req.user._id,
             userRole: req.user.role,
@@ -2559,7 +2563,6 @@ router.post(
             pendingReviewCount,
           });
         }
-      }
 
       exam.resultsReleasedAt = new Date();
       await exam.save();

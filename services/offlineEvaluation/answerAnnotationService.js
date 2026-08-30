@@ -54,7 +54,11 @@ const annotationHash = (value) => crypto.createHash('sha256').update(JSON.string
 
 export const buildCanonicalAnnotations = ({ segment, result, pageId }) => {
   if (!pageId) return [];
-  const score = Number(result?.pointsEarned || 0);
+  // For no-rubric subjective answers this is explicitly a proposal. It is
+  // persisted as a PROPOSED annotation below and cannot reach the final PDF
+  // until the evaluator resolves the Answer score.
+  const proposed = Number(result?.aiProposedScore ?? result?.aiEvaluation?.proposedScore ?? result?.pointsEarned);
+  const score = Number.isFinite(proposed) ? proposed : 0;
   const maxScore = Number(result?.maxScore || result?.aiEvaluation?.maxScore || 0);
   const markerType = result?.isCorrect ? 'CORRECT' : score > 0 ? 'PARTIAL' : 'INCORRECT';
   const items = [{

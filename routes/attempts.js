@@ -38,6 +38,13 @@ import {
 } from '../utils/certificateTemplate.js';
 import { ensureScoreSummary } from '../utils/attemptScores.js';
 import {
+  applyEvaluatorApproval,
+  applyEvaluatorOverride,
+  applyManualScore,
+  isUnresolvedScore,
+  resolveProposedScore,
+} from '../services/offlineEvaluation/scoreResolutionService.js';
+import {
   reconcileOfflineAttempt,
   validateTimestamps,
   detectAnomalies,
@@ -60,7 +67,9 @@ import { normalizeCodingLanguage } from '../utils/codingQuestions.js';
 import { hasRole } from '../utils/userRoles.js';
 import offlineEvaluationConfig from '../config/offlineEvaluationConfig.js';
 import { ANSWER_SCRIPT_JOB, enqueueAnswerScriptStage } from '../services/offlineEvaluation/answerScriptQueueService.js';
-import { normalizeAnnotationType, normalizeRegion } from '../services/offlineEvaluation/answerAnnotationService.js';
+import { routeAndEvaluate } from '../services/offlineEvaluation/evaluationRouterService.js';
+import { materializeFromScript } from '../services/offlineEvaluation/attemptMaterializationService.js';
+import { normalizeAnnotationType, normalizeRegion, persistCanonicalAnnotations } from '../services/offlineEvaluation/answerAnnotationService.js';
 import {
   FOCUS_VIOLATION_SUBMISSION_SOURCE,
   TAB_SWITCH_DISQUALIFY_STATUS,
@@ -3379,7 +3388,7 @@ router.get(
       const allAnswers = await Answer.find({ attemptId: attempt._id })
         .populate({
           path: 'questionId',
-          select: 'questionText questionType options correctAnswer points sectionId order evaluationConfig',
+          select: 'questionText questionType options correctAnswer points sectionId order evaluationConfig rubricSnapshot',
           populate: { path: 'sectionId', select: 'name order' },
         });
       // Answer.questionId.order is only known after population, so sort
@@ -3520,7 +3529,7 @@ router.put(
       let examinerAssignment = null;
 
       const answer = await Answer.findOne({ _id: req.params.answerId, attemptId: attempt._id })
-        .populate('questionId', 'points sectionId evaluationConfig');
+        .populate('questionId', 'points sectionId evaluationConfig rubricSnapshot');
       if (!answer) return res.status(404).json({ error: 'Answer not found for this attempt' });
 
       examinerAssignment = await hasActiveExaminerAssignment(req.user._id, attempt.examId, {
@@ -3548,7 +3557,7 @@ router.put(
         return res.status(400).json({ error: `Marks cannot exceed the question maximum of ${maximumMarks}` });
       }
 
-      const previousMarks = Number(answer.pointsEarned) || 0;
+      const previousMarks = resolveProposedScore(answer) ?? Number(answer.pointsEarned) ?? 0;
       const marksChanged = Math.abs(requestedMarks - previousMarks) > 0.001;
       if (marksChanged && !normalizeString(req.body.feedback)) {
         return res.status(400).json({
@@ -3560,7 +3569,7 @@ router.put(
       const priorEvaluation = answer.aiEvaluation && typeof answer.aiEvaluation === 'object'
         ? answer.aiEvaluation
         : {};
-      answer.pointsEarned = Number(requestedMarks.toFixed(2));
+      applyManualScore({ answer, evaluatorId: req.user._id, score: Number(requestedMarks.toFixed(2)) });
       answer.isCorrect = maximumMarks > 0 && answer.pointsEarned >= maximumMarks;
       answer.needsReview = false;
       answer.aiEvaluation = {
@@ -3582,12 +3591,7 @@ router.put(
         overrideReason: req.body.overrideReason,
       });
 
-      answer.examinerScore = answer.pointsEarned;
       answer.examinerFeedback = normalizeString(req.body.feedback) || answer.examinerFeedback;
-      answer.examinerId = req.user._id;
-      answer.examinerReviewedAt = new Date();
-      answer.finalScoreSource = 'EXAMINER';
-      answer.evaluationStatus = 'REVIEWED';
 
       await answer.save();
 
@@ -3656,7 +3660,7 @@ router.put(
       let examinerAssignment = null;
 
       const answer = await Answer.findOne({ _id: req.params.answerId, attemptId: attempt._id })
-        .populate('questionId', 'points sectionId evaluationConfig');
+        .populate('questionId', 'points sectionId evaluationConfig rubricSnapshot');
       if (!answer) return res.status(404).json({ error: 'Answer not found for this attempt' });
 
       examinerAssignment = await hasActiveExaminerAssignment(req.user._id, attempt.examId, {
@@ -3680,13 +3684,16 @@ router.put(
         if (examinerAssignment && !examinerAssignment.canApproveAiScore) {
           return res.status(403).json({ error: 'This assignment does not permit approving AI scores.' });
         }
-        answer.examinerScore = answer.pointsEarned;
+        const wasUnresolved = isUnresolvedScore(answer);
+        try {
+          applyEvaluatorApproval({ answer, evaluatorId: req.user._id, maximumMarks });
+        } catch (approvalError) {
+          if (approvalError.statusCode) return res.status(approvalError.statusCode).json({ error: approvalError.message, code: approvalError.code });
+          throw approvalError;
+        }
+        answer.isCorrect = maximumMarks > 0 && answer.pointsEarned >= maximumMarks;
         answer.examinerFeedback = feedback || answer.examinerFeedback;
-        answer.examinerId = req.user._id;
-        answer.examinerReviewedAt = new Date();
-        answer.finalScoreSource = 'EXAMINER';
-        answer.evaluationStatus = 'REVIEWED';
-        answer.needsReview = false;
+        scoreChanged = wasUnresolved;
       } else if (action === 'override') {
         if (examinerAssignment && !examinerAssignment.canOverrideScore) {
           return res.status(403).json({ error: 'This assignment does not permit overriding scores.' });
@@ -3707,7 +3714,7 @@ router.put(
         if (requestedMarks > maximumMarks) {
           return res.status(400).json({ error: `Marks cannot exceed the question maximum of ${maximumMarks}` });
         }
-        const previousMarks = Number(answer.pointsEarned) || 0;
+        const previousMarks = resolveProposedScore(answer) ?? Number(answer.pointsEarned) ?? 0;
         const marksChanged = Math.abs(requestedMarks - previousMarks) > 0.001;
         if (marksChanged && !feedback) {
           return res.status(400).json({
@@ -3716,15 +3723,9 @@ router.put(
             answerId: answer._id,
           });
         }
-        answer.pointsEarned = Number(requestedMarks.toFixed(2));
+        applyEvaluatorOverride({ answer, evaluatorId: req.user._id, score: Number(requestedMarks.toFixed(2)) });
         answer.isCorrect = maximumMarks > 0 && answer.pointsEarned >= maximumMarks;
-        answer.examinerScore = answer.pointsEarned;
         answer.examinerFeedback = feedback || answer.examinerFeedback;
-        answer.examinerId = req.user._id;
-        answer.examinerReviewedAt = new Date();
-        answer.finalScoreSource = 'EXAMINER';
-        answer.evaluationStatus = 'REVIEWED';
-        answer.needsReview = false;
         persistRubricOverride({
           answer,
           rubric,
@@ -3812,6 +3813,64 @@ router.put(
   }
 );
 
+// Retry remains within the existing offline AnswerScript evaluation pipeline:
+// no generic fallback is introduced when a frozen rubric failed. The active
+// evaluator assignment is checked against the exact answer before any call.
+router.post(
+  '/:attemptId/answers/:answerId/retry-ai-evaluation',
+  requireAuth,
+  requireEvaluatorAccess(),
+  validateObjectId('attemptId'),
+  validateObjectId('answerId'),
+  async (req, res, next) => {
+    try {
+      if (!hasRole(req.user, 'EVALUATOR')) return res.status(403).json({ error: 'Evaluator role required to retry an evaluation.' });
+      const attempt = await ExamAttempt.findOne({ _id: req.params.attemptId, tenantId: req.user.tenantId }).select('tenantId examId sourceAnswerScriptId isCompleted');
+      if (!attempt?.sourceAnswerScriptId || !attempt.isCompleted) return res.status(404).json({ error: 'Offline answer-sheet review was not found.' });
+      const answer = await Answer.findOne({ _id: req.params.answerId, attemptId: attempt._id })
+        .populate('questionId', 'questionText questionType correctAnswer points sectionId evaluationConfig rubricSnapshot');
+      if (!answer?.sourceAnswerSegmentId) return res.status(409).json({ error: 'This answer has no retryable AI evaluation source.' });
+      const assignment = await hasActiveExaminerAssignment(req.user._id, attempt.examId, {
+        attemptId: attempt._id,
+        questionId: answer.questionId?._id || answer.questionId,
+        sectionId: answer.questionId?.sectionId,
+      });
+      if (!assignment || !assignment.canApproveAiScore) return res.status(403).json({ error: 'Your evaluator assignment does not permit retrying this AI evaluation.' });
+      if (['REVIEWED', 'FINALIZED', 'MODERATED'].includes(answer.evaluationStatus)) {
+        return res.status(409).json({ error: 'A reviewed score is immutable here; use the evaluator override workflow instead.' });
+      }
+      const segment = await AnswerSegment.findOne({ _id: answer.sourceAnswerSegmentId, answerScriptId: attempt.sourceAnswerScriptId, tenantId: attempt.tenantId });
+      if (!segment) return res.status(404).json({ error: 'The answer region for this evaluation was not found.' });
+      const result = await routeAndEvaluate({
+        question: answer.questionId,
+        extractedText: segment.extractedText,
+        extractionConfidence: segment.extractionConfidence,
+        mappingConfidence: segment.mappingConfidence,
+        tenantId: attempt.tenantId,
+        userId: req.user._id,
+        examId: attempt.examId,
+        answerScriptId: attempt.sourceAnswerScriptId,
+      });
+      segment.evaluationResult = result;
+      segment.evaluationStatus = 'EVALUATED';
+      segment.evaluationCheckpoint = {
+        ...(segment.evaluationCheckpoint || {}),
+        lastError: result.scoringMode === 'EVALUATION_FAILED' ? result.reason : '',
+        evaluatedAt: new Date(),
+      };
+      segment.materializedAnswerId = null;
+      await segment.save();
+      await persistCanonicalAnnotations({ segmentId: segment._id });
+      await materializeFromScript({ answerScriptId: attempt.sourceAnswerScriptId, actorUserId: req.user._id });
+      const refreshed = await Answer.findOne({ _id: answer._id, attemptId: attempt._id });
+      const refreshedAttempt = await ExamAttempt.findById(attempt._id).select('scoreSummary');
+      return res.json({ answer: refreshed, scoreSummary: refreshedAttempt?.scoreSummary || null, message: result.scoringMode === 'EVALUATION_FAILED' ? 'AI evaluation still requires manual review.' : 'AI evaluation was retried.' });
+    } catch (error) {
+      return next(error);
+    }
+  },
+);
+
 router.post(
   '/:attemptId/review/approve-page',
   requireAuth,
@@ -3837,6 +3896,7 @@ router.post(
       const answers = await Answer.find({ _id: { $in: segments.map((segment) => segment.materializedAnswerId) } })
         .populate('questionId', 'points sectionId');
       const approved = [];
+      const approvedAnswers = [];
       const skipped = [];
       for (const answer of answers) {
         const segment = segments.find((item) => String(item.materializedAnswerId) === String(answer._id));
@@ -3857,25 +3917,55 @@ router.post(
           skipped.push({ answerId: answer._id, reason: assignment ? 'Needs individual review because it is flagged, low-confidence, manually routed, or already resolved.' : 'Outside evaluator assignment.' });
           continue;
         }
-        answer.examinerScore = answer.pointsEarned;
-        answer.examinerId = req.user._id;
-        answer.examinerReviewedAt = new Date();
-        answer.finalScoreSource = 'EXAMINER';
-        answer.evaluationStatus = 'REVIEWED';
-        answer.needsReview = false;
+        const maximumMarks = Math.max(Number(answer.questionId?.points) || 0, 0);
+        try {
+          applyEvaluatorApproval({ answer, evaluatorId: req.user._id, maximumMarks });
+        } catch (approvalError) {
+          skipped.push({
+            answerId: answer._id,
+            reason: approvalError.message || 'This answer does not have an approvable score.',
+          });
+          continue;
+        }
+        answer.isCorrect = maximumMarks > 0 && answer.pointsEarned >= maximumMarks;
         await answer.save();
         await AnswerAnnotation.updateMany(
           { answerId: answer._id, status: 'PROPOSED' },
           { $set: { status: 'APPROVED', updatedBy: req.user._id } },
         );
         approved.push(answer._id);
+        approvedAnswers.push({
+          _id: answer._id,
+          evaluationStatus: answer.evaluationStatus,
+          scoringMode: answer.scoringMode,
+          evaluatorDecision: answer.evaluatorDecision,
+          finalScore: answer.finalScore,
+          scoreResolved: answer.scoreResolved,
+          requiresReview: answer.requiresReview,
+          needsReview: answer.needsReview,
+          pointsEarned: answer.pointsEarned,
+          examinerScore: answer.examinerScore,
+        });
         await logAuditEvent(AUDIT_ACTIONS.ANSWER_EXAMINER_REVIEWED, {
           userId: req.user._id, userRole: req.user.role, tenantId: attempt.tenantId,
           resourceType: 'Answer', resourceId: answer._id,
           details: { attemptId: attempt._id, action: 'approve_page', pageId: page._id },
         });
       }
-      return res.json({ approvedAnswerIds: approved, skipped, message: `${approved.length} safe answer(s) approved on page ${page.pageNumber}.` });
+      let scoreSummary = null;
+      if (approved.length) {
+        const updatedAttempt = await ExamAttempt.findById(attempt._id);
+        await ensureScoreSummary(updatedAttempt, { includeAnswers: false, force: true });
+        await updatedAttempt.save();
+        scoreSummary = updatedAttempt.scoreSummary;
+      }
+      return res.json({
+        approvedAnswerIds: approved,
+        approvedAnswers,
+        skipped,
+        scoreSummary,
+        message: `${approved.length} safe answer(s) approved on page ${page.pageNumber}.`,
+      });
     } catch (error) { return next(error); }
   },
 );
@@ -4086,8 +4176,11 @@ router.post(
           questionId: answer.questionId?._id || answer.questionId,
           sectionId: answer.questionId?.sectionId,
         });
-        if (!assignment || !['REVIEWED', 'FINALIZED', 'MODERATED'].includes(answer.evaluationStatus)) {
-          unresolved.push({ answerId: answer._id, reason: assignment ? answer.evaluationStatus : 'OUTSIDE_ASSIGNMENT' });
+        if (!assignment || !['REVIEWED', 'FINALIZED', 'MODERATED'].includes(answer.evaluationStatus) || isUnresolvedScore(answer)) {
+          unresolved.push({
+            answerId: answer._id,
+            reason: !assignment ? 'OUTSIDE_ASSIGNMENT' : (answer.scoringMode === 'EVALUATION_FAILED' ? 'EVALUATION_FAILED' : answer.evaluationStatus),
+          });
         }
       }
       if (unresolved.length) {
@@ -4095,6 +4188,11 @@ router.post(
       }
       const script = await AnswerScript.findOne({ _id: attempt.sourceAnswerScriptId, tenantId: attempt.tenantId });
       if (!script) return res.status(404).json({ error: 'Answer script not found.' });
+      // The score resolver has just established that every answer is
+      // authoritative. Recompute once here so the evaluated paper and all
+      // result readers receive a final total, not the stale proposed total
+      // from before the last evaluator decision.
+      await ensureScoreSummary(attempt, { includeAnswers: false, force: true });
       attempt.reviewCompletion = {
         status: 'COMPLETED', completedAt: new Date(), completedBy: req.user._id,
         completionComment: String(req.body?.comment || '').trim(),

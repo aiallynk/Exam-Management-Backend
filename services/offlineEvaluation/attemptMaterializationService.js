@@ -155,6 +155,7 @@ export const materializeFromScript = async ({ answerScriptId, actorUserId }) => 
     }
     materializedQuestionIds.add(questionKey);
     materializedCount += 1;
+    if (payload.needsReview) needsReviewCount += 1;
   }
 
   const populatedAnswers = await Answer.find({ attemptId: attempt._id })

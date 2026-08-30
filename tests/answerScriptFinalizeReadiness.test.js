@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import {
+  buildPendingReviewFilter,
   buildFinalizeReadiness,
   resolvePostMaterializeStatus,
 } from '../services/offlineEvaluation/answerScriptFinalizeReadiness.js';
@@ -42,5 +43,14 @@ describe('finalize readiness', () => {
     const result = buildFinalizeReadiness({ ...ready, unmappedCount: 1 });
     assert.equal(result.canFinalize, false);
     assert.equal(result.blockers[0].code, 'QUESTION_MAPPING');
+  });
+
+  test('does not count a rubric failure that already has an evaluator manual score', () => {
+    const failureClause = buildPendingReviewFilter().$or.find((clause) => clause.scoringMode === 'EVALUATION_FAILED');
+    assert.deepEqual(failureClause.$or, [
+      { scoreResolved: { $ne: true } },
+      { finalScore: null },
+      { evaluatorDecision: { $nin: ['OVERRIDE', 'MANUAL_SCORE'] } },
+    ]);
   });
 });

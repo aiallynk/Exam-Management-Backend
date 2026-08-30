@@ -229,6 +229,15 @@ const QuestionSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
       default: {},
     },
+    // An additive frozen copy for newly-authored question rubrics. Historic
+    // delivery questions continue to resolve their already-persisted
+    // evaluationConfig.rubric through the strategy resolver; null therefore
+    // means "no explicit snapshot", not "broken rubric".
+    rubricSnapshot: {
+      type: mongoose.Schema.Types.Mixed,
+      default: null,
+      immutable: true,
+    },
     points: {
       type: Number,
       default: 1,

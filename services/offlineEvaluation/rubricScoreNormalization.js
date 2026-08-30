@@ -70,13 +70,15 @@ export const normalizeRubricCriterionScores = (scores = [], rubric = []) => {
   return { entries, total: entries.reduce((sum, item) => sum + item.marks, 0) };
 };
 
-export const buildRubricEvaluationPayload = ({ rubricScores, questionRubric = [], pointsEarned, overriddenBy = null, overrideReason = '' } = {}) => {
+export const buildRubricEvaluationPayload = ({ rubricScores, questionRubric = [], pointsEarned, finalized = true, overriddenBy = null, overrideReason = '' } = {}) => {
   const normalized = normalizeRubricCriterionScores(rubricScores, questionRubric);
   if (!normalized) return undefined;
   return {
     aiScores: normalized.entries,
-    finalScores: normalized.entries,
-    finalMark: finiteNumber(pointsEarned) ?? normalized.total,
+    // A rubric AI result may still be awaiting an evaluator. Keep the
+    // criterion evidence, but never present it as the final breakdown first.
+    finalScores: finalized ? normalized.entries : [],
+    finalMark: finalized ? (finiteNumber(pointsEarned) ?? normalized.total) : null,
     overriddenBy: overriddenBy || null,
     overrideReason: overrideReason || '',
     updatedAt: new Date(),

@@ -3,6 +3,27 @@ import AnswerSegment from '../../models/AnswerSegment.js';
 
 export const FINALIZE_ELIGIBLE_STATUSES = ['EVALUATED', 'NEEDS_REVIEW', 'DERIVATIVE_FAILED'];
 export const BLOCKING_EVALUATION_STATUSES = ['PENDING_REVIEW', 'UNDER_REVIEW', 'FLAGGED'];
+const HUMAN_RESOLVED_FAILURE_DECISIONS = ['OVERRIDE', 'MANUAL_SCORE'];
+
+// This filter is deliberately the persistence equivalent of
+// scoreResolutionService.isUnresolvedScore. A failed AI/rubric pass blocks
+// finalization only until an evaluator records a real manual score. Keeping
+// the failure audit data must not re-open an already resolved answer.
+export const buildPendingReviewFilter = () => ({
+  $or: [
+    { evaluationStatus: { $in: BLOCKING_EVALUATION_STATUSES } },
+    {
+      scoringMode: 'EVALUATION_FAILED',
+      $or: [
+        { scoreResolved: { $ne: true } },
+        { finalScore: null },
+        { evaluatorDecision: { $nin: HUMAN_RESOLVED_FAILURE_DECISIONS } },
+      ],
+    },
+    { scoreResolved: false },
+    { requiresReview: true },
+  ],
+});
 
 export const resolvePostMaterializeStatus = (needsReviewCount = 0) => {
   const count = Number(needsReviewCount) || 0;
@@ -65,7 +86,7 @@ export const loadFinalizeReadiness = async (script) => {
     script.materializedAttemptId
       ? Answer.countDocuments({
         attemptId: script.materializedAttemptId,
-        evaluationStatus: { $in: BLOCKING_EVALUATION_STATUSES },
+        ...buildPendingReviewFilter(),
       })
       : 0,
   ]);
