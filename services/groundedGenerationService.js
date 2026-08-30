@@ -64,9 +64,12 @@ const DIFFICULTY_GUIDANCE = {
   ultra_hard: 'requires precise, nuanced understanding of the source text',
 };
 
-const buildSystemPrompt = ({ retrievedChunks, difficulty }) => {
+const buildSystemPrompt = ({ retrievedChunks, difficulty, requestedTypes = [] }) => {
+  // Xamigo-issued evidence keys (spec Part 10). The model may only *select*
+  // which of these keys it used — it never supplies a resource id, title,
+  // chapter or page number; Xamigo resolves the keys back to real metadata.
   const sourceBlock = retrievedChunks
-    .map((chunk, index) => `[chunk ${index + 1}]\n${chunk.text}`)
+    .map((chunk, index) => `[evidence_${index + 1}]\n${chunk.text}`)
     .join('\n\n');
 
   return [
@@ -99,9 +102,23 @@ const buildSystemPrompt = ({ retrievedChunks, difficulty }) => {
     'sub-topic, or the topic is broad/generic), you MUST still use it and generate real questions',
     'from it — do not require an exact match between the topic phrase and the source text.',
     '',
+    'QUESTION TYPE: the requested question TYPE(S) and COUNT are fixed by the teacher / framework.',
+    `Requested type(s): ${requestedTypes.join(', ') || 'MULTIPLE_CHOICE'}. The source supplies only`,
+    'the KNOWLEDGE — generate the requested type even when the passage is explanatory prose. A new',
+    'wording, scenario, application or MCQ distractor is allowed as long as the factual proposition',
+    'and the expected answer remain supportable from the evidence. Do NOT merely paraphrase a source',
+    'sentence; do NOT switch to a different question type because the prose "reads like an essay".',
+    '',
+    'EVIDENCE KEYS: for each question you MUST cite which supplied evidence blocks you used, by their',
+    '[evidence_N] key. Put the keys whose content the question is built from in "evidenceReferenceKeys"',
+    'and the keys that specifically support the correct answer in "answerSupportKeys". Use ONLY keys',
+    'that were actually provided above. Never output a book title, chapter, page number or source id —',
+    'only evidence_N keys.',
+    '',
     'Respond with a JSON object: { "questions": [ { "questionText", "questionType", "options"',
-    '(if applicable), "correctAnswer", "evidenceSnippet" (a short verbatim quote from the source',
-    'material that supports this question) } ], "insufficientMaterial": boolean }.',
+    '(if applicable), "correctAnswer", "evidenceReferenceKeys": ["evidence_1", ...],',
+    '"answerSupportKeys": ["evidence_1", ...], "evidenceSnippet" (a short verbatim quote from the',
+    'cited evidence) } ], "insufficientMaterial": boolean }.',
     'Only set insufficientMaterial to true if the source material genuinely cannot support ANY',
     'valid question without violating the hard rules above — not merely because it does not match',
     'the topic phrase exactly. Prefer generating fewer questions over returning zero.',
@@ -205,6 +222,21 @@ export const generateGroundedCandidates = async ({
     };
   }
 
+  // Xamigo mints evidence_1..N keys for exactly the chunks it retrieved, so
+  // the model can only cite evidence it was actually given (spec Part 10).
+  const evidenceKeyToChunkId = new Map(
+    retrievedChunks.map((chunk, index) => [`evidence_${index + 1}`, String(chunk._id)])
+  );
+  const resolveKeys = (rawKeys) => {
+    const out = [];
+    const seen = new Set();
+    for (const k of Array.isArray(rawKeys) ? rawKeys : []) {
+      const id = evidenceKeyToChunkId.get(String(k || '').trim());
+      if (id && !seen.has(id)) { seen.add(id); out.push(id); }
+    }
+    return out;
+  };
+
   const completion = await runEngineChatCompletion({
     operation: AI_OPERATIONS.CONTENT_GROUNDED_QUESTION_GENERATION,
     feature: 'source_grounded_generation',
@@ -214,7 +246,7 @@ export const generateGroundedCandidates = async ({
       model: config.openaiModel,
       response_format: { type: 'json_object' },
       messages: [
-        { role: 'system', content: buildSystemPrompt({ retrievedChunks, difficulty }) },
+        { role: 'system', content: buildSystemPrompt({ retrievedChunks, difficulty, requestedTypes: questionTypes }) },
         {
           role: 'user',
           content: buildUserPrompt({
@@ -259,18 +291,36 @@ export const generateGroundedCandidates = async ({
       if (!normalized) return null;
       const shapeCheck = validateGeneratedQuestionShape(normalized);
       if (!shapeCheck.valid) return null;
+      // Resolve the model's cited evidence_N keys back to the real chunk ids
+      // Xamigo issued. Keys the model invented are dropped. If it cited
+      // nothing usable, fall back to all retrieved chunks so grounding
+      // validation still runs (a fully-unsupported candidate is rejected
+      // there, not accepted with no provenance).
+      const conceptChunkIds = resolveKeys(raw?.evidenceReferenceKeys);
+      const answerChunkIds = resolveKeys(raw?.answerSupportKeys);
+      const citedChunkIds = [...new Set([...conceptChunkIds, ...answerChunkIds])];
+      const effectiveChunkIds = citedChunkIds.length
+        ? citedChunkIds
+        : retrievedChunks.map((chunk) => String(chunk._id));
+      const validationChunks = retrievedChunks.filter((c) => effectiveChunkIds.includes(String(c._id)));
       return {
         ...normalized,
         provenance: {
           sourceIds,
-          chunkIds: retrievedChunks.map((chunk) => chunk._id),
+          chunkIds: effectiveChunkIds,
+          // Model-authored quote — kept only as a display hint, never as proof.
           evidenceSnippet: String(raw?.evidenceSnippet || '').slice(0, 500),
         },
-        // Transient — not persisted (stripped before a candidate is
-        // accepted/saved). Lets the orchestrator run grounding validation
-        // against the exact chunks this candidate was generated from
-        // without a second DB round trip.
-        retrievedChunksForValidation: retrievedChunks,
+        // Transient — not persisted. Carries the per-candidate cited-evidence
+        // breakdown so the orchestrator can freeze Xamigo-owned source
+        // references (services/questionProvenanceService.js) and re-run
+        // grounding validation against exactly the cited chunks.
+        retrievedChunksForValidation: validationChunks.length ? validationChunks : retrievedChunks,
+        citedEvidence: {
+          conceptChunkIds,
+          answerChunkIds,
+          modelCitedAny: citedChunkIds.length > 0,
+        },
       };
     })
     .filter(Boolean);

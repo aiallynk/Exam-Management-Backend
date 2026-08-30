@@ -32,6 +32,9 @@ const AnswerSegmentSchema = new mongoose.Schema({
   lineBoxes: [{
     _id: false,
     id: String,
+    // Additive page identity keeps continuation geometry associated with the
+    // physical page on which the handwritten line appears.
+    pageId: { type: mongoose.Schema.Types.ObjectId, ref: 'AnswerScriptPage', default: null },
     text: String,
     x: { type: Number, min: 0, max: 1 },
     y: { type: Number, min: 0, max: 1 },

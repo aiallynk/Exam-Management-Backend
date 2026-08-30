@@ -69,6 +69,13 @@ const AIGenerationRunSchema = new mongoose.Schema(
       type: mongoose.Schema.Types.Mixed,
       default: {},
     },
+    // Source-discovery summary (spec Parts 6, 24, 28) — which selected
+    // sources actually carried relevant evidence, per-resource coverage,
+    // chapters used. Metadata only; never chunk text or prompts.
+    evidencePlanSummary: {
+      type: mongoose.Schema.Types.Mixed,
+      default: undefined,
+    },
     insufficientSourceMaterial: {
       type: Boolean,
       default: false,

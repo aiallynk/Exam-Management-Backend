@@ -137,6 +137,21 @@ const ExamSchema = new mongoose.Schema(
     // Governance is resolved by the application and frozen with the assessment.
     resolvedSpecificationSnapshot: { type: mongoose.Schema.Types.Mixed, default: null, immutable: true },
     resolvedSpecificationAt: { type: Date, default: null, immutable: true },
+    // Institutional Question Paper Template (Phase 1A). Additive & optional —
+    // every existing exam and every exam created without a template has
+    // paperTemplateId: null and paperTemplateSnapshot: null and renders/exports
+    // exactly as before. The Exam Creator selects an APPROVED QuestionPaperTemplate;
+    // the resolved configuration (template + institution branding + permitted
+    // overrides) is deep-frozen once at finalize so later branding/template
+    // edits never alter an already-created paper — same contract as
+    // resolvedSpecificationSnapshot / rubricSnapshot above.
+    paperTemplateId: { type: mongoose.Schema.Types.ObjectId, ref: 'QuestionPaperTemplate', default: null },
+    paperTemplateSnapshot: { type: mongoose.Schema.Types.Mixed, default: null, immutable: true },
+    paperTemplateSnapshotAt: { type: Date, default: null, immutable: true },
+    // Assessment-specific permitted overrides only (documentNumber,
+    // assessmentTitle, paperName, instructions). Mutable until the snapshot is
+    // frozen; the route validates the key allow-list.
+    paperTemplateOverrides: { type: mongoose.Schema.Types.Mixed, default: {} },
     // Tenant field - Exam belongs to a tenant
     tenantId: {
       type: mongoose.Schema.Types.ObjectId,

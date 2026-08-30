@@ -2,7 +2,7 @@ import sourceGroundedConfig from '../config/sourceGroundedConfig.js';
 import { generateGroundedCandidates } from './groundedGenerationService.js';
 import { isQuestionGrounded } from './groundingValidatorService.js';
 import { createBatchNoveltyTracker, probeNovelty, reserveNovelty } from './noveltyService.js';
-import { evaluateQuestionRepeatPolicy, REPEAT_POLICIES, recordQuestionIntelligenceSignal, SIGNAL_TYPES } from './questionMemoryService.js';
+import { evaluateQuestionRepeatPolicy, REPEAT_POLICIES, recordQuestionIntelligenceSignal, SIGNAL_TYPES, classifyRepeatRelationship } from './questionMemoryService.js';
 import { normalizeQuestionType } from '../utils/questionTypeRegistry.js';
 
 // Source-Grounded AI Question Generation — the candidate-pool pipeline
@@ -255,10 +255,23 @@ export const generateWithNoveltyAndGrounding = async ({
       }
 
       batchTracker.record(candidate);
+      // retrievedChunksForValidation is transient; citedEvidence (the
+      // per-candidate concept/answer chunk breakdown from evidence-key
+      // resolution) is carried through so routes/ai.js can freeze
+      // Xamigo-owned source references (services/questionProvenanceService.js).
       // eslint-disable-next-line no-unused-vars
-      const { retrievedChunksForValidation, ...candidateWithoutTransientFields } = candidate;
+      const { retrievedChunksForValidation, citedEvidence, ...candidateWithoutTransientFields } = candidate;
       accepted.push({
         ...candidateWithoutTransientFields,
+        citedEvidence: citedEvidence || undefined,
+        groundingVerdict: grounding.verdict || (grounding.grounded ? 'SUPPORTED' : undefined),
+        // Educator-facing "Previous Question Check" status (spec Part 18) —
+        // a category + rounded %, never a raw cosine. SAME_CONCEPT is not a
+        // rejection; only EXACT/NEAR were already blocked above.
+        previousQuestionCheck: classifyRepeatRelationship({
+          questionText: candidate.questionText,
+          repeatResult: memoryCheck,
+        }),
         provenance: {
           ...candidate.provenance,
           generationRunId,

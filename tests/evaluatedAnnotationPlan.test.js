@@ -10,6 +10,7 @@ import {
   placeTeacherMark,
   regionsOverlap,
   selectExportCorrections,
+  selectExportEvidenceAnnotations,
 } from '../services/offlineEvaluation/evaluatedAnnotationPlan.js';
 
 const answers = ({
@@ -159,6 +160,52 @@ describe('teacher annotation plan — required render cases', () => {
     assert.equal(plan.marks[0].placement.strategy, 'SAFE_MARGIN');
   });
 
+  test('7b. a blank mapped question uses its local question anchor, not a bottom-page score slot', () => {
+    const plan = buildTeacherAnnotationPlan({
+      answers: [{
+        ...answers()[3],
+        evaluationStatus: 'NOT_ATTEMPTED',
+        aiEvaluation: { notAttempted: true },
+      }],
+      segments: [],
+      // A blank response has no materialized AnswerSegment. Reuse the
+      // persisted page-extraction question label rather than a page corner.
+      questionAnchorsByQuestionNumber: {
+        4: { pageNumber: 2, region: { x: 0.08, y: 0.31, width: 0.18, height: 0.035 } },
+      },
+      pageNumberById,
+      attemptTotal: 0,
+    });
+    assert.equal(plan.marks[0].pageNumber, 2);
+    assert.equal(plan.marks[0].remark, 'Not attempted');
+    assert.equal(plan.marks[0].placement.strategy, 'RIGHT_MARGIN');
+    assert.ok(Math.abs(plan.marks[0].placement.y - 0.316) < 0.03);
+  });
+
+  test('7c. a blank-question score avoids the next answer while staying beside its question anchor', () => {
+    const blank = {
+      ...answers()[3],
+      evaluationStatus: 'NOT_ATTEMPTED',
+      aiEvaluation: { notAttempted: true },
+    };
+    const nextAnswer = answers()[4];
+    const plan = buildTeacherAnnotationPlan({
+      answers: [blank, nextAnswer],
+      segments: [{ _id: 's5', pageIds: ['p2'], boundingRegion: { x: 0.08, y: 0.36, width: 0.68, height: 0.11 } }],
+      questionAnchorsByQuestionNumber: {
+        4: { pageNumber: 2, region: { x: 0.08, y: 0.31, width: 0.18, height: 0.035 } },
+      },
+      pageNumberById,
+      attemptTotal: 3,
+    });
+    const q4 = plan.marks.find((mark) => mark.questionNumber === 4);
+    const q5 = plan.marks.find((mark) => mark.questionNumber === 5);
+    assert.equal(q4.placement.strategy, 'RIGHT_MARGIN');
+    assert.ok(q4.placement.x >= 0.76, 'Q4 uses the right-side margin rather than Q5 space');
+    assert.ok(!regionsOverlap(q4.placement, { x: 0.08, y: 0.36, width: 0.68, height: 0.11 }, 0));
+    assert.ok(!regionsOverlap(q4.placement, q5.placement, 0));
+  });
+
   test('8. insufficient blank margin falls back to below-answer or a safe page margin', () => {
     const wide = placeTeacherMark({
       answerRegion: { x: 0.04, y: 0.12, width: 0.94, height: 0.78 },
@@ -214,6 +261,17 @@ describe('teacher annotation plan — required render cases', () => {
     assert.equal(new Set(plan.marks.map((mark) => mark.questionNumber)).size, 5);
     assertDerivativeIntegrity(plan, { answers: authoritative, attemptTotal: 15 });
   });
+
+  test('11. evaluator check, cross, highlight, and underline stay on original-page coordinates for export', () => {
+    const evidence = selectExportEvidenceAnnotations([
+      { type: 'CHECK', source: 'EVALUATOR', status: 'APPROVED', region: { x: 0.8, y: 0.12, width: 0.04, height: 0.05 }, pageId: 'p1' },
+      { type: 'CROSS', source: 'EVALUATOR', status: 'APPROVED', region: { x: 0.8, y: 0.24, width: 0.04, height: 0.05 }, pageId: 'p1' },
+      { type: 'HIGHLIGHT', source: 'EVALUATOR', status: 'APPROVED', region: { x: 0.2, y: 0.42, width: 0.22, height: 0.04 }, pageId: 'p2' },
+      { type: 'UNDERLINE', source: 'EVALUATOR', status: 'APPROVED', region: { x: 0.2, y: 0.52, width: 0.24, height: 0.02 }, pageId: 'p2' },
+    ], pageNumberById);
+    assert.deepEqual(evidence.map((item) => item.type), ['CHECK', 'CROSS', 'HIGHLIGHT', 'UNDERLINE']);
+    assert.deepEqual(evidence.map((item) => item.pageNumber), [1, 1, 2, 2]);
+  });
 });
 
 describe('teacher annotation plan — integrity failures', () => {
@@ -244,12 +302,12 @@ describe('teacher annotation plan — integrity failures', () => {
     );
   });
 
-  test('word-level OCR boxes are not treated as answer regions', () => {
+  test('word-level OCR boxes are not treated as full answers but can anchor a blank-question score', () => {
     assert.equal(isWordLevelRegion({ x: 0.2, y: 0.3, width: 0.12, height: 0.03 }), true);
     const placement = placeTeacherMark({
       answerRegion: { x: 0.2, y: 0.3, width: 0.12, height: 0.03 },
     });
-    assert.equal(placement.strategy, 'SAFE_MARGIN');
-    assert.equal(placement.confidence, 'LOW');
+    assert.equal(placement.strategy, 'RIGHT_MARGIN');
+    assert.equal(placement.confidence, 'MEDIUM');
   });
 });

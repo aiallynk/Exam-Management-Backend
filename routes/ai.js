@@ -27,6 +27,9 @@ import { resolveLibraryResourcesToContextSourceIds } from '../services/libraryRe
 import { buildGenerationContext, CONTEXT_MODES, InsufficientContextError } from '../services/generationContextOrchestrator.js';
 import { resolveGenerationStrategy } from '../services/groundedGenerationService.js';
 import { computeShortfallDistribution } from '../utils/sourceGroundedFulfilment.js';
+import { buildFrozenSourceReferences, buildQuestionProvenance } from '../services/questionProvenanceService.js';
+import { buildGenerationEvidencePlan, summarizeEvidencePlan } from '../services/sourceDiscoveryService.js';
+import { recordGenerationEvent } from '../services/questionHistoryService.js';
 import { qualityGateQuestionsAgainstSpecification, resolveAssessmentSpecification } from '../services/assessmentSpecificationResolver.js';
 import ContextSet from '../models/ContextSet.js';
 import ContextSource from '../models/ContextSource.js';
@@ -1571,6 +1574,28 @@ router.post(
         generatedAt: new Date(),
       };
 
+      // Source discovery (spec Parts 5, 6, 23): before generating, search
+      // every selected source and drop the ones that carry no relevant
+      // evidence, so an unrelated book never reaches the model or provenance.
+      let evidencePlanSummary = null;
+      if (isSourceGrounded && verifiedContextSourceIds.length > 1) {
+        try {
+          const plan = await buildGenerationEvidencePlan({
+            tenantId,
+            contextSourceIds: verifiedContextSourceIds,
+            topic,
+            instructions: instructions || examDescription || '',
+            questionTypes: normalizedRequestedTypes,
+          });
+          if (plan.selectedContextSourceIds.length) {
+            verifiedContextSourceIds = plan.selectedContextSourceIds;
+          }
+          evidencePlanSummary = summarizeEvidencePlan(plan);
+        } catch (discoveryError) {
+          console.error('[source-grounded] evidence discovery failed (non-fatal):', discoveryError?.message);
+        }
+      }
+
       // Source-grounded generation never falls through to the unconstrained
       // general-knowledge path below.
       let providerQuestions = [];
@@ -1585,6 +1610,7 @@ router.post(
           requestedSourceIds: verifiedContextSourceIds,
           requestedCount: providerQuestionCount,
           status: 'RUNNING',
+          evidencePlanSummary: evidencePlanSummary || undefined,
         });
 
         // STRICT_SOURCE keeps the original anti-fallback contract: report the
@@ -1794,6 +1820,96 @@ router.post(
           requireProviderExactDistribution: true,
         });
       }
+
+      // --- Source-Verified provenance freeze (spec Parts 1, 2, 10) ----------
+      // Xamigo assigns every educator-facing source value (resource title /
+      // chapter / topic / page) from persisted LibraryResource / ContextSource
+      // / ContextChunk metadata — the AI provider contributes none of it.
+      // Never let provenance enrichment break generation.
+      let sourceCoverage = null;
+      try {
+        if (isSourceGrounded) {
+          const grounded = [];
+          for (const q of providerQuestions) {
+            const cited = q?.citedEvidence || {};
+            const chunkIds = Array.isArray(q?.provenance?.chunkIds) ? q.provenance.chunkIds.map(String) : [];
+            if (!chunkIds.length) {
+              // A top-up (non-strict) or otherwise ungrounded question — labelled
+              // honestly, never with a fabricated textbook reference.
+              q.provenance = buildQuestionProvenance({
+                generationMode: 'STANDARD',
+                sourcePolicy: 'NONE',
+                creatorInstruction: instructions || '',
+                generationRunId: sourceGroundedRun?._id || null,
+                generatedAt: new Date(),
+              });
+              continue;
+            }
+            const chunkUsage = new Map();
+            (cited.conceptChunkIds || chunkIds).forEach((id) =>
+              chunkUsage.set(String(id), [...(chunkUsage.get(String(id)) || []), 'QUESTION_CONCEPT']));
+            (cited.answerChunkIds || []).forEach((id) =>
+              chunkUsage.set(String(id), [...(chunkUsage.get(String(id)) || []), 'ANSWER_SUPPORT']));
+            // eslint-disable-next-line no-await-in-loop
+            const sourceReferences = await buildFrozenSourceReferences({ tenantId, chunkIds, chunkUsage });
+            q.provenance = buildQuestionProvenance({
+              generationMode: 'SOURCE_GROUNDED',
+              sourcePolicy:
+                normalizedContextMode === CONTEXT_MODES.STRICT_SOURCE
+                  ? 'STRICT_SOURCE'
+                  : normalizedContextMode === CONTEXT_MODES.AUTO_CONTEXT
+                    ? 'AUTO_CONTEXT'
+                    : 'SELECTED_CONTEXT',
+              creatorInstruction: instructions || '',
+              generationRunId: sourceGroundedRun?._id || null,
+              generationOperationId: 'CONTENT_GROUNDED_QUESTION_GENERATION',
+              groundingVerdict: q.groundingVerdict || (sourceReferences.length ? 'SUPPORTED' : 'UNSUPPORTED'),
+              sourceReferences,
+              noveltySignatures: q.provenance?.noveltySignatures,
+              generatedAt: new Date(),
+            });
+            grounded.push(q);
+            delete q.citedEvidence;
+            delete q.groundingVerdict;
+          }
+          // Real per-resource question counts, computed from the frozen refs
+          // (never a "pretty distribution that did not happen" — spec Part 24).
+          const byResource = new Map();
+          const chaptersUsed = new Set();
+          for (const q of grounded) {
+            for (const ref of q.provenance?.sourceReferences || []) {
+              const key = ref.resourceTitleSnapshot || ref.fileTitleSnapshot || 'Unknown';
+              byResource.set(key, (byResource.get(key) || 0) + 1);
+              if (ref.chapterSnapshot) chaptersUsed.add(ref.chapterSnapshot);
+            }
+          }
+          sourceCoverage = {
+            ...(evidencePlanSummary || {}),
+            sourcesSelected: evidencePlanSummary?.sourcesSelected ?? verifiedContextSourceIds.length,
+            sourcesRelevant: evidencePlanSummary?.sourcesRelevant ?? byResource.size,
+            chaptersUsed: chaptersUsed.size,
+            questionsByResource: Object.fromEntries(byResource),
+            groundedQuestionCount: grounded.length,
+            supplementedQuestionCount: providerQuestions.length - grounded.length,
+          };
+        }
+      } catch (provenanceError) {
+        console.error('[source-grounded] provenance freeze failed (non-fatal):', provenanceError?.message);
+      }
+
+      // Question generation history event (spec Parts 12, 13) — tenant-scoped,
+      // fire-and-forget, never blocks the response, never mutates a question.
+      void recordGenerationEvent({
+        tenantId,
+        userId: req.user?._id || null,
+        generationRunId: sourceGroundedRun?._id || null,
+        generationMode: isSourceGrounded ? 'SOURCE_GROUNDED' : 'STANDARD',
+        questionTypes: normalizedRequestedTypes,
+        difficulty,
+        topic,
+        questions: providerQuestions,
+      }).catch(() => {});
+
       // The application re-resolves policy server-side. AI receives/requested
       // constraints, but never chooses governance rules itself.
       const qualityGate = qualityGateQuestionsAgainstSpecification(
@@ -1840,6 +1956,7 @@ router.post(
         qualityGate: { acceptedCount: questions.length, rejected: qualityGate.rejected },
         ...(governedSpecification ? { resolvedSpecification: governedSpecification } : {}),
         ...(sourceGroundedDiagnostics ? { sourceGrounded: sourceGroundedDiagnostics } : {}),
+        ...(sourceCoverage ? { sourceCoverage } : {}),
       });
     } catch (error) {
       next(error);
