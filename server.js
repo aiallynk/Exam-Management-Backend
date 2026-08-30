@@ -208,6 +208,14 @@ app.use(
 );
 app.use(express.json({ limit: '10mb' }));
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
+// NOTE (deployment): multipart uploads accept up to 25 MB PER FILE (multer
+// `fileSize` in the upload routes — each file is its own request; a batch has
+// no combined cap). Any reverse proxy in front of this server MUST allow at
+// least that per request:
+//   nginx  → `client_max_body_size 30M;`  in the server/location block
+// Without it the proxy returns its own 413 *before* this app runs, so the
+// response carries no CORS headers and the browser reports it as an opaque
+// "blocked by CORS policy" error instead of "file too large".
 app.use(requestTimeout(30000)); // 30 second timeout for all requests
 app.use(requestContextMiddleware);
 app.use((req, _res, next) => {
