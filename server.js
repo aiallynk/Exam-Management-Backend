@@ -244,11 +244,26 @@ app.use('/uploads', async (req, res, next) => {
     if (!s3Response) return next();
     res.set('Content-Type', s3Response.ContentType || 'application/octet-stream');
     if (s3Response.ContentLength) res.set('Content-Length', String(s3Response.ContentLength));
+    // These are public assets (logos, question/certificate images); let
+    // browsers and any CDN cache them, and allow cross-origin embedding on a
+    // split-origin (frontend ≠ backend) deployment.
+    res.set('Cache-Control', 'public, max-age=86400');
+    res.set('Cross-Origin-Resource-Policy', 'cross-origin');
+    s3Response.Body.on('error', (streamError) => {
+      console.error(`[uploads] S3 stream error for ${key}:`, streamError?.message);
+      if (!res.headersSent) res.status(502);
+      res.end();
+    });
     s3Response.Body.pipe(res);
   } catch (error) {
-    if (error?.code === 'S3_NOT_CONFIGURED' || error?.$metadata?.httpStatusCode === 404) {
-      return next();
+    const status = error?.$metadata?.httpStatusCode;
+    if (error?.code === 'S3_NOT_CONFIGURED' || status === 404 || error?.name === 'NoSuchKey') {
+      return next(); // → 404 (object genuinely absent, or S3 not set up)
     }
+    // 403 / AccessDenied / region errors are a real misconfiguration, not a
+    // "not found" — log loudly so a deployed instance's S3 read-permission
+    // problem is diagnosable instead of a silent broken image.
+    console.error(`[uploads] S3 read failed for ${key} (status ${status || '?'}):`, error?.name || error?.message);
     next(error);
   }
 });

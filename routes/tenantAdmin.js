@@ -80,6 +80,50 @@ router.use((req, res, next) => {
   next();
 });
 
+// Organization identity (name / code / contact) — editable by the Tenant
+// Admin from Settings → Organization Profile. Additive; email is the account
+// email and is NOT changed here.
+router.put(
+  '/organization-profile',
+  [
+    body('name').optional().isString().trim().isLength({ min: 1, max: 200 }),
+    body('contactPhone').optional({ nullable: true }).isString().trim().isLength({ max: 40 }),
+    body('contactEmail').optional().isString().trim().isEmail(),
+    body('address').optional({ nullable: true }).isString().trim().isLength({ max: 500 }),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const tenant = await Tenant.findById(req.user.tenantId);
+      if (!tenant) return res.status(404).json({ error: 'Tenant not found.' });
+
+      // `code` (unique routing key) and `type` are deliberately NOT editable here.
+      const before = { name: tenant.name, contactPhone: tenant.contactPhone, contactEmail: tenant.contactEmail, address: tenant.address };
+      if (typeof req.body.name === 'string' && req.body.name.trim()) tenant.name = req.body.name.trim();
+      if (typeof req.body.contactEmail === 'string' && req.body.contactEmail.trim()) tenant.contactEmail = req.body.contactEmail.trim().toLowerCase();
+      if (req.body.contactPhone !== undefined) tenant.contactPhone = String(req.body.contactPhone || '').trim();
+      if (req.body.address !== undefined) tenant.address = String(req.body.address || '').trim();
+      await tenant.save();
+      await logAuditEvent(AUDIT_ACTIONS.TENANT_UPDATED, {
+        userId: req.user._id, tenantId: tenant._id, resourceType: 'Tenant', resourceId: tenant._id,
+        method: req.method, path: req.path, before,
+        after: { name: tenant.name, contactPhone: tenant.contactPhone, contactEmail: tenant.contactEmail, address: tenant.address },
+      }).catch(() => {});
+
+      res.json({
+        tenant: {
+          _id: tenant._id, name: tenant.name, code: tenant.code, type: tenant.type,
+          contactPhone: tenant.contactPhone, contactEmail: tenant.contactEmail, address: tenant.address,
+        },
+      });
+    } catch (error) {
+      if (error?.code === 11000) return res.status(409).json({ error: 'That contact email is already in use.' });
+      next(error);
+    }
+  }
+);
+
 const BULK_IMPORT_MAX_ROWS = 500;
 const BULK_IMPORT_ALLOWED_ROLES = new Set(['EXAM_CREATOR', 'CANDIDATE']);
 const BULK_IMPORT_EMAIL_PATTERN = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
