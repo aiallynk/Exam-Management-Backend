@@ -205,6 +205,19 @@ const OMRResultSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
+    // Canonical ExamAttempt/Answer materialization (V2); scores here are diagnostic only.
+    materializedAttemptId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'ExamAttempt',
+      default: null,
+      index: true,
+    },
+    materializedAt: { type: Date, default: null },
+    materializedBy: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'User',
+      default: null,
+    },
   },
   { timestamps: true }
 );

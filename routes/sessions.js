@@ -19,8 +19,6 @@ import { generateSessionQRCode } from '../services/qrService.js';
 import { assignQuestionPaperToStudent } from '../services/sessionAssignment.js';
 import { AUDIT_ACTIONS, logAuditEvent } from '../utils/auditLogger.js';
 import { resolveAttemptExhaustedExamIds } from '../utils/attemptAvailability.js';
-import { assertExamProductAccess, WizKidsAccessError } from '../services/wizKidsAccessService.js';
-import WizKidsExamConfig from '../models/WizKidsExamConfig.js';
 
 const router = express.Router();
 
@@ -369,7 +367,7 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
     }
 
     const sessions = await ExamSession.find(filter)
-      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt candidateCount productModule')
+      .populate('examId', 'title duration showResultsImmediately resultsReleasedAt candidateCount assessmentPurpose resolvedSpecificationSnapshot')
       .populate('questionPaperId', 'setName')
       .populate('questionPaperIds', 'setName')
       .populate('createdBy', 'name email')
@@ -395,24 +393,10 @@ router.get('/', requireAuth, requireTenant, enforceTenantBoundaries, async (req,
     const countMap = {};
     candidateCounts.forEach((c) => { countMap[String(c._id)] = c.count; });
 
-    const juniorExamIds = sessions
-      .map((session) => session.examId)
-      .filter((exam) => exam?.productModule === 'WIZKIDS')
-      .map((exam) => exam._id);
-    const juniorConfigs = juniorExamIds.length
-      ? await WizKidsExamConfig.find({ tenantId: req.user.tenantId, examId: { $in: juniorExamIds } })
-        .select('examId mode gradeLevel domains interactionMode flashMaths')
-        .lean()
-      : [];
-    const juniorConfigByExamId = new Map(juniorConfigs.map((config) => [String(config.examId), config]));
-
     const sessionsWithCounts = sessions.map((s) => {
       const sessionId = String(s._id);
       const plain = s.toObject ? s.toObject() : { ...s };
       plain.assignedCandidatesCount = countMap[sessionId] ?? 0;
-      if (plain.examId?.productModule === 'WIZKIDS') {
-        plain.juniorConfig = juniorConfigByExamId.get(String(plain.examId._id)) || null;
-      }
       return plain;
     });
 
@@ -523,14 +507,12 @@ router.get('/:sessionId/candidates', requireAuth, requireTenant, enforceTenantBo
           examAssigned: true,
         }));
       } else {
+        // V2 candidate listing uses exam participants / enrollments, not legacy SubTenant.
         const userQuery = {
           role: 'CANDIDATE',
           tenantId: session.tenantId,
           status: 'ACTIVE',
         };
-        if (session.examId?.subTenantId) {
-          userQuery.subTenantId = session.examId.subTenantId;
-        }
         const users = await User.find(userQuery)
           .select('name email profileImage createdAt')
           .lean();
@@ -625,7 +607,7 @@ router.get('/:sessionId', requireAuth, requireTenant, enforceTenantBoundaries, a
     const session = await ExamSession.findById(req.params.sessionId)
       .populate(
         'examId',
-        'title description duration gracePeriod maxAttempts showResultsImmediately resultsReleasedAt allowCertification passingPercentage productModule'
+        'title description duration gracePeriod maxAttempts showResultsImmediately resultsReleasedAt allowCertification passingPercentage'
       )
       .populate('questionPaperId', 'setName')
       .populate('questionPaperIds', 'setName')
@@ -672,12 +654,7 @@ router.get('/:sessionId', requireAuth, requireTenant, enforceTenantBoundaries, a
       };
     }
 
-    const juniorConfig = session.examId?.productModule === 'WIZKIDS'
-      ? await WizKidsExamConfig.findOne({ tenantId: req.user.tenantId, examId: session.examId._id })
-        .select('mode gradeLevel domains interactionMode flashMaths')
-        .lean()
-      : null;
-    res.json({ session, assignment, juniorConfig });
+    res.json({ session, assignment });
   } catch (error) {
     next(error);
   }
@@ -755,15 +732,6 @@ router.post(
       if (!exam) {
         return res.status(404).json({ error: 'Exam not found' });
       }
-      try {
-        await assertExamProductAccess({ tenantId: req.user.tenantId, exam });
-      } catch (accessError) {
-        if (accessError instanceof WizKidsAccessError) {
-          return res.status(accessError.status).json({ error: accessError.message });
-        }
-        throw accessError;
-      }
-
       // Check if user has CREATE_SESSION permission for this exam
       const canCreateSession = await hasExamPermission(req.user._id, examId, 'CREATE_SESSION');
       if (!canCreateSession && req.user.role !== 'SUPER_ADMIN' && req.user.role !== 'EXAM_CREATOR') {
@@ -890,7 +858,7 @@ router.post(
         });
       }
 
-      await session.populate('examId', 'title duration showResultsImmediately resultsReleasedAt');
+      await session.populate('examId', 'title duration showResultsImmediately resultsReleasedAt assessmentPurpose resolvedSpecificationSnapshot');
       await session.populate('questionPaperId', 'setName');
       await session.populate('questionPaperIds', 'setName');
 
@@ -1044,7 +1012,7 @@ router.put(
         }
       }
 
-      await session.populate('examId', 'title duration showResultsImmediately resultsReleasedAt');
+      await session.populate('examId', 'title duration showResultsImmediately resultsReleasedAt assessmentPurpose resolvedSpecificationSnapshot');
       await session.populate('questionPaperId', 'setName');
       await session.populate('questionPaperIds', 'setName');
       await session.populate('createdBy', 'name email');
@@ -1124,7 +1092,7 @@ router.get('/validate/:qrCode', requireAuth, async (req, res, next) => {
     const { qrCode } = req.params;
 
     const session = await ExamSession.findOne({ qrCode })
-      .populate('examId', 'title duration maxAttempts showResultsImmediately resultsReleasedAt')
+      .populate('examId', 'title duration maxAttempts showResultsImmediately resultsReleasedAt assessmentPurpose resolvedSpecificationSnapshot')
       .populate('questionPaperId', 'setName')
       .populate('questionPaperIds', 'setName');
 
@@ -1171,7 +1139,7 @@ router.get('/manual-token/:token', requireAuth, async (req, res, next) => {
     const { token } = req.params;
 
     const session = await ExamSession.findOne({ manualToken: token })
-      .populate('examId', 'title duration maxAttempts showResultsImmediately resultsReleasedAt')
+      .populate('examId', 'title duration maxAttempts showResultsImmediately resultsReleasedAt assessmentPurpose resolvedSpecificationSnapshot')
       .populate('questionPaperId', 'setName')
       .populate('questionPaperIds', 'setName');
 

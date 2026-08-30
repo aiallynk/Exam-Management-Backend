@@ -29,6 +29,14 @@ const AnswerSchema = new mongoose.Schema(
     aiEvaluation: {
       type: mongoose.Schema.Types.Mixed,
     },
+    rubricEvaluation: {
+      aiScores: { type: mongoose.Schema.Types.Mixed, default: [] },
+      finalScores: { type: mongoose.Schema.Types.Mixed, default: [] },
+      finalMark: { type: Number, min: 0, default: null },
+      overriddenBy: { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+      overrideReason: { type: String, trim: true, default: '' },
+      updatedAt: { type: Date, default: null },
+    },
     submissionId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'Submission',
@@ -39,6 +47,16 @@ const AnswerSchema = new mongoose.Schema(
     needsReview: {
       type: Boolean,
       default: false,
+    },
+    // Set only when this Answer was materialized from a scanned offline
+    // answer script (Master Phase 4) rather than typed online — links back
+    // to the AnswerSegment so the evaluator UI can show the original
+    // scanned page alongside the extracted text. Null for every online
+    // answer, which is the overwhelming majority of Answer documents.
+    sourceAnswerSegmentId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'AnswerSegment',
+      default: null,
     },
     timeSpent: {
       type: Number,
@@ -88,6 +106,7 @@ const AnswerSchema = new mongoose.Schema(
     evaluationStatus: {
       type: String,
       enum: [
+        'NOT_ATTEMPTED',
         'NOT_EVALUATED',
         'AUTO_EVALUATED',
         'AI_EVALUATED',
@@ -109,4 +128,3 @@ const AnswerSchema = new mongoose.Schema(
 AnswerSchema.index({ attemptId: 1, questionId: 1 }, { unique: true });
 
 export default mongoose.model('Answer', AnswerSchema);
-

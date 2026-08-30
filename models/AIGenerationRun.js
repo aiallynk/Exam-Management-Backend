@@ -1,9 +1,8 @@
 import mongoose from 'mongoose';
 
 // Source-Grounded AI Question Generation — one audit/trace row per
-// POST /api/ai/generate-questions call, regardless of generationMode or
-// productModule. STANDARD and WIZKIDS generation, and STANDARD and
-// SOURCE_GROUNDED modes, all write to this same collection so support/
+// POST /api/ai/generate-questions call, regardless of generation mode. Both
+// standard and source-grounded modes write to this same collection so support/
 // debugging/usage-review has one place to look, matching how
 // AITokenUsage is a single collection for every AI feature rather than
 // one per feature.
@@ -32,11 +31,6 @@ const AIGenerationRunSchema = new mongoose.Schema(
       required: true,
       index: true,
     },
-    productModule: {
-      type: String,
-      enum: ['STANDARD', 'WIZKIDS'],
-      required: true,
-    },
     contextSetId: {
       type: mongoose.Schema.Types.ObjectId,
       ref: 'ContextSet',
@@ -52,6 +46,15 @@ const AIGenerationRunSchema = new mongoose.Schema(
       min: 0,
     },
     acceptedCount: {
+      type: Number,
+      default: 0,
+      min: 0,
+    },
+    // Non-STRICT source-grounded runs (SELECTED_CONTEXT / AUTO_CONTEXT) top up
+    // any grounded shortfall on the same topic so the request is always
+    // fulfilled (Blueprint §4C). This is how many of the delivered questions
+    // came from that top-up rather than from grounded retrieval.
+    supplementedCount: {
       type: Number,
       default: 0,
       min: 0,

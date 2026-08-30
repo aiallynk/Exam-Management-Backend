@@ -447,6 +447,7 @@ export const generateExamPackage = async (examId, questionPaperId, userId, expir
 
   await ensureQuestionsImageAvailability({
     questions,
+    tenantId,
     examId,
     // Avoid package-generation side-effect writes that can trigger BSON serialization issues.
     persist: false,

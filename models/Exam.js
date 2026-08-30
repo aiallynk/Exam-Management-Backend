@@ -30,19 +30,16 @@ const ExamSchema = new mongoose.Schema(
       default: 'ONLINE',
       index: true,
     },
-    // Which product this exam belongs to. Deliberately kept separate from
-    // examType (delivery mechanism: online vs OMR) — product module and
-    // delivery mechanism are independent concerns (master prompt §17).
-    // Default 'STANDARD' preserves today's behavior for every existing exam
-    // unchanged; only WizKids-created exams ever set this to 'WIZKIDS'.
-    // WizKids-specific configuration (mode, grade, domains, batches, timing
-    // behavior) lives entirely outside this model in WizKidsExamConfig
-    // (master prompt §18) — this field is the only thing core Exam needs to
-    // know about WizKids.
-    productModule: {
+    // Independent of examType (which distinguishes ONLINE candidate-portal
+    // delivery from OMR bubble-sheet delivery). deliveryMode instead
+    // answers "does this assessment accept scanned subjective/mixed
+    // answer scripts" (Master Phase 4 — see docs/XAMIGO_V2_OFFLINE_EVALUATION_INSPECTION.md
+    // Part 13). Legacy exams default to ONLINE, preserving current
+    // behavior exactly.
+    deliveryMode: {
       type: String,
-      enum: ['STANDARD', 'WIZKIDS'],
-      default: 'STANDARD',
+      enum: ['ONLINE', 'OFFLINE', 'HYBRID'],
+      default: 'ONLINE',
       index: true,
     },
     duration: {
@@ -116,6 +113,30 @@ const ExamSchema = new mongoose.Schema(
       type: Boolean,
       default: true,
     },
+    // V2 context is additive. Null/default values preserve all legacy exams.
+    // creationMode records which Step 1 flow the creator took; it never
+    // gates capability. Null covers every exam created before this field
+    // existed and every exam created with an empty academicContext today —
+    // both are legacy-compatible and behave exactly like QUICK.
+    creationMode: { type: String, enum: ['QUICK', 'ACADEMIC'], default: null },
+    assessmentPurpose: { type: String, enum: ['OF', 'FOR', 'AS'], default: 'OF', index: true },
+    assessmentType: { type: String, trim: true, default: 'EXAM' },
+    academicContext: { type: mongoose.Schema.Types.Mixed, default: {} },
+    frameworkId: { type: mongoose.Schema.Types.ObjectId, ref: 'AssessmentFramework', default: null },
+    frameworkVersionId: { type: mongoose.Schema.Types.ObjectId, ref: 'FrameworkVersion', default: null },
+    rubricTemplateId: { type: mongoose.Schema.Types.ObjectId, ref: 'RubricTemplate', default: null },
+    // Additive assessment-level rubric pool. rubricTemplateId/rubricSnapshot
+    // remain a legacy-compatible view of the first selected rubric; each
+    // question chooses one applicable member of this immutable pool.
+    rubricTemplateIds: [{ type: mongoose.Schema.Types.ObjectId, ref: 'RubricTemplate' }],
+    // Immutable copy of the selected published rubric. Questions carry their
+    // applicable criteria too, but this records the assessment-level source
+    // template/version without relying on a mutable lookup later.
+    rubricSnapshot: { type: mongoose.Schema.Types.Mixed, default: null, immutable: true },
+    rubricSnapshots: { type: [mongoose.Schema.Types.Mixed], default: undefined, immutable: true },
+    // Governance is resolved by the application and frozen with the assessment.
+    resolvedSpecificationSnapshot: { type: mongoose.Schema.Types.Mixed, default: null, immutable: true },
+    resolvedSpecificationAt: { type: Date, default: null, immutable: true },
     // Tenant field - Exam belongs to a tenant
     tenantId: {
       type: mongoose.Schema.Types.ObjectId,
@@ -340,8 +361,7 @@ ExamSchema.index({ tenantId: 1, createdAt: -1 });
 ExamSchema.index({ createdBy: 1, createdAt: -1 });
 ExamSchema.index({ tenantId: 1, isActive: 1 });
 ExamSchema.index({ tenantId: 1, examType: 1, createdAt: -1 });
+ExamSchema.index({ tenantId: 1, assessmentPurpose: 1, createdAt: -1 });
 ExamSchema.index({ tenantId: 1, subTenantId: 1, createdAt: -1 });
-ExamSchema.index({ tenantId: 1, productModule: 1, createdAt: -1 });
 
 export default mongoose.model('Exam', ExamSchema);
-

@@ -7,7 +7,7 @@ import Language from '../models/Language.js';
 import { initializeSubscriptionPlanCatalog } from './subscriptionPlanCatalog.js';
 
 const MONGO_CONNECT_OPTIONS = {
-  dbName: 'exam_system',
+  dbName: config.mongodbDbName,
   // Connection pool settings for better performance and resource management
   maxPoolSize: 10, // Maximum number of connections in the pool
   minPoolSize: 2, // Minimum number of connections to maintain
@@ -155,6 +155,21 @@ const finalizeSuccessfulConnection = async (usedSrvDnsFallback) => {
     await initializeSubscriptionPlanCatalog();
   } catch (error) {
     console.warn('⚠️  Failed to load subscription plan catalog overrides:', error.message);
+  }
+
+  // Question-memory semantic search diagnostic (Part 6: never silently
+  // claim production semantic memory while only using the bounded
+  // in-process cosine fallback — see services/questionEmbeddingService.js).
+  try {
+    const { getVectorSearchDiagnostic } = await import('../services/questionEmbeddingService.js');
+    const diagnostic = await getVectorSearchDiagnostic();
+    if (diagnostic.status === 'ACTIVE') {
+      console.log(`✅ VECTOR_SEARCH = ACTIVE (index "${diagnostic.indexName}")`);
+    } else {
+      console.log(`ℹ️  VECTOR_SEARCH = FALLBACK — ${diagnostic.reason}`);
+    }
+  } catch (error) {
+    console.warn('⚠️  Unable to run the vector-search startup diagnostic:', error.message);
   }
 };
 

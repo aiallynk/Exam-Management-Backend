@@ -1,7 +1,7 @@
 import config from '../config/env.js';
 import sourceGroundedConfig from '../config/sourceGroundedConfig.js';
-import { getOpenAIClient } from './aiService.js';
-import { createTrackedChatCompletion } from './aiTokenUsageService.js';
+import { runEngineChatCompletion, isOpenAIEngineConfigured } from './aiEngine/aiEngineClient.js';
+import { AI_OPERATIONS } from './aiEngine/aiOperations.js';
 
 // Source-Grounded AI Question Generation — grounding validation (master
 // prompt §18). Deliberately heuristic-first with LLM escalation only for
@@ -41,16 +41,18 @@ export const scoreGroundingHeuristic = ({ questionText, correctAnswer, retrieved
 };
 
 const escalateToLlm = async ({ questionText, correctAnswer, retrievedChunks, tenantId, userId }) => {
-  const client = getOpenAIClient();
-  if (!client) return false; // fail closed — never claim "grounded" without a way to verify
+  if (!isOpenAIEngineConfigured()) return false; // fail closed — never claim "grounded" without a way to verify
 
   const excerpt = (retrievedChunks || [])
     .map((chunk) => chunk.text)
     .join('\n---\n')
     .slice(0, 4000);
 
-  const completion = await createTrackedChatCompletion({
-    client,
+  const completion = await runEngineChatCompletion({
+    operation: AI_OPERATIONS.QUESTION_CLASSIFICATION,
+    feature: 'source_grounded_grounding_validation',
+    tenantId,
+    userId,
     request: {
       model: config.openaiModel,
       response_format: { type: 'json_object' },

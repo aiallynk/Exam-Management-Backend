@@ -6,19 +6,23 @@ import util from 'util';
 import crypto from 'crypto';
 import { execFile } from 'child_process';
 import { fileURLToPath } from 'url';
-import OpenAI from 'openai';
-import pdfParse from 'pdf-parse';
-import readXlsxFile from 'read-excel-file/node';
-import { parse as parseCsv } from 'csv-parse/sync';
 import config from '../config/env.js';
-import {
-  createTrackedChatCompletion,
-  createTrackedImageGeneration,
-} from './aiTokenUsageService.js';
+import { runEngineChatCompletion, runEngineImageGeneration, isOpenAIEngineConfigured, isImageGenerationEngineConfigured } from './aiEngine/aiEngineClient.js';
+import { AI_OPERATIONS } from './aiEngine/aiOperations.js';
+import { getModelForOperation } from './aiEngine/aiConfigService.js';
 import {
   sanitizeIndexedQuestionOptionText,
   sanitizeQuestionOptions,
 } from '../utils/questionOptionSanitizer.js';
+import {
+  putImage,
+  getImageBuffer,
+  imageExists,
+  moveImage,
+  urlToKey as s3UrlToKey,
+  keyToUrl as s3KeyToUrl,
+  buildImageLocation,
+} from './storage/imageStorage.js';
 
 const SUPPORTED_IMAGE_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.svg']);
 const IMAGE_REFERENCE_KEYS = [
@@ -46,10 +50,16 @@ const GENERATED_IMAGE_UPLOAD_SEGMENT = '/uploads/generated_images/';
 const AI_PLACEHOLDER_MARKER = 'AI Diagram Placeholder';
 const AI_PLACEHOLDER_MARKER_LOWER = AI_PLACEHOLDER_MARKER.toLowerCase();
 
-const openAiImageClient = config.openaiApiKey
-  ? new OpenAI({ apiKey: config.openaiApiKey })
-  : null;
+const isVisionConfigured = () => isOpenAIEngineConfigured();
+const isImageGenConfigured = () => isImageGenerationEngineConfigured();
 const OPENAI_MODEL = config.openaiModel || 'gpt-4o-mini';
+
+const engineImportChat = (request, feature = 'question_import_ocr', context = {}) => runEngineChatCompletion({
+  operation: AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE,
+  feature,
+  ...context,
+  request: { model: OPENAI_MODEL, ...request },
+});
 
 let artifactSequence = 0;
 let unzipperModuleCache = null;
@@ -262,16 +272,14 @@ const uploadUrlContainsPlaceholderMarker = async (uploadUrl) => {
   const normalizedUploadUrl = normalizeUploadUrl(uploadUrl);
   if (!normalizedUploadUrl) return false;
 
-  const absolutePath = uploadUrlToAbsolutePath(normalizedUploadUrl);
-  if (!absolutePath) return false;
-
-  if (normalizeImageExt(path.extname(absolutePath)) !== '.svg') {
+  if (normalizeImageExt(path.extname(normalizedUploadUrl)) !== '.svg') {
     return false;
   }
 
   try {
-    const fileContents = await fs.readFile(absolutePath, 'utf-8');
-    return sanitizeString(fileContents).toLowerCase().includes(AI_PLACEHOLDER_MARKER_LOWER);
+    const buffer = await getImageBuffer({ url: normalizedUploadUrl });
+    if (!buffer?.length) return false;
+    return buffer.toString('utf-8').toLowerCase().includes(AI_PLACEHOLDER_MARKER_LOWER);
   } catch {
     return false;
   }
@@ -298,20 +306,6 @@ const isGeneratedImageReference = (value) => {
   return normalized.includes(AI_PLACEHOLDER_MARKER);
 };
 
-const absolutePathToUploadUrl = (absolutePath) => {
-  const normalized = sanitizeString(absolutePath);
-  if (!normalized) return '';
-
-  const uploadsRoot = path.resolve(getUploadsRoot());
-  const candidate = path.resolve(normalized);
-  if (!candidate.startsWith(uploadsRoot)) {
-    return '';
-  }
-
-  const relative = path.relative(uploadsRoot, candidate).split(path.sep).join('/');
-  return relative ? `/uploads/${relative}` : '';
-};
-
 const normalizeUploadUrl = (value) => {
   const normalized = sanitizeString(value);
   if (!normalized) return '';
@@ -336,13 +330,6 @@ const normalizeUploadUrl = (value) => {
   return '';
 };
 
-const uploadUrlToAbsolutePath = (uploadUrl) => {
-  const normalized = normalizeUploadUrl(uploadUrl);
-  if (!normalized) return '';
-  const relative = normalized.replace(/^\/uploads\//, '');
-  return path.join(getUploadsRoot(), relative);
-};
-
 const detectMimeByPath = (filePath) => {
   const ext = normalizeImageExt(path.extname(filePath));
   if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
@@ -350,6 +337,9 @@ const detectMimeByPath = (filePath) => {
   return 'image/png';
 };
 
+// filePathToDataUri reads a genuine local filesystem path (used by the
+// scanned-PDF OCR pipeline, whose crop images are read straight off disk
+// before/without ever being uploaded — see extractQuestionsFromScannedBlocks).
 const filePathToDataUri = async (filePath) => {
   try {
     const buffer = await fs.readFile(filePath);
@@ -361,12 +351,27 @@ const filePathToDataUri = async (filePath) => {
   }
 };
 
-const uploadUrlExists = async (uploadUrl) => {
-  const absolutePath = uploadUrlToAbsolutePath(uploadUrl);
-  if (!absolutePath) return false;
+// uploadUrlToDataUri fetches an already-S3-stored image (referenced by its
+// /uploads/... URL) and returns it as a data URI — the S3 counterpart to
+// filePathToDataUri above.
+const uploadUrlToDataUri = async (uploadUrl) => {
+  const normalized = normalizeUploadUrl(uploadUrl);
+  if (!normalized) return '';
   try {
-    await fs.access(absolutePath);
-    return true;
+    const buffer = await getImageBuffer({ url: normalized });
+    if (!buffer?.length) return '';
+    const mimeType = detectMimeByPath(normalized);
+    return `data:${mimeType};base64,${buffer.toString('base64')}`;
+  } catch {
+    return '';
+  }
+};
+
+const uploadUrlExists = async (uploadUrl) => {
+  const normalized = normalizeUploadUrl(uploadUrl);
+  if (!normalized) return false;
+  try {
+    return await imageExists({ url: normalized });
   } catch {
     return false;
   }
@@ -374,24 +379,60 @@ const uploadUrlExists = async (uploadUrl) => {
 
 const persistArtifactToStorage = async ({
   artifact,
-  pathSegments = [],
+  tenantId,
+  examId,
+  category = 'misc',
+  subpath = [],
   fileStem = 'diagram',
 }) => {
   if (!artifact || !Buffer.isBuffer(artifact.buffer) || !artifact.buffer.length) {
     return '';
   }
 
-  const uploadsRoot = getUploadsRoot();
-  const folder = path.join(uploadsRoot, ...pathSegments.filter(Boolean).map((segment) => String(segment)));
-  await fs.mkdir(folder, { recursive: true });
-
   const extension = normalizeImageExt(artifact.extension || detectMimeAndExtFromBuffer(artifact.buffer).extension || '.png');
   const stem = sanitizeFilename(fileStem || path.parse(artifact.name || 'image').name, 'diagram');
-  const filename = `${stem}-${Date.now()}${Math.random().toString(36).slice(2, 6)}${extension}`;
-  const absolutePath = path.join(folder, filename);
-  await fs.writeFile(absolutePath, artifact.buffer);
+  const stored = await putImage({
+    tenantId,
+    examId,
+    category,
+    subpath,
+    fileStem: stem,
+    extension,
+    buffer: artifact.buffer,
+  });
 
-  return absolutePathToUploadUrl(absolutePath);
+  return stored?.url || '';
+};
+
+// Reads an already-on-disk image file and uploads it to S3 — used for the
+// scanned-PDF OCR pipeline, whose Python subprocess writes crop/page images
+// directly to local disk before this module ever sees them (see
+// runScannedPdfProcessor). Returns '' only when the local file itself is
+// missing/empty; an S3-configuration or upload error still throws (from
+// putImage) so callers get a clear hard-fail rather than a silently-broken
+// empty image URL.
+const uploadLocalImageFile = async ({ tenantId, examId, category = 'misc', subpath = [], absolutePath, fileStem }) => {
+  const normalizedPath = sanitizeString(absolutePath);
+  if (!normalizedPath) return '';
+  let buffer;
+  try {
+    buffer = await fs.readFile(normalizedPath);
+  } catch {
+    return '';
+  }
+  if (!buffer.length) return '';
+
+  const extension = normalizeImageExt(path.extname(normalizedPath)) || '.png';
+  const stored = await putImage({
+    tenantId,
+    examId,
+    category,
+    subpath,
+    fileStem: fileStem || path.parse(normalizedPath).name,
+    extension,
+    buffer,
+  });
+  return stored?.url || '';
 };
 
 const normalizeOptionValue = (value, index = null) => {
@@ -487,11 +528,78 @@ const ensureUniqueQuestionText = (questions) => {
   return result;
 };
 
+// Uploads every block/page crop the Python renderer wrote to local disk,
+// filling in the *Url fields alongside the existing *Path fields (the raw
+// local paths stay valid — extractQuestionsFromScannedBlocks still reads
+// them directly for vision OCR). Deliberately NOT called from inside the
+// runtime-retry loop below: an S3-configuration error here must propagate
+// as-is, not get swallowed and misreported as "python runtime failed".
+const uploadScannedPdfImages = async ({ pages, tenantId, importSessionId }) => {
+  const blocks = [];
+
+  for (const page of pages) {
+    const rawImagePath = sanitizeString(page?.rawImage || '');
+    const preprocessedImagePath = sanitizeString(page?.preprocessedImage || '');
+    page.rawImageUrl = rawImagePath
+      ? await uploadLocalImageFile({
+          tenantId,
+          category: 'questions',
+          subpath: ['imports', importSessionId, 'scanned'],
+          absolutePath: rawImagePath,
+          fileStem: 'page-raw',
+        })
+      : '';
+    page.preprocessedImageUrl = preprocessedImagePath
+      ? await uploadLocalImageFile({
+          tenantId,
+          category: 'questions',
+          subpath: ['imports', importSessionId, 'scanned'],
+          absolutePath: preprocessedImagePath,
+          fileStem: 'page-preprocessed',
+        })
+      : '';
+
+    for (const block of Array.isArray(page?.blocks) ? page.blocks : []) {
+      const blockImagePath = sanitizeString(block?.blockImage || '');
+      const preprocessedPath = sanitizeString(block?.preprocessedBlockImage || '');
+      const ocrBlockImagePath = sanitizeString(block?.ocrBlockImage || '');
+      const ocrPreprocessedPath = sanitizeString(block?.ocrBlockPreprocessedImage || '');
+      const diagramPath = sanitizeString(block?.diagramImage || '');
+      const subpath = ['imports', importSessionId, 'scanned'];
+      const uploadIfPresent = (absolutePath, fileStem) =>
+        absolutePath
+          ? uploadLocalImageFile({ tenantId, category: 'questions', subpath, absolutePath, fileStem })
+          : Promise.resolve('');
+
+      blocks.push({
+        pageNumber: Number.isFinite(Number(page?.pageNumber)) ? Number(page.pageNumber) : 1,
+        blockIndex: Number.isFinite(Number(block?.blockIndex)) ? Number(block.blockIndex) : blocks.length + 1,
+        bbox: block?.bbox || null,
+        blockImagePath,
+        preprocessedBlockImagePath: preprocessedPath,
+        ocrBlockImagePath,
+        ocrBlockPreprocessedImagePath: ocrPreprocessedPath,
+        diagramImagePath: diagramPath,
+        blockImageUrl: await uploadIfPresent(blockImagePath, 'block'),
+        preprocessedBlockImageUrl: await uploadIfPresent(preprocessedPath, 'block-preprocessed'),
+        ocrBlockImageUrl: await uploadIfPresent(ocrBlockImagePath, 'block-ocr'),
+        ocrBlockPreprocessedImageUrl: await uploadIfPresent(ocrPreprocessedPath, 'block-ocr-preprocessed'),
+        diagramImageUrl: await uploadIfPresent(diagramPath, 'block-diagram'),
+        layoutRegions:
+          block?.layoutRegions && typeof block.layoutRegions === 'object' ? block.layoutRegions : null,
+      });
+    }
+  }
+
+  return blocks;
+};
+
 const runScannedPdfProcessor = async ({
   sourceBuffer,
   pdfBuffer,
   inputExtension = '.pdf',
   importSessionId,
+  tenantId,
   extractionErrors,
 }) => {
   const effectiveBuffer = Buffer.isBuffer(sourceBuffer)
@@ -504,7 +612,7 @@ const runScannedPdfProcessor = async ({
       stage: 'scanned-pdf-processor',
       message: 'No valid input buffer provided for scanned processor.',
     });
-    return { blocks: [], pages: [] };
+    return { blocks: [], pages: [], workingDir: '' };
   }
 
   const uploadsRoot = getUploadsRoot();
@@ -532,6 +640,7 @@ const runScannedPdfProcessor = async ({
         ];
 
   const runtimeErrors = [];
+  let pages = null;
 
   for (const runtime of runtimeCandidates) {
     try {
@@ -560,104 +669,75 @@ const runScannedPdfProcessor = async ({
           stage: 'scanned-pdf-processor',
           message: sanitizeString(parsed.error),
         });
-        return { blocks: [], pages: [] };
+        return { blocks: [], pages: [], workingDir };
       }
 
-      const pages = Array.isArray(parsed?.pages) ? parsed.pages : [];
-      const blocks = [];
-
-      pages.forEach((page) => {
-        (Array.isArray(page?.blocks) ? page.blocks : []).forEach((block) => {
-          const blockImagePath = sanitizeString(block?.blockImage || '');
-          const preprocessedPath = sanitizeString(block?.preprocessedBlockImage || '');
-          const ocrBlockImagePath = sanitizeString(block?.ocrBlockImage || '');
-          const ocrPreprocessedPath = sanitizeString(block?.ocrBlockPreprocessedImage || '');
-          const diagramPath = sanitizeString(block?.diagramImage || '');
-
-          blocks.push({
-            pageNumber: Number.isFinite(Number(page?.pageNumber))
-              ? Number(page.pageNumber)
-              : 1,
-            blockIndex: Number.isFinite(Number(block?.blockIndex))
-              ? Number(block.blockIndex)
-              : blocks.length + 1,
-            bbox: block?.bbox || null,
-            blockImagePath,
-            preprocessedBlockImagePath: preprocessedPath,
-            ocrBlockImagePath,
-            ocrBlockPreprocessedImagePath: ocrPreprocessedPath,
-            diagramImagePath: diagramPath,
-            blockImageUrl: absolutePathToUploadUrl(blockImagePath),
-            preprocessedBlockImageUrl: absolutePathToUploadUrl(preprocessedPath),
-            ocrBlockImageUrl: absolutePathToUploadUrl(ocrBlockImagePath),
-            ocrBlockPreprocessedImageUrl: absolutePathToUploadUrl(ocrPreprocessedPath),
-            diagramImageUrl: absolutePathToUploadUrl(diagramPath),
-            layoutRegions:
-              block?.layoutRegions && typeof block.layoutRegions === 'object'
-                ? block.layoutRegions
-                : null,
-          });
-        });
-      });
-
-      return { blocks, pages };
+      pages = Array.isArray(parsed?.pages) ? parsed.pages : [];
+      break;
     } catch (error) {
       const runtimeLabel = `${runtime.executable}${runtime.prefixArgs.length ? ` ${runtime.prefixArgs.join(' ')}` : ''}`;
       runtimeErrors.push(`${runtimeLabel}: ${error?.message || 'Execution failed'}`);
     }
   }
 
-  extractionErrors.push({
-    stage: 'scanned-pdf-processor',
-    message:
-      runtimeErrors.length > 0
-        ? `Failed to execute scanned PDF processor via available runtimes. ${runtimeErrors.join(' | ').slice(0, 900)}`
-        : 'Failed to execute scanned PDF processor.',
-  });
-  return { blocks: [], pages: [] };
+  if (pages === null) {
+    extractionErrors.push({
+      stage: 'scanned-pdf-processor',
+      message:
+        runtimeErrors.length > 0
+          ? `Failed to execute scanned PDF processor via available runtimes. ${runtimeErrors.join(' | ').slice(0, 900)}`
+          : 'Failed to execute scanned PDF processor.',
+    });
+    return { blocks: [], pages: [], workingDir };
+  }
+
+  // Outside the runtime-retry try/catch on purpose — an S3-configuration
+  // error here is real and must propagate, not be misreported as a failed
+  // python runtime.
+  const blocks = await uploadScannedPdfImages({ pages, tenantId, importSessionId });
+  return { blocks, pages, workingDir };
 };
 
 const extractStructuredQuestionWithVision = async ({
   primaryImagePath,
   fallbackImagePath,
+  // Pre-built data URIs bypass the local-fs read above — used by callers
+  // whose image already lives in S3 rather than on local disk (see the
+  // single-image-upload fallback in parseQuestionImportFile).
+  primaryDataUri: primaryDataUriOverride,
+  fallbackDataUri: fallbackDataUriOverride,
   blockIndex,
   extractionErrors,
 }) => {
-  if (!openAiImageClient) return null;
+  if (!isVisionConfigured()) return null;
 
-  const primaryDataUri = await filePathToDataUri(primaryImagePath);
-  const fallbackDataUri = fallbackImagePath
-    ? await filePathToDataUri(fallbackImagePath)
-    : '';
+  const primaryDataUri = primaryDataUriOverride || (await filePathToDataUri(primaryImagePath));
+  const fallbackDataUri =
+    fallbackDataUriOverride || (fallbackImagePath ? await filePathToDataUri(fallbackImagePath) : '');
   const payloadImage = primaryDataUri || fallbackDataUri;
   if (!payloadImage) return null;
 
   // Stage 1: OCR-like raw text extraction from the block.
   let ocrQuestion = null;
   try {
-    const ocrCompletion = await createTrackedChatCompletion({
-      client: openAiImageClient,
-      feature: 'question_import_ocr',
-      request: {
-        model: OPENAI_MODEL,
-        temperature: 0,
-        messages: [
-          {
-            role: 'user',
-            content: [
-              {
-                type: 'text',
-                text:
-                  'Read this scanned question block and return only the visible text with original line breaks, including options.',
-              },
-              {
-                type: 'image_url',
-                image_url: { url: payloadImage },
-              },
-            ],
-          },
-        ],
-      },
+    const ocrCompletion = await engineImportChat({
+      temperature: 0,
+      messages: [
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'text',
+              text:
+                'Read this scanned question block and return only the visible text with original line breaks, including options.',
+            },
+            {
+              type: 'image_url',
+              image_url: { url: payloadImage },
+            },
+          ],
+        },
+      ],
     });
 
     const ocrText = sanitizeString(ocrCompletion?.choices?.[0]?.message?.content || '');
@@ -677,11 +757,7 @@ const extractStructuredQuestionWithVision = async ({
 
   // Stage 2: AI structured fallback if OCR text is weak.
   try {
-    const completion = await createTrackedChatCompletion({
-      client: openAiImageClient,
-      feature: 'question_import_ocr',
-      request: {
-        model: OPENAI_MODEL,
+    const completion = await engineImportChat({
         temperature: 0.1,
         response_format: { type: 'json_object' },
         messages: [
@@ -704,7 +780,6 @@ const extractStructuredQuestionWithVision = async ({
             ],
           },
         ],
-      },
     });
 
     const parsed = JSON.parse(completion?.choices?.[0]?.message?.content || '{}');
@@ -1352,33 +1427,14 @@ const extractPdfImageArtifacts = async (pdfBuffer, extractionErrors) => {
   return dedupeArtifacts(artifacts);
 };
 
-const persistArtifactForQuestion = async ({ artifact, importSessionId, questionIndex, fileStem }) => {
-  const uploadsRoot = getUploadsRoot();
-  const folder = path.join(
-    uploadsRoot,
-    'questions',
-    'imports',
-    importSessionId,
-    `q${questionIndex + 1}`
-  );
-  await fs.mkdir(folder, { recursive: true });
-
-  const extension = normalizeImageExt(artifact.extension);
-  const stem = sanitizeFilename(fileStem || path.parse(artifact.name || 'image').name, 'diagram');
-  const filename = `${stem}-${Date.now()}${Math.random().toString(36).slice(2, 6)}${extension}`;
-  const absolutePath = path.join(folder, filename);
-  await fs.writeFile(absolutePath, artifact.buffer);
-
-  const relativePath = path.posix.join(
-    'uploads',
-    'questions',
-    'imports',
-    importSessionId,
-    `q${questionIndex + 1}`,
-    filename
-  );
-  return `/${relativePath}`;
-};
+const persistArtifactForQuestion = async ({ artifact, tenantId, importSessionId, questionIndex, fileStem }) =>
+  persistArtifactToStorage({
+    artifact,
+    tenantId,
+    category: 'questions',
+    subpath: ['imports', importSessionId, `q${questionIndex + 1}`],
+    fileStem,
+  });
 const decodeDataUriToArtifact = (value, source) => {
   const match = String(value || '').match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,([A-Za-z0-9+/=\s]+)$/);
   if (!match) return null;
@@ -1504,14 +1560,13 @@ const generateDiagramArtifact = async ({
   const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const safeRetries = Math.max(1, Number.isFinite(Number(maxRetries)) ? Number(maxRetries) : 3);
 
-  if (openAiImageClient) {
+  if (isImageGenConfigured()) {
     for (let attempt = 0; attempt < safeRetries; attempt += 1) {
       try {
-        const response = await createTrackedImageGeneration({
-          client: openAiImageClient,
+        const response = await runEngineImageGeneration({
           feature: 'question_image_generation',
           request: {
-            model: 'gpt-image-1',
+            model: getModelForOperation(AI_OPERATIONS.QUESTION_IMAGE_GENERATION),
             prompt: buildDiagramPrompt(diagramType, sanitizeString(questionText).slice(0, 500)),
             size: '1536x1024',
             background: 'opaque',
@@ -1606,6 +1661,7 @@ const generateDiagramArtifact = async ({
 };
 
 export const createGeneratedQuestionImage = async ({
+  tenantId = null,
   examId = '',
   questionId = '',
   questionText = '',
@@ -1646,7 +1702,10 @@ export const createGeneratedQuestionImage = async ({
 
   const generatedImage = await persistArtifactToStorage({
     artifact,
-    pathSegments: ['questions', safeExamId || 'shared', safeQuestionId],
+    tenantId,
+    examId: safeExamId || undefined,
+    category: 'questions',
+    subpath: [safeQuestionId],
     fileStem,
   });
   const imageBase64 = artifactToDataUri(artifact);
@@ -1835,7 +1894,7 @@ const extractQuestionsFromPdfVisionDirect = async ({
   pdfBuffer,
   extractionErrors,
 }) => {
-  if (!openAiImageClient) return [];
+  if (!isVisionConfigured()) return [];
   if (!Buffer.isBuffer(pdfBuffer) || !pdfBuffer.length) return [];
   if (pdfBuffer.length > 8 * 1024 * 1024) {
     extractionErrors.push({
@@ -1847,11 +1906,7 @@ const extractQuestionsFromPdfVisionDirect = async ({
 
   try {
     const dataUri = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`;
-    const completion = await createTrackedChatCompletion({
-      client: openAiImageClient,
-      feature: 'question_import_ocr',
-      request: {
-        model: OPENAI_MODEL,
+    const completion = await engineImportChat({
         temperature: 0.1,
         response_format: { type: 'json_object' },
         messages: [
@@ -1888,7 +1943,6 @@ const extractQuestionsFromPdfVisionDirect = async ({
             ],
           },
         ],
-      },
     });
 
     const parsed = JSON.parse(completion?.choices?.[0]?.message?.content || '{}');
@@ -1938,7 +1992,7 @@ const extractQuestionsFromPdfVisionDirect = async ({
   }
 };
 
-export const parseQuestionImportFile = async (file) => {
+export const parseQuestionImportFile = async (file, { tenantId } = {}) => {
   const extension = path.extname(file?.originalname || '').toLowerCase();
   const extractionErrors = [];
   const importSessionId = makeImportSessionId();
@@ -2028,17 +2082,29 @@ export const parseQuestionImportFile = async (file) => {
     // vision pass above didn't produce anything — this heavier
     // page-rendering/block-detection pipeline is reserved as a last resort.
     if (!text && (!Array.isArray(structuredRows) || structuredRows.length === 0)) {
-      const scanned = await runScannedPdfProcessor({
-        sourceBuffer: file.buffer,
-        inputExtension: extension,
-        importSessionId,
-        extractionErrors,
-      });
+      let scanned = { blocks: [], pages: [], workingDir: '' };
+      try {
+        scanned = await runScannedPdfProcessor({
+          sourceBuffer: file.buffer,
+          inputExtension: extension,
+          importSessionId,
+          tenantId,
+          extractionErrors,
+        });
+      } catch (scannedError) {
+        extractionErrors.push({
+          stage: 'scanned-pdf-processor',
+          message: scannedError?.message || 'Failed to persist scanned PDF images.',
+        });
+      }
 
       const scannedQuestions = await extractQuestionsFromScannedBlocks({
         blocks: scanned.blocks,
         extractionErrors,
       });
+      if (scanned.workingDir) {
+        await fs.rm(scanned.workingDir, { recursive: true, force: true }).catch(() => {});
+      }
 
       if (scannedQuestions.length > 0) {
         structuredRows = scannedQuestions;
@@ -2060,10 +2126,7 @@ export const parseQuestionImportFile = async (file) => {
         scanned.pages.length > 0
       ) {
         const pagePlaceholders = scanned.pages.slice(0, 25).map((page, idx) => {
-          const imageUrl =
-            absolutePathToUploadUrl(sanitizeString(page?.rawImage || '')) ||
-            absolutePathToUploadUrl(sanitizeString(page?.preprocessedImage || '')) ||
-            '';
+          const imageUrl = sanitizeString(page?.rawImageUrl || page?.preprocessedImageUrl || '');
           return {
             questionText: `Scanned PDF page ${idx + 1} (diagram/manual review required)`,
             questionType: 'MULTIPLE_CHOICE',
@@ -2102,12 +2165,20 @@ export const parseQuestionImportFile = async (file) => {
           let imageUrl = '';
           const artifact = extractedArtifacts[idx];
           if (artifact) {
-            imageUrl = await persistArtifactForQuestion({
-              artifact,
-              importSessionId,
-              questionIndex: idx,
-              fileStem: 'scanned-page',
-            });
+            try {
+              imageUrl = await persistArtifactForQuestion({
+                artifact,
+                tenantId,
+                importSessionId,
+                questionIndex: idx,
+                fileStem: 'scanned-page',
+              });
+            } catch (persistError) {
+              extractionErrors.push({
+                stage: 'pdf-manual-review-fallback',
+                message: persistError?.message || 'Failed to persist placeholder image.',
+              });
+            }
           }
 
           placeholderRows.push({
@@ -2145,17 +2216,29 @@ export const parseQuestionImportFile = async (file) => {
 
     // Image input path: run the same scanned-layout pipeline for raster images.
     if (extension !== '.svg') {
-      const scanned = await runScannedPdfProcessor({
-        sourceBuffer: file.buffer,
-        inputExtension: extension,
-        importSessionId,
-        extractionErrors,
-      });
+      let scanned = { blocks: [], pages: [], workingDir: '' };
+      try {
+        scanned = await runScannedPdfProcessor({
+          sourceBuffer: file.buffer,
+          inputExtension: extension,
+          importSessionId,
+          tenantId,
+          extractionErrors,
+        });
+      } catch (scannedError) {
+        extractionErrors.push({
+          stage: 'scanned-pdf-processor',
+          message: scannedError?.message || 'Failed to persist scanned image.',
+        });
+      }
 
       const scannedQuestions = await extractQuestionsFromScannedBlocks({
         blocks: scanned.blocks,
         extractionErrors,
       });
+      if (scanned.workingDir) {
+        await fs.rm(scanned.workingDir, { recursive: true, force: true }).catch(() => {});
+      }
       if (scannedQuestions.length > 0) {
         structuredRows = scannedQuestions;
         text = scannedQuestions
@@ -2175,6 +2258,7 @@ export const parseQuestionImportFile = async (file) => {
       try {
         uploadedImageUrl = await persistArtifactForQuestion({
           artifact: uploadedArtifact,
+          tenantId,
           importSessionId,
           questionIndex: 0,
           fileStem: 'uploaded-question-image',
@@ -2186,11 +2270,11 @@ export const parseQuestionImportFile = async (file) => {
         });
       }
 
-      const uploadedImagePath = uploadUrlToAbsolutePath(uploadedImageUrl);
-      if (uploadedImagePath) {
+      const uploadedImageDataUri = await uploadUrlToDataUri(uploadedImageUrl);
+      if (uploadedImageDataUri) {
         const extracted = await extractStructuredQuestionWithVision({
-          primaryImagePath: uploadedImagePath,
-          fallbackImagePath: uploadedImagePath,
+          primaryDataUri: uploadedImageDataUri,
+          fallbackDataUri: uploadedImageDataUri,
           blockIndex: 1,
           extractionErrors,
         });
@@ -2256,6 +2340,7 @@ export const attachImagesToImportedQuestions = async ({
   rowEmbeddedArtifacts,
   extractionErrors,
   importSessionId,
+  tenantId,
   // When false, only images actually present in the uploaded file
   // (mapped/extracted artifacts) are attached — no AI-generated diagram
   // and no local-SVG-fallback diagram is ever created for a question
@@ -2301,6 +2386,7 @@ export const attachImagesToImportedQuestions = async ({
     try {
       return await persistArtifactForQuestion({
         artifact,
+        tenantId,
         importSessionId,
         questionIndex,
         fileStem,
@@ -2321,25 +2407,15 @@ export const attachImagesToImportedQuestions = async ({
       return normalized;
     }
 
-    const absolutePath = uploadUrlToAbsolutePath(normalized);
-    if (!absolutePath) {
-      errors.push({
-        stage,
-        message: `Invalid upload image path mapping: ${normalized}`,
-      });
-      return '';
+    if (await imageExists({ url: normalized })) {
+      return normalized;
     }
 
-    try {
-      await fs.access(absolutePath);
-      return normalized;
-    } catch {
-      errors.push({
-        stage,
-        message: `Image file not found during import validation: ${normalized}`,
-      });
-      return '';
-    }
+    errors.push({
+      stage,
+      message: `Image file not found during import validation: ${normalized}`,
+    });
+    return '';
   };
 
   const consumeRowEmbeddedArtifact = (rowIndex) => {
@@ -2584,7 +2660,7 @@ export const attachImagesToImportedQuestions = async ({
   for (const question of safeQuestions) {
     const normalizedImageUrl = normalizeUploadUrl(question.imageUrl || question.generatedImage);
     if (!sanitizeString(question.imageBase64) && normalizedImageUrl) {
-      question.imageBase64 = await filePathToDataUri(uploadUrlToAbsolutePath(normalizedImageUrl));
+      question.imageBase64 = await uploadUrlToDataUri(normalizedImageUrl);
     }
     question.image_path = sanitizeString(question.imageUrl || question.generatedImage || '');
     question.image_base64 = sanitizeString(question.imageBase64);
@@ -2614,7 +2690,7 @@ export const extractTextFromImageArtifacts = async ({
     return { text: '', warnings };
   }
 
-  if (!openAiImageClient) {
+  if (!isVisionConfigured()) {
     warnings.push({
       stage: 'ocr-images',
       message: 'OpenAI API key is not configured for OCR fallback.',
@@ -2632,13 +2708,9 @@ export const extractTextFromImageArtifacts = async ({
     if (!dataUri) continue;
 
     try {
-      const response = await createTrackedChatCompletion({
-        client: openAiImageClient,
-        feature: 'question_import_ocr',
-        request: {
-          model: OPENAI_MODEL,
-          temperature: 0,
-          messages: [
+      const response = await engineImportChat({
+        temperature: 0,
+        messages: [
             {
               role: 'user',
               content: [
@@ -2654,7 +2726,6 @@ export const extractTextFromImageArtifacts = async ({
               ],
             },
           ],
-        },
       });
 
       const extracted = sanitizeString(response?.choices?.[0]?.message?.content || '');
@@ -2684,7 +2755,7 @@ export const extractTextFromPdfBufferWithVision = async ({
     return { text: '', warnings };
   }
 
-  if (!openAiImageClient) {
+  if (!isVisionConfigured()) {
     warnings.push({
       stage: 'ocr-pdf',
       message: 'OpenAI API key is not configured for scanned PDF OCR fallback.',
@@ -2702,11 +2773,7 @@ export const extractTextFromPdfBufferWithVision = async ({
 
   try {
     const dataUri = `data:application/pdf;base64,${pdfBuffer.toString('base64')}`;
-    const response = await createTrackedChatCompletion({
-      client: openAiImageClient,
-      feature: 'question_import_ocr',
-      request: {
-        model: OPENAI_MODEL,
+    const response = await engineImportChat({
         temperature: 0,
         messages: [
           {
@@ -2724,7 +2791,6 @@ export const extractTextFromPdfBufferWithVision = async ({
             ],
           },
         ],
-      },
     });
 
     return {
@@ -2739,18 +2805,6 @@ export const extractTextFromPdfBufferWithVision = async ({
     return { text: '', warnings };
   }
 };
-const moveFile = async (sourcePath, destinationPath) => {
-  try {
-    await fs.rename(sourcePath, destinationPath);
-  } catch (error) {
-    if (error.code !== 'EXDEV') {
-      throw error;
-    }
-    await fs.copyFile(sourcePath, destinationPath);
-    await fs.unlink(sourcePath);
-  }
-};
-
 export const questionRequiresImageSupport = (question, { allowKeywordInference = true } = {}) => {
   if (!question || typeof question !== 'object') return false;
 
@@ -2809,6 +2863,7 @@ const applyQuestionImageUpdates = (question, updates = {}) => {
 
 export const ensureQuestionImageAvailability = async ({
   question,
+  tenantId = null,
   examId,
   questionId = null,
   persist = true,
@@ -2889,6 +2944,7 @@ export const ensureQuestionImageAvailability = async ({
   if (!effectiveForceGenerate && safeExamId && resolvedQuestionId && imageUrl) {
     const relocatedImageUrl = await relocateImportedQuestionImage({
       imageUrl,
+      tenantId,
       examId: safeExamId,
       questionId: resolvedQuestionId,
     });
@@ -2914,9 +2970,10 @@ export const ensureQuestionImageAvailability = async ({
     if (restoredArtifact) {
       const restoredUrl = await persistArtifactToStorage({
         artifact: restoredArtifact,
-        pathSegments: restoreBase64IntoGeneratedField
-          ? ['generated_images', safeExamId || 'shared', resolvedQuestionId || 'question-image']
-          : ['questions', safeExamId || 'shared', resolvedQuestionId || 'question-image'],
+        tenantId,
+        examId: safeExamId || undefined,
+        category: restoreBase64IntoGeneratedField ? 'generated_images' : 'questions',
+        subpath: [resolvedQuestionId || 'question-image'],
         fileStem: 'restored-image',
       });
       if (restoredUrl) {
@@ -2956,7 +3013,10 @@ export const ensureQuestionImageAvailability = async ({
     if (artifact) {
       const generatedUrl = await persistArtifactToStorage({
         artifact,
-        pathSegments: ['generated_images', safeExamId || 'shared', resolvedQuestionId || 'question-image'],
+        tenantId,
+        examId: safeExamId || undefined,
+        category: 'generated_images',
+        subpath: [resolvedQuestionId || 'question-image'],
         fileStem: 'generated-diagram',
       });
       const generatedBase64 = artifactToDataUri(artifact);
@@ -2978,11 +3038,11 @@ export const ensureQuestionImageAvailability = async ({
     const fallbackGeneratedSourceUrl = normalizeUploadUrl(generatedImage);
 
     if (primaryImageSourceUrl) {
-      imageBase64 = await filePathToDataUri(uploadUrlToAbsolutePath(primaryImageSourceUrl));
+      imageBase64 = await uploadUrlToDataUri(primaryImageSourceUrl);
     }
 
     if (!imageBase64 && fallbackGeneratedSourceUrl) {
-      imageBase64 = await filePathToDataUri(uploadUrlToAbsolutePath(fallbackGeneratedSourceUrl));
+      imageBase64 = await uploadUrlToDataUri(fallbackGeneratedSourceUrl);
     }
   }
 
@@ -3007,6 +3067,7 @@ export const ensureQuestionImageAvailability = async ({
 
 export const ensureQuestionsImageAvailability = async ({
   questions,
+  tenantId = null,
   examId,
   persist = true,
   forceGenerate = false,
@@ -3019,6 +3080,7 @@ export const ensureQuestionsImageAvailability = async ({
   for (const question of safeQuestions) {
     const result = await ensureQuestionImageAvailability({
       question,
+      tenantId,
       examId,
       persist,
       forceGenerate,
@@ -3038,6 +3100,7 @@ export const ensureQuestionsImageAvailability = async ({
 
 export const relocateImportedQuestionImage = async ({
   imageUrl,
+  tenantId,
   examId,
   questionId,
 }) => {
@@ -3055,41 +3118,24 @@ export const relocateImportedQuestionImage = async ({
     return localUploadUrl;
   }
 
-  const uploadsRoot = getUploadsRoot();
-  const sourcePath = uploadUrlToAbsolutePath(localUploadUrl);
-  if (!sourcePath) {
+  if (!(await imageExists({ url: localUploadUrl }))) {
     return normalizedUrl;
   }
 
-  try {
-    await fs.access(sourcePath);
-  } catch {
-    return normalizedUrl;
-  }
+  const sourceKey = s3UrlToKey(localUploadUrl);
+  const filename = sanitizeFilename(path.basename(sourceKey || localUploadUrl), 'diagram.png');
+  const destination = buildImageLocation({
+    tenantId,
+    examId,
+    category: 'questions',
+    subpath: [String(questionId)],
+    filename,
+  });
 
-  const normalizedSegments = localUploadUrl.split('/').filter(Boolean);
-  const isAlreadyQuestionScoped =
-    normalizedSegments[0] === 'uploads' &&
-    normalizedSegments[1] === 'questions' &&
-    normalizedSegments[2] === String(examId) &&
-    normalizedSegments[3] === String(questionId);
-  if (isAlreadyQuestionScoped) {
+  if (destination.url === localUploadUrl) {
     return localUploadUrl;
   }
 
-  const filename = sanitizeFilename(path.basename(sourcePath), 'diagram.png');
-  const destinationDir = path.join(
-    uploadsRoot,
-    'questions',
-    String(examId),
-    String(questionId)
-  );
-  await fs.mkdir(destinationDir, { recursive: true });
-  const destinationPath = path.join(destinationDir, filename);
-  if (path.resolve(sourcePath) === path.resolve(destinationPath)) {
-    return absolutePathToUploadUrl(destinationPath) || localUploadUrl;
-  }
-  await moveFile(sourcePath, destinationPath);
-
-  return absolutePathToUploadUrl(destinationPath) || `/uploads/questions/${examId}/${questionId}/${filename}`;
+  const moved = await moveImage({ sourceUrl: localUploadUrl, destinationUrl: destination.url });
+  return moved?.url || localUploadUrl;
 };

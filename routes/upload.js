@@ -7,6 +7,7 @@ import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
 import config from '../config/env.js';
 import { generateImportPreview } from '../services/importService.js';
+import { putImage } from '../services/storage/imageStorage.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -183,7 +184,7 @@ const ALLOWED_IMAGE_MIMETYPES = [
 
 const createImageUploadMiddleware = () =>
   multer({
-    storage,
+    storage: multer.memoryStorage(),
     limits: {
       fileSize: 5 * 1024 * 1024, // 5MB
       files: 1, // Only allow single file
@@ -219,28 +220,6 @@ const createImageUploadMiddleware = () =>
 const imageUpload = createImageUploadMiddleware();
 const legacyImageUpload = createImageUploadMiddleware();
 
-const buildPublicUrl = (req, filename) => {
-  const configured = (config.assetBaseUrl || '').trim();
-  const sanitizeBase = (base) => base.replace(/\/$/, '');
-
-  let base = configured ? sanitizeBase(configured) : '';
-
-  if (!base) {
-    const forwardedProto = (req.headers['x-forwarded-proto'] || '').split(',')[0];
-    const protocol = forwardedProto || req.protocol || 'http';
-    const host = req.get('host');
-    if (host) {
-      base = sanitizeBase(`${protocol}://${host}`);
-    }
-  }
-
-  if (!base) {
-    return `/uploads/${filename}`;
-  }
-
-  return `${base}/uploads/${filename}`;
-};
-
 const getUploadedImageFile = (req) =>
   req.file || req.files?.image?.[0] || req.files?.file?.[0] || null;
 
@@ -250,26 +229,34 @@ const handleImageUploadRequest = async (req, res, next) => {
     if (!uploadedFile) {
       return res.status(400).json({ error: 'No image uploaded' });
     }
-    
-    // Additional validation: check file actually exists and has content
-    try {
-      const stats = await fs.stat(uploadedFile.path);
-      if (stats.size === 0) {
-        await fs.unlink(uploadedFile.path);
-        return res.status(400).json({ error: 'Uploaded image is empty' });
-      }
-    } catch (statError) {
-      return res.status(400).json({ error: 'Failed to validate uploaded image' });
+
+    if (!uploadedFile.buffer || !uploadedFile.buffer.length) {
+      return res.status(400).json({ error: 'Uploaded image is empty' });
     }
 
-    const fileName = uploadedFile.filename;
-    const fileUrl = buildPublicUrl(req, fileName);
+    const sanitizedName = sanitizeFilename(uploadedFile.originalname);
+    const extension = path.extname(sanitizedName) || '.png';
+    const requestedExamId = String(req.body?.examId || '').trim();
+    const examId = /^[a-fA-F0-9]{24}$/.test(requestedExamId) ? requestedExamId : undefined;
+
+    const stored = await putImage({
+      tenantId: req.user.tenantId,
+      examId,
+      category: 'misc',
+      fileStem: path.parse(sanitizedName).name,
+      extension,
+      buffer: uploadedFile.buffer,
+    });
+
+    if (!stored) {
+      return res.status(400).json({ error: 'Failed to store uploaded image' });
+    }
 
     res.json({
       success: true,
-      url: fileUrl,
+      url: stored.url,
       fileName: uploadedFile.originalname,
-      storedFileName: fileName,
+      storedFileName: stored.key.split('/').pop(),
       mimeType: uploadedFile.mimetype,
       size: uploadedFile.size,
     });

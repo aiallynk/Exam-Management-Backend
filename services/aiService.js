@@ -1,7 +1,11 @@
-import OpenAI from 'openai';
 import config from '../config/env.js';
+import { evaluateAnswerWithGemini } from './aiEngine/geminiEvaluationAdapter.js';
+import { getDefaultEvaluationProvider } from './aiEngine/aiConfigService.js';
+import { runEngineChatCompletion, isOpenAIEngineConfigured } from './aiEngine/aiEngineClient.js';
+import { AI_OPERATIONS } from './aiEngine/aiOperations.js';
+import { getOpenAIClient } from './aiEngine/openaiClient.js';
 import { createGeneratedQuestionImage } from './questionImportImageService.js';
-import { createTrackedChatCompletion, trackAIUsageEvent } from './aiTokenUsageService.js';
+import { trackAIUsageEvent } from './aiTokenUsageService.js';
 import {
   normalizeQuestionCorrectAnswer,
   sanitizeQuestionOptions,
@@ -13,16 +17,22 @@ import {
   normalizeQuestionType,
   validateGeneratedQuestionShape,
 } from '../utils/questionTypeRegistry.js';
+import { BLOOM_LEVELS, COGNITIVE_DEMAND_DESCRIPTIONS, buildBloomTargetsFromCognitiveDistribution } from '../utils/cognitiveDemand.js';
 
-const client = config.openaiApiKey
-  ? new OpenAI({ apiKey: config.openaiApiKey })
-  : null;
+// Sanitizes an AI-returned bloomLevel token to one of the six canonical
+// values or undefined — never trusted/stored if unrecognized. cognitiveDemand
+// itself is deliberately NOT computed here: it is derived once, centrally,
+// from bloomLevel + the resolved framework mapping (see
+// utils/cognitiveDemand.js#deriveCognitiveDemandFromBloom), not per call site.
+const sanitizeBloomLevel = (value) => {
+  const token = String(value || '').trim().toUpperCase();
+  return BLOOM_LEVELS.includes(token) ? token : undefined;
+};
+
 const OPENAI_MODEL = config.openaiModel || 'gpt-4o-mini';
 
-// Exposed so other services (e.g. Source-Grounded ingestion/generation)
-// reuse this single client instance rather than constructing their own —
-// keeps API-key handling and null-when-unconfigured behavior in one place.
-export const getOpenAIClient = () => client;
+// Re-export for backward compatibility — canonical client lives in aiEngine/openaiClient.js
+export { getOpenAIClient };
 const IMPORT_EXTRACTION_MODEL = 'gpt-4o-mini';
 const MAX_IMPORT_AI_CHUNKS = 120;
 const MAX_IMPORT_CHUNK_PREVIEW_LENGTH = 8000;
@@ -69,6 +79,77 @@ const normalizeQuestionTypeToken = (value) => {
   }
   return normalizeQuestionType(value) || '';
 };
+
+// AI providers and model versions do not always use the exact property names
+// in our prompt. Keep the accepted spellings here, at the adapter boundary,
+// rather than weakening the canonical Question schema or distribution gate.
+const QUESTION_TYPE_FIELDS = [
+  'questionType',
+  'question_type',
+  'type',
+  'questionFormat',
+  'question_format',
+  'format',
+  'responseType',
+  'response_type',
+  'answerType',
+  'answer_type',
+];
+
+const QUESTION_TEXT_FIELDS = [
+  'questionText',
+  'question_text',
+  'question',
+  'text',
+  'prompt',
+  'stem',
+  'content',
+  'title',
+];
+
+const QUESTION_OPTION_FIELDS = ['options', 'choices', 'answerOptions', 'answer_options'];
+
+const resolveDeclaredQuestionType = (question) => {
+  if (!question || typeof question !== 'object') return '';
+  for (const field of QUESTION_TYPE_FIELDS) {
+    const normalized = normalizeQuestionTypeToken(question[field]);
+    if (normalized) return normalized;
+  }
+  return '';
+};
+
+const resolveQuestionText = (question) => {
+  if (!question || typeof question !== 'object') return '';
+  for (const field of QUESTION_TEXT_FIELDS) {
+    const text = sanitizeString(question[field]);
+    if (text) return text;
+  }
+  return '';
+};
+
+const resolveQuestionOptions = (question) => {
+  if (!question || typeof question !== 'object') return [];
+  for (const field of QUESTION_OPTION_FIELDS) {
+    if (!Array.isArray(question[field])) continue;
+    return question[field].map((option) => {
+      if (!option || typeof option !== 'object') return option;
+      return option.text || option.label || option.value || option.content || option.option || '';
+    });
+  }
+  return [];
+};
+
+const resolveQuestionCorrectAnswer = (question) =>
+  question?.correctAnswer ??
+  question?.correct_answer ??
+  question?.answer ??
+  question?.correct_option ??
+  question?.correctOptions ??
+  question?.correct_options ??
+  question?.answers ??
+  question?.correctAnswers ??
+  question?.correct_answers ??
+  '';
 
 const resolveTrackingContext = ({ tenantId = null, userId = null, metadata = null } = {}) => {
   const metadataTenantId =
@@ -140,14 +221,10 @@ export const normalizeQuestionObject = (question, index = 0) => {
     return null;
   }
 
-  const rawType = normalizeQuestionTypeToken(
-    question.questionType || question.type || question.question_type
-  );
+  const rawType = resolveDeclaredQuestionType(question);
   const resolvedType = rawType;
   const questionType = VALID_QUESTION_TYPES.includes(resolvedType) ? resolvedType : 'SHORT_ANSWER';
-  const questionText = sanitizeString(
-    question.questionText || question.title || question.question || question.text
-  );
+  const questionText = resolveQuestionText(question);
   if (!questionText) {
     return null;
   }
@@ -163,6 +240,7 @@ export const normalizeQuestionObject = (question, index = 0) => {
         question.description || question.problemStatement || question.prompt || question.details
       ),
       difficulty: sanitizeString(question.difficulty || 'medium') || 'medium',
+      bloomLevel: sanitizeBloomLevel(question.bloomLevel),
       category: sanitizeString(question.category || codingFields.category),
       questionType,
       points,
@@ -180,9 +258,8 @@ export const normalizeQuestionObject = (question, index = 0) => {
     };
   }
 
-  let options = Array.isArray(question.options)
-    ? sanitizeQuestionOptions(question.options)
-    : undefined;
+  const providerOptions = resolveQuestionOptions(question);
+  let options = providerOptions.length ? sanitizeQuestionOptions(providerOptions) : undefined;
 
   if (['MULTIPLE_CHOICE', 'MULTIPLE_OPTIONS', 'TRUE_FALSE'].includes(questionType)) {
     if (!options || options.length === 0) {
@@ -200,13 +277,13 @@ export const normalizeQuestionObject = (question, index = 0) => {
   if (questionType === 'MULTIPLE_OPTIONS') {
     correctAnswer = normalizeQuestionCorrectAnswer({
       questionType,
-      correctAnswer: question.correctAnswer || question.answers || question.correctAnswers,
+      correctAnswer: resolveQuestionCorrectAnswer(question),
       options,
     });
   } else {
     correctAnswer = normalizeQuestionCorrectAnswer({
       questionType,
-      correctAnswer: question.correctAnswer || question.answer || question.correct_option || '',
+      correctAnswer: resolveQuestionCorrectAnswer(question),
       options,
     });
   }
@@ -245,12 +322,76 @@ export const normalizeQuestionObject = (question, index = 0) => {
       question.imageUrl || question.image_path || question.imagePath || question.diagram || question.figure || ''
     ),
     matchingPairs,
+    bloomLevel: sanitizeBloomLevel(question.bloomLevel),
     sourceRowIndex: Number.isInteger(question.sourceRowIndex)
       ? question.sourceRowIndex
       : Number.isInteger(question._sourceRowIndex)
         ? question._sourceRowIndex
         : undefined,
   };
+};
+
+// Some otherwise usable provider responses omit the redundant `questionType`
+// property. We may recover a type only when the candidate itself makes that
+// type clear (options, matching pairs, a writing instruction, or a passage).
+// This is deliberately not a generic fallback and never converts a candidate
+// that already declares a canonical type.
+const inferQuestionTypeFromShape = ({ question, allowedTypes = [] } = {}) => {
+  if (!question || typeof question !== 'object') return '';
+
+  const allowed = new Set(
+    (Array.isArray(allowedTypes) ? allowedTypes : [])
+      .map(normalizeQuestionType)
+      .filter((type) => VALID_QUESTION_TYPES.includes(type))
+  );
+  const supports = (type) => !allowed.size || allowed.has(type);
+  const questionText = resolveQuestionText(question);
+  const options = sanitizeQuestionOptions(resolveQuestionOptions(question));
+  const answer = resolveQuestionCorrectAnswer(question);
+  const answerValues = parseMultiAnswer(answer);
+  const passage = sanitizeString(
+    question.passage || question.context || question.sourceText || question.reference || question.passageText || question.reading
+  );
+  const matchingPairs = question.matchingPairs || question.matching_pairs;
+
+  if (Array.isArray(matchingPairs) && matchingPairs.length >= 2 && supports('MATCHING')) {
+    return 'MATCHING';
+  }
+
+  if (options.length >= 2) {
+    const isTrueFalse = options.length === 2 && options.every((option) => ['true', 'false'].includes(option.toLowerCase()));
+    if (isTrueFalse && supports('TRUE_FALSE')) return 'TRUE_FALSE';
+    if (answerValues.length >= 2 && supports('MULTIPLE_OPTIONS')) return 'MULTIPLE_OPTIONS';
+    if (supports('MULTIPLE_CHOICE')) return 'MULTIPLE_CHOICE';
+  }
+
+  if (supports('FILL_IN_THE_BLANK') && (/_{2,}/.test(questionText) || /\b(?:fill|complete)\s+(?:in\s+)?the\s+blank\b/i.test(questionText))) {
+    return 'FILL_IN_THE_BLANK';
+  }
+  if (supports('ESSAY_LETTER') && /\b(?:write|draft|compose)\b[\s\S]{0,80}\bletter\b/i.test(questionText)) {
+    return 'ESSAY_LETTER';
+  }
+  if (supports('ESSAY_STORY') && /\b(?:write|create|compose)\b[\s\S]{0,80}\b(?:story|narrative)\b/i.test(questionText)) {
+    return 'ESSAY_STORY';
+  }
+  if (supports('ESSAY') && /\b(?:write|compose|develop)\b[\s\S]{0,80}\bessay\b/i.test(questionText)) {
+    return 'ESSAY';
+  }
+  if (supports('PARAGRAPH') && (Boolean(passage) || /\b(?:write|answer|respond)\b[\s\S]{0,80}\bparagraph\b/i.test(questionText))) {
+    return 'PARAGRAPH';
+  }
+  if (supports('CODING') && (Boolean(question.starterCode || question.starter_code) || /\b(?:write|implement)\b[\s\S]{0,80}\b(?:code|function|program)\b/i.test(questionText))) {
+    return 'CODING';
+  }
+
+  // An untyped open response is safely attributable only when the caller
+  // requested Short Answer alone. Objective and longer writing types still
+  // require their own explicit shape above.
+  if (allowed.size === 1 && allowed.has('SHORT_ANSWER') && questionText && !options.length) {
+    return 'SHORT_ANSWER';
+  }
+
+  return '';
 };
 
 const parseCount = (value, fallback = 0) => {
@@ -1084,11 +1225,16 @@ export const selectQuestionsForExactDistribution = ({ questions, typeDistributio
       question?.questionFormat || question?.question_format
     ).toUpperCase();
     const isParagraphGrouped = rawFormat === 'PARAGRAPH' && Boolean(targetByType.PARAGRAPH);
-    const claimedType = normalizeQuestionType(
-      question?.questionType || question?.type || question?.question_type
-    );
+    const declaredType = resolveDeclaredQuestionType(question);
+    const claimedType = declaredType || inferQuestionTypeFromShape({
+      question,
+      allowedTypes: Object.keys(targetByType),
+    });
     if (!isParagraphGrouped && !claimedType) return;
-    const normalized = normalizeQuestionObject(question, index + 1);
+    const normalized = normalizeQuestionObject(
+      claimedType ? { ...question, questionType: claimedType } : question,
+      index + 1
+    );
     if (!normalized) return;
     const type = isParagraphGrouped
       ? 'PARAGRAPH'
@@ -1293,7 +1439,7 @@ const enhanceParagraphScenarioQuestions = async ({
     scenarioQuestionTypes: normalizedScenarioQuestionTypes,
   });
 
-  if (!client) {
+  if (!isOpenAIEngineConfigured()) {
     return applyParagraphScenarioGroups({
       questions: safeQuestions,
       groupIndexes,
@@ -1325,8 +1471,8 @@ const enhanceParagraphScenarioQuestions = async ({
     : '';
 
   try {
-    const completion = await createTrackedChatCompletion({
-      client,
+    const completion = await runEngineChatCompletion({
+      operation: AI_OPERATIONS.QUESTION_REGENERATION,
       feature: 'question_generation',
       tenantId,
       userId,
@@ -1479,6 +1625,14 @@ export const generateQuestions = async (params) => {
     questionTypes,
     scenarioQuestionTypes = ['PARAGRAPH'],
     questionTypeDistribution, // NEW: Array of { type, count } for specific distribution
+    // Cognitive demand (Blueprint section 4B) — a paper-level { LOT, MOT, HOT }
+    // percentage target, already resolved by the caller (governed framework
+    // value when locked, creator override when the framework permits one,
+    // or a Quick Assessment creator's own optional custom target). Absent
+    // means "Automatic" — no cognitive-demand instruction is added to the
+    // prompt at all, matching Part E's "Quick Assessment must remain simple."
+    cognitiveDemandDistribution,
+    cognitiveDemandMapping,
     questionSorting = 'MIX_ALL',
     questionSortPattern = [],
     duration,
@@ -1497,7 +1651,6 @@ export const generateQuestions = async (params) => {
     metadata = null,
     tenantId = null,
     userId = null,
-    juniorContext = null,
     requireProviderExactDistribution = false,
     distributionFillDepth = 0,
   } = params;
@@ -1529,7 +1682,7 @@ export const generateQuestions = async (params) => {
 
   // Validate count
   const questionCount = parseInt(count, 10);
-  const minimumQuestionCount = juniorContext || distributionFillDepth > 0 ? 1 : 5;
+  const minimumQuestionCount = distributionFillDepth > 0 ? 1 : 5;
   if (isNaN(questionCount) || questionCount < minimumQuestionCount || questionCount > 50) {
     throw new Error(`Question count must be between ${minimumQuestionCount} and 50`);
   }
@@ -1562,7 +1715,7 @@ export const generateQuestions = async (params) => {
     : imageQuestionConfig;
 
   // Validate OpenAI API key
-  if (!client) {
+  if (!isOpenAIEngineConfigured()) {
     if (requireProviderExactDistribution) {
       const providerError = new Error('AI question generation is unavailable because the provider is not configured. No questions were added.');
       providerError.status = 503;
@@ -1641,16 +1794,22 @@ These questions should be at the highest difficulty level, suitable for expert-l
       count: questionCount,
     });
 
+    // Bloom/cognitive-demand targets — the application (not the AI) decides
+    // the mapping and the per-Bloom-level counts; the AI is only asked to
+    // tag each question's bloomLevel toward them (Blueprint section 4B).
+    const bloomTargets = cognitiveDemandDistribution
+      ? buildBloomTargetsFromCognitiveDistribution({ distribution: cognitiveDemandDistribution, mapping: cognitiveDemandMapping, count: questionCount })
+      : [];
+    const bloomTargetInstructions = bloomTargets.length
+      ? `\nCOGNITIVE DEMAND / BLOOM TARGET (tag every question, do not skip):\n- Tag each question's bloomLevel field with exactly one of: ${BLOOM_LEVELS.join(', ')}\n- Target mix across all ${questionCount} questions: ${bloomTargets.map((t) => `${t.count} ${t.bloomLevel}`).join(', ')}\n- LOT (${COGNITIVE_DEMAND_DESCRIPTIONS.LOT}), MOT (${COGNITIVE_DEMAND_DESCRIPTIONS.MOT}), HOT (${COGNITIVE_DEMAND_DESCRIPTIONS.HOT}) are cognitive demand, NOT difficulty — a HOT question is not automatically hard, and an easy question is not automatically LOT.\n`
+      : '';
+
     // Build system prompt with enhanced difficulty guidance
     const existingQuestionsText = Array.isArray(existingQuestions) && existingQuestions.length > 0
       ? existingQuestions.slice(0, 50).map((q, idx) => `${idx + 1}. ${String(q).substring(0, 200)}`).join('\n')
       : '';
 
-    const juniorPromptContext = juniorContext
-      ? `\nJUNIOR EXAM CONTEXT (MANDATORY):\n- Grade: ${Number(juniorContext.gradeLevel)}\n- Enabled domains: ${(juniorContext.domains || []).join(', ')}\n- Use child-appropriate language and examples for this grade.\n- Do not introduce content outside the enabled domains.\n- Arithmetic operands and answers are generated separately by deterministic code; do not invent NUMBER arithmetic questions in this provider response.\n`
-      : '';
-
-    let systemPrompt = `You are an expert exam question generator specializing in creating questions at precise difficulty levels. Generate high-quality exam questions in JSON format.${juniorPromptContext}
+    let systemPrompt = `You are an expert exam question generator specializing in creating questions at precise difficulty levels. Generate high-quality exam questions in JSON format.
 
 CRITICAL REQUIREMENTS:
 - Generate exactly ${questionCount} questions
@@ -1666,7 +1825,7 @@ ${typeDistribution.map(item => `  - ${item.count} question${item.count > 1 ? 's'
 - Each question's questionType field MUST be one of: ${questionTypes.join(', ')}
 - The total count MUST equal exactly ${questionCount} questions
 - DO NOT deviate from the specified distribution - generate exactly as specified above
-
+${bloomTargetInstructions}
 ${existingQuestionsText ? `\nCRITICAL: DUPLICATE PREVENTION
 - The following questions already exist in this exam. You MUST NOT generate questions that are similar or duplicate these:
 ${existingQuestionsText}
@@ -1711,7 +1870,7 @@ PER-TYPE SHAPE RULES (MANDATORY — do not substitute one type's shape for anoth
 - testCases: For CODING questions, return an array of objects with input, expectedOutput, and hidden (boolean). Include at least one visible sample with hidden=false.
 - timeLimit: For CODING questions, provide a time limit in seconds.
 - points: Points for this question (default 1)
-- order: Sequential order starting from 1
+- order: Sequential order starting from 1${bloomTargets.length ? `\n- bloomLevel: REQUIRED on every question — one of ${BLOOM_LEVELS.join(', ')}, reflecting the cognitive skill the question genuinely demands (not a rephrasing of difficulty)` : ''}
 
 Return a JSON object with a "questions" array containing exactly ${questionCount} questions. Format: { "questions": [...] }`;
 
@@ -1734,7 +1893,8 @@ Difficulty:
 - Strictly follow the ${difficulty.toUpperCase()} difficulty guidelines provided
 - Each question must genuinely reflect ${difficulty === 'ultra_hard' ? 'expert-level, extreme difficulty requiring deep mastery' : difficulty === 'hard' ? 'advanced difficulty requiring deep understanding' : difficulty === 'medium' ? 'intermediate difficulty requiring solid understanding' : 'basic difficulty requiring fundamental knowledge'}
 - Ensure questions are appropriately challenging for the ${difficulty} level
-${uploadedContent ? `- Base questions on the provided detailed content while maintaining ${difficulty} difficulty level` : ''}`;
+${uploadedContent ? `- Base questions on the provided detailed content while maintaining ${difficulty} difficulty level` : ''}
+${bloomTargets.length ? `\nCognitive demand (independent of difficulty — a HOT question is not automatically hard, an easy question is not automatically LOT):\n${bloomTargets.map((t) => `- Generate ${t.count} question${t.count > 1 ? 's' : ''} tagged bloomLevel: ${t.bloomLevel} (${t.cognitiveDemand})`).join('\n')}\n- Tag every single question's bloomLevel field — do not leave it out.` : ''}`;
 
     // Adjust temperature based on difficulty - higher for harder questions to encourage more creative/complex questions
     const temperatureMap = {
@@ -1751,8 +1911,8 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
     
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
-        const completion = await createTrackedChatCompletion({
-          client,
+        const completion = await runEngineChatCompletion({
+          operation: AI_OPERATIONS.QUESTION_GENERATION,
           feature: 'question_generation',
           tenantId: trackingContext.tenantId,
           userId: trackingContext.userId,
@@ -1789,15 +1949,13 @@ ${uploadedContent ? `- Base questions on the provided detailed content while mai
           throw new Error('Invalid response format from OpenAI');
         }
 
-        const normalizedQuestions = extractedQuestions
-          .map((q, index) => normalizeQuestionObject(q, index + 1))
-          .filter(Boolean);
-
         // Keep only valid candidates in their own requested type bucket. If
         // the provider missed a type, call the same generation mechanism for
-        // only that deficit; never relabel overflow from another type.
+        // only that deficit; never relabel overflow from another type. Pass
+        // the provider objects through unchanged: selection needs their
+        // original field names to recognize safe alternate response shapes.
         const selection = selectQuestionsForExactDistribution({
-          questions: normalizedQuestions,
+          questions: extractedQuestions,
           typeDistribution,
           count: questionCount,
           topic: sanitizedTopic,
@@ -2035,7 +2193,7 @@ export const extractQuestionsFromContent = async (params) => {
     throw new Error('No content provided to extract questions');
   }
 
-  if (!client) {
+  if (!isOpenAIEngineConfigured()) {
     console.warn('OpenAI API key not configured, using fallback question extraction');
     await trackFallbackUsage({
       feature: 'question_import',
@@ -2210,7 +2368,21 @@ export const evaluateAnswer = async (params) => {
   } = params;
   const trackingContext = resolveTrackingContext({ tenantId, userId, metadata });
 
-  if (!client) {
+  if (getDefaultEvaluationProvider() === 'gemini') {
+    return evaluateAnswerWithGemini({
+      question,
+      correctAnswer,
+      studentAnswer,
+      questionType,
+      points,
+      rubric,
+      evaluationConfig,
+      tenantId: trackingContext.tenantId,
+      userId: trackingContext.userId,
+    });
+  }
+
+  if (!isOpenAIEngineConfigured()) {
     await trackFallbackUsage({
       feature: 'evaluation',
       tenantId: trackingContext.tenantId,
@@ -2300,8 +2472,8 @@ Partial-marking configuration: ${JSON.stringify(config.partialMarking || {})}
 Numerical configuration: ${JSON.stringify(config.numerical || {})}
 Rubric (score only these criteria): ${JSON.stringify(effectiveRubric.map(({ criterion, description, maxScore, mandatory, keyPoints, acceptableAlternatives }) => ({ criterion, description, maxScore, mandatory, keyPoints, acceptableAlternatives })))} `;
 
-    const completion = await createTrackedChatCompletion({
-      client,
+    const completion = await runEngineChatCompletion({
+      operation: AI_OPERATIONS.ANSWER_RUBRIC_EVALUATION,
       feature: 'evaluation',
       tenantId: trackingContext.tenantId,
       userId: trackingContext.userId,
@@ -2975,8 +3147,8 @@ const parseSingleChunkWithAi = async ({
     return null;
   }
 
-  const completion = await createTrackedChatCompletion({
-    client,
+  const completion = await runEngineChatCompletion({
+    operation: AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE,
     feature: 'question_import',
     tenantId: trackingContext.tenantId,
     userId: trackingContext.userId,
@@ -3446,7 +3618,7 @@ const generateImageBasedQuestionVariant = async ({
     imageType,
   });
 
-  if (!client) {
+  if (!isOpenAIEngineConfigured()) {
     return fallbackVariant;
   }
 
@@ -3506,8 +3678,8 @@ ${JSON.stringify(baseQuestionPayload)}
 Create one improved image-based variant now.`;
 
   try {
-    const completion = await createTrackedChatCompletion({
-      client,
+    const completion = await runEngineChatCompletion({
+      operation: AI_OPERATIONS.QUESTION_REGENERATION,
       feature: 'question_generation',
       tenantId,
       userId,
@@ -3616,7 +3788,7 @@ const generateImageBasedQuestionGroup = async ({
     imageType: safeImageType,
   });
 
-  if (!client) {
+  if (!isOpenAIEngineConfigured()) {
     return fallbackGroup;
   }
 
@@ -3684,8 +3856,8 @@ Base questions in required order:
 ${JSON.stringify(baseQuestionPayload)}`;
 
   try {
-    const completion = await createTrackedChatCompletion({
-      client,
+    const completion = await runEngineChatCompletion({
+      operation: AI_OPERATIONS.QUESTION_REGENERATION,
       feature: 'question_generation',
       tenantId,
       userId,
@@ -3811,6 +3983,7 @@ const attachImageBasedQuestions = async ({
           userId,
         });
         const imageFields = await createGeneratedQuestionImage({
+          tenantId,
           questionId: `ai-question-group-${Date.now()}-${groupIndexes[0] + 1}`,
           questionText: groupResult.questions.map((question) => sanitizeString(question.questionText)).join(' '),
           diagramType: groupResult.diagramType || imageType,

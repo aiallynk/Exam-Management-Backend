@@ -55,7 +55,10 @@ const run = async () => {
     { contextSetId: 1, snapshotHash: 1 },
     {
       unique: true,
-      partialFilterExpression: { snapshotHash: { $type: 'string', $ne: '' } },
+      // $ne / $not is rejected by MongoDB in a partialFilterExpression;
+      // { $gt: '' } is type-bracketed to non-empty strings. Mirrors
+      // models/ContextSource.js.
+      partialFilterExpression: { snapshotHash: { $gt: '' } },
       name: 'contextSetId_1_snapshotHash_1_partial_unique',
     }
   );
@@ -86,7 +89,13 @@ const run = async () => {
   await ensureIndex(
     NoveltySignature,
     { tenantId: 1, layer: 1, createdAt: -1 },
-    { partialFilterExpression: { tenantId: { $ne: null } }, name: 'tenantId_1_layer_1_createdAt_-1_partial' }
+    {
+      // $ne / $not is rejected by MongoDB in a partialFilterExpression;
+      // { $type: 'objectId' } selects exactly the non-null TENANT rows.
+      // Mirrors models/NoveltySignature.js.
+      partialFilterExpression: { tenantId: { $type: 'objectId' } },
+      name: 'tenantId_1_layer_1_createdAt_-1_partial',
+    }
   );
 
   console.log(dryRun ? 'Source-Grounded index migration dry run complete.' : 'Source-Grounded index migration complete.');

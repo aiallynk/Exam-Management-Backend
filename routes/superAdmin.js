@@ -11,11 +11,14 @@ import { enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { body, validationResult } from 'express-validator';
 import { checkTenantLimits } from '../middleware/planLimits.js';
 import Tenant from '../models/Tenant.js';
+import { OrganizationUnit } from '../models/academic/index.js';
 import User from '../models/User.js';
 import Exam from '../models/Exam.js';
 import ExamAttempt from '../models/ExamAttempt.js';
 import ExamSession from '../models/ExamSession.js';
 import AITokenUsage from '../models/AITokenUsage.js';
+import AnswerScript from '../models/AnswerScript.js';
+import AnswerScriptBatch from '../models/AnswerScriptBatch.js';
 import CreditRequest from '../models/CreditRequest.js';
 import AuditLog from '../models/AuditLog.js';
 import BackupHistory from '../models/BackupHistory.js';
@@ -77,9 +80,11 @@ import {
 import {
   CONTROL_CATEGORY_DEFINITIONS,
   TENANT_CAPABILITIES,
-  WIZKIDS_CAPABILITY_KEYS,
-  WIZKIDS_PLAN_FEATURE_KEYS,
 } from '../services/tenantFeatureService.js';
+import { getAiEngineAdminSnapshot, updateAiEngineAdminConfig } from '../services/aiEngine/aiAdminService.js';
+import { getAnswerScriptQueueHealth } from '../services/offlineEvaluation/answerScriptQueueService.js';
+import { getAnswerScriptWorkerHeartbeat } from '../services/offlineEvaluation/answerScriptWorkerService.js';
+import offlineEvaluationConfig from '../config/offlineEvaluationConfig.js';
 
 const router = express.Router();
 
@@ -1708,6 +1713,87 @@ const buildTenantSubscriptionSummary = async (tenant) => {
 router.use(requireAuth);
 router.use(requireRole('SUPER_ADMIN'));
 
+router.get('/answer-scripts/telemetry', async (_req, res, next) => {
+  try {
+    const staleBefore = new Date(Date.now() - offlineEvaluationConfig.STALE_AFTER_MS);
+    const [queue, worker, statusCounts, totals, tenantUsage, oldestWaiting, staleCount, batchCounts] = await Promise.all([
+      getAnswerScriptQueueHealth(),
+      getAnswerScriptWorkerHeartbeat(),
+      AnswerScript.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }, { $sort: { count: -1 } }]),
+      AnswerScript.aggregate([{ $group: {
+        _id: null,
+        originalBytes: { $sum: '$storageMetrics.originalBytes' },
+        normalizedBytes: { $sum: '$storageMetrics.normalizedBytes' },
+        previewBytes: { $sum: '$storageMetrics.previewBytes' },
+        thumbnailBytes: { $sum: '$storageMetrics.thumbnailBytes' },
+        annotatedBytes: { $sum: '$storageMetrics.annotatedBytes' },
+        identityCalls: { $sum: '$aiMetrics.identityCalls' },
+        extractionCalls: { $sum: '$aiMetrics.extractionCalls' },
+        evaluationCalls: { $sum: '$aiMetrics.evaluationCalls' },
+        visualCalls: { $sum: '$aiMetrics.visualCalls' },
+        aiLatencyMs: { $sum: '$aiMetrics.latencyMs' },
+        retries: { $sum: '$aiMetrics.retryCount' },
+        estimatedCost: { $sum: { $ifNull: ['$aiMetrics.estimatedCost', 0] } },
+      } }]),
+      AnswerScript.aggregate([
+        { $group: {
+          _id: '$tenantId', scripts: { $sum: 1 }, originalBytes: { $sum: '$storageMetrics.originalBytes' },
+          normalizedBytes: { $sum: '$storageMetrics.normalizedBytes' }, aiCalls: { $sum: { $add: ['$aiMetrics.identityCalls', '$aiMetrics.extractionCalls', '$aiMetrics.evaluationCalls', '$aiMetrics.visualCalls'] } },
+          failed: { $sum: { $cond: [{ $eq: ['$status', 'FAILED'] }, 1, 0] } },
+        } },
+        { $sort: { originalBytes: -1 } }, { $limit: 100 },
+        { $lookup: { from: 'tenants', localField: '_id', foreignField: '_id', as: 'tenant' } },
+        { $project: { tenantId: '$_id', tenantName: { $arrayElemAt: ['$tenant.name', 0] }, scripts: 1, originalBytes: 1, normalizedBytes: 1, aiCalls: 1, failed: 1 } },
+      ]),
+      AnswerScript.find({ status: { $in: ['QUEUED', 'NORMALIZING', 'IDENTIFYING_CANDIDATE', 'EXTRACTING', 'SEGMENTING', 'EVALUATING', 'FINALIZING'] } })
+        .select('_id tenantId status processingMeta.stage createdAt updatedAt').sort({ createdAt: 1 }).limit(20).lean(),
+      AnswerScript.countDocuments({
+        status: { $in: ['NORMALIZING', 'IDENTIFYING_CANDIDATE', 'EXTRACTING', 'SEGMENTING', 'EVALUATING', 'FINALIZING'] },
+        'processingMeta.heartbeatAt': { $lt: staleBefore },
+      }),
+      AnswerScriptBatch.aggregate([{ $group: { _id: '$status', count: { $sum: 1 } } }]),
+    ]);
+    const aggregate = totals[0] || {};
+    const aiCalls = Number(aggregate.identityCalls || 0) + Number(aggregate.extractionCalls || 0) + Number(aggregate.evaluationCalls || 0) + Number(aggregate.visualCalls || 0);
+    return res.json({
+      generatedAt: new Date(),
+      queue,
+      worker,
+      state: {
+        scripts: Object.fromEntries(statusCounts.map((item) => [item._id, item.count])),
+        batches: Object.fromEntries(batchCounts.map((item) => [item._id, item.count])),
+        staleCount,
+        oldestWaiting,
+      },
+      storage: {
+        originalBytes: Number(aggregate.originalBytes || 0),
+        normalizedBytes: Number(aggregate.normalizedBytes || 0),
+        previewBytes: Number(aggregate.previewBytes || 0),
+        thumbnailBytes: Number(aggregate.thumbnailBytes || 0),
+        annotatedBytes: Number(aggregate.annotatedBytes || 0),
+        workingToOriginalRatio: aggregate.originalBytes ? Number((aggregate.normalizedBytes / aggregate.originalBytes).toFixed(4)) : null,
+        retentionPolicyKey: offlineEvaluationConfig.RETENTION_POLICY_KEY,
+      },
+      ai: {
+        calls: aiCalls,
+        identityCalls: Number(aggregate.identityCalls || 0), extractionCalls: Number(aggregate.extractionCalls || 0),
+        evaluationCalls: Number(aggregate.evaluationCalls || 0), visualCalls: Number(aggregate.visualCalls || 0),
+        retries: Number(aggregate.retries || 0), averageLatencyMs: aiCalls ? Math.round(Number(aggregate.aiLatencyMs || 0) / aiCalls) : null,
+        estimatedCost: Number(aggregate.estimatedCost || 0),
+      },
+      limits: {
+        documentConcurrency: offlineEvaluationConfig.DOCUMENT_CONCURRENCY,
+        aiConcurrency: offlineEvaluationConfig.AI_CONCURRENCY,
+        renderConcurrency: offlineEvaluationConfig.RENDER_CONCURRENCY,
+        maxActivePerTenant: offlineEvaluationConfig.MAX_ACTIVE_PER_TENANT,
+        maxActivePerUploader: offlineEvaluationConfig.MAX_ACTIVE_PER_UPLOADER,
+        providerRequestsPerMinute: offlineEvaluationConfig.PROVIDER_REQUESTS_PER_MINUTE,
+      },
+      tenants: tenantUsage,
+    });
+  } catch (error) { return next(error); }
+});
+
 // Platform controls use the same capability catalogue that resolves tenant
 // controls.  This prevents the platform overview from drifting into a static
 // marketing count while still avoiding a tenant-specific assumption.
@@ -1748,6 +1834,46 @@ router.get('/controls/overview', async (_req, res, next) => {
     });
   } catch (error) { return next(error); }
 });
+
+router.get('/ai-engine/config', async (_req, res, next) => {
+  try {
+    const configSnapshot = await getAiEngineAdminSnapshot();
+    return res.json({ config: configSnapshot });
+  } catch (error) {
+    return next(error);
+  }
+});
+
+router.put(
+  '/ai-engine/config',
+  [
+    body('defaultQuestionProvider').optional().isIn(['openai', 'gemini']),
+    body('defaultEvaluationProvider').optional().isIn(['openai', 'gemini']),
+    body('operationRouting').optional().isObject(),
+    body('runtime').optional().isObject(),
+    body('runtime.requestTimeoutMs').optional().isInt({ min: 5000, max: 300000 }),
+    body('runtime.maxRetries').optional().isInt({ min: 0, max: 5 }),
+    body('runtime.strictProviderRouting').optional().isBoolean(),
+    body('runtime.enableProviderFallback').optional().isBoolean(),
+  ],
+  async (req, res, next) => {
+    try {
+      const errors = validationResult(req);
+      if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
+      const configSnapshot = await updateAiEngineAdminConfig(req.body, req.user._id);
+      await logAuditEvent(AUDIT_ACTIONS.AI_ENGINE_CONFIG_UPDATED, {
+        userId: req.user._id,
+        userEmail: req.user.email,
+        userName: req.user.name,
+        userRole: req.user.role,
+        resourceType: 'AIEngineConfig',
+      });
+      return res.json({ config: configSnapshot });
+    } catch (error) {
+      return next(error);
+    }
+  }
+);
 
 /**
  * SUBSCRIPTION PLAN CATALOG
@@ -3643,92 +3769,6 @@ router.get('/tenants/:tenantId/features', async (req, res, next) => {
 });
 
 /**
- * ENABLE COMPLETE WIZKIDS PACKAGE FOR ONE TENANT
- * POST /api/super-admin/tenants/:tenantId/wizkids/enable
- *
- * This is deliberately a Super-Admin-only, explicit activation action. It
- * grants every WizKids plan capability and re-enables the corresponding tenant
- * preferences in one auditable operation. Granular controls remain available
- * through the normal tenant-feature update endpoint afterwards.
- */
-router.post('/tenants/:tenantId/wizkids/enable', async (req, res, next) => {
-  try {
-    const tenantId = req.params.tenantId;
-    if (!isValidMongoId(tenantId)) {
-      return res.status(400).json({ error: 'Invalid tenantId' });
-    }
-
-    const tenant = await Tenant.findById(tenantId);
-    if (!tenant) {
-      return res.status(404).json({ error: 'Tenant not found' });
-    }
-
-    const tenantObject = tenant.toObject ? tenant.toObject() : tenant;
-    const subscription = normalizeOptionalObject(tenantObject?.subscription);
-    const previousCustomFeatures = extractActiveCustomFeatureOverrides(subscription.customFeatures);
-    const nextCustomFeatures = { ...previousCustomFeatures };
-    WIZKIDS_PLAN_FEATURE_KEYS.forEach((featureKey) => {
-      nextCustomFeatures[featureKey] = true;
-    });
-
-    const now = new Date();
-    // Store an explicit enabled tenant preference too. This repairs a previous
-    // local "off" preference, which otherwise would keep the parent disabled
-    // even after its Super Admin entitlement was granted.
-    await TenantFeatureSetting.bulkWrite(
-      WIZKIDS_CAPABILITY_KEYS.map((featureKey) => ({
-        updateOne: {
-          filter: { tenantId: tenant._id, featureKey },
-          update: {
-            $set: {
-              requestedEnabled: true,
-              superAdminEnforced: false,
-              enforcedEnabled: true,
-              effectiveEnabled: true,
-              planEntitled: true,
-              disabledReason: '',
-              configuredBy: req.user._id,
-              configuredAt: now,
-            },
-            $inc: { version: 1 },
-            $setOnInsert: { tenantId: tenant._id, featureKey },
-          },
-          upsert: true,
-        },
-      }))
-    );
-
-    tenant.subscription = tenant.subscription || {};
-    tenant.subscription.customFeatures = nextCustomFeatures;
-    tenant.subscription.updatedAt = now;
-    await tenant.save();
-
-    await logAuditEvent(AUDIT_ACTIONS.TENANT_UPDATED, {
-      ...buildActorAuditDetails(req),
-      tenantId: tenant._id,
-      tenantName: tenant.name,
-      resourceType: 'Tenant',
-      resourceId: tenant._id,
-      details: {
-        type: 'WIZKIDS_PACKAGE_ENABLED',
-        enabledCapabilities: WIZKIDS_CAPABILITY_KEYS,
-        enabledPlanFeatures: WIZKIDS_PLAN_FEATURE_KEYS,
-        previousCustomFeatures,
-        nextCustomFeatures,
-      },
-    });
-
-    const tenantFeatures = await buildTenantFeaturePayload(tenant);
-    return res.json({
-      tenantFeatures,
-      enabledCapabilities: WIZKIDS_CAPABILITY_KEYS,
-    });
-  } catch (error) {
-    return next(error);
-  }
-});
-
-/**
  * TENANT FEATURE MANAGEMENT UPDATE
  * PUT /api/super-admin/tenants/:tenantId/features
  */
@@ -5422,6 +5462,13 @@ router.post(
       .matches(/^[A-Z0-9_-]+$/)
       .withMessage('Code must contain only uppercase letters, numbers, hyphens, and underscores'),
     body('type').isIn(['SCHOOL', 'COLLEGE', 'COMPANY', 'INSTITUTE', 'GOVERNMENT', 'OTHER']).withMessage('Valid tenant type is required'),
+    // Separate from `type` above (that drives billing/plan-restriction
+    // logic and is unchanged). This is the root of the academic
+    // organization hierarchy (models/academic/OrganizationUnit.js) that
+    // this tenant's admin will build under — see the ownership model in
+    // docs/XAMIGO_TENANT_ADMIN_IA_UI_CORRECTION.md.
+    body('organizationType').isIn(['SCHOOL_GROUP', 'SCHOOL', 'UNIVERSITY', 'COLLEGE', 'INSTITUTE', 'TRAINING_ORGANIZATION', 'OTHER']).withMessage('Valid organization type is required'),
+    body('organizationName').optional().trim().isLength({ max: 160 }).withMessage('organizationName must be 160 characters or fewer'),
     body('contactEmail').isEmail().normalizeEmail().withMessage('Valid email is required'),
     body('planType').optional().isString().withMessage('planType must be a string'),
     body('startedAt')
@@ -5499,10 +5546,17 @@ router.post(
         }
         return true;
       }),
+    // `status` here is the tenant's own enable/disable state (Tenant.status:
+    // ACTIVE/INACTIVE/SUSPENDED) — matches the PUT /tenants/:tenantId update
+    // route's semantics for the same field name. Billing/plan state is the
+    // separate `subscriptionStatus` field below; the two must not be
+    // conflated (they previously were, which made "Inactive" in the Create
+    // Tenant form fail validation and made "Suspended" silently set the
+    // wrong field).
     body('status')
       .optional()
-      .isIn(SUBSCRIPTION_STATUS_VALUES)
-      .withMessage('status must be one of ACTIVE, EXPIRED, SUSPENDED, or CANCELLED'),
+      .isIn(['ACTIVE', 'INACTIVE', 'SUSPENDED'])
+      .withMessage('status must be one of ACTIVE, INACTIVE, or SUSPENDED'),
     body('subscriptionStatus')
       .optional()
       .isIn(SUBSCRIPTION_STATUS_VALUES)
@@ -5519,6 +5573,8 @@ router.post(
         name,
         code,
         type,
+        organizationType,
+        organizationName,
         contactEmail,
         contactPhone,
         address,
@@ -5536,6 +5592,7 @@ router.post(
         status,
         subscriptionStatus,
       } = req.body;
+      const tenantStatus = ['ACTIVE', 'INACTIVE', 'SUSPENDED'].includes(status) ? status : 'ACTIVE';
 
       // Check if code already exists
       const existing = await Tenant.findOne({ code: code.toUpperCase() });
@@ -5579,7 +5636,7 @@ router.post(
       }
 
       const requestedStatus =
-        normalizeSubscriptionStatusInput(subscriptionStatus ?? status) ||
+        normalizeSubscriptionStatusInput(subscriptionStatus) ||
         SUBSCRIPTION_STATUSES.ACTIVE;
       if (requestedStatus === SUBSCRIPTION_STATUSES.EXPIRED && !parsedExpiresAt) {
         parsedExpiresAt = new Date();
@@ -5625,6 +5682,7 @@ router.post(
         contactEmail,
         contactPhone,
         address,
+        status: tenantStatus,
         examLimit: parseOptionalLimitValue(resolvedCustomLimits.maxExamsPerMonth ?? legacyExamLimit),
         attemptLimit: parseOptionalLimitValue(
           resolvedCustomLimits.maxAttemptsPerMonth ?? legacyAttemptLimit
@@ -5637,6 +5695,20 @@ router.post(
         createdBy: req.user._id,
       });
 
+      await tenant.save();
+
+      // Platform provisioning creates the root of the organization
+      // hierarchy in the same request — a Tenant Admin can add children
+      // under it but never create another root (see the guard in
+      // routes/academicV2.js's POST /organization-units).
+      const rootOrganizationUnit = await OrganizationUnit.create({
+        tenantId: tenant._id,
+        name: (organizationName || name).trim(),
+        type: organizationType,
+        parentOrganizationUnitId: null,
+        createdBy: req.user._id,
+      });
+      tenant.rootOrganizationUnitId = rootOrganizationUnit._id;
       await tenant.save();
       await tenant.populate('createdBy', 'name email');
 
@@ -5653,6 +5725,8 @@ router.post(
           tenantStatus: tenant.status,
           planType: subscriptionPayload.planType,
           subscriptionStatus: subscriptionPayload.status,
+          rootOrganizationUnitId: rootOrganizationUnit._id,
+          organizationType: rootOrganizationUnit.type,
         },
       });
 
@@ -5675,7 +5749,7 @@ router.post(
         console.error('[NOTIFICATIONS] Failed to log tenant creation:', notifyError?.message || notifyError);
       }
 
-      res.status(201).json({ tenant });
+      res.status(201).json({ tenant, rootOrganizationUnit });
     } catch (error) {
       if (error.code === 11000) {
         return res.status(409).json({ error: 'Tenant code already exists' });

@@ -72,9 +72,14 @@ const NoveltySignatureSchema = new mongoose.Schema(
 
 // The atomic reservation index — see CONCURRENCY CONTRACT above.
 NoveltySignatureSchema.index({ scope: 1, layer: 1, signature: 1 }, { unique: true });
+// TENANT-scope rows only (GLOBAL rows have tenantId: null). A partialFilter
+// expression cannot use $ne / $not (MongoDB rejects it — "Expression not
+// supported in partial index: $not"); `{ $type: 'objectId' }` selects
+// exactly the non-null tenant rows and is an allowed partial-filter
+// operator.
 NoveltySignatureSchema.index(
   { tenantId: 1, layer: 1, createdAt: -1 },
-  { partialFilterExpression: { tenantId: { $ne: null } } }
+  { partialFilterExpression: { tenantId: { $type: 'objectId' } } }
 );
 
 export default mongoose.model('NoveltySignature', NoveltySignatureSchema);

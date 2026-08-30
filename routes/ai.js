@@ -20,8 +20,14 @@ import {
   getOrCreateContextSet,
 } from '../services/contextIngestionService.js';
 import { generateWithNoveltyAndGrounding } from '../services/candidatePoolOrchestratorService.js';
+import { mapFrameworkMemoryPolicy } from '../services/questionMemoryService.js';
 import { buildTenantOwnedSourceFilter } from '../services/contextRetrievalService.js';
+import { assertContentSourcesSelectable, ContentLibraryError } from '../services/contentLibraryService.js';
+import { resolveLibraryResourcesToContextSourceIds } from '../services/libraryResourceService.js';
+import { buildGenerationContext, CONTEXT_MODES, InsufficientContextError } from '../services/generationContextOrchestrator.js';
 import { resolveGenerationStrategy } from '../services/groundedGenerationService.js';
+import { computeShortfallDistribution } from '../utils/sourceGroundedFulfilment.js';
+import { qualityGateQuestionsAgainstSpecification, resolveAssessmentSpecification } from '../services/assessmentSpecificationResolver.js';
 import ContextSet from '../models/ContextSet.js';
 import ContextSource from '../models/ContextSource.js';
 import ContextChunk from '../models/ContextChunk.js';
@@ -38,15 +44,22 @@ import multer from 'multer';
 import path from 'path';
 import pdfParse from 'pdf-parse';
 import readXlsxFile from 'read-excel-file/node';
-import OpenAI from 'openai';
 import config from '../config/env.js';
+import { runEngineChatCompletion, isOpenAIEngineConfigured } from '../services/aiEngine/aiEngineClient.js';
+import { AI_OPERATIONS } from '../services/aiEngine/aiOperations.js';
 import { normalizeQuestionFormat } from '../utils/questionTypes.js';
 import {
   computeDistributionDiagnostics,
   normalizeQuestionType,
 } from '../utils/questionTypeRegistry.js';
 import {
-  createTrackedChatCompletion,
+  resolveEffectiveCognitiveDemandDistribution,
+  resolveCognitiveDemandMapping,
+  deriveCognitiveDemandFromBloom,
+  validateCognitiveDemandDistribution,
+  computeCognitiveDemandDiagnostics,
+} from '../utils/cognitiveDemand.js';
+import {
   getAIQuestionCountForTenantByWindow,
   getAIUsageCountForTenantByWindow,
   trackAIUsageEvent,
@@ -66,9 +79,6 @@ import {
   resolveUserEffectivePlanType,
   sendPlanRestriction,
 } from '../middleware/planRestrictions.js';
-import { prepareWizKidsExamInput, WizKidsExamError } from '../services/wizKidsExamService.js';
-import { findUnsupportedJuniorQuestionType } from '../utils/juniorQuestionPolicy.js';
-import { generateJuniorDeterministicNumberQuestions } from '../services/juniorAiQuestionService.js';
 import {
   CREDIT_REQUEST_TYPES,
   normalizeTenantExtraCredits,
@@ -650,7 +660,7 @@ router.post(
         }
       }
 
-      const importData = await parseQuestionImportFile(req.file);
+      const importData = await parseQuestionImportFile(req.file, { tenantId: req.user?.tenantId || null });
       const isCsvImport =
         String(importData?.extension || '').trim().toLowerCase() === '.csv';
       let { text, structuredRows } = importData;
@@ -762,6 +772,7 @@ router.post(
         rowEmbeddedArtifacts: importData.rowEmbeddedArtifacts,
         extractionErrors: importData.extractionErrors,
         importSessionId: importData.importSessionId,
+        tenantId: req.user?.tenantId || null,
         // Question import must only ever use images that genuinely exist
         // in the uploaded file (mapped/extracted artifacts, handled
         // above this flag inside attachImagesToImportedQuestions) — never
@@ -1021,7 +1032,11 @@ router.post(
   enforceContextSourceLimit,
   contextSourceUpload.single('file'),
   handleMulterUploadError,
-  [body('contextSetId').optional().isMongoId().withMessage('Invalid contextSetId')],
+  // nullable/checkFalsy: the client sends contextSetId only in the
+  // uploaded-ContextSet flow; the Content Library flow legitimately has none
+  // and may serialize it as null/''. Plain .optional() only skips
+  // `undefined`, so those tripped isMongoId() with "Invalid contextSetId".
+  [body('contextSetId').optional({ nullable: true, checkFalsy: true }).isMongoId().withMessage('Invalid contextSetId')],
   async (req, res, next) => {
     try {
       const errors = validationResult(req);
@@ -1075,7 +1090,7 @@ router.post(
   enforceContextSourceLimit,
   [
     body('url').isURL({ protocols: ['http', 'https'], require_protocol: true }).withMessage('A valid http(s) URL is required'),
-    body('contextSetId').optional().isMongoId().withMessage('Invalid contextSetId'),
+    body('contextSetId').optional({ nullable: true, checkFalsy: true }).isMongoId().withMessage('Invalid contextSetId'),
   ],
   async (req, res, next) => {
     try {
@@ -1205,12 +1220,20 @@ router.post(
     body('scenarioQuestionTypes').optional().isArray().withMessage('scenarioQuestionTypes must be an array'),
     body('imageQuestionMode').optional().isIn(['percentage', 'per_count']).withMessage('Invalid imageQuestionMode'),
     body('imageQuestionTypes').optional().isArray().withMessage('imageQuestionTypes must be an array'),
-    body('productModule').optional().isIn(['STANDARD', 'WIZKIDS']),
-    body('juniorContext').optional().isObject().withMessage('juniorContext must be an object'),
     body('generationMode').optional().isIn(['STANDARD', 'SOURCE_GROUNDED']).withMessage('Invalid generationMode'),
-    body('contextSetId').optional().isMongoId().withMessage('Invalid contextSetId'),
+    // `null` is the legacy/current UI representation of Automatic. Treat it
+    // exactly like an omitted field; a real custom target must still be a
+    // plain object and is revalidated below for LOT/MOT/HOT totals.
+    body('cognitiveDemandDistribution').optional({ nullable: true }).isObject({ strict: true }).withMessage('cognitiveDemandDistribution must be an object'),
+    // nullable/checkFalsy: the Content Library flow selects libraryResourceIds
+    // and has no ContextSet, so the client legitimately sends no contextSetId
+    // (or a null/'' from older serialization). Plain .optional() only skips
+    // `undefined`, which is what surfaced as "Invalid contextSetId".
+    body('contextSetId').optional({ nullable: true, checkFalsy: true }).isMongoId().withMessage('Invalid contextSetId'),
     body('contextSourceIds').optional().isArray({ max: 10 }).withMessage('contextSourceIds must be an array of at most 10 items'),
     body('contextSourceIds.*').optional().isMongoId().withMessage('Invalid contextSourceIds entry'),
+    body('libraryResourceIds').optional().isArray({ max: 10 }).withMessage('libraryResourceIds must be an array of at most 10 items'),
+    body('libraryResourceIds.*').optional().isMongoId().withMessage('Invalid libraryResourceIds entry'),
   ],
   async (req, res, next) => {
     try {
@@ -1242,50 +1265,92 @@ router.post(
         scenarioQuestionTypes,
         imageQuestionMode,
         imageQuestionTypes,
-        productModule,
-        juniorContext,
         generationMode,
         contextSetId,
         contextSourceIds,
+        libraryResourceIds,
+        contextMode,
+        cognitiveDemandDistribution: requestedCognitiveDemandDistribution,
       } = req.body;
-      // Deliberately keyed only on generationMode, not productModule — see
-      // resolveGenerationStrategy's doc comment. This is what makes
-      // STANDARD and WIZKIDS share one Source-Grounded pipeline.
-      const isSourceGrounded = resolveGenerationStrategy({ generationMode }) === 'SOURCE_GROUNDED';
-      const effectivePlanType = await resolveUserEffectivePlanType(req.user);
-      const isJuniorGeneration = String(productModule || 'STANDARD').toUpperCase() === 'WIZKIDS';
-      let preparedJuniorContext = null;
-      if (isJuniorGeneration) {
-        try {
-          preparedJuniorContext = await prepareWizKidsExamInput({
-            tenantId: req.user.tenantId,
-            mode: juniorContext?.mode || 'TEST',
-            gradeLevel: juniorContext?.gradeLevel,
-            domains: juniorContext?.domains,
-            interactionMode: juniorContext?.interactionMode || 'STANDARD',
-            flashMaths: juniorContext?.flashMaths,
-          });
-        } catch (juniorError) {
-          if (juniorError instanceof WizKidsExamError) {
-            return res.status(juniorError.status).json({ error: juniorError.message });
-          }
-          throw juniorError;
+      // Quick Assessment is intentionally independent of academic framework
+      // policy. Older saved browser drafts can retain a resolved specification
+      // after switching modes, so ignore that stale client state here.
+      const creationMode = String(req.body?.creationMode || '').toUpperCase();
+      const isQuickAssessment = creationMode === 'QUICK';
+      const suppliedSpecification = isQuickAssessment ? null : (req.body?.resolvedSpecification || null);
+      let governedSpecification = null;
+      if (!isQuickAssessment && (suppliedSpecification || req.body?.assessmentPurpose || req.body?.frameworkId || req.body?.frameworkVersionId)) {
+        const specificationContext = suppliedSpecification?.academicContext || req.body?.academicContext || {};
+        governedSpecification = await resolveAssessmentSpecification({
+          tenantId: req.user.tenantId,
+          purpose: req.body?.assessmentPurpose || suppliedSpecification?.purpose || 'OF',
+          assessmentType: req.body?.assessmentType || suppliedSpecification?.assessmentType || 'QUIZ',
+          academicContext: specificationContext,
+          frameworkId: req.body?.frameworkId || suppliedSpecification?.framework?.id || null,
+          frameworkVersionId: req.body?.frameworkVersionId || suppliedSpecification?.frameworkVersion?.id || null,
+          creatorOverrides: req.body?.creatorOverrides || {},
+        });
+        // Framework question types guide recommendations; they are not a
+        // hidden allow-list. Canonical registry shape checks and active
+        // feature/capability gates remain authoritative for technical
+        // compatibility.
+      }
+
+      // Cognitive demand (Blueprint section 4B): an Academic framework's
+      // approved target remains authoritative. If it does not declare one,
+      // Academic Assessment receives the application-owned automatic
+      // 30/40/30 target. Quick stays optional; unlabeled legacy callers keep
+      // their prior no-target behavior.
+      const effectiveCognitiveDemandDistribution = resolveEffectiveCognitiveDemandDistribution({
+        creationMode,
+        requestedDistribution: requestedCognitiveDemandDistribution,
+        frameworkDistribution: governedSpecification?.specification?.cognitiveDemandDistribution || null,
+      });
+      const effectiveCognitiveDemandMapping = resolveCognitiveDemandMapping({
+        cognitiveDemandMapping: isQuickAssessment
+          ? null
+          : governedSpecification?.specification?.cognitiveDemandMapping,
+      });
+      if (effectiveCognitiveDemandDistribution) {
+        const distributionCheck = validateCognitiveDemandDistribution(effectiveCognitiveDemandDistribution);
+        if (!distributionCheck.valid) {
+          return res.status(400).json({ error: `Invalid cognitive demand distribution: ${distributionCheck.error}` });
         }
-        const normalizedJuniorTypes = Array.isArray(questionTypes)
-          ? questionTypes.map(normalizeAiQuestionType).filter(Boolean)
-          : [];
-        const unsupportedType = findUnsupportedJuniorQuestionType(normalizedJuniorTypes);
-        if (unsupportedType) {
-          return res.status(400).json({ error: `Question type ${unsupportedType} is not supported for Junior AI authoring.` });
+      }
+
+      const isSourceGrounded = resolveGenerationStrategy({ generationMode }) === 'SOURCE_GROUNDED'
+        || [CONTEXT_MODES.AUTO_CONTEXT, CONTEXT_MODES.SELECTED_CONTEXT, CONTEXT_MODES.STRICT_SOURCE].includes(String(contextMode || '').toUpperCase());
+      const effectivePlanType = await resolveUserEffectivePlanType(req.user);
+
+      let orchestratedContext = null;
+      const normalizedContextMode = String(contextMode || CONTEXT_MODES.STANDARD).toUpperCase();
+      if (normalizedContextMode !== CONTEXT_MODES.STANDARD) {
+        try {
+          orchestratedContext = await buildGenerationContext({
+            user: req.user,
+            creationMode: req.body.creationMode || 'STANDARD',
+            academicContext: req.body.academicContext || governedSpecification?.academicContext || {},
+            assessmentPurpose: req.body.assessmentPurpose || governedSpecification?.purpose || null,
+            resolvedSpecification: governedSpecification?.specification || suppliedSpecification || null,
+            topic,
+            questionBlueprint: { questionTypes },
+            selectedLibraryResourceIds: libraryResourceIds,
+            selectedContextSourceIds: contextSourceIds,
+            contextMode: normalizedContextMode,
+            creatorInstructions: instructions,
+            instructions,
+          });
+        } catch (contextError) {
+          if (contextError instanceof InsufficientContextError) {
+            return res.status(400).json({ error: contextError.message, code: contextError.code });
+          }
+          throw contextError;
         }
       }
 
       // Source-Grounded AI Question Generation — feature-flag + tenant-
-      // ownership validation. This check is inline (not static route
-      // middleware) because it depends on request-body content
-      // (generationMode), matching the same productModule branching
-      // pattern used for isJuniorGeneration above. Shared by STANDARD and
-      // WIZKIDS productModule alike (master prompt §32-34).
+      // ownership validation. This check is inline because it depends on
+      // request-body generationMode.
       let verifiedContextSourceIds = [];
       if (isSourceGrounded) {
         const capability = await resolveTenantFeature(req.user.tenantId, 'SOURCE_GROUNDED_GENERATION');
@@ -1293,26 +1358,61 @@ router.post(
           return res.status(403).json({ error: 'Source-Grounded AI generation is not enabled for this tenant.' });
         }
         const requestedSourceIds = Array.isArray(contextSourceIds) ? contextSourceIds : [];
-        if (requestedSourceIds.length === 0) {
-          return res.status(400).json({ error: 'At least one context source must be selected for Source-Grounded generation.' });
+        const requestedLibraryResourceIds = Array.isArray(libraryResourceIds) ? libraryResourceIds : [];
+        const orchestratedSourceIds = orchestratedContext?.selectedContextSourceIds || [];
+        const orchestratedLibraryIds = orchestratedContext?.selectedLibraryResourceIds || [];
+        if (requestedSourceIds.length === 0 && requestedLibraryResourceIds.length === 0 && orchestratedSourceIds.length === 0) {
+          return res.status(400).json({ error: 'At least one content library resource or source must be selected for Source-Grounded generation.' });
+        }
+        let resolvedFromLibrary = [];
+        const libraryIdsToResolve = orchestratedLibraryIds.length ? orchestratedLibraryIds : requestedLibraryResourceIds;
+        if (libraryIdsToResolve.length) {
+          try {
+            resolvedFromLibrary = await resolveLibraryResourcesToContextSourceIds(req.user, libraryIdsToResolve);
+          } catch (resolveError) {
+            if (resolveError instanceof ContentLibraryError) {
+              return res.status(resolveError.status).json({ error: resolveError.message, code: resolveError.code });
+            }
+            throw resolveError;
+          }
+        }
+        const mergedSourceIds = [...new Set([
+          ...requestedSourceIds.map(String),
+          ...resolvedFromLibrary.map(String),
+          ...orchestratedSourceIds.map(String),
+        ])];
+        if (mergedSourceIds.length > 10) {
+          return res.status(400).json({ error: 'At most 10 context sources may be selected for Source-Grounded generation.' });
         }
         // The exact tenant-isolation / IDOR guard: every requested source
         // ID must belong to THIS tenant and be READY. A cross-tenant or
         // unknown ID silently fails this count-equality check rather than
         // ever being fetched/compared after the fact.
-        const readyOwnedCount = await ContextSource.countDocuments(
+        const readyOwnedSources = await ContextSource.find(
           buildTenantOwnedSourceFilter({
             tenantId: req.user.tenantId,
-            sourceIds: requestedSourceIds,
+            sourceIds: mergedSourceIds,
             status: 'READY',
           })
-        );
-        if (readyOwnedCount !== requestedSourceIds.length) {
+        ).select('createdBy isLibraryItem visibility academicScope libraryResourceId').lean();
+        if (readyOwnedSources.length !== mergedSourceIds.length) {
           return res.status(403).json({
             error: 'One or more selected sources are unavailable, still processing, or do not belong to this tenant.',
           });
         }
-        verifiedContextSourceIds = requestedSourceIds;
+        // Content Library authorization (Part S): a source another user
+        // uploaded must fall within this requester's own academic
+        // visibility (or be a SHARED, unscoped library item) — never
+        // trusted just because it passed the tenant/READY check above.
+        try {
+          await assertContentSourcesSelectable(req.user, readyOwnedSources);
+        } catch (scopeError) {
+          if (scopeError instanceof ContentLibraryError) {
+            return res.status(scopeError.status).json({ error: scopeError.message });
+          }
+          throw scopeError;
+        }
+        verifiedContextSourceIds = mergedSourceIds;
       }
 
       const normalizedDistribution = Array.isArray(questionTypeDistribution)
@@ -1356,23 +1456,7 @@ router.post(
           });
         }
       }
-      if (isJuniorGeneration && preparedJuniorContext?.interactionMode === 'FLASH_MATHS') {
-        const requestedFlashTypes = new Set([
-          ...normalizedRequestedTypes,
-          ...normalizedDistribution.map((item) => item.type),
-        ]);
-        if ([...requestedFlashTypes].some((type) => type !== 'NUMBER')) {
-          return res.status(400).json({ error: 'Flash Maths generation supports deterministic NUMBER rounds only.' });
-        }
-      }
-      if (isJuniorGeneration && normalizedRequestedTypes.includes('NUMBER') && normalizedRequestedTypes.length > 1 && normalizedDistribution.length === 0) {
-        return res.status(400).json({ error: 'A questionTypeDistribution is required when NUMBER is mixed with other Junior AI question types.' });
-      }
-      const deterministicNumberCount = isJuniorGeneration
-        ? (normalizedDistribution.find((item) => item.type === 'NUMBER')?.count ||
-          (normalizedRequestedTypes.length === 1 && normalizedRequestedTypes[0] === 'NUMBER' ? toNonNegativeInt(count, 0) : 0))
-        : 0;
-      const providerQuestionCount = Math.max(0, toNonNegativeInt(count, 0) - deterministicNumberCount);
+      const providerQuestionCount = toNonNegativeInt(count, 0);
 
       // AI-generated image questions — platform-wide kill switch (master
       // prompt §36-37, Rule 10). Checked for EVERY plan, not only free:
@@ -1487,23 +1571,8 @@ router.post(
         generatedAt: new Date(),
       };
 
-      const deterministicQuestions = deterministicNumberCount > 0
-        ? generateJuniorDeterministicNumberQuestions({
-          count: deterministicNumberCount,
-          difficulty,
-          juniorContext: preparedJuniorContext,
-          topic,
-          seedBase: `${tenantId}:${req.user?._id}:${Date.now()}`,
-        })
-        : [];
-      const providerTypes = normalizedRequestedTypes.filter((type) => type !== 'NUMBER');
-      const providerDistribution = normalizedDistribution.filter((item) => item.type !== 'NUMBER');
-
-      // Source-Grounded AI Question Generation — shared entry point for
-      // BOTH productModule STANDARD and WIZKIDS (master prompt §32-34: one
-      // pipeline, not a parallel WizKids-only implementation). Never falls
-      // through to generateQuestions()'s unconstrained/general-knowledge
-      // path below.
+      // Source-grounded generation never falls through to the unconstrained
+      // general-knowledge path below.
       let providerQuestions = [];
       let sourceGroundedRun = null;
       let sourceGroundedDiagnostics = null;
@@ -1512,100 +1581,195 @@ router.post(
           tenantId,
           userId: req.user._id,
           generationMode: 'SOURCE_GROUNDED',
-          productModule: isJuniorGeneration ? 'WIZKIDS' : 'STANDARD',
           contextSetId: contextSetId || null,
           requestedSourceIds: verifiedContextSourceIds,
           requestedCount: providerQuestionCount,
           status: 'RUNNING',
         });
 
+        // STRICT_SOURCE keeps the original anti-fallback contract: report the
+        // exact shortfall rather than supplementing with general knowledge.
+        // SELECTED_CONTEXT / AUTO_CONTEXT (the default Source-Grounded path)
+        // always fulfil the request — ground what the sources support, then
+        // top up the remainder on the same topic using the retrieved source
+        // text as reference context (Blueprint §4C).
+        const isStrictSource = normalizedContextMode === CONTEXT_MODES.STRICT_SOURCE;
+
+        const memoryPolicy = governedSpecification?.specification?.rules?.memory
+          ? mapFrameworkMemoryPolicy(governedSpecification.specification.rules.memory)
+          : null;
+
+        let groundedResult = null;
+        let groundedQuestions = [];
         try {
-          const result = await generateWithNoveltyAndGrounding({
+          groundedResult = await generateWithNoveltyAndGrounding({
             tenantId,
             userId: req.user._id,
             generationRunId: sourceGroundedRun._id,
             sourceIds: verifiedContextSourceIds,
             topic,
-            // Prefer the dedicated "Instructions for AI" field (distinct
-            // from Topic — master prompt §16/§63: Topic is WHAT to focus
-            // on, Instructions is HOW to construct the questions); fall
-            // back to examDescription for older callers that predate this
-            // field.
             instructions: instructions || examDescription || '',
             difficulty,
-            questionTypes: isJuniorGeneration ? providerTypes : normalizedRequestedTypes,
-            questionTypeDistribution: isJuniorGeneration
-              ? providerDistribution
-              : normalizedDistribution,
+            questionTypes: normalizedRequestedTypes,
+            questionTypeDistribution: normalizedDistribution,
             targetCount: providerQuestionCount,
             examTitle,
             examDescription,
-            juniorContext: preparedJuniorContext,
+            memoryPolicy,
           });
+          groundedQuestions = Array.isArray(groundedResult.questions) ? groundedResult.questions : [];
+        } catch (groundedError) {
+          if (isStrictSource) {
+            sourceGroundedRun.status = 'FAILED';
+            sourceGroundedRun.errorMessage = groundedError?.message || 'Source-grounded generation failed.';
+            sourceGroundedRun.completedAt = new Date();
+            await sourceGroundedRun.save();
+            throw groundedError;
+          }
+          // Non-strict: a grounded-pass failure is not fatal — fall through to
+          // the topic top-up below so the request is still fulfilled.
+          console.error('[source-grounded] grounded pass failed; supplementing from topic:', groundedError?.message);
+          groundedResult = null;
+          groundedQuestions = [];
+        }
 
-          providerQuestions = result.questions;
+        if (isStrictSource) {
+          providerQuestions = groundedQuestions;
           sourceGroundedDiagnostics = {
-            insufficientSourceMaterial: result.insufficientSourceMaterial,
-            // Distinguishes WHY generation fell short (master prompt
-            // §29/§30/§44) so the frontend can show a specific message
-            // instead of one generic "insufficient" string regardless of
-            // cause: retrieval found nothing at all, the model itself
-            // judged the material insufficient for the requested count,
-            // or candidates were produced but rejected by grounding/
-            // novelty validation.
-            insufficientReason: result.insufficientReason,
-            dominantRejectionReason: result.dominantRejectionReason,
+            insufficientSourceMaterial: groundedResult.insufficientSourceMaterial,
+            insufficientReason: groundedResult.insufficientReason,
+            dominantRejectionReason: groundedResult.dominantRejectionReason,
             requestedCount: providerQuestionCount,
-            acceptedCount: result.acceptedCount,
-            rejectedCount: result.rejectedCount,
-            rejectionReasons: result.rejectionReasons,
-            attempts: result.attempts,
-            requestedDistribution: result.requestedDistribution,
-            generatedDistribution: result.generatedDistribution,
-            missingDistribution: result.missingDistribution,
+            acceptedCount: groundedResult.acceptedCount,
+            rejectedCount: groundedResult.rejectedCount,
+            rejectionReasons: groundedResult.rejectionReasons,
+            attempts: groundedResult.attempts,
+            requestedDistribution: groundedResult.requestedDistribution,
+            generatedDistribution: groundedResult.generatedDistribution,
+            missingDistribution: groundedResult.missingDistribution,
           };
-
-          sourceGroundedRun.acceptedCount = result.acceptedCount;
-          sourceGroundedRun.rejectedCount = result.rejectedCount;
-          sourceGroundedRun.rejectionReasons = result.rejectionReasons;
-          sourceGroundedRun.insufficientSourceMaterial = result.insufficientSourceMaterial;
+          sourceGroundedRun.acceptedCount = groundedResult.acceptedCount;
+          sourceGroundedRun.rejectedCount = groundedResult.rejectedCount;
+          sourceGroundedRun.rejectionReasons = groundedResult.rejectionReasons;
+          sourceGroundedRun.insufficientSourceMaterial = groundedResult.insufficientSourceMaterial;
           sourceGroundedRun.status =
-            result.acceptedCount >= providerQuestionCount
+            groundedResult.acceptedCount >= providerQuestionCount
               ? 'COMPLETED'
-              : result.acceptedCount > 0
+              : groundedResult.acceptedCount > 0
                 ? 'PARTIAL'
                 : 'FAILED';
           sourceGroundedRun.completedAt = new Date();
           await sourceGroundedRun.save();
 
-          if (result.missingDistribution.length > 0) {
+          if (groundedResult.missingDistribution.length > 0) {
             throw new QuestionDistributionError({
-              requested: result.requestedDistribution,
-              generated: result.generatedDistribution,
-              missing: result.missingDistribution.map((item) => ({
+              requested: groundedResult.requestedDistribution,
+              generated: groundedResult.generatedDistribution,
+              missing: groundedResult.missingDistribution.map((item) => ({
                 type: item.type,
-                expected: result.requestedDistribution[item.type] || 0,
-                actual: result.generatedDistribution[item.type] || 0,
+                expected: groundedResult.requestedDistribution[item.type] || 0,
+                actual: groundedResult.generatedDistribution[item.type] || 0,
                 count: item.count,
               })),
             });
           }
-        } catch (groundedError) {
-          sourceGroundedRun.status = 'FAILED';
-          sourceGroundedRun.errorMessage = groundedError?.message || 'Source-grounded generation failed.';
+        } else {
+          const { shortfallDistribution, shortfallCount } = computeShortfallDistribution({
+            requestedDistribution: normalizedDistribution,
+            requestedCount: providerQuestionCount,
+            generatedByType: groundedResult?.generatedDistribution || {},
+            fallbackTypes: normalizedRequestedTypes,
+          });
+
+          let supplementQuestions = [];
+          if (shortfallCount > 0) {
+            // Reference context so the top-up still "checks the attached
+            // file": the token-budgeted chunks the orchestrator already
+            // retrieved, else a direct sample of this source's chunks.
+            let referenceText = (orchestratedContext?.retrievedChunks || [])
+              .map((chunk) => String(chunk?.text || '').trim())
+              .filter(Boolean)
+              .join('\n\n');
+            if (!referenceText && verifiedContextSourceIds.length) {
+              const sampleChunks = await ContextChunk.find({
+                tenantId,
+                sourceId: { $in: verifiedContextSourceIds },
+              })
+                .select('text')
+                .sort({ sourceId: 1, chunkIndex: 1 })
+                .limit(sourceGroundedConfig.RETRIEVAL_TOP_K || 12)
+                .lean();
+              referenceText = sampleChunks
+                .map((chunk) => String(chunk?.text || '').trim())
+                .filter(Boolean)
+                .join('\n\n');
+            }
+
+            supplementQuestions = await generateQuestions({
+              topic,
+              count: shortfallCount,
+              difficulty,
+              questionTypes: shortfallDistribution.length
+                ? shortfallDistribution.map((item) => item.type)
+                : normalizedRequestedTypes,
+              questionTypeDistribution: shortfallDistribution.length ? shortfallDistribution : undefined,
+              uploadedContent: referenceText || uploadedContent || undefined,
+              examTitle,
+              examDescription,
+              existingQuestions: [
+                ...(Array.isArray(existingQuestions) ? existingQuestions : []),
+                ...groundedQuestions.map((question) => question?.questionText).filter(Boolean),
+              ],
+              cognitiveDemandDistribution: effectiveCognitiveDemandDistribution,
+              cognitiveDemandMapping: effectiveCognitiveDemandMapping,
+              tenantId,
+              userId: req.user?._id || null,
+              metadata: aiMetadata,
+              // Resilient by design: the shortfall distribution still steers
+              // the provider toward the right types/count, but a provider or
+              // distribution failure degrades to the deterministic local
+              // filler rather than throwing — the request must always be
+              // fulfilled for SELECTED_CONTEXT / AUTO_CONTEXT (Blueprint §4C).
+              requireProviderExactDistribution: false,
+            });
+          }
+
+          providerQuestions = [...groundedQuestions, ...(Array.isArray(supplementQuestions) ? supplementQuestions : [])];
+          const deliveredCount = providerQuestions.length;
+          sourceGroundedDiagnostics = {
+            // Never surfaced as a blocking error for SELECTED_CONTEXT /
+            // AUTO_CONTEXT — kept for telemetry / the "View source evidence"
+            // affordance only.
+            fulfilled: deliveredCount >= providerQuestionCount,
+            requestedCount: providerQuestionCount,
+            acceptedCount: deliveredCount,
+            groundedCount: groundedQuestions.length,
+            supplementedCount: Array.isArray(supplementQuestions) ? supplementQuestions.length : 0,
+            attempts: groundedResult?.attempts || 0,
+            requestedDistribution: groundedResult?.requestedDistribution || {},
+            generatedDistribution: groundedResult?.generatedDistribution || {},
+            rejectionReasons: groundedResult?.rejectionReasons || {},
+          };
+          sourceGroundedRun.acceptedCount = groundedQuestions.length;
+          sourceGroundedRun.supplementedCount = Array.isArray(supplementQuestions) ? supplementQuestions.length : 0;
+          sourceGroundedRun.rejectedCount = groundedResult?.rejectedCount || 0;
+          sourceGroundedRun.rejectionReasons = groundedResult?.rejectionReasons || {};
+          sourceGroundedRun.insufficientSourceMaterial = false;
+          sourceGroundedRun.status = deliveredCount >= providerQuestionCount
+            ? 'COMPLETED'
+            : deliveredCount > 0
+              ? 'PARTIAL'
+              : 'FAILED';
           sourceGroundedRun.completedAt = new Date();
           await sourceGroundedRun.save();
-          throw groundedError;
         }
       } else if (providerQuestionCount > 0) {
         providerQuestions = await generateQuestions({
           topic,
           count: providerQuestionCount,
           difficulty,
-          questionTypes: isJuniorGeneration ? providerTypes : normalizedRequestedTypes,
-          questionTypeDistribution: isJuniorGeneration
-            ? providerDistribution
-            : (normalizedDistribution.length ? normalizedDistribution : undefined),
+          questionTypes: normalizedRequestedTypes,
+          questionTypeDistribution: normalizedDistribution.length ? normalizedDistribution : undefined,
           questionSorting,
           questionSortPattern: Array.isArray(questionSortPattern) ? questionSortPattern : undefined,
           duration,
@@ -1622,15 +1786,31 @@ router.post(
           scenarioQuestionTypes: Array.isArray(scenarioQuestionTypes) ? scenarioQuestionTypes : undefined,
           imageQuestionMode,
           imageQuestionTypes: Array.isArray(imageQuestionTypes) ? imageQuestionTypes : [],
+          cognitiveDemandDistribution: effectiveCognitiveDemandDistribution,
+          cognitiveDemandMapping: effectiveCognitiveDemandMapping,
           tenantId,
           userId: req.user?._id || null,
           metadata: aiMetadata,
-          juniorContext: preparedJuniorContext,
           requireProviderExactDistribution: true,
         });
       }
-      const questions = [...deterministicQuestions, ...providerQuestions]
-        .map((question, index) => ({ ...question, order: index + 1 }));
+      // The application re-resolves policy server-side. AI receives/requested
+      // constraints, but never chooses governance rules itself.
+      const qualityGate = qualityGateQuestionsAgainstSpecification(
+        providerQuestions,
+        governedSpecification?.specification || null
+      );
+      // cognitiveDemand is always application-derived from bloomLevel + the
+      // resolved mapping here — never trusted from any AI-provided label
+      // (none of the prompts above even ask the model for cognitiveDemand
+      // directly, only bloomLevel). A question with no bloomLevel keeps
+      // cognitiveDemand: null rather than a guessed value.
+      const questions = qualityGate.accepted
+        .map((question, index) => ({
+          ...question,
+          order: index + 1,
+          cognitiveDemand: deriveCognitiveDemandFromBloom(question.bloomLevel, effectiveCognitiveDemandMapping),
+        }));
 
       // Requested-vs-generated distribution diagnostics: compares the exact
       // per-type counts the caller asked for against what actually came
@@ -1640,6 +1820,14 @@ router.post(
         normalizedDistribution.length ? normalizedDistribution : questionTypeDistribution,
         questions
       );
+      // Same idea for cognitive demand — never trust the aggregate count
+      // blindly; report target vs actual so the creator/UI can see it
+      // (Post-generation validation: "Do not trust the AI's label blindly").
+      const cognitiveDemandDiagnostics = computeCognitiveDemandDiagnostics({
+        targetDistribution: effectiveCognitiveDemandDistribution,
+        questions,
+        mapping: effectiveCognitiveDemandMapping,
+      });
 
       res.json({
         questions,
@@ -1648,6 +1836,9 @@ router.post(
         generatedDistribution: distributionDiagnostics.generated,
         totalQuestions: Array.isArray(questions) ? questions.length : 0,
         validationStatus: distributionDiagnostics.validationStatus,
+        cognitiveDemandDiagnostics,
+        qualityGate: { acceptedCount: questions.length, rejected: qualityGate.rejected },
+        ...(governedSpecification ? { resolvedSpecification: governedSpecification } : {}),
         ...(sourceGroundedDiagnostics ? { sourceGrounded: sourceGroundedDiagnostics } : {}),
       });
     } catch (error) {
@@ -1710,26 +1901,24 @@ router.post(
       } else if (['.jpg', '.jpeg', '.png'].includes(fileExtension)) {
         // For images, we'll use OpenAI Vision API if available
         // Otherwise, return error suggesting to convert to PDF
-        if (!config.openaiApiKey) {
+        if (!isOpenAIEngineConfigured()) {
           return res.status(400).json({ 
             error: 'Image OCR requires OpenAI API key. Please convert image to PDF or use Excel format.' 
           });
         }
-
-        const client = new OpenAI({ apiKey: config.openaiApiKey });
         
         // Convert image buffer to base64
         const base64Image = req.file.buffer.toString('base64');
         const mimeType = fileExtension === '.png' ? 'image/png' : 'image/jpeg';
         
         try {
-          const response = await createTrackedChatCompletion({
-            client,
+          const response = await runEngineChatCompletion({
+            operation: AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE,
             feature: 'answer_key_generation',
             tenantId: req.user?.tenantId,
             userId: req.user?._id,
             request: {
-              model: OPENAI_MODEL,
+              model: config.openaiModel,
               messages: [
                 {
                   role: 'user',
@@ -1778,22 +1967,20 @@ Format: { "answers": { "q1": { "questionText": "...", "correctAnswer": "...", "p
 
       const userPrompt = `Extract the answer key from the following content:\n\n${extractedContent.substring(0, 15000)}`;
 
-      if (!config.openaiApiKey) {
+      if (!isOpenAIEngineConfigured()) {
         return res.status(500).json({ 
           error: 'OpenAI API key not configured. Cannot generate answer key.' 
         });
       }
 
-      const client = new OpenAI({ apiKey: config.openaiApiKey });
-
       try {
-        const completion = await createTrackedChatCompletion({
-          client,
+        const completion = await runEngineChatCompletion({
+          operation: AI_OPERATIONS.QUESTION_IMPORT_ASSISTANCE,
           feature: 'answer_key_generation',
           tenantId: req.user?.tenantId,
           userId: req.user?._id,
           request: {
-            model: OPENAI_MODEL,
+            model: config.openaiModel,
             messages: [
               { role: 'system', content: systemPrompt },
               { role: 'user', content: userPrompt },

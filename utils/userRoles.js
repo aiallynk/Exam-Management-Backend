@@ -13,6 +13,8 @@
 export const ALL_ROLES = Object.freeze([
   'SUPER_ADMIN',
   'TENANT_ADMIN',
+  'ACADEMIC_ADMIN',
+  'TEACHER',
   'EXAM_CREATOR',
   'CANDIDATE',
   'EVALUATOR',

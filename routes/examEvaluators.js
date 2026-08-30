@@ -5,6 +5,7 @@ import Exam from '../models/Exam.js';
 import User from '../models/User.js';
 import { requireAuth } from '../middleware/auth.js';
 import { requireRole } from '../middleware/roles.js';
+import { requireExamEvaluatorManager } from '../middleware/examPermissions.js';
 import { requireTenant, enforceTenantBoundaries } from '../middleware/multiTenant.js';
 import { validateObjectId } from '../middleware/validation.js';
 import { AUDIT_ACTIONS } from '../middleware/audit.js';
@@ -47,12 +48,14 @@ const router = express.Router();
 // already exist — used by the "Assign Evaluators" step of exam creation.
 // It uses the same active-EVALUATOR filter as every later assignment route,
 // so a person shown before creation remains assignable after creation.
+const EVALUATOR_MANAGER_ROLES = ['EXAM_CREATOR', 'ACADEMIC_ADMIN', 'TEACHER', 'TENANT_ADMIN'];
+
 router.get(
   '/evaluators/eligible',
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  requireRole(...EVALUATOR_MANAGER_ROLES),
   requireTenantFeature('EVALUATOR_REVIEW'),
   async (req, res, next) => {
     try {
@@ -91,9 +94,10 @@ router.get(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  requireRole(...EVALUATOR_MANAGER_ROLES),
   requireTenantFeature('EVALUATOR_REVIEW'),
   validateObjectId('examId'),
+  requireExamEvaluatorManager(),
   async (req, res, next) => {
     try {
       const exam = await Exam.findOne({ _id: req.params.examId, ...(req.tenantFilter || {}) })
@@ -133,9 +137,10 @@ router.get(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  requireRole(...EVALUATOR_MANAGER_ROLES),
   requireTenantFeature('EVALUATOR_REVIEW'),
   validateObjectId('examId'),
+  requireExamEvaluatorManager(),
   async (req, res, next) => {
     try {
       const exam = await Exam.findOne({ _id: req.params.examId, ...(req.tenantFilter || {}) }).select('_id tenantId').lean();
@@ -167,9 +172,10 @@ router.post(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  requireRole(...EVALUATOR_MANAGER_ROLES),
   requireTenantFeature('EVALUATOR_REVIEW'),
   validateObjectId('examId'),
+  requireExamEvaluatorManager(),
   [
     body('examinerId').notEmpty().withMessage('examinerId is required').isMongoId(),
     body('scopeType').optional().isIn(SCOPE_TYPES),
@@ -270,9 +276,10 @@ router.get(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  requireRole(...EVALUATOR_MANAGER_ROLES),
   requireTenantFeature('EVALUATOR_REVIEW'),
   validateObjectId('examId'),
+  requireExamEvaluatorManager(),
   async (req, res, next) => {
     try {
       const summary = await getDistributionSummary({ examId: req.params.examId, tenantFilter: req.tenantFilter });
@@ -294,9 +301,10 @@ router.post(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  requireRole(...EVALUATOR_MANAGER_ROLES),
   requireTenantFeature('EVALUATOR_REVIEW'),
   validateObjectId('examId'),
+  requireExamEvaluatorManager(),
   [
     body('evaluatorIds').isArray({ min: 1 }).withMessage('evaluatorIds must be a non-empty array'),
     body('evaluatorIds.*').isMongoId(),
@@ -350,9 +358,10 @@ router.post(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  requireRole(...EVALUATOR_MANAGER_ROLES),
   requireTenantFeature('EVALUATOR_REVIEW'),
   validateObjectId('examId'),
+  requireExamEvaluatorManager(),
   [
     body('attemptId').notEmpty().isMongoId(),
     body('toExaminerId').notEmpty().isMongoId(),
@@ -391,9 +400,10 @@ router.patch(
   requireAuth,
   requireTenant,
   enforceTenantBoundaries,
-  requireRole('EXAM_CREATOR', 'TENANT_ADMIN', 'SUPER_ADMIN'),
+  requireRole(...EVALUATOR_MANAGER_ROLES),
   requireTenantFeature('EVALUATOR_REVIEW'),
   validateObjectId('examId'),
+  requireExamEvaluatorManager(),
   [body('strategy').optional({ nullable: true }).isIn(DISTRIBUTION_STRATEGIES)],
   async (req, res, next) => {
     try {

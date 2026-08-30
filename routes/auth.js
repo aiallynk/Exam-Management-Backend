@@ -733,13 +733,13 @@ router.post(
       // Find user
       loginProfiler.mark('user_lookup_start');
       let user = await User.findOne({ email }).select(
-        'name email password role tenantId status planType examsCreated'
+        'name email password role roles tenantId status planType examsCreated'
       );
       loginProfiler.mark('user_lookup_done', { found: Boolean(user) });
       if (!user && rawEmailInput && rawEmailInput !== email) {
         loginProfiler.mark('user_lookup_raw_fallback_start');
         user = await User.findOne({ email: rawEmailInput.trim() }).select(
-          'name email password role tenantId status planType examsCreated'
+          'name email password role roles tenantId status planType examsCreated'
         );
         loginProfiler.mark('user_lookup_raw_fallback_done', {
           found: Boolean(user),
@@ -1387,4 +1387,3 @@ router.get('/me', requireAuth, async (req, res, next) => {
 });
 
 export default router;
-

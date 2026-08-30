@@ -3,6 +3,9 @@ import { logError } from '../utils/logger.js';
 import { emitSystemFailureAlert } from '../services/systemAlertService.js';
 
 export const errorHandler = (err, req, res, next) => {
+  if (res.headersSent) {
+    return next(err);
+  }
   logError(err, `${req.method} ${req.path}`);
 
   // Standardized error response structure

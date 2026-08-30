@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import {
   QuestionDistributionError,
   enforceQuestionDistribution,
+  normalizeQuestionObject,
   normalizeToRequestedType,
 } from '../services/aiService.js';
 
@@ -164,6 +165,113 @@ describe('enforceQuestionDistribution — final per-type tally always matches th
     assert.equal(result.length, 2);
     assert.deepEqual(tallyByType(result), { MULTIPLE_CHOICE: 1, SHORT_ANSWER: 1 });
   });
+
+  test('accepts provider field aliases instead of discarding otherwise valid candidates from every requested bucket', () => {
+    const result = enforceQuestionDistribution({
+      questions: [
+        {
+          question_text: 'Which gas do plants absorb during photosynthesis?',
+          format: 'Multiple Choice',
+          choices: ['Oxygen', 'Carbon dioxide', 'Nitrogen', 'Hydrogen'],
+          correct_answer: 'Carbon dioxide',
+        },
+        {
+          prompt: 'Write one paragraph explaining why photosynthesis matters to ecosystems.',
+          response_type: 'Paragraph',
+          correct_answer: 'A paragraph explaining food chains and oxygen production.',
+        },
+        {
+          stem: 'Write an essay about the importance of photosynthesis.',
+          answer_type: 'Essay',
+          correct_answer: 'A structured essay.',
+        },
+        {
+          content: 'Write a letter to a school principal proposing a tree-planting drive.',
+          question_format: 'Letter Writing',
+          correct_answer: 'A formal persuasive letter.',
+        },
+        {
+          text: 'Write a story about a seed that grows into a tree.',
+          type: 'Story Writing',
+          correct_answer: 'A coherent story.',
+        },
+      ],
+      typeDistribution: [
+        { type: 'MULTIPLE_CHOICE', count: 1 },
+        { type: 'PARAGRAPH', count: 1 },
+        { type: 'ESSAY', count: 1 },
+        { type: 'ESSAY_LETTER', count: 1 },
+        { type: 'ESSAY_STORY', count: 1 },
+      ],
+      count: 5,
+      topic: 'Photosynthesis',
+    });
+
+    assert.deepEqual(tallyByType(result), {
+      MULTIPLE_CHOICE: 1,
+      PARAGRAPH: 1,
+      ESSAY: 1,
+      ESSAY_LETTER: 1,
+      ESSAY_STORY: 1,
+    });
+  });
+
+  test('recovers only self-evident untyped provider questions without substituting an overflow from another type', () => {
+    const result = enforceQuestionDistribution({
+      questions: [
+        {
+          questionText: 'Which gas do plants absorb during photosynthesis?',
+          choices: ['Oxygen', 'Carbon dioxide', 'Nitrogen', 'Hydrogen'],
+          correctAnswer: 'Carbon dioxide',
+        },
+        {
+          questionText: 'Write one paragraph explaining why photosynthesis matters to ecosystems.',
+          correctAnswer: 'A paragraph explaining food chains and oxygen production.',
+        },
+        {
+          questionText: 'Write an essay about the importance of photosynthesis.',
+          correctAnswer: 'A structured essay.',
+        },
+        {
+          questionText: 'Write a letter to a school principal proposing a tree-planting drive.',
+          correctAnswer: 'A formal persuasive letter.',
+        },
+        {
+          questionText: 'Write a story about a seed that grows into a tree.',
+          correctAnswer: 'A coherent story.',
+        },
+      ],
+      typeDistribution: [
+        { type: 'MULTIPLE_CHOICE', count: 1 },
+        { type: 'PARAGRAPH', count: 1 },
+        { type: 'ESSAY', count: 1 },
+        { type: 'ESSAY_LETTER', count: 1 },
+        { type: 'ESSAY_STORY', count: 1 },
+      ],
+      count: 5,
+      topic: 'Photosynthesis',
+    });
+
+    assert.deepEqual(tallyByType(result), {
+      MULTIPLE_CHOICE: 1,
+      PARAGRAPH: 1,
+      ESSAY: 1,
+      ESSAY_LETTER: 1,
+      ESSAY_STORY: 1,
+    });
+  });
+});
+
+test('normalizes provider option and answer aliases before Question schema validation', () => {
+  const normalized = normalizeQuestionObject({
+    question_text: 'Which gas do plants absorb during photosynthesis?',
+    format: 'Multiple Choice',
+    choices: [{ label: 'Oxygen' }, { label: 'Carbon dioxide' }, { label: 'Nitrogen' }],
+    correct_answer: 'Carbon dioxide',
+  });
+  assert.equal(normalized.questionType, 'MULTIPLE_CHOICE');
+  assert.deepEqual(normalized.options, ['Oxygen', 'Carbon dioxide', 'Nitrogen']);
+  assert.equal(normalized.correctAnswer, 'Carbon dioxide');
 });
 
 describe('normalizeToRequestedType — PARAGRAPH branch always returns questionType: PARAGRAPH', () => {

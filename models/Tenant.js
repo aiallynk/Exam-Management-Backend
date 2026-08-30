@@ -63,6 +63,16 @@ const TenantSchema = new mongoose.Schema(
       type: String,
       trim: true,
     },
+    // The platform-provisioned root of this tenant's organization hierarchy
+    // (models/academic/OrganizationUnit.js) — set once at tenant creation
+    // (routes/superAdmin.js) and never reassigned. Tenant Admins add
+    // children beneath it; they cannot create another root — see the
+    // duplicate-root guard in routes/academicV2.js.
+    rootOrganizationUnitId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: 'OrganizationUnit',
+      default: null,
+    },
     status: {
       type: String,
       enum: ['ACTIVE', 'INACTIVE', 'SUSPENDED'],

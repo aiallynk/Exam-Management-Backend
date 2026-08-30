@@ -235,15 +235,6 @@ export const resolvePlanLimits = (planType, tenant = null) => {
       legacyValue: null,
       baseValue: baseLimits?.maxCandidates,
     }),
-    // WizKids Phase 3 — Batch/Grade. Same override precedence as every other
-    // limit here: per-tenant customLimits.maxWizKidsBatches (Super-Admin-set,
-    // -1 = explicitly unlimited) -> plan default -> unlimited if undefined.
-    maxWizKidsBatches: resolvePlanLimitWithOverride({
-      customLimits,
-      key: 'maxWizKidsBatches',
-      legacyValue: null,
-      baseValue: baseLimits?.maxWizKidsBatches,
-    }),
   };
 
   return applyExtraCreditsToPlanLimits(limits, tenant?.extraCredits);

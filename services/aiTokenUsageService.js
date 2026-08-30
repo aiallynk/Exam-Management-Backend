@@ -333,6 +333,8 @@ export const createTrackedChatCompletion = async ({
 export const createTrackedEmbedding = async ({
   client,
   request,
+  model,
+  input,
   feature = 'source_grounded_context_embedding',
   tenantId,
   userId,
@@ -341,11 +343,16 @@ export const createTrackedEmbedding = async ({
     throw new Error('OpenAI client is not initialized');
   }
 
-  const requestedModel = normalizeModelName(request?.model) || 'unknown';
+  const resolvedRequest = request || { model, input };
+  const requestedModel = normalizeModelName(resolvedRequest?.model) || 'unknown';
+  if (requestedModel.includes('gpt-') && !requestedModel.includes('embedding')) {
+    throw new Error(`Invalid embedding model "${requestedModel}". Configure an embeddings model for EMBEDDING operations.`);
+  }
+
   let response;
 
   try {
-    response = await client.embeddings.create(request);
+    response = await client.embeddings.create(resolvedRequest);
   } catch (error) {
     await trackAITokenUsage({
       usage: null,
@@ -353,7 +360,7 @@ export const createTrackedEmbedding = async ({
       tenantId,
       userId,
       model: requestedModel,
-      usageCount: 1,
+      usageCount: Array.isArray(resolvedRequest?.input) ? resolvedRequest.input.length : 1,
       questionCount: 0,
       requestStatus: 'FAILED',
       errorMessage: error?.message || 'AI embedding request failed',
@@ -374,7 +381,7 @@ export const createTrackedEmbedding = async ({
     tenantId,
     userId,
     model: resolvedModel,
-    usageCount: 1,
+    usageCount: Array.isArray(resolvedRequest?.input) ? resolvedRequest.input.length : 1,
     questionCount: 0,
     requestStatus: 'SUCCESS',
   });
