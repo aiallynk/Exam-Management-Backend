@@ -23,41 +23,41 @@
     "backfill:historical-question-signatures": "node scripts/backfillHistoricalQuestionSignatures.js"
   },
   "dependencies": {
-    "@aws-sdk/client-kms": "^3.1093.0",
-    "@aws-sdk/client-s3": "^3.1093.0",
-    "@aws-sdk/s3-request-presigner": "^3.1093.0",
+    "@aws-sdk/client-kms": "^3.1136.0",
+    "@aws-sdk/client-s3": "^3.1136.0",
+    "@aws-sdk/s3-request-presigner": "^3.1136.0",
     "@google/generative-ai": "^0.24.1",
     "archiver": "^7.0.1",
-    "axios": "^1.13.6",
+    "axios": "^1.20.0",
     "bcryptjs": "^2.4.3",
     "bullmq": "^5.80.12",
     "bwip-js": "^4.11.4",
-    "compression": "^1.7.4",
+    "compression": "^1.8.2",
     "cors": "^2.8.5",
     "csv-parse": "^5.5.3",
     "dotenv": "^16.3.1",
     "express": "^4.18.2",
     "express-rate-limit": "^7.1.5",
-    "express-validator": "^7.0.1",
+    "express-validator": "^7.3.2",
     "helmet": "^7.1.0",
     "ioredis": "^5.11.1",
     "jimp": "^1.6.1",
     "jsonwebtoken": "^9.0.2",
     "jsqr": "^1.4.0",
     "mongoose": "^8.0.3",
-    "morgan": "^1.10.0",
+    "morgan": "^1.12.1",
     "multer": "^1.4.5-lts.1",
-    "node-cron": "^4.2.1",
+    "node-cron": "^4.6.0",
     "nodemailer": "^9.0.3",
     "openai": "^4.20.1",
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^1.1.1",
     "qrcode": "^1.5.3",
     "read-excel-file": "^5.7.1",
-    "tar": "^7.5.21",
-    "unzipper": "^0.12.3"
+    "tar": "^7.5.22",
+    "unzipper": "^0.12.5"
   },
   "devDependencies": {
-    "nodemon": "^3.0.2"
+    "nodemon": "^3.1.14"
   }
 }
